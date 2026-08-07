@@ -74,6 +74,7 @@ remain the operator's responsibility.
 ```powershell
 git clone --recurse-submodules https://github.com/cpappas213/meridian59-llm-bot.git
 Set-Location .\meridian59-llm-bot
+python -m pip install --editable .
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
@@ -90,6 +91,9 @@ secrets in an ACL-restricted file below `%LOCALAPPDATA%\m59-llm-bot`, writes the
 runtime TOML configuration, registers a restart-on-failure logon task, and adds
 the controller and knowledge MCP servers when the `hermes` command is available.
 Restart the MCP host after installation.
+
+The package installs `tzdata` on Windows so Python can resolve configured IANA
+timezone names. Unix-like systems continue to use their system timezone data.
 
 The default request contract uses OpenAI JSON response mode. If an otherwise
 compatible endpoint does not implement `response_format`, set

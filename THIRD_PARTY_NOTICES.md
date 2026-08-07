@@ -16,3 +16,9 @@ distributing a checkout that includes submodule contents.
 Meridian 59 names and game assets may be subject to rights held by their
 respective owners. No game assets are intentionally distributed by this root
 project.
+
+## tzdata
+
+Windows installations use the Python Software Foundation's `tzdata` package as
+the standard-library `zoneinfo` fallback. It is distributed under Apache-2.0:
+<https://pypi.org/project/tzdata/>.

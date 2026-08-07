@@ -9,7 +9,9 @@ description = "Durable LLM controller and MCP supervision facade for m59-harness
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "tzdata>=2025.2; platform_system == 'Windows'",
+]
 authors = [{ name = "Meridian 59 LLM Bot contributors" }]
 keywords = ["meridian-59", "llm", "game-bot", "mcp"]
 classifiers = [
