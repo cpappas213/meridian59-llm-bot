@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify pinned submodule
+        shell: pwsh
+        run: |
+          $expected = (Select-String -Path config/bot.example.toml -Pattern '^expected_revision = "([0-9a-f]{40})"$').Matches.Groups[1].Value
+          $actual = git -C vendor/m59-harness rev-parse HEAD
+          if ($actual -ne $expected) { throw "m59-harness is $actual; expected $expected" }
+          git -C vendor/m59-harness diff --exit-code
+
+      - name: Compile and test
+        shell: pwsh
+        run: .\scripts\test.ps1 -PythonExecutable python
+
+      - name: Check publication metadata and privacy
+        shell: pwsh
+        run: python .\scripts\check_publication.py

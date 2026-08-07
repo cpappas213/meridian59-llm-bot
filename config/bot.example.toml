@@ -1,0 +1,95 @@
+[deployment]
+instance_id = "primary"
+timezone = "UTC"
+data_dir = "%LOCALAPPDATA%/m59-llm-bot/data"
+log_dir = "%LOCALAPPDATA%/m59-llm-bot/logs"
+run_dir = "%LOCALAPPDATA%/m59-llm-bot/run"
+secret_file = "%LOCALAPPDATA%/m59-llm-bot/secrets.env"
+
+[game]
+host = "127.0.0.1"
+port = 5959
+agent = "primary"
+account_alias = "primary"
+character = ""
+autojoin = true
+
+[harness]
+root = "../vendor/m59-harness"
+expected_revision = "0c45c425aedb4deda643a30aa21273d2e95c6bde"
+control_url = "http://127.0.0.1:8901"
+dashboard_port = 8902
+lifecycle = "controller_managed"
+node_executable = "node"
+state_file = "%LOCALAPPDATA%/m59-llm-bot/data/harness-fleet-state.json"
+
+[model]
+base_url = "http://127.0.0.1:8000/v1"
+name = "YOUR_MODEL_ID"
+planner_timeout_seconds = 90
+responder_timeout_seconds = 45
+max_output_tokens = 1200
+temperature = 0.2
+# Disable when the endpoint does not implement OpenAI JSON response format.
+json_mode = true
+# Enable only for servers/models that implement Qwen-style enable_thinking.
+disable_thinking = false
+
+[controller]
+control_bind = "127.0.0.1"
+control_port = 8903
+dashboard_bind = "127.0.0.1"
+dashboard_port = 8904
+active_cadence_seconds = 3
+idle_cadence_seconds = 30
+error_backoff_max_seconds = 60
+fallback_mode = "survive"
+conversation_enabled = true
+social_poll_seconds = 1
+proactive_greetings_enabled = true
+greeting_cooldown_seconds = 1200
+# Generous enough for a busy room, while still bounding unthrottled room speech.
+greetings_per_minute = 20
+conversation_history_turns = 8
+# A supervisor cannot irreversibly abandon a fresh active goal merely because its
+# criteria have not moved yet. It may pause/replan; verified safety, invalidity,
+# durable stall, or an explicit operator request can justify earlier cancel.
+minimum_goal_commitment_seconds = 3600
+minimum_stall_seconds = 300
+
+[onboarding]
+enabled = true
+create_from_persona = true
+# Generated first-run User######### placeholders may be replaced automatically.
+# Any other differently named character requires explicit replacement through
+# the persona tool.
+preserve_existing_character = true
+
+[policy]
+avoid_death = true
+bank_before_hazard = true
+rest_health_fraction = 0.70
+critical_health_fraction = 0.40
+carried_currency_bank_threshold = 1
+protected_item_value_threshold = 5000
+protected_item_names = []
+consequential_action_guidance = "strongly_avoid_unnecessary_loss"
+
+[learning]
+enabled = true
+no_progress_budget = 4
+repeated_tactic_budget = 3
+wait_budget = 6
+survival_interrupt_budget = 3
+world_retry_cooldown_seconds = 1800
+generic_retry_cooldown_seconds = 3600
+
+[notifications]
+windows_enabled = false
+minimum_severity = "notice"
+obsidian_enabled = false
+obsidian_vault_path = ""
+obsidian_project_relative_path = "01 Projects/Meridian 59 Bot"
+obsidian_index_filename = "Meridian 59 Bot.md"
+obsidian_journal_subdirectory = "Journal"
+obsidian_assessment_batch_size = 20
