@@ -52,8 +52,8 @@ gate below is complete or explicitly waived with a recorded rationale.
 
 ## GitHub publication gates
 
-- [ ] Require a green CI workflow on the published `main` commit.
-- [ ] Enable private vulnerability reporting.
-- [ ] Add repository topics and a concise public description.
-- [ ] Protect `main`, require pull requests, and require the CI matrix checks.
-- [ ] Publish the initial GitHub release as a prerelease.
+- [x] Require a green CI workflow on the published `main` commit.
+- [x] Enable private vulnerability reporting.
+- [x] Add repository topics and a concise public description.
+- [x] Protect `main`, require pull requests, and require the CI matrix checks.
+- [x] Publish the initial GitHub release as a prerelease.
