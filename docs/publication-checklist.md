@@ -20,10 +20,10 @@ gate below is complete or explicitly waived with a recorded rationale.
 - [x] Replace repository URL placeholders and add canonical package URLs.
 - [x] Document that the harness has no tracked license at the pinned revision;
   do not claim that the root MIT license covers it.
-- [ ] Verify from a fresh recursive clone that the configured harness URL,
+- [x] Verify from a fresh recursive clone that the configured harness URL,
   committed gitlink, example configuration, installer, and documentation all
   resolve to the same public revision.
-- [ ] Run compilation, all unit tests, wheel construction, PowerShell parsing,
+- [x] Run compilation, all unit tests, wheel construction, PowerShell parsing,
   Markdown-link checks, metadata-version checks, privacy checks, and the GitHub
   Actions matrix against the final commit.
 - [x] Review and stage every intended root change without including ignored
