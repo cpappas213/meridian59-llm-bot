@@ -1,10 +1,21 @@
 # Meridian 59 LLM Bot
 
+[![CI](https://github.com/cpappas213/meridian59-llm-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/cpappas213/meridian59-llm-bot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An experimental Windows control plane for an LLM-driven Meridian 59 character.
 This project supplies durable goals, policy, supervision, and an
 OpenAI-compatible model loop while the separately maintained
-[`m59-harness`](https://github.com/tpeppers/m59-harness) owns the ordinary game
+[`m59-harness` integration fork](https://github.com/cpappas213/m59-harness)
+([upstream](https://github.com/tpeppers/m59-harness)) owns the ordinary game
 protocol and mechanical actions.
+
+> [!IMPORTANT]
+> **Alpha status:** source publication and automated validation do not mean the
+> bot has completed live commissioning. Clean-profile installation, live
+> onboarding, outage exercises, and the 24-hour soak remain release gates. No
+> stable release is declared; see the
+> [public release checklist](docs/publication-checklist.md).
 
 > [!WARNING]
 > This is pre-release software. Run it on an account and server where automated
@@ -61,7 +72,7 @@ remain the operator's responsibility.
 ## Install
 
 ```powershell
-git clone --recurse-submodules <repository-url>
+git clone --recurse-submodules https://github.com/cpappas213/meridian59-llm-bot.git
 Set-Location .\meridian59-llm-bot
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
@@ -128,5 +139,7 @@ simulator and do not connect to a game account, model server, or Obsidian vault.
 ## License and third-party code
 
 Project-authored code is available under the [MIT License](LICENSE). The
-`vendor/m59-harness` submodule is a separate project governed by its own license;
-see [third-party notices](THIRD_PARTY_NOTICES.md) before redistribution.
+`vendor/m59-harness` submodule is a separate project. No tracked license file was
+found at the pinned revision, so availability on GitHub must not be interpreted
+as permission to redistribute it. See
+[third-party notices](THIRD_PARTY_NOTICES.md) before redistribution.

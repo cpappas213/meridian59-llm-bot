@@ -13,6 +13,15 @@ and intends to use semantic versioning after its first public release.
   requested.
 - Public-repository documentation, contribution, security, and CI scaffolding.
 
+### Fixed
+
+- Pointed the harness submodule at a publicly fetchable, privacy-safe integration
+  revision.
+- Replaced repository URL placeholders and added canonical project metadata.
+- Strengthened publication checks for repository URLs, submodule-pin alignment,
+  private-key material, and known token formats.
+- Clarified alpha commissioning status and unresolved third-party licensing.
+
 ## 0.2.0 - 2026-08-07
 
 ### Added

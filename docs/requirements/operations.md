@@ -18,7 +18,7 @@ hosts, but mutation surfaces must remain loopback-local to the controller.
 ## 3. Fresh installation
 
 ```powershell
-git clone --recurse-submodules <repository-url>
+git clone --recurse-submodules https://github.com/cpappas213/meridian59-llm-bot.git
 Set-Location .\meridian59-llm-bot
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1

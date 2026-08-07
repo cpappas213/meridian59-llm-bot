@@ -25,6 +25,12 @@ classifiers = [
 [project.scripts]
 m59-bot = "meridian_bot.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/cpappas213/meridian59-llm-bot"
+Repository = "https://github.com/cpappas213/meridian59-llm-bot.git"
+Issues = "https://github.com/cpappas213/meridian59-llm-bot/issues"
+Documentation = "https://github.com/cpappas213/meridian59-llm-bot/tree/main/docs"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
