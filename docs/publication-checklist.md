@@ -1,50 +1,59 @@
 # Public release checklist
 
-Use this checklist before making the GitHub repository public.
+This is the live release gate for the current alpha. A checked item requires
+repeatable evidence; source visibility alone does not complete commissioning.
+Unchecked items are intentional blockers to a stable release.
 
-## Repository checks
+**Current status (2026-08-07): alpha / commissioning incomplete.** The source may
+be reviewed publicly, but no stable deployment or unattended-operation claim is
+made. The initial GitHub release must remain a prerelease until every applicable
+gate below is complete or explicitly waived with a recorded rationale.
+
+## Source publication gates
 
 - [x] Remove private deployment defaults, identities, paths, model IDs, and
-  standing campaign policy from public text/configuration.
-- [x] Ignore local credentials, runtime data, incident exports/backfills, and the
-  legacy deployment-specific infographic.
-- [x] Align the committed harness gitlink, example configuration, installer, and
-  implementation documentation to one tested revision.
-- [x] Add README, license, third-party notice, contribution guide, security
-  policy, changelog, editor settings, CI, and publication checks.
-- [x] Verify compilation, unit tests, wheel construction, PowerShell parsing,
-  Markdown links, metadata versions, and common privacy patterns.
-- [ ] Confirm that MIT is the intended license and that the copyright attribution
-  is acceptable.
-- [ ] Replace `<repository-url>` examples after the GitHub owner/repository name
-  is chosen.
-- [ ] Review and stage every intended root file. Do not include ignored local
-  incident material or the dirty contents of the harness submodule.
-- [ ] Review the pinned harness's own license before distributing submodule
-  contents.
+  standing campaign policy from public text and configuration.
+- [x] Ignore local credentials, runtime data, incident exports/backfills,
+  compiled caches, and the legacy deployment-specific infographic.
+- [x] Add the README, root MIT license, third-party notice, contribution guide,
+  security policy, changelog, editor settings, CI, and publication checks.
+- [x] Replace repository URL placeholders and add canonical package URLs.
+- [x] Document that the harness has no tracked license at the pinned revision;
+  do not claim that the root MIT license covers it.
+- [x] Verify from a fresh recursive clone that the configured harness URL,
+  committed gitlink, example configuration, installer, and documentation all
+  resolve to the same public revision.
+- [x] Run compilation, all unit tests, wheel construction, PowerShell parsing,
+  Markdown-link checks, metadata-version checks, privacy checks, and the GitHub
+  Actions matrix against the final commit.
+- [x] Review and stage every intended root change without including ignored
+  local material or dirty harness working-tree contents.
+- [ ] Confirm that MIT is the intended root-project license and that
+  `Meridian 59 LLM Bot contributors` is the intended copyright attribution.
+- [ ] Obtain or verify upstream permission before redistributing
+  `m59-harness` contents; no tracked harness license has been found.
 
-## Commissioning checks
+## Live commissioning gates
 
 - [ ] Confirm that the target server permits automated play and that the account
-  is dedicated/authorized for this deployment.
+  is dedicated or otherwise authorized for this deployment.
 - [ ] Install from a fresh clone on a clean Windows user profile.
 - [ ] Run `doctor` and verify the exact configured LLM model is advertised.
-- [ ] Verify first status is `awaiting_persona` and that premature goal/proposal
-  activation returns `ONBOARDING_REQUIRED`.
+- [ ] Verify first status is `awaiting_persona` and that premature goal or
+  proposal activation returns `ONBOARDING_REQUIRED`.
 - [ ] Set a test persona. Verify a generated placeholder is replaced using the
   LLM-selected supported build, while an established identity is preserved
   without the explicit replacement flag.
-- [ ] Verify onboarding becomes `ready_for_goals` with no auto-created goal, then
-  submit one reversible human-authored goal.
+- [ ] Verify onboarding becomes `ready_for_goals` with no auto-created goal,
+  then submit one reversible human-authored goal.
 - [ ] Exercise restart, model outage, broker outage, dashboard redaction, event
   pagination, and notification behavior with no secret leakage.
 - [ ] Complete the documented 24-hour soak before declaring a stable release.
 
-## GitHub settings
+## GitHub publication gates
 
-- [ ] Enable private vulnerability reporting/security advisories.
-- [ ] Add repository topics, description, and the final source URL to package
-  metadata after the repository name is known.
-- [ ] Protect the default branch and require the CI workflow for pull requests.
-- [ ] Publish the initial release as a prerelease until live commissioning and
-  soak criteria are complete.
+- [ ] Require a green CI workflow on the published `main` commit.
+- [ ] Enable private vulnerability reporting.
+- [ ] Add repository topics and a concise public description.
+- [ ] Protect `main`, require pull requests, and require the CI matrix checks.
+- [ ] Publish the initial GitHub release as a prerelease.

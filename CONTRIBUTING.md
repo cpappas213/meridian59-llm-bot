@@ -6,8 +6,9 @@ compatible with the pinned public harness contract.
 ## Development setup
 
 ```powershell
-git clone --recurse-submodules <repository-url>
+git clone --recurse-submodules https://github.com/cpappas213/meridian59-llm-bot.git
 Set-Location .\meridian59-llm-bot
+python -m pip install --editable .
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1
 ```
 

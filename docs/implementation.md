@@ -7,7 +7,9 @@ in the [operations runbook](requirements/operations.md).
 ## Runtime topology
 
 The controller is a companion process, not a harness fork. The harness is pinned
-as a Git submodule at revision `0c45c425aedb4deda643a30aa21273d2e95c6bde`.
+to the public integration fork as a Git submodule at revision
+`afeb5f3e67673643547c2c9aa245e01a69035af0`. That commit has the same source tree
+as the locally tested integration revision and uses privacy-safe commit metadata.
 
 | Surface | Default | Access |
 |---|---:|---|
