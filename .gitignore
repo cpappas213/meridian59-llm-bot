@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state and secrets never belong in the repository.
+bot.toml
+secrets.env
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+runtime/
+logs/
+backups/
+diagnostics/
+*.diagnostic.json
+*.lock
+
+# Local one-off incident exports and backfills may contain account history.
+/_extract_events.py
+/_fetch_status_events.py
+/scripts/backfill-room535-farm-incident.py
+/scripts/backfill-room603-safe-spot-failure.py
+
+# Legacy reviewed-deployment diagram contains private deployment details.
+/docs/functional-architecture-infographic.png
