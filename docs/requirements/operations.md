@@ -12,7 +12,8 @@ hosts, but mutation surfaces must remain loopback-local to the controller.
 - Python 3.11+ and a compatible Node.js on `PATH`, or explicit executable paths.
 - Git with the pinned `vendor/m59-harness` submodule initialized.
 - An authorized game account and a reachable server.
-- A reachable OpenAI-compatible API with a known model ID.
+- A reachable OpenAI-compatible API exposing `/models`, or a known model ID for
+  manual fallback.
 - Optional Hermes CLI for MCP registration, Obsidian vault, and notifications.
 
 ## 3. Fresh installation
@@ -27,8 +28,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 The interactive installer asks for:
 
 - game host, port, username, and password;
-- IANA timezone;
-- LLM base URL, model ID, and optional API key;
+- timezone from a numbered regional picker; common aliases are normalized to an
+  IANA timezone and advanced entries are validated before configuration is
+  written;
+- LLM base URL and authentication mode (`none`, Bearer for OpenAI/Codex, or
+  Anthropic API key for Claude); the installer queries `/models` with the
+  selected provider headers and offers a numbered model picker, with manual
+  model-ID entry as a fallback;
 - optional Obsidian vault path; and
 - dashboard bind address (loopback by default).
 
@@ -52,7 +58,7 @@ Configuration is TOML and unknown keys fail closed. Important sections are:
 | `deployment` | Instance ID, timezone, private data/log/run paths, secret file. |
 | `game` | Server endpoint, account alias, agent, and autojoin. |
 | `harness` | Root, exact expected revision, broker endpoint, Node path, state file. |
-| `model` | OpenAI-compatible base URL, exact model ID, timeouts, output budget, JSON-mode and optional thinking controls. |
+| `model` | OpenAI-compatible base URL, exact model ID, explicit auth mode, timeouts, output budget, JSON-mode and optional thinking controls. |
 | `controller` | Loopback API, read-only dashboard, cadence, conversation bounds. |
 | `onboarding` | Persona-driven creation and established-character preservation. |
 | `policy` | Survival and consequence guidance. |
@@ -62,21 +68,50 @@ Configuration is TOML and unknown keys fail closed. Important sections are:
 `secrets.env` supports `M59_ACCOUNT_USERNAME`, `M59_ACCOUNT_PASSWORD`,
 `M59_BOT_CONTROL_TOKEN`, `M59_LLM_API_KEY`, and
 `M59_OBSIDIAN_VAULT_PATH`. Do not quote values, print the file, or commit it.
+`M59_LLM_API_KEY` is a provider API credential. Do not copy a Codex, ChatGPT,
+Claude, or Claude Code subscription-login token into it.
 
 ## 5. First-run onboarding
 
-After installation and MCP-host restart:
+During installation and first launch:
 
-1. Run `doctor` and correct dependency failures.
-2. Read persona/status. Status should initially say `awaiting_persona`.
-3. A human supplies the character name and persona. The supervisor sets the full
-   versioned persona.
+1. The installer locally prompts for and persists the human-supplied character
+   name and complete persona. This path does not require an MCP host or a
+   supervising model. `-SkipPersonaSetup` deliberately leaves onboarding at
+   `awaiting_persona`; `-PersonaFile` supports unattended setup.
+2. Run `doctor` and correct dependency failures.
+3. Read persona/status and verify that the intended persona is versioned and
+   onboarding is pending or in progress.
 4. The configured LLM chooses a supported build; the controller previews,
    audits, creates, and verifies the character.
 5. An established differently named character is not replaced without an
    explicit `replace_existing_character=true` persona update.
 6. Wait for `onboarding.ready_for_goals=true`.
 7. A human or higher-level agent supplies the first strategic goal.
+
+The supported interactive entry point is first-run aware:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch.ps1
+```
+
+With no installed configuration it runs setup once and hands off to the terminal
+dashboard. With an existing configuration it offers the live console or an
+explicit reconfiguration path, starts the scheduled controller if necessary,
+and does not repeat setup. The console uses color for rapid state scanning;
+press `S` for complete character abilities, inventory, attributes, and verified
+equipment, then Enter to return. Set `NO_COLOR` before launch for plain output.
+Leaving the console does not stop the controller.
+
+The same local wizard can be run manually:
+
+```powershell
+python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" setup-persona
+```
+
+It preserves an existing persona by default. Explicitly replacing an established
+differently named character requires
+`--update-existing --reuse-current --replace-existing-character`.
 
 No standing goal is installed and no goal is inferred from persona text.
 
@@ -94,6 +129,9 @@ python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" doc
 Get-ScheduledTask -TaskName "Meridian59 LLM Bot"
 Stop-ScheduledTask -TaskName "Meridian59 LLM Bot"
 Start-ScheduledTask -TaskName "Meridian59 LLM Bot"
+
+# Reattach the interactive goal/status console
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch.ps1
 
 # Remove task and MCP registrations; retain runtime state
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1

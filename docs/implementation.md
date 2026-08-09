@@ -18,6 +18,7 @@ as the locally tested integration revision and uses privacy-safe commit metadata
 | Dashboard | `127.0.0.1:8904` | Redacted, read-only status. LAN exposure is opt-in. |
 | `meridian_bot` MCP | stdio | Persona, goals, proposals, events, and supervision. |
 | `meridian_knowledge` MCP | stdio | Read-only grounded game facts and validation. |
+| Local terminal console | loopback API | Live character/goal monitoring and authenticated goal management. |
 | LLM endpoint | `127.0.0.1:8000/v1` | Configurable OpenAI-compatible API. |
 | Game server | `127.0.0.1:5959` | Configurable ordinary player connection. |
 
@@ -35,8 +36,8 @@ and per-speaker history are optional.
 
 ```mermaid
 flowchart LR
-    A["Install: configure game and LLM"] --> B["Await persona"]
-    B --> C["Human sets name and persona"]
+    A["Install: configure game, LLM, and account"] --> B["Local persona wizard"]
+    B --> C["Persist operator-authored name and persona"]
     C --> D{"Existing established character?"}
     D -->|"Yes, no replacement permission"| E["Preserve and request decision"]
     D -->|"No or explicitly replace"| F["LLM selects supported build"]
@@ -52,14 +53,19 @@ other differently named character is preserved until a persona update includes
 `replace_existing_character=true`. The LLM chooses from harness-supported stat
 and loadout presets; the controller previews and audits the destructive reroll,
 then verifies the exact desired name. It does not create a gameplay goal.
+The installer invokes the local `setup-persona` command before launching the
+controller, so this state machine does not depend on a frontier supervisor or an
+MCP host. The configured runtime model is used only for the supported build
+selection and later bot roles; it does not invent the persona.
 
 ## Major components
 
 - `controller.py`: onboarding, observe-plan-authorize-execute-verify loop,
   campaign coordination, deterministic completion, and supervision projection.
 - `storage.py`: SQLite/WAL durable state and request idempotency.
-- `model.py`: OpenAI-compatible planning, onboarding, conversation, and journal
-  assessment roles.
+- `model.py`: OpenAI-compatible goal drafting, planning, onboarding, conversation, and journal
+  assessment roles with explicit unauthenticated, Bearer, and Anthropic header
+  modes.
 - `policy.py`: hard authority separation and non-blocking consequence audits.
 - `broker.py`: harness JSON-RPC adapter and managed broker lifecycle.
 - `campaign.py`, `learning.py`: persistent internal phases, circuit breakers,
@@ -67,6 +73,9 @@ then verifies the exact desired name. It does not create a gameplay goal.
 - `knowledge.py`, `knowledge_mcp.py`: versioned compendium index, provenance,
   resolution, progression context, and goal validation.
 - `api.py`, `mcp.py`: authenticated local API, read-only dashboard, and MCP facade.
+- `tui.py`: color-coded polling dashboard, human-readable complete on-demand
+  character view, model-draft review loop, goal/queue management client, and
+  immediate Escape-to-cancel navigation across nested screens and prompts.
 - `pvp.py`: bounded controller-owned tactical composites using fresh local state.
 - `notifications.py`, `obsidian.py`: asynchronous optional notification sinks.
 - `simulator.py`: deterministic dependency substitute used by tests.

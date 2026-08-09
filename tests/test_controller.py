@@ -88,6 +88,16 @@ class WaitingModel:
         }
 
 
+class GoalDraftModel:
+    def __init__(self, drafts: list[dict[str, object]]) -> None:
+        self.drafts = list(drafts)
+        self.calls: list[dict[str, object]] = []
+
+    def draft_goal(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        return self.drafts.pop(0)
+
+
 class InvalidRevisionModel:
     def plan(self, **_: object) -> dict[str, object]:
         return {
@@ -1275,6 +1285,44 @@ class ControllerTests(unittest.TestCase):
                     repaired["normalizations"][-1]["kind"],
                 )
                 self.assertIsNone(controller._planner_feedback(goal))
+            finally:
+                controller.storage.close()
+
+    def test_goal_drafter_repairs_invalid_model_schema_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            model = GoalDraftModel(
+                [
+                    {
+                        "title": "Unverifiable draft",
+                        "objective": "Reach the bank.",
+                        "success_criteria": [],
+                        "constraints": {},
+                        "priority": 50,
+                        "activation": "queue",
+                    },
+                    {
+                        "title": "Reach the bank",
+                        "objective": "Reach the bank.",
+                        "success_criteria": [
+                            {"id": "done", "kind": "operator_confirmed"}
+                        ],
+                        "constraints": {"avoid_death": True},
+                        "priority": 70,
+                        "activation": "queue",
+                    },
+                ]
+            )
+            controller.model = model  # type: ignore[assignment]
+            try:
+                result = controller.draft_goal({"prompt": "Reach the bank safely."})
+
+                self.assertEqual("Reach the bank", result["goal"]["title"])
+                self.assertEqual(70, result["goal"]["priority"])
+                self.assertEqual(2, len(model.calls))
+                feedback = model.calls[1]["validation_feedback"]
+                self.assertIsInstance(feedback, list)
+                self.assertEqual("INVALID_GOAL_SCHEMA", feedback[0]["code"])
             finally:
                 controller.storage.close()
 
@@ -3360,6 +3408,77 @@ class ControllerTests(unittest.TestCase):
                     statuses=["deferred"], goal_id=goal["id"]
                 )
                 self.assertTrue(any(item["scope"] == "tactic" for item in lessons))
+            finally:
+                controller.storage.close()
+
+    def test_character_status_exposes_complete_verified_character_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            broker = SimulatedBroker()
+            controller.broker = broker
+            observation = broker.observe()
+            observation["observed_at"] = time.time()
+            observation["status"]["character"] = "Sable"
+            observation["status"]["attributes"] = {"might": 25, "intellect": 30}
+            observation["inventory"] = {
+                "items": [
+                    {
+                        "id": 7,
+                        "name": "mace",
+                        "amount": 1,
+                        "in_use": True,
+                        "slot": "hands",
+                    },
+                    {"id": 8, "name": "wheel of cheese", "amount": 3},
+                ],
+                "carry": {
+                    "known": True,
+                    "items": 2,
+                    "load": {"weight": 8, "bulk": 4, "exact": True},
+                    "weight_max": 50,
+                    "bulk_max": 30,
+                },
+            }
+            observation["equipment"] = {
+                "known": True,
+                "equipped": [{"id": 7, "name": "mace", "slot": "hands"}],
+                "wielding": ["mace"],
+            }
+            observation["abilities"] = {
+                "skills": [
+                    {"name": f"Skill {index}", "ability": index}
+                    for index in range(30)
+                ],
+                "spells": [
+                    {"name": f"Spell {index}", "ability": index}
+                    for index in range(27)
+                ],
+                "freshness": {"known": True, "from": "cache"},
+            }
+            observation["spells"] = {
+                "spells": [
+                    {
+                        "name": "Spell 1",
+                        "castable": False,
+                        "blocked_by": ["mana"],
+                    }
+                ]
+            }
+            controller.last_observation = observation
+            try:
+                detail = controller.character_status()
+
+                self.assertEqual("Sable", detail["game"]["character_name"])
+                self.assertEqual(30, len(detail["abilities"]["skills"]))
+                self.assertEqual(27, len(detail["abilities"]["spells"]))
+                self.assertEqual(3, detail["inventory"]["items"][1]["quantity"])
+                self.assertTrue(detail["inventory"]["items"][0]["equipped"])
+                self.assertEqual(
+                    ["mace"], detail["equipment"]["wielded_weapons"]
+                )
+                self.assertEqual(
+                    "hands", detail["equipment"]["equipped"][0]["slot"]
+                )
             finally:
                 controller.storage.close()
 

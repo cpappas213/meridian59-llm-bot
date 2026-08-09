@@ -39,13 +39,17 @@ gate below is complete or explicitly waived with a recorded rationale.
   is dedicated or otherwise authorized for this deployment.
 - [ ] Install from a fresh clone on a clean Windows user profile.
 - [ ] Run `doctor` and verify the exact configured LLM model is advertised.
-- [ ] Verify first status is `awaiting_persona` and that premature goal or
-  proposal activation returns `ONBOARDING_REQUIRED`.
-- [ ] Set a test persona. Verify a generated placeholder is replaced using the
-  LLM-selected supported build, while an established identity is preserved
-  without the explicit replacement flag.
+- [ ] Exercise `-SkipPersonaSetup`; verify first status is `awaiting_persona`
+  and that premature goal or proposal activation returns `ONBOARDING_REQUIRED`.
+- [ ] Complete the local installer persona wizard without an MCP host. Verify a
+  generated placeholder is replaced using the configured LLM's supported build,
+  while an established identity is preserved without the explicit replacement
+  flag.
 - [ ] Verify onboarding becomes `ready_for_goals` with no auto-created goal,
   then submit one reversible human-authored goal.
+- [ ] Reopen the first-run-aware launcher. Verify it skips setup, attaches one
+  terminal console to the existing controller, displays live development and
+  queue state, and leaves the controller running when the console exits.
 - [ ] Exercise restart, model outage, broker outage, dashboard redaction, event
   pagination, and notification behavior with no secret leakage.
 - [ ] Complete the documented 24-hour soak before declaring a stable release.

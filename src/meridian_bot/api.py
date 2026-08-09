@@ -23,6 +23,7 @@ def _error(exc: Exception) -> tuple[int, dict[str, Any]]:
         "GOAL_DEFERRED": 409,
         "POLICY_DENIED": 403,
         "CONTROLLER_NOT_READY": 503,
+        "MODEL_UNAVAILABLE": 503,
     }
     details = getattr(exc, "result", {}) if isinstance(getattr(exc, "result", {}), dict) else {}
     return statuses.get(code, 400 if isinstance(exc, (ValueError, StorageError)) else 500), {
@@ -87,6 +88,19 @@ class ApiServers:
                         return self.send_json(200 if ready else 503, {"ready": ready, "state": controller.state, "dependencies": controller.dependencies})
                     if parsed.path == "/v1/status":
                         return self.send_json(200, controller.status(detail=_first(query, "detail", "summary"), include_recent_events=int(_first(query, "include_recent_events", "3"))))
+                    if parsed.path == "/v1/character":
+                        return self.send_json(200, controller.character_status())
+                    if parsed.path == "/v1/goals":
+                        statuses = [
+                            part
+                            for item in query.get("statuses", [])
+                            for part in item.split(",")
+                            if part
+                        ]
+                        return self.send_json(
+                            200,
+                            {"goals": controller.storage.goals(statuses or None)},
+                        )
                     if parsed.path == "/v1/proposals":
                         return self.send_json(200, {"proposals": controller.storage.proposals(_first(query, "status", "pending") or None)})
                     if parsed.path == "/v1/consequences":
@@ -134,6 +148,8 @@ class ApiServers:
                 parsed = urlparse(self.path)
                 try:
                     body = self.read_json()
+                    if parsed.path == "/v1/goals/draft":
+                        return self.send_json(200, controller.draft_goal(body))
                     if parsed.path == "/v1/goals":
                         return self.send_json(201, controller.submit_goal(body))
                     if parsed.path.startswith("/v1/goals/") and parsed.path.endswith("/commands"):

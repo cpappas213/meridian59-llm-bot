@@ -650,6 +650,9 @@ The MCP facade maps to a versioned local API. Recommended routes:
 | `GET /v1/health/live` | Process liveness only. |
 | `GET /v1/health/ready` | Storage, broker compatibility, and configuration readiness. |
 | `GET /v1/status?detail=...` | Status schema. |
+| `GET /v1/character` | Authenticated complete read-only character detail for the local terminal client. |
+| `GET /v1/goals` | Authenticated full durable goal list for local management clients. |
+| `POST /v1/goals/draft` | Use the configured model to create and validate an inert structured goal draft from operator text and an optional current draft. |
 | `POST /v1/goals` | Submit goal. |
 | `POST /v1/goals/{id}/commands` | Pause/resume/cancel/reprioritize/confirm. |
 | `GET /v1/proposals` / `POST /v1/proposals/{id}/decision` | Proposal control. |
@@ -667,6 +670,68 @@ The MCP facade maps to a versioned local API. Recommended routes:
 All non-health routes require a random local bearer secret even though the
 listener binds to loopback. The MCP facade reads it from its private environment.
 State changes use the same `request_id` semantics as MCP.
+
+### 9.1 Goal drafting
+
+`POST /v1/goals/draft` is authenticated and non-mutating. An initial request is:
+
+```json
+{"prompt":"Reach Tos Inn safely."}
+```
+
+A revision adds the exact draft currently displayed to the user:
+
+```json
+{
+  "prompt": "Make this priority 80 and avoid unnecessary combat.",
+  "current_goal": {
+    "title": "Reach Tos Inn",
+    "objective": "Travel to Tos Inn.",
+    "success_criteria": [
+      {"id": "at_inn", "kind": "location_reached", "location": "Tos Inn", "room_id": 52}
+    ],
+    "constraints": {},
+    "priority": 50,
+    "activation": "queue"
+  }
+}
+```
+
+The response contains `goal`, the canonical inert draft; `validation`, including
+warnings and resolved entities; and the configured `model` id. It never contains
+a `request_id`, never stores a goal, and never executes a game action.
+
+### 9.2 Local terminal client
+
+`m59-bot --config <path> tui` polls only authenticated loopback routes. It shows
+the compact supervision view, full goal list, and bounded interesting events.
+For a new goal, it sends trusted plain-language operator intent to
+`POST /v1/goals/draft`. The controller asks the configured model for a typed
+object, applies the durable goal contract and knowledge canonicalization, and
+performs at most two corrective re-prompts after an invalid draft. The terminal
+shows the complete canonical object and accepts approve, cancel, or modify.
+Modify sends the displayed object and new operator instruction back to the draft
+route and repeats review; only approve adds a fresh `request_id` and calls the
+normal goal mutation route. Every queue command copies the selected goal's
+current version. Closing the client never signals `safe-stop`; the scheduled
+controller and harness keeper remain independent.
+
+The main screen applies ANSI colors to connection/controller states, vitals,
+risk, goal state and priority, criteria, events, and status messages. `NO_COLOR`
+disables styling. Pressing `S` calls authenticated `GET /v1/character` once and
+shows all reported 0-100 skill/spell values, spell castability, inventory
+quantities/capacity, attributes, vitals, location, and server-verified equipped
+and wielded items. This detail is not added to the routine polling response.
+
+### 9.3 Character detail
+
+`GET /v1/character` is authenticated, read-only, and never invokes the model. Its
+response contains clocks/timezone; `game` identity, connection, location,
+position, vitals, attributes, risk, currency, and observation age; `abilities`
+with untruncated known skill/spell rows and spell readiness; `inventory.items`
+with name and quantity plus carry capacity; and `equipment` with verification
+state, equipped rows, and wielded weapons. The projection selects those fields
+from the latest ordinary-client observation and applies standard redaction.
 
 ## 10. Read-only LAN API
 

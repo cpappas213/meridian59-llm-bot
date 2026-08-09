@@ -64,6 +64,7 @@ class ModelConfig:
     temperature: float
     json_mode: bool = True
     disable_thinking: bool = False
+    auth_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,7 @@ class BotConfig:
                 "temperature",
                 "json_mode",
                 "disable_thinking",
+                "auth_mode",
             },
             "model",
         )
@@ -234,7 +236,12 @@ class BotConfig:
             temperature=float(model_raw.get("temperature", 0.2)),
             json_mode=bool(model_raw.get("json_mode", True)),
             disable_thinking=bool(model_raw.get("disable_thinking", False)),
+            auth_mode=str(model_raw.get("auth_mode", "auto")),
         )
+        if model.auth_mode not in {"auto", "none", "bearer", "anthropic"}:
+            raise ValueError(
+                "model.auth_mode must be auto, none, bearer, or anthropic"
+            )
 
         ctl_raw = _section(raw, "controller")
         _unknown(
