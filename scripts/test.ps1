@@ -4,9 +4,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $PythonExecutable = if ($PythonExecutable) {
-    (Get-Command $PythonExecutable -CommandType Application -ErrorAction Stop).Source
+    (Get-Command $PythonExecutable -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 } else {
-    (Get-Command python -CommandType Application -ErrorAction Stop).Source
+    (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = Join-Path $projectRoot "src"
