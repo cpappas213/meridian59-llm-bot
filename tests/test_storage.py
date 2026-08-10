@@ -259,6 +259,24 @@ class StorageTests(unittest.TestCase):
             {tool["name"] for tool in selected},
         )
 
+    def test_research_progression_phase_can_move_to_collect_local_evidence(self) -> None:
+        selected = CampaignCoordinator.tools_for_phase(
+            {"kind": "research_progression"},
+            [
+                {"name": "look"},
+                {"name": "map"},
+                {"name": "travel"},
+                {"name": "hunting_grounds"},
+                {"name": "fight"},
+                {"name": "autopilot"},
+            ],
+        )
+
+        self.assertEqual(
+            {"look", "map", "travel", "hunting_grounds"},
+            {tool["name"] for tool in selected},
+        )
+
     def test_liquidate_inventory_can_drop_junk_and_buy_replacement_gear(self) -> None:
         selected = CampaignCoordinator.tools_for_phase(
             {"kind": "liquidate_inventory"},

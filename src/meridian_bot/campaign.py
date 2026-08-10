@@ -47,6 +47,13 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "knowledge_search",
     },
     "research_progression": {
+        # Progression research may need to move out of a sanctuary and inspect
+        # the locally connected route before the read-only creature/room
+        # adapters can produce useful evidence. Mutation still requires a
+        # verified execution-plan step and the ordinary controller safeguards.
+        "look",
+        "map",
+        "travel",
         "prey",
         "hunting_grounds",
         "safe_spots",
