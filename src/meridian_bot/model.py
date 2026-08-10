@@ -157,6 +157,10 @@ is controller-owned completion hygiene, not a new public goal criterion and not 
 If grounded_knowledge.goal_outcome_checkpoint is present, the goal outcome is already durably latched:
 do not repeat it, launch new work, or choose another tactic; release any keeper and execute/revise only
 the safe-ending travel.
+If grounded_knowledge.phase_outcome_checkpoint is present, the active campaign phase outcome is likewise
+durably latched. Do not repeat that phase's work or start supporting work; release any keeper and
+execute/revise only the safe-ending travel. The controller advances the campaign after fresh observation
+verifies that exact source-safe room.
 Proposals are inert optional future goals for the supervisor to accept or reject. They never replace,
 refine, unblock, or execute the active goal. Do not propose a plan, tactic, route, or subtask for
 the active goal: use available tools to carry it out. A pending proposal is never a reason to wait.

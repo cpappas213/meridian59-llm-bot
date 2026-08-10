@@ -200,8 +200,9 @@ class FixedModel:
                     "revision_reason": None,
                 }, ending_room),
             }
-        if isinstance(grounded, dict) and isinstance(
-            grounded.get("goal_outcome_checkpoint"), dict
+        if isinstance(grounded, dict) and any(
+            isinstance(grounded.get(key), dict)
+            for key in ("goal_outcome_checkpoint", "phase_outcome_checkpoint")
         ):
             return {
                 "decision": "act",
@@ -1139,6 +1140,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("does not condemn separately evidenced open-field farming", PLANNER_SYSTEM)
         self.assertIn("`pvp_engage only` defines a closed, expiring local opportunity", PLANNER_SYSTEM)
         self.assertIn("If pvp_seek reports route_unavailable or travel_error", PLANNER_SYSTEM)
+        self.assertIn("phase_outcome_checkpoint", PLANNER_SYSTEM)
 
     def test_exactly_six_mcp_tools(self) -> None:
         self.assertEqual({"status", "submit_goal", "manage_goal", "proposals", "persona", "events"}, {tool["name"] for tool in TOOLS})
@@ -1222,6 +1224,76 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("travel", returned["action"])
                 self.assertEqual(100, simulator.room["num"])
                 self.assertEqual("succeeded", controller.storage.goal(goal["id"])["status"])
+            finally:
+                controller.storage.close()
+
+    def test_campaign_phase_outcome_is_latched_until_safe_ending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                simulator = SimulatedBroker()
+                simulator.room = {"num": 200, "name": "Unsafe test room"}
+                controller.broker = simulator
+                controller.model = FixedModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-phase-ending-latch")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "general",
+                        "objective": "Verify the bounded phase, then withdraw safely.",
+                        "success_criteria": [
+                            {
+                                "id": "healthy-enough",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 30},
+                    },
+                    mode="start",
+                )
+                controller.last_observation = simulator.observe()
+                retained_plan = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Finish the verified phase safely.",
+                            "steps": [],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                action = controller.turn()
+
+                self.assertEqual("travel", action["action"])
+                self.assertEqual(100, simulator.room["num"])
+                self.assertEqual(
+                    phase["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+                self.assertEqual(
+                    retained_plan["safe_ending"],
+                    controller._execution_plan(goal)["safe_ending"],
+                )
+
+                completed = controller.turn()
+
+                self.assertTrue(completed["campaign_phase_completed"])
+                self.assertEqual(
+                    "succeeded",
+                    controller.storage.campaign_phases(run["id"])[0]["status"],
+                )
+                self.assertIsNone(controller._execution_plan(goal))
             finally:
                 controller.storage.close()
 

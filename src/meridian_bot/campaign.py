@@ -595,6 +595,8 @@ class CampaignCoordinator:
         run: dict[str, Any],
         phase: dict[str, Any] | None,
         observation: dict[str, Any],
+        *,
+        allow_completion: bool = True,
     ) -> PhaseOutcome:
         if phase is None:
             return PhaseOutcome(False, False, None, {"reason": "no_active_phase"})
@@ -664,23 +666,40 @@ class CampaignCoordinator:
             goal, phase, criteria, observation
         )
         if completion.get("all_met") is True:
-            finished = self.storage.transition_campaign_phase(
-                phase["id"],
-                "succeeded",
-                reason="all deterministic phase criteria verified",
-                resume_parent=bool(phase.get("parent_phase_id")),
-            )
-            self.storage.update_campaign_memory(
-                run["id"],
-                progress_checkpoint={
-                    "phase_id": phase["id"],
-                    "phase_kind": phase["kind"],
-                    "completion": completion,
-                    "recorded_at": timestamp(),
-                },
-            )
-            return PhaseOutcome(True, False, finished, completion)
+            if not allow_completion:
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {**completion, "completion_deferred": True},
+                )
+            return self.complete_phase(run, phase, completion)
         return PhaseOutcome(False, False, phase, completion)
+
+    def complete_phase(
+        self,
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> PhaseOutcome:
+        """Commit a previously verified phase outcome after completion hygiene."""
+
+        finished = self.storage.transition_campaign_phase(
+            phase["id"],
+            "succeeded",
+            reason="all deterministic phase criteria verified",
+            resume_parent=bool(phase.get("parent_phase_id")),
+        )
+        self.storage.update_campaign_memory(
+            run["id"],
+            progress_checkpoint={
+                "phase_id": phase["id"],
+                "phase_kind": phase["kind"],
+                "completion": completion,
+                "recorded_at": timestamp(),
+            },
+        )
+        return PhaseOutcome(True, False, finished, completion)
 
     @staticmethod
     def budget_exhausted(phase: dict[str, Any]) -> dict[str, Any] | None:

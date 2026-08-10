@@ -159,9 +159,10 @@ revising tactics in service of the active goal.
   ending chosen by the configured planning model from source-grounded options.
   The controller shall reject a missing ending, an ending without
   `ROOM_SANCTUARY` or `ROOM_NO_COMBAT`, a non-final/non-travel ending step, or a
-  mismatched runtime travel target. Once public criteria are verified, the
-  controller shall latch that outcome, permit only the ending step, freshly
-  verify arrival and safety flags, and only then set `succeeded`.
+  mismatched runtime travel target. Once active campaign-phase criteria or public
+  goal criteria are verified, the controller shall latch that outcome, permit
+  only the ending step, freshly verify arrival and safety flags, and only then
+  advance the campaign phase or set the goal `succeeded`.
 
 ### 4.3 Autonomous play
 

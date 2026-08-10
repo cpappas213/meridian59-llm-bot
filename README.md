@@ -163,6 +163,12 @@ and tactical planning. It can shape choices among equally safe, goal-compatible
 strategies—including which source-verified safe location ends a plan—but cannot
 override the operator's goal or controller policy.
 
+Every accepted tactical plan must end with exact travel to a source-verified
+safe location selected by the model. When an internal campaign phase or the
+public goal becomes complete, the controller latches that result, permits only
+the declared safe-ending step, and advances only after fresh room and safety
+verification.
+
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional
 tone, social presence, and a useful tension or flaw. Setup explains that this

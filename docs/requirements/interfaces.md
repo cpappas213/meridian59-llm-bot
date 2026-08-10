@@ -593,8 +593,10 @@ a top-level `version` field. `request_id` is required and idempotent. Persona
 accepts only the eight nested fields shown above, with string arrays for traits,
 speech style, values, and taboos. The top-level replacement flag is optional and
 must be true only after explicit operator direction. A successful read/update
-also returns durable `onboarding` status. Persona affects dialogue and initial
-identity, not controller authority or the gameplay goal queue.
+also returns durable `onboarding` status. The complete persona affects dialogue,
+initial identity, and the model's choices among equally safe, goal-compatible
+campaign phases, tactics, and safe endings. It does not grant controller
+authority or modify the gameplay goal queue.
 
 ### 8.6 `events`
 

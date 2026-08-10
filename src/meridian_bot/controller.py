@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
-from .campaign import CampaignCoordinator
+from .campaign import CampaignCoordinator, PhaseOutcome
 from .config import BotConfig
 from .criteria import CriteriaEvaluator
 from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationError, normalize
@@ -96,6 +96,7 @@ LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
 EXECUTION_PLAN_SCHEMA_VERSION = 4
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
+PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
@@ -1541,6 +1542,152 @@ class BotController:
         values = dict(values)
         values.pop(goal_id, None)
         self.storage.set_runtime(GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
+
+    @staticmethod
+    def _phase_contract(phase: dict[str, Any]) -> str:
+        return canonical_json(
+            {
+                key: phase.get(key)
+                for key in (
+                    "id",
+                    "goal_id",
+                    "kind",
+                    "objective",
+                    "success_criteria",
+                    "abandon_predicates",
+                    "parent_phase_id",
+                )
+            }
+        )
+
+    def _phase_completion_checkpoint(
+        self, phase: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not isinstance(phase, dict):
+            return None
+        values = self.storage.get_runtime(
+            PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict):
+            return None
+        value = values.get(str(phase.get("id") or ""))
+        if (
+            not isinstance(value, dict)
+            or value.get("phase_contract") != self._phase_contract(phase)
+            or not isinstance(value.get("completion"), dict)
+        ):
+            return None
+        return value
+
+    def _latch_phase_completion(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        existing = self._phase_completion_checkpoint(phase)
+        if existing is not None:
+            return existing
+        if completion.get("all_met") is not True:
+            return None
+        values = self.storage.get_runtime(
+            PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        latched_completion = {
+            key: value
+            for key, value in completion.items()
+            if key != "completion_deferred"
+        }
+        value = {
+            "goal_id": goal["id"],
+            "run_id": run["id"],
+            "phase_id": phase["id"],
+            "phase_contract": self._phase_contract(phase),
+            "completion": latched_completion,
+            "verified_at": timestamp(),
+        }
+        values[phase["id"]] = value
+        self.storage.set_runtime(PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
+        self.storage.emit_event(
+            "campaign.phase.outcome_verified",
+            "Campaign phase outcome verified; returning to its planned safe ending",
+            interesting=False,
+            goal_id=goal["id"],
+            data={
+                "run_id": run["id"],
+                "phase_id": phase["id"],
+                "phase_kind": phase.get("kind"),
+                "completion": latched_completion,
+                "terminal_deferred": True,
+            },
+        )
+        return value
+
+    def _clear_phase_completion_checkpoint(self, phase_id: str) -> None:
+        values = self.storage.get_runtime(
+            PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or phase_id not in values:
+            return
+        values = dict(values)
+        values.pop(phase_id, None)
+        self.storage.set_runtime(PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
+
+    def _evaluate_campaign_phase(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any],
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+    ) -> PhaseOutcome:
+        """Latch a phase outcome until its model-selected safe ending is reached."""
+
+        if phase is None:
+            return self.campaign.evaluate_phase(goal, run, phase, observation)
+        checkpoint = self._phase_completion_checkpoint(phase)
+        safety = self._safe_ending_reached(goal, observation)
+        if checkpoint is not None:
+            if safety.get("met") is True:
+                outcome = self.campaign.complete_phase(
+                    run, phase, checkpoint["completion"]
+                )
+                self._clear_phase_completion_checkpoint(phase["id"])
+                return outcome
+            return PhaseOutcome(
+                False,
+                False,
+                phase,
+                {
+                    **checkpoint["completion"],
+                    "completion_deferred": True,
+                    "safe_ending": safety,
+                },
+            )
+        outcome = self.campaign.evaluate_phase(
+            goal,
+            run,
+            phase,
+            observation,
+            allow_completion=safety.get("met") is True,
+        )
+        if outcome.detail.get("completion_deferred") is not True:
+            return outcome
+        current_phase = outcome.phase if isinstance(outcome.phase, dict) else phase
+        checkpoint = self._latch_phase_completion(
+            goal, run, current_phase, outcome.detail
+        )
+        return PhaseOutcome(
+            False,
+            False,
+            current_phase,
+            {
+                **outcome.detail,
+                "safe_ending": safety,
+                "checkpoint": redact(checkpoint),
+            },
+        )
 
     def _safe_ending_reached(
         self, goal: dict[str, Any], observation: dict[str, Any]
@@ -5806,6 +5953,8 @@ class BotController:
         goal: dict[str, Any],
         observation: dict[str, Any],
         completion: dict[str, Any],
+        *,
+        force_stop_reason: str | None = None,
     ) -> dict[str, Any] | None:
         """Give a running farm exclusive control until its bounded HP phase ends."""
         full_scan = goal["id"] not in self._farm_full_scan_goals
@@ -5862,6 +6011,22 @@ class BotController:
                 "background_keeper_stopping": True,
                 "mode": keeper_mode,
                 "activity": status.get("activity"),
+                "result": redact(stopped),
+                "completion": completion,
+            }
+
+        if force_stop_reason:
+            stopped = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "stop"},
+                timeout=20,
+                mutation=True,
+            )
+            self.storage.set_runtime("background_farm_owner_v1", {})
+            return {
+                "background_farm_stopping": True,
+                "activity": status.get("activity"),
+                "reason": force_stop_reason,
                 "result": redact(stopped),
                 "completion": completion,
             }
@@ -6441,7 +6606,7 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         """Reconcile the durable internal phase and select one when needed."""
         run, phase = self.campaign.ensure(goal)
-        outcome = self.campaign.evaluate_phase(goal, run, phase, observation)
+        outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if outcome.completed or outcome.failed:
             self._invalidate_execution_plan(
                 goal,
@@ -6453,6 +6618,11 @@ class BotController:
             )
             run = self.storage.campaign_run(goal["id"]) or run
             phase = self.storage.active_campaign_phase(run["id"])
+        elif outcome.detail.get("completion_deferred") is True:
+            # Once the bounded phase outcome is durably verified, tactical
+            # invalidation and phase replacement are no longer relevant. Keep
+            # the phase and its plan intact until the safe-ending epilogue.
+            return run, outcome.phase or phase, None
         phase_blocker = self._campaign_phase_grounding_blocker(
             phase,
             observation,
@@ -6766,10 +6936,14 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
-        outcome = self.campaign.evaluate_phase(goal, run, phase, observation)
+        outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         exhausted = (
             None
-            if outcome.completed or outcome.failed
+            if (
+                outcome.completed
+                or outcome.failed
+                or outcome.detail.get("completion_deferred") is True
+            )
             else self.campaign.budget_exhausted(phase)
         )
         if not outcome.completed and not outcome.failed and exhausted is None:
@@ -6947,12 +7121,22 @@ class BotController:
                 # outcome latched while the final safe travel executes.
                 completion = completion_checkpoint["completion"]
             goal = self.storage.set_goal_completion(goal["id"], completion)
+            phase_completion_checkpoint = None
             if completion_checkpoint is None:
                 phase_completion = self._reconcile_existing_campaign_phase(
                     goal, observation
                 )
                 if phase_completion is not None:
                     return phase_completion
+                existing_run = self.storage.campaign_run(goal["id"])
+                existing_phase = (
+                    self.storage.active_campaign_phase(existing_run["id"])
+                    if existing_run is not None
+                    else None
+                )
+                phase_completion_checkpoint = self._phase_completion_checkpoint(
+                    existing_phase
+                )
             expired_opportunity = self._expire_direct_pvp_opportunity(
                 goal, observation, completion
             )
@@ -6985,7 +7169,7 @@ class BotController:
             purchase_result_met = self._purchase_result_met(goal, completion)
             purchase_preflight = (
                 None
-                if purchase_result_met
+                if purchase_result_met or phase_completion_checkpoint is not None
                 else self._purchase_preflight(goal, observation)
             )
             if isinstance(purchase_preflight, dict):
@@ -7067,11 +7251,25 @@ class BotController:
             incident = self.storage.get_runtime("survival_incident_v1", {})
             if isinstance(incident, dict) and incident.get("goal_id") == goal["id"]:
                 self.storage.set_runtime("survival_incident_v1", None)
-            farm_control = self._manage_background_farm(goal, observation, completion)
+            farm_control = self._manage_background_farm(
+                goal,
+                observation,
+                completion,
+                force_stop_reason=(
+                    "the active campaign phase outcome is verified; release movement "
+                    "control for the plan's safe-ending travel"
+                    if phase_completion_checkpoint is not None
+                    else None
+                ),
+            )
             if farm_control is not None:
                 return farm_control
-            structured_purchase = self._structured_purchase_preparation_action(
-                goal, observation, completion, purchase_preflight
+            structured_purchase = (
+                None
+                if phase_completion_checkpoint is not None
+                else self._structured_purchase_preparation_action(
+                    goal, observation, completion, purchase_preflight
+                )
             )
             if structured_purchase is not None:
                 execution_plan = self._execution_plan(goal)
@@ -7095,8 +7293,12 @@ class BotController:
                         )
                         return {"planned": True, "execution_plan": stored_plan}
                     return self._execute(goal, observation, structured_purchase)
-            structured_preparation = self._structured_farm_preparation_action(
-                goal, observation, completion
+            structured_preparation = (
+                None
+                if phase_completion_checkpoint is not None
+                else self._structured_farm_preparation_action(
+                    goal, observation, completion
+                )
             )
             if structured_preparation is not None:
                 execution_plan = self._execution_plan(goal)
@@ -7119,8 +7321,12 @@ class BotController:
                         )
                         return {"planned": True, "execution_plan": stored_plan}
                     return self._execute(goal, observation, structured_preparation)
-            structured_launch = self._structured_farm_launch_plan(
-                goal, observation, completion
+            structured_launch = (
+                None
+                if phase_completion_checkpoint is not None
+                else self._structured_farm_launch_plan(
+                    goal, observation, completion
+                )
             )
             if structured_launch is not None:
                 execution_plan = self._execution_plan(goal)
@@ -7153,6 +7359,9 @@ class BotController:
                 campaign_run, campaign_phase, _campaign_selection = self._campaign_turn_state(
                     goal, observation, grounding
                 )
+            phase_completion_checkpoint = self._phase_completion_checkpoint(
+                campaign_phase
+            )
             page = self.storage.events(after_cursor=max(0, self.storage.get_runtime("planner_event_cursor", 0) - 12), limit=20)
             pending_proposals = self.storage.proposals()[:10]
             planner_feedback = self._planner_feedback(goal)
@@ -7167,6 +7376,17 @@ class BotController:
                     "verified_at": completion_checkpoint.get("verified_at"),
                     "instruction": (
                         "The public goal outcome is latched. Stop/release any keeper and "
+                        "execute only the verified plan's final safe-ending travel."
+                    ),
+                }
+            if phase_completion_checkpoint is not None:
+                grounded_context["phase_outcome_checkpoint"] = {
+                    "verified": True,
+                    "verified_at": phase_completion_checkpoint.get("verified_at"),
+                    "phase_id": campaign_phase.get("id"),
+                    "phase_kind": campaign_phase.get("kind"),
+                    "instruction": (
+                        "The active phase outcome is latched. Stop/release any keeper and "
                         "execute only the verified plan's final safe-ending travel."
                     ),
                 }
@@ -7259,6 +7479,24 @@ class BotController:
                     return {"plan_rejected": True, "reason": str(exc)}
                 self._clear_planner_feedback()
                 return {"planned": True, "execution_plan": stored_plan}
+            safe_return_checkpoint = (
+                completion_checkpoint
+                if completion_checkpoint is not None
+                else phase_completion_checkpoint
+            )
+            if (
+                safe_return_checkpoint is not None
+                and decision["decision"] != "act"
+            ):
+                self._set_planner_feedback(
+                    goal,
+                    "The active goal or campaign phase outcome is already verified. "
+                    "Select only the stored plan's final safe-ending travel step.",
+                )
+                return {
+                    "safe_ending_required": True,
+                    "action_suppressed": True,
+                }
             if decision["decision"] == "act" and execution_plan is None:
                 self._set_planner_feedback(
                     goal,
@@ -7290,11 +7528,12 @@ class BotController:
                 safe_step_id = str(
                     deep_get(execution_plan, "safe_ending.step_id", "")
                 )
-                if completion_checkpoint is not None and step_id != safe_step_id:
+                if safe_return_checkpoint is not None and step_id != safe_step_id:
                     self._set_planner_feedback(
                         goal,
-                        "The public goal outcome is already verified. Select only the final "
-                        f"safe-ending step {safe_step_id!r}; do not repeat completed work.",
+                        "The active goal or campaign phase outcome is already verified. "
+                        f"Select only the final safe-ending step {safe_step_id!r}; "
+                        "do not repeat completed work.",
                     )
                     return {
                         "safe_ending_required": True,
@@ -7309,15 +7548,28 @@ class BotController:
                     == str(deep_get(execution_plan, "safe_ending.room_id"))
                     for criterion in goal.get("success_criteria", [])
                 )
+                safe_step_is_phase_destination = any(
+                    isinstance(criterion, dict)
+                    and criterion.get("kind") == "location_reached"
+                    and criterion.get("room_id") is not None
+                    and str(criterion.get("room_id"))
+                    == str(deep_get(execution_plan, "safe_ending.room_id"))
+                    for criterion in (
+                        campaign_phase.get("success_criteria", [])
+                        if isinstance(campaign_phase, dict)
+                        else []
+                    )
+                )
                 if (
-                    completion_checkpoint is None
+                    safe_return_checkpoint is None
                     and step_id == safe_step_id
                     and not safe_step_is_goal_destination
+                    and not safe_step_is_phase_destination
                 ):
                     self._set_planner_feedback(
                         goal,
-                        "The final safe-ending step is reserved for after the public goal "
-                        "outcome is verified. Advance an earlier plan step first.",
+                        "The final safe-ending step is reserved for after the active phase "
+                        "or public goal outcome is verified. Advance an earlier plan step first.",
                     )
                     return {
                         "safe_ending_premature": True,
@@ -10629,6 +10881,9 @@ class BotController:
             "status": run["status"],
             "strategy_summary": run.get("strategy_summary"),
             "active_phase": phase,
+            "phase_outcome_latched": (
+                self._phase_completion_checkpoint(phase) is not None
+            ),
             "recent_phases": phases[-8:],
             "recent_attempts": attempts,
             "progress_checkpoint": run.get("progress_checkpoint"),
