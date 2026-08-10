@@ -174,6 +174,9 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
     "pvp_opportunity": {"look", "inventory", "equipment", "bank", "map", "travel", "pvp_engage"},
 }
 
+PHASE_ACTION_SUCCEEDED = "phase_action_succeeded"
+PHASE_ACTION_CRITERION_FIELDS = frozenset({"id", "kind", "tools"})
+
 
 @dataclass(frozen=True)
 class PhaseOutcome:
@@ -251,7 +254,8 @@ class CampaignCoordinator:
                     "success_criteria": [
                         {
                             "id": f"local-farm-recipe-{milestone}",
-                            "kind": "operator_confirmed",
+                            "kind": PHASE_ACTION_SUCCEEDED,
+                            "tools": ["hunting_grounds"],
                         }
                     ],
                     "abandon_predicates": [],
@@ -294,18 +298,17 @@ class CampaignCoordinator:
             criteria = phase.get("success_criteria")
             if not isinstance(criteria, list) or not criteria:
                 raise ValueError("campaign phase requires at least one deterministic success criterion")
+            if any(
+                isinstance(criterion, dict)
+                and criterion.get("kind") == "operator_confirmed"
+                for criterion in criteria
+            ):
+                raise ValueError(
+                    "internal campaign phases cannot require operator_confirmed; "
+                    "use observable state or phase_action_succeeded evidence"
+                )
             criteria = self._normalize_phase_success_criteria(criteria)
-            # Reuse the public criterion validator without creating a public goal.
-            self.storage._validate_goal(
-                {
-                    "title": str(phase.get("objective") or "Internal campaign phase")[:120],
-                    "objective": str(phase.get("objective") or "Internal campaign phase"),
-                    "success_criteria": criteria,
-                    "constraints": {},
-                    "priority": int(goal.get("priority", 50)),
-                    "activation": "queue",
-                }
-            )
+            self._validate_phase_success_criteria(kind, criteria, goal, phase)
             abandon_predicates = phase.get("abandon_predicates", [])
             if not isinstance(abandon_predicates, list):
                 raise ValueError("campaign phase abandon_predicates must be an array")
@@ -393,6 +396,9 @@ class CampaignCoordinator:
     @staticmethod
     def _normalize_phase_success_criteria(
         criteria: list[dict[str, Any]],
+        *,
+        phase_kind: str | None = None,
+        migrate_legacy: bool = False,
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for criterion in criteria:
@@ -404,8 +410,166 @@ class CampaignCoordinator:
                 and isinstance(value.get("value"), str)
             ):
                 value["value"] = [value["value"]]
+            if (
+                migrate_legacy
+                and phase_kind == "research_progression"
+                and isinstance(value, dict)
+                and value.get("kind") == "operator_confirmed"
+            ):
+                value = {
+                    "id": value.get("id"),
+                    "kind": PHASE_ACTION_SUCCEEDED,
+                    "tools": ["hunting_grounds"],
+                }
             normalized.append(value)
         return normalized
+
+    def _validate_phase_success_criteria(
+        self,
+        phase_kind: str,
+        criteria: list[dict[str, Any]],
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+    ) -> None:
+        public_criteria: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        has_internal = False
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                raise ValueError("campaign phase success criteria must be objects")
+            criterion_id = str(criterion.get("id") or f"criterion_{index + 1}")
+            if criterion_id in ids:
+                raise ValueError(f"duplicate criterion id: {criterion_id}")
+            ids.add(criterion_id)
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
+                public_criteria.append(criterion)
+                continue
+            has_internal = True
+            unknown = set(criterion) - PHASE_ACTION_CRITERION_FIELDS
+            if unknown:
+                raise ValueError(
+                    "unknown phase_action_succeeded criterion field(s): "
+                    + ", ".join(sorted(unknown))
+                )
+            tools = criterion.get("tools")
+            if (
+                not isinstance(tools, list)
+                or not tools
+                or any(not isinstance(tool, str) or not tool.strip() for tool in tools)
+            ):
+                raise ValueError(
+                    "phase_action_succeeded.tools must be a non-empty array of tool names"
+                )
+            unavailable = sorted(set(tools) - PHASE_TOOL_NAMES.get(phase_kind, set()))
+            if unavailable:
+                raise ValueError(
+                    "phase_action_succeeded names tools unavailable to this phase: "
+                    + ", ".join(unavailable)
+                )
+        if has_internal and any(
+            criterion.get("kind") in {"composite_all", "composite_any"}
+            for criterion in public_criteria
+        ):
+            raise ValueError(
+                "phase_action_succeeded cannot be referenced by composite criteria"
+            )
+        if public_criteria:
+            # Reuse the public criterion validator without creating a public goal.
+            self.storage._validate_goal(
+                {
+                    "title": str(phase.get("objective") or "Internal campaign phase")[:120],
+                    "objective": str(phase.get("objective") or "Internal campaign phase"),
+                    "success_criteria": public_criteria,
+                    "constraints": {},
+                    "priority": int(goal.get("priority", 50)),
+                    "activation": "queue",
+                }
+            )
+
+    def _evaluate_phase_success_criteria(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        criteria: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        annotated = [
+            {
+                **criterion,
+                "id": str(criterion.get("id") or f"criterion_{index + 1}"),
+            }
+            for index, criterion in enumerate(criteria)
+            if isinstance(criterion, dict)
+        ]
+        public = [
+            criterion
+            for criterion in annotated
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED
+        ]
+        public_results: dict[str, dict[str, Any]] = {}
+        if public:
+            evaluated = self.criteria.evaluate(
+                {"id": goal["id"], "success_criteria": public}, observation
+            )
+            public_results = {
+                str(result.get("id") or ""): result
+                for result in evaluated.get("criteria", [])
+                if isinstance(result, dict)
+            }
+
+        attempts = self.storage.phase_attempts(phase["id"], limit=200)
+        successful = [attempt for attempt in attempts if attempt.get("status") == "succeeded"]
+        results: list[dict[str, Any]] = []
+        evidence_event_ids: list[str] = []
+        for criterion in annotated:
+            criterion_id = str(criterion["id"])
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
+                result = public_results.get(criterion_id)
+                if result is not None:
+                    results.append(result)
+                continue
+            allowed_tools = {str(tool) for tool in criterion.get("tools", [])}
+            matches = [
+                attempt
+                for attempt in successful
+                if str(attempt.get("semantic_action") or "") in allowed_tools
+            ]
+            met = bool(matches)
+            if matches:
+                evidence_event_ids.extend(
+                    str(attempt.get("id"))
+                    for attempt in matches
+                    if attempt.get("id") is not None
+                )
+            results.append(
+                {
+                    "id": criterion_id,
+                    "kind": PHASE_ACTION_SUCCEEDED,
+                    "met": met,
+                    "detail": (
+                        "verified successful phase action(s): "
+                        + ", ".join(
+                            sorted(
+                                {
+                                    str(attempt.get("semantic_action") or "")
+                                    for attempt in matches
+                                }
+                            )
+                        )
+                        if met
+                        else "awaiting a successful phase action from: "
+                        + ", ".join(sorted(allowed_tools))
+                    ),
+                }
+            )
+        met_count = sum(result.get("met") is True for result in results)
+        return {
+            "percent_estimate": round(100 * met_count / len(results)) if results else 0,
+            "summary": f"{met_count} of {len(results)} criteria verified",
+            "evidence_event_ids": evidence_event_ids,
+            "criteria": results,
+            "all_met": bool(results) and met_count == len(results),
+        }
 
     def _filter_initially_true_abandonment(
         self,
@@ -435,7 +599,11 @@ class CampaignCoordinator:
         if phase is None:
             return PhaseOutcome(False, False, None, {"reason": "no_active_phase"})
         raw_criteria = phase.get("success_criteria", [])
-        criteria = self._normalize_phase_success_criteria(raw_criteria)
+        criteria = self._normalize_phase_success_criteria(
+            raw_criteria,
+            phase_kind=str(phase.get("kind") or ""),
+            migrate_legacy=True,
+        )
         abandon = phase.get("abandon_predicates", [])
         context = (
             dict(phase.get("context"))
@@ -445,9 +613,9 @@ class CampaignCoordinator:
         normalization_reasons: list[str] = []
         if criteria != raw_criteria:
             context["normalized_success_criteria"] = [
-                "equipment.wielding scalar expected value converted to the broker's canonical name array"
+                "converted legacy phase criteria to deterministic controller representations"
             ]
-            normalization_reasons.append("normalized equipment.wielding success value")
+            normalization_reasons.append("normalized internal phase success criteria")
         if (
             isinstance(abandon, list)
             and abandon
@@ -469,7 +637,6 @@ class CampaignCoordinator:
                 success_criteria=criteria,
                 reason="; ".join(normalization_reasons),
             )
-        pseudo_goal = {"id": goal["id"], "success_criteria": criteria}
         if isinstance(abandon, list) and abandon:
             abandonment = self.criteria.evaluate(
                 {"id": goal["id"], "success_criteria": abandon}, observation
@@ -493,7 +660,9 @@ class CampaignCoordinator:
                     finished,
                     {"reason": reason, "abandonment": abandonment},
                 )
-        completion = self.criteria.evaluate(pseudo_goal, observation)
+        completion = self._evaluate_phase_success_criteria(
+            goal, phase, criteria, observation
+        )
         if completion.get("all_met") is True:
             finished = self.storage.transition_campaign_phase(
                 phase["id"],

@@ -296,8 +296,11 @@ Choose one bounded internal phase. Supported phase kinds are: general, research_
 free_inventory_capacity, liquidate_inventory, acquire_item, train_ability, farm, recover, return_home, and
 pvp_opportunity. A supporting prerequisite uses decision=push_support_phase. Replacing a disproved tactic uses
 decision=replace_phase. Use decision=start_phase when no phase exists. Every new phase needs an objective and one
-or more deterministic success_criteria using the same typed criterion schema as public goals. A phase criterion
-must describe the local phase outcome, not the whole strategic campaign unless this is the terminal return phase.
+or more deterministic success_criteria. Internal phases must never use operator_confirmed because the operator
+confirms public goals, not hidden campaign bookkeeping. Use observable public criterion kinds for observable state.
+For a research_progression phase that completes by collecting controller evidence, use the internal-only criterion
+{{"kind":"phase_action_succeeded","tools":[...]}} naming one or more available tools; one successful listed tool satisfies it.
+A phase criterion must describe the local phase outcome, not the whole strategic campaign unless this is the terminal return phase.
 Useful verified local paths include status.vitals.health.max, status.vitals.health.value,
 status.vitals.vigor.value, inventory.carry.items, inventory.carry.room_for.weight,
 inventory.carry.room_for.bulk, equipment.known, equipment.wielding, and status.position.col/row. Use
@@ -342,7 +345,8 @@ Schema:
   "budget":{{"max_actions":integer,"max_minutes":integer}},"context":object,"rationale":string}}|null,
   "rationale":string,"evidence":array}}
 
-Supported criterion kinds: {', '.join(CRITERION_KINDS)}.
+Supported observable phase criterion kinds: {', '.join(kind for kind in CRITERION_KINDS if kind != 'operator_confirmed')}.
+Research phases additionally support phase_action_succeeded with only id, kind, and a non-empty tools array.
 Use only these fields: {CRITERION_FIELD_GUIDE}.
 Do not use event criteria for ordinary internal preparation or farming. Never invent combat.kill."""
 

@@ -277,6 +277,110 @@ class StorageTests(unittest.TestCase):
             {tool["name"] for tool in selected},
         )
 
+    def test_internal_phase_rejects_human_confirmation_criterion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+
+                with self.assertRaisesRegex(
+                    ValueError, "internal campaign phases cannot require operator_confirmed"
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "research_progression",
+                                "objective": "Find a usable regional farm.",
+                                "success_criteria": [
+                                    {
+                                        "id": "human-check",
+                                        "kind": "operator_confirmed",
+                                    }
+                                ],
+                                "abandon_predicates": [],
+                                "budget": {"max_actions": 20, "max_minutes": 45},
+                            },
+                        },
+                    )
+
+    def test_legacy_research_confirmation_migrates_to_successful_action_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Find a usable regional farm.",
+                        "success_criteria": [
+                            {"id": "farm-found", "kind": "operator_confirmed"}
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 20, "max_minutes": 45},
+                    },
+                    mode="start",
+                )
+                observation = {"look": {"room": {"num": 1012, "name": "Raza"}}}
+
+                pending = coordinator.evaluate_phase(goal, run, phase, observation)
+                self.assertFalse(pending.completed)
+                migrated = storage.active_campaign_phase(run["id"])
+                self.assertEqual(
+                    "phase_action_succeeded",
+                    migrated["success_criteria"][0]["kind"],
+                )
+
+                attempt_id = storage.create_phase_attempt(
+                    phase["id"],
+                    semantic_action="hunting_grounds",
+                    signature="regional-farm-evidence",
+                    expected_effect={"farm_candidate": True},
+                )
+                storage.update_phase_attempt(
+                    attempt_id,
+                    "succeeded",
+                    result={"best_room": 1016, "creature": "mummy"},
+                )
+
+                completed = coordinator.evaluate_phase(
+                    goal,
+                    run,
+                    storage.active_campaign_phase(run["id"]),
+                    observation,
+                )
+                self.assertTrue(completed.completed)
+                self.assertEqual("succeeded", completed.phase["status"])
+
+    def test_progression_fallback_uses_controller_evidence_not_human_confirmation(self) -> None:
+        goal = goal_payload(
+            objective="Raise maximum HP to 25.",
+            success_criteria=[
+                {
+                    "id": "hp-25",
+                    "kind": "numeric_threshold",
+                    "metric": "status.vitals.health.max",
+                    "operator": ">=",
+                    "value": 25,
+                }
+            ],
+        )
+        fallback = CampaignCoordinator.fallback_phase(
+            goal,
+            {"status": {"vitals": {"health": {"max": 20}}}},
+        )
+
+        self.assertEqual("research_progression", fallback["kind"])
+        self.assertEqual(
+            "phase_action_succeeded",
+            fallback["success_criteria"][0]["kind"],
+        )
+
     def test_liquidate_inventory_can_drop_junk_and_buy_replacement_gear(self) -> None:
         selected = CampaignCoordinator.tools_for_phase(
             {"kind": "liquidate_inventory"},
