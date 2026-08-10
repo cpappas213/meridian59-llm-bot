@@ -62,10 +62,7 @@ $aclTestPath = Join-Path $projectRoot "runtime\acl-installer-test.tmp"
 [System.IO.File]::WriteAllText($aclTestPath, "test")
 try {
     Protect-UserOnlyFile $aclTestPath
-    $acl = [System.IO.File]::GetAccessControl(
-        $aclTestPath,
-        [System.Security.AccessControl.AccessControlSections]::Access
-    )
+    $acl = Get-Acl -LiteralPath $aclTestPath
     if (-not $acl.AreAccessRulesProtected) {
         throw "The installer ACL test file still inherits access rules"
     }

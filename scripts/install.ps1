@@ -90,12 +90,9 @@ function Protect-UserOnlyFile {
         [System.Security.AccessControl.AccessControlType]::Allow
     )
     $security.AddAccessRule($rule) | Out-Null
-    [System.IO.File]::SetAccessControl($Path, $security)
+    Set-Acl -LiteralPath $Path -AclObject $security
 
-    $verified = [System.IO.File]::GetAccessControl(
-        $Path,
-        [System.Security.AccessControl.AccessControlSections]::Access
-    )
+    $verified = Get-Acl -LiteralPath $Path
     $rules = @($verified.GetAccessRules(
         $true,
         $false,
