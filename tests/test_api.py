@@ -35,9 +35,24 @@ class ApiTests(unittest.TestCase):
     def test_control_auth_and_separate_read_only_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
+
+            class DraftModel:
+                def draft_goal(self, **_: object) -> dict[str, object]:
+                    return {
+                        "title": "Meet the operator's request",
+                        "objective": "Complete the requested outcome.",
+                        "success_criteria": [
+                            {"id": "confirmed", "kind": "operator_confirmed"}
+                        ],
+                        "constraints": {},
+                        "priority": 50,
+                        "activation": "queue",
+                    }
+
             servers = ApiServers(controller)
             try:
                 controller.startup(connect_game=False)
+                controller.model = DraftModel()  # type: ignore[assignment]
                 servers.start()
                 control_port = servers.control.server_address[1]
                 dashboard_port = servers.dashboard.server_address[1]
@@ -50,6 +65,30 @@ class ApiTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(request, timeout=2) as response:
                     self.assertEqual("running", json.load(response)["controller"]["state"])
+                goals_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/goals",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(goals_request, timeout=2) as response:
+                    self.assertEqual({"goals": []}, json.load(response))
+                character_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/character",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(character_request, timeout=2) as response:
+                    character_status = json.load(response)
+                    self.assertEqual(200, response.status)
+                    self.assertIn("abilities", character_status)
+                    self.assertIn("inventory", character_status)
+                    self.assertIn("equipment", character_status)
+                draft_status, draft = self.request_json(
+                    f"http://127.0.0.1:{control_port}/v1/goals/draft",
+                    body={"prompt": "Do something useful."},
+                )
+                self.assertEqual(200, draft_status)
+                self.assertEqual(
+                    "Meet the operator's request", draft["goal"]["title"]
+                )
                 mutation = urllib.request.Request(
                     f"http://127.0.0.1:{dashboard_port}/goals",
                     data=b"{}",

@@ -10,12 +10,17 @@ param(
     [string]$Timezone = "",
     [string]$ModelBaseUrl = "",
     [string]$ModelName = "",
+    [ValidateSet("none", "bearer", "anthropic")]
+    [string]$ModelAuthMode = "",
     [System.Security.SecureString]$ModelApiKey,
     [bool]$ModelJsonMode = $true,
     [switch]$ModelDisableThinking,
     [string]$ObsidianVaultPath = "",
     [string]$DashboardBind = "127.0.0.1",
+    [string]$PersonaFile = "",
     [System.Management.Automation.PSCredential]$Credential,
+    [switch]$SkipPersonaSetup,
+    [switch]$SkipTui,
     [switch]$SkipHermes,
     [switch]$SkipScheduledTask
 )
@@ -71,15 +76,256 @@ function Assert-SingleLineSetting {
     }
 }
 
+function Protect-UserOnlyFile {
+    param([string]$Path)
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $identity.User) {
+        throw "The current Windows identity has no security identifier"
+    }
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $identity.User,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.AddAccessRule($rule) | Out-Null
+    Set-Acl -LiteralPath $Path -AclObject $security
+
+    $verified = Get-Acl -LiteralPath $Path
+    $rules = @($verified.GetAccessRules(
+        $true,
+        $false,
+        [System.Security.Principal.SecurityIdentifier]
+    ))
+    if (-not $verified.AreAccessRulesProtected -or $rules.Count -ne 1 -or
+        $rules[0].IdentityReference -ne $identity.User -or
+        $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+        ($rules[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne
+            [System.Security.AccessControl.FileSystemRights]::FullControl) {
+        throw "Could not verify user-only permissions on $Path"
+    }
+}
+
+function Resolve-IanaTimezoneAlias {
+    param([string]$Value)
+    $trimmed = $Value.Trim()
+    $aliases = @{
+        "UTC" = "UTC"
+        "GMT" = "UTC"
+        "PST" = "America/Los_Angeles"
+        "PDT" = "America/Los_Angeles"
+        "PT" = "America/Los_Angeles"
+        "Pacific Standard Time" = "America/Los_Angeles"
+        "MST" = "America/Denver"
+        "MDT" = "America/Denver"
+        "MT" = "America/Denver"
+        "Mountain Standard Time" = "America/Denver"
+        "US Mountain Standard Time" = "America/Phoenix"
+        "CST" = "America/Chicago"
+        "CDT" = "America/Chicago"
+        "CT" = "America/Chicago"
+        "Central Standard Time" = "America/Chicago"
+        "EST" = "America/New_York"
+        "EDT" = "America/New_York"
+        "ET" = "America/New_York"
+        "Eastern Standard Time" = "America/New_York"
+        "Alaskan Standard Time" = "America/Anchorage"
+        "Hawaiian Standard Time" = "Pacific/Honolulu"
+    }
+    if ($aliases.ContainsKey($trimmed)) { return $aliases[$trimmed] }
+    return $trimmed
+}
+
+function Test-IanaTimezone {
+    param([string]$Value)
+    if (-not $Value) { return $false }
+    $previousErrorPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        if ($hasNativePreference) { $PSNativeCommandUseErrorActionPreference = $false }
+        & $PythonExecutable -c "import sys; from zoneinfo import ZoneInfo; ZoneInfo(sys.argv[1])" $Value 2>$null
+        $valid = $LASTEXITCODE -eq 0
+        $global:LASTEXITCODE = 0
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+    return $valid
+}
+
+function Read-InstallTimezone {
+    param([string]$Value)
+    if ($Value) {
+        $resolved = Resolve-IanaTimezoneAlias $Value
+        if (-not (Test-IanaTimezone $resolved)) {
+            throw "Timezone '$Value' is not available. Use a valid IANA timezone such as America/Los_Angeles."
+        }
+        return $resolved
+    }
+
+    $choices = @(
+        @{ Label = "UTC"; Value = "UTC" },
+        @{ Label = "Pacific Time (PST/PDT)"; Value = "America/Los_Angeles" },
+        @{ Label = "Mountain Time (MST/MDT)"; Value = "America/Denver" },
+        @{ Label = "Arizona Time"; Value = "America/Phoenix" },
+        @{ Label = "Central Time (CST/CDT)"; Value = "America/Chicago" },
+        @{ Label = "Eastern Time (EST/EDT)"; Value = "America/New_York" },
+        @{ Label = "Alaska Time"; Value = "America/Anchorage" },
+        @{ Label = "Hawaii Time"; Value = "Pacific/Honolulu" }
+    )
+    $localIana = Resolve-IanaTimezoneAlias ([System.TimeZoneInfo]::Local.Id)
+    $defaultIndex = 0
+    for ($index = 0; $index -lt $choices.Count; $index++) {
+        if ($choices[$index].Value -eq $localIana) { $defaultIndex = $index; break }
+    }
+
+    Write-Host "Timezone:"
+    for ($index = 0; $index -lt $choices.Count; $index++) {
+        $detected = if ($index -eq $defaultIndex) { " (detected/default)" } else { "" }
+        Write-Host "  [$($index + 1)] $($choices[$index].Label) - $($choices[$index].Value)$detected"
+    }
+    Write-Host "  [M] Another IANA timezone"
+    while ($true) {
+        $entered = (Read-Host "Select timezone [$($defaultIndex + 1)]").Trim()
+        if (-not $entered) { return $choices[$defaultIndex].Value }
+        if ($entered.ToLowerInvariant() -eq "m") {
+            $manual = Resolve-IanaTimezoneAlias (Read-Host "IANA timezone (for example Europe/London)")
+            if (Test-IanaTimezone $manual) { return $manual }
+            Write-Warning "That timezone is not available. Enter an IANA name such as Europe/London."
+            continue
+        }
+        $selection = 0
+        if ([int]::TryParse($entered, [ref]$selection) -and
+            $selection -ge 1 -and $selection -le $choices.Count) {
+            return $choices[$selection - 1].Value
+        }
+        Write-Warning "Choose a number from 1 through $($choices.Count), or M for another IANA timezone."
+    }
+}
+
+function ConvertFrom-InstallSecureString {
+    param([System.Security.SecureString]$Value)
+    if (-not $Value) { return "" }
+    $keyCredential = New-Object System.Management.Automation.PSCredential("model", $Value)
+    return $keyCredential.GetNetworkCredential().Password
+}
+
+function Get-OpenAiModelIds {
+    param(
+        [string]$BaseUrl,
+        [string]$ApiKey = "",
+        [ValidateSet("none", "bearer", "anthropic")]
+        [string]$AuthMode = "none"
+    )
+    $modelsUrl = "$($BaseUrl.TrimEnd('/'))/models"
+    $headers = @{}
+    if ($AuthMode -eq "bearer" -and $ApiKey) {
+        $headers.Authorization = "Bearer $ApiKey"
+    } elseif ($AuthMode -eq "anthropic" -and $ApiKey) {
+        $headers["x-api-key"] = $ApiKey
+        $headers["anthropic-version"] = "2023-06-01"
+    }
+    try {
+        $response = Invoke-RestMethod -Method Get -Uri $modelsUrl -Headers $headers -TimeoutSec 10
+    } catch {
+        Write-Warning "Could not query $modelsUrl`: $($_.Exception.Message)"
+        return @()
+    }
+    $items = if ($null -ne $response.data) { @($response.data) } else { @($response) }
+    return @(
+        $items |
+            ForEach-Object { if ($null -ne $_.id) { [string]$_.id } } |
+            Where-Object { $_ } |
+            Sort-Object -Unique
+    )
+}
+
+function Read-ModelAuthMode {
+    param(
+        [string]$Value,
+        [string]$BaseUrl,
+        [bool]$HasApiKey
+    )
+    if ($Value) { return $Value }
+    $default = if ($BaseUrl -match '(?i)api\.anthropic\.com') {
+        "anthropic"
+    } elseif ($BaseUrl -match '(?i)api\.openai\.com' -or $HasApiKey) {
+        "bearer"
+    } else {
+        "none"
+    }
+    Write-Host "LLM authentication:"
+    Write-Host "  [1] None (local vLLM or an unauthenticated compatible endpoint)"
+    Write-Host "  [2] Bearer API key (OpenAI/Codex or another compatible provider)"
+    Write-Host "  [3] Anthropic API key (Claude; x-api-key plus API version)"
+    $defaultNumber = @{ none = "1"; bearer = "2"; anthropic = "3" }[$default]
+    while ($true) {
+        $entered = (Read-Host "Select authentication [$defaultNumber]").Trim()
+        if (-not $entered) { return $default }
+        if ($entered -eq "1") { return "none" }
+        if ($entered -eq "2") { return "bearer" }
+        if ($entered -eq "3") { return "anthropic" }
+        Write-Warning "Choose 1, 2, or 3."
+    }
+}
+
+function Select-OpenAiModel {
+    param([string[]]$ModelIds)
+    Write-Host "Models reported by the endpoint:"
+    for ($index = 0; $index -lt $ModelIds.Count; $index++) {
+        Write-Host "  [$($index + 1)] $($ModelIds[$index])"
+    }
+    Write-Host "  [M] Enter a model ID manually"
+    while ($true) {
+        $entered = (Read-Host "Select model [1]").Trim()
+        if (-not $entered) { return $ModelIds[0] }
+        if ($entered.ToLowerInvariant() -eq "m") {
+            return Read-InstallSetting "" "LLM model ID"
+        }
+        $selection = 0
+        if ([int]::TryParse($entered, [ref]$selection) -and
+            $selection -ge 1 -and $selection -le $ModelIds.Count) {
+            return $ModelIds[$selection - 1]
+        }
+        Write-Warning "Choose a number from 1 through $($ModelIds.Count), or M for manual entry."
+    }
+}
+
 $GameHost = Read-InstallSetting $GameHost "Meridian 59 server host" "127.0.0.1"
-$Timezone = Read-InstallSetting $Timezone "IANA timezone for status and journals" "UTC"
+$Timezone = Read-InstallTimezone $Timezone
 $ModelBaseUrl = Read-InstallSetting $ModelBaseUrl "OpenAI-compatible LLM base URL" "http://127.0.0.1:8000/v1"
-$ModelName = Read-InstallSetting $ModelName "LLM model ID"
+$modelApiKeyPlain = ConvertFrom-InstallSecureString $ModelApiKey
+$ModelAuthMode = Read-ModelAuthMode $ModelAuthMode $ModelBaseUrl ([bool]$modelApiKeyPlain)
+if ($ModelAuthMode -ne "none" -and -not $modelApiKeyPlain) {
+    $providerLabel = if ($ModelAuthMode -eq "anthropic") { "Anthropic/Claude" } else { "Bearer/OpenAI" }
+    $ModelApiKey = Read-Host "$providerLabel API key" -AsSecureString
+    $modelApiKeyPlain = ConvertFrom-InstallSecureString $ModelApiKey
+    if (-not $modelApiKeyPlain) {
+        throw "$providerLabel authentication requires a non-empty API key"
+    }
+}
+if (-not $ModelName) {
+    $modelIds = @(Get-OpenAiModelIds $ModelBaseUrl $modelApiKeyPlain $ModelAuthMode)
+    if ($modelIds.Count -gt 0) {
+        $ModelName = Select-OpenAiModel $modelIds
+    } else {
+        Write-Warning "No model list was available; enter the exact model ID manually."
+        $ModelName = Read-InstallSetting $ModelName "LLM model ID"
+    }
+}
 foreach ($setting in @(
     @{ Name = "GameHost"; Value = $GameHost },
     @{ Name = "Timezone"; Value = $Timezone },
     @{ Name = "ModelBaseUrl"; Value = $ModelBaseUrl },
     @{ Name = "ModelName"; Value = $ModelName },
+    @{ Name = "ModelAuthMode"; Value = $ModelAuthMode },
     @{ Name = "DashboardBind"; Value = $DashboardBind }
 )) {
     Assert-SingleLineSetting $setting.Name $setting.Value
@@ -167,14 +413,7 @@ $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 try { $random.GetBytes($controlTokenBytes) } finally { $random.Dispose() }
 $controlToken = [Convert]::ToBase64String($controlTokenBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
 
-$modelApiKeyPlain = ""
-if (-not $ModelApiKey) {
-    $ModelApiKey = Read-Host "LLM API key (leave blank when the endpoint needs none)" -AsSecureString
-}
-if ($ModelApiKey) {
-    $modelApiKeyCredential = New-Object System.Management.Automation.PSCredential("model", $ModelApiKey)
-    $modelApiKeyPlain = $modelApiKeyCredential.GetNetworkCredential().Password
-}
+$modelApiKeyPlain = ConvertFrom-InstallSecureString $ModelApiKey
 if ($ObsidianVaultPath -and ($ObsidianVaultPath.Contains("`r") -or $ObsidianVaultPath.Contains("`n"))) {
     throw "ObsidianVaultPath must be a single-line path"
 }
@@ -190,11 +429,7 @@ $secretLines = @(
 $plainPassword = $null
 $modelApiKeyPlain = $null
 $secretLines = $null
-$acl = Get-Acl -LiteralPath $secretPath
-$acl.SetAccessRuleProtection($true, $false)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($env:USERNAME, "FullControl", "Allow")
-$acl.SetAccessRule($rule)
-Set-Acl -LiteralPath $secretPath -AclObject $acl
+Protect-UserOnlyFile $secretPath
 
 $harnessRoot = Join-Path $ProjectRoot "vendor\m59-harness"
 $escapedProject = $ProjectRoot.Replace('\', '/')
@@ -221,7 +456,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "afeb5f3e67673643547c2c9aa245e01a69035af0"
+expected_revision = "4a2428739505ed8e05a98ddcbac4c41e6f941895"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -231,6 +466,7 @@ state_file = "$escapedInstall/data/harness-fleet-state.json"
 [model]
 base_url = "$ModelBaseUrl"
 name = "$ModelName"
+auth_mode = "$ModelAuthMode"
 planner_timeout_seconds = 90
 responder_timeout_seconds = 45
 max_output_tokens = 1200
@@ -292,6 +528,24 @@ obsidian_assessment_batch_size = 20
 "@
 [System.IO.File]::WriteAllText($configPath, $config, [System.Text.UTF8Encoding]::new($false))
 
+if (-not $SkipPersonaSetup) {
+    $personaArguments = @(
+        "-m",
+        "meridian_bot.cli",
+        "--config",
+        $configPath,
+        "setup-persona"
+    )
+    if ($PersonaFile) {
+        if (-not (Test-Path -LiteralPath $PersonaFile -PathType Leaf)) {
+            throw "Persona JSON file not found: $PersonaFile"
+        }
+        $personaArguments += @("--input", [System.IO.Path]::GetFullPath($PersonaFile))
+    }
+    & $PythonExecutable @personaArguments
+    if ($LASTEXITCODE -ne 0) { throw "Persona setup failed" }
+}
+
 if (-not $SkipScheduledTask) {
     $launcher = Join-Path $ProjectRoot "scripts\run-controller.ps1"
     $arguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`" -ProjectRoot `"$ProjectRoot`" -PythonExecutable `"$PythonExecutable`" -ConfigPath `"$configPath`""
@@ -323,4 +577,15 @@ if (-not $SkipScheduledTask) { Start-ScheduledTask -TaskName "Meridian59 LLM Bot
 Write-Host "Installed. Controller data: $installRoot"
 if ($registerHermes) { Write-Host "Restart Hermes to load mcp_meridian_bot_* and mcp_meridian_knowledge_* tools." }
 if (-not $SkipScheduledTask) { Write-Host "Dashboard: http://$DashboardBind`:8904/" }
-Write-Host "Next: restart the higher-level agent, set the character persona/name, then wait for onboarding to report ready_for_goals=true."
+if ($SkipPersonaSetup) {
+    Write-Host "Next: run 'm59-bot --config `"$configPath`" setup-persona', then wait for onboarding to report ready_for_goals=true."
+} else {
+    Write-Host "Character onboarding is configured. Wait for onboarding to report ready_for_goals=true, then submit the first strategic goal."
+    Write-Host "If an established character requires explicit replacement, run setup-persona with --update-existing --reuse-current --replace-existing-character."
+}
+if ((-not $SkipScheduledTask) -and (-not $SkipTui)) {
+    Write-Host "Opening the goal monitoring console. Press Q to leave the console; the controller will continue running."
+    $env:PYTHONPATH = Join-Path $ProjectRoot "src"
+    & $PythonExecutable -m meridian_bot.cli --config $configPath tui
+    if ($LASTEXITCODE -ne 0) { throw "Goal monitoring console failed" }
+}

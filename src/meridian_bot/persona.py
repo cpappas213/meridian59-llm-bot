@@ -19,7 +19,12 @@ PERSONA_SCHEMA: dict[str, Any] = {
         },
         "character_voice": {
             "type": "string",
-            "description": "Concise first-person voice and identity concept for model-generated in-game dialogue.",
+            "description": (
+                "One short paragraph, ideally 2-4 sentences or 40-100 words, describing the broad "
+                "archetype/background impression, emotional tone, social presence, and a meaningful "
+                "tension or flaw. It informs build selection, roleplay-aware planning, and dialogue "
+                "without creating goals or overriding policy."
+            ),
         },
         "traits": {
             "type": "array",

@@ -81,6 +81,18 @@ revising tactics in service of the active goal.
   shall not report `ready_for_goals` until the intended identity is verified.
 - **FR-CHAR-011**: Goal submission and proposal acceptance shall fail with
   `ONBOARDING_REQUIRED` until onboarding reports `ready_for_goals=true`.
+- **FR-CHAR-012**: The standard installer shall offer a local interactive path
+  that collects and durably stores the operator-authored persona before launch,
+  without requiring a supervising model or MCP host. Existing persona versions
+  shall be preserved unless the operator explicitly requests an update.
+- **FR-CHAR-013**: Model authentication shall be explicit and fail closed. The
+  supported local modes are unauthenticated, HTTP Bearer API key for
+  OpenAI/Codex-compatible providers, and Anthropic API key with the required API
+  version header for Claude. Product subscription-login tokens shall not be
+  imported or repurposed as application credentials.
+- **FR-CHAR-014**: Interactive setup shall select timezone from labelled regions
+  that persist valid IANA identifiers, normalize documented common aliases, and
+  validate any advanced IANA entry before writing runtime configuration.
 
 ### 4.2 Durable goal management
 
@@ -110,7 +122,11 @@ revising tactics in service of the active goal.
   opportunities or risks. Proposals shall not become active until the supervisor or the
   user accepts them as queue-management decisions.
 - **FR-GOAL-011**: Operator-supplied goal text is trusted intent, but shall still
-  be normalized into the goal schema and checked against authority policy.
+  be normalized into the goal schema and checked against authority policy. In
+  the local TUI, the configured model shall construct an inert structured draft
+  from that text. The user shall approve, cancel, or revise it before submission;
+  revision shall supply both the displayed draft and new operator text to the
+  model and return to the same review step.
 - **FR-GOAL-012**: Player-supplied chat shall never create, modify, accept,
   reprioritize, or cancel a goal.
 - **FR-GOAL-013**: A bounded goal failure shall create a durable typed lesson
@@ -309,6 +325,20 @@ revising tactics in service of the active goal.
   bind to the LAN. It shall reveal no secrets or mutation controls.
 - **FR-OBS-006**: Notification bursts shall be deduplicated and rate-limited without
   losing the underlying durable events.
+- **FR-OBS-007**: A local authenticated terminal interface shall continuously
+  display controller/game state, character vitals and development, current goal,
+  goal queue, liveness, and recent events, and shall expose reviewed
+  plain-language-to-structured goal submission plus versioned
+  pause/resume/cancel/reprioritize/confirmation commands. It shall use color to
+  distinguish operational states when the terminal supports ANSI output and
+  provide an on-demand read-only view of all reported skills, spells, inventory
+  quantities, carry capacity, attributes, and verified equipment. Escape shall
+  immediately cancel any non-main screen or nested prompt and return to the main
+  terminal dashboard without submitting a partial mutation.
+- **FR-OBS-008**: The standard interactive launcher shall run setup only when no
+  installed configuration exists. Subsequent launches shall attach the terminal
+  interface to the independently running controller without creating a second
+  game loop, and leaving the interface shall not stop the controller.
 
 ## 5. Non-functional requirements
 

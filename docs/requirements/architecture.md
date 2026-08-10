@@ -10,10 +10,12 @@ checks, recovery, and operator-facing integration.
 ```mermaid
 flowchart LR
     U["Human operator"] --> V["Higher-level MCP supervisor"]
+    U --> T["Local terminal console"]
     V -->|"six supervisory tools"| M["Controller MCP facade"]
     V -->|"five read-only tools"| K["Knowledge MCP facade"]
     M --> C["Durable bot controller"]
     K --> C
+    T -->|"authenticated loopback API"| C
 
     subgraph CTRL["Controller process"]
       C --> G["Goal manager"]
@@ -150,9 +152,13 @@ only a projection of lesson events and cannot change lesson state.
 
 ### 2.7 Model service
 
-The controller uses the local OpenAI-compatible endpoint. Planner and responder
-requests share the configured endpoint but use separate prompts, context builders,
-timeouts, and output validators. Neither role depends on Hermes being active.
+The controller uses a configured OpenAI-compatible endpoint. Goal-drafter,
+planner, and responder requests share the configured endpoint but use separate
+prompts, context builders, timeouts, and output validators. None of these roles
+depends on Hermes being active. Authentication is explicit: no credential header, HTTP
+Bearer for OpenAI/Codex-compatible APIs, or Anthropic `x-api-key` plus
+`anthropic-version`. Legacy `auto` mode preserves the original optional-Bearer
+behavior.
 
 The model name, base URL, authentication behavior, sampling parameters, and
 context budgets are configuration. Startup validates that the configured model
@@ -183,6 +189,14 @@ Two read-only views may coexist:
 
 They are operational views, not control planes. All buttons or HTTP methods that
 mutate game/controller state are absent from LAN listeners.
+
+### 2.10 Local terminal console
+
+The optional terminal console is a control client, not a controller process. It
+reads the same compact supervision state used by the MCP facade and sends typed,
+versioned goal mutations to the authenticated loopback API. Its lifetime is
+independent from the scheduled controller and it never connects to the harness
+directly.
 
 ## 3. Network and process topology
 

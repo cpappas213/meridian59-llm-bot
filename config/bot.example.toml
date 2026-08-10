@@ -16,7 +16,7 @@ autojoin = true
 
 [harness]
 root = "../vendor/m59-harness"
-expected_revision = "afeb5f3e67673643547c2c9aa245e01a69035af0"
+expected_revision = "4a2428739505ed8e05a98ddcbac4c41e6f941895"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -26,6 +26,9 @@ state_file = "%LOCALAPPDATA%/m59-llm-bot/data/harness-fleet-state.json"
 [model]
 base_url = "http://127.0.0.1:8000/v1"
 name = "YOUR_MODEL_ID"
+# auto preserves legacy behavior: no key means no auth; a key means Bearer.
+# Prefer an explicit value: none, bearer (OpenAI/Codex), or anthropic (Claude).
+auth_mode = "none"
 planner_timeout_seconds = 90
 responder_timeout_seconds = 45
 max_output_tokens = 1200

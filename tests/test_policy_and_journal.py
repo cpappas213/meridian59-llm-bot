@@ -7,8 +7,9 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
-from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, VllmClient
+from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, VllmClient
 from meridian_bot.obsidian import ObsidianJournal
 from meridian_bot.policy import PolicyEngine
 from meridian_bot.controller import BotController
@@ -19,6 +20,76 @@ from .helpers import config
 
 
 class PolicyAndJournalTests(unittest.TestCase):
+    def test_model_auth_modes_build_provider_specific_headers(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"data":[{"id":"test-model"}]}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = replace(
+                config(Path(temporary)),
+                secrets={"M59_LLM_API_KEY": "test-key"},
+            )
+            expected = {
+                "none": {},
+                "auto": {"authorization": "Bearer test-key"},
+                "bearer": {"authorization": "Bearer test-key"},
+                "anthropic": {
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                },
+            }
+            for mode, auth_headers in expected.items():
+                with self.subTest(mode=mode):
+                    client = VllmClient(
+                        replace(base, model=replace(base.model, auth_mode=mode))
+                    )
+                    with patch(
+                        "meridian_bot.model.urllib.request.urlopen",
+                        return_value=Response(),
+                    ) as request:
+                        client.health()
+                    sent = {
+                        key.lower(): value
+                        for key, value in request.call_args.args[0].header_items()
+                    }
+                    for key, value in auth_headers.items():
+                        self.assertEqual(value, sent[key])
+                    if mode == "none":
+                        self.assertNotIn("authorization", sent)
+                        self.assertNotIn("x-api-key", sent)
+                    elif mode in {"auto", "bearer"}:
+                        self.assertNotIn("x-api-key", sent)
+                    else:
+                        self.assertNotIn("authorization", sent)
+
+    def test_explicit_model_auth_requires_a_key_before_network_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = config(Path(temporary))
+            client = VllmClient(
+                replace(base, model=replace(base.model, auth_mode="anthropic"))
+            )
+            with patch("meridian_bot.model.urllib.request.urlopen") as request:
+                with self.assertRaisesRegex(ModelError, "requires M59_LLM_API_KEY"):
+                    client.health()
+            request.assert_not_called()
+
+    def test_unknown_model_auth_mode_is_rejected_by_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bot.toml"
+            path.write_text(
+                "[model]\nauth_mode = \"subscription-session\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "model.auth_mode"):
+                BotConfig.load(path)
+
     def test_openai_payload_uses_only_configured_compatibility_extensions(self) -> None:
         class Response:
             def __enter__(self) -> "Response":
@@ -87,6 +158,104 @@ class PolicyAndJournalTests(unittest.TestCase):
             repair_request = request.call_args_list[1].args[0]
             repair_payload = json.loads(repair_request.data.decode("utf-8"))
             self.assertIn("not valid complete JSON", repair_payload["messages"][-1]["content"])
+
+    def test_character_onboarding_reserves_room_for_reasoning_then_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch.object(
+                client,
+                "_complete",
+                return_value={
+                    "stats": "caster",
+                    "loadout": "selfSufficient",
+                    "rationale": "Matches the persona.",
+                },
+            ) as complete:
+                result = client.plan_character(
+                    persona={"name": "Sable"},
+                    current_character={"name": "User123"},
+                )
+
+            self.assertEqual("caster", result["stats"])
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 1200)
+
+    def test_vllm_reports_reasoning_only_response_clearly(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length",
+                                "message": {
+                                    "content": None,
+                                    "reasoning": "Still thinking...",
+                                },
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch(
+                "meridian_bot.model.urllib.request.urlopen", return_value=Response()
+            ):
+                with self.assertRaisesRegex(
+                    ModelError, "reasoning but no final JSON"
+                ):
+                    client._complete(
+                        [{"role": "system", "content": "Return JSON."}], 5
+                    )
+
+    def test_goal_drafter_receives_operator_revision_and_current_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            current = {
+                "title": "Reach Tos Inn",
+                "objective": "Travel to Tos Inn.",
+                "success_criteria": [
+                    {
+                        "id": "at_inn",
+                        "kind": "location_reached",
+                        "room_id": 52,
+                    }
+                ],
+                "constraints": {},
+                "priority": 50,
+                "activation": "queue",
+            }
+            revised = {**current, "priority": 90}
+            with patch.object(client, "_complete", return_value=revised) as complete:
+                result = client.draft_goal(
+                    prompt="Make this priority 90.",
+                    current_goal=current,
+                    validation_feedback=[
+                        {"code": "EXAMPLE", "message": "Repair this."}
+                    ],
+                    verified_character_state={"character": "Sable"},
+                    grounding_hints=[
+                        {
+                            "kind": "location",
+                            "canonical_name": "Tos Inn",
+                            "room_id": 52,
+                        }
+                    ],
+                )
+
+            self.assertEqual(revised, result)
+            messages = complete.call_args.args[0]
+            context = json.loads(messages[1]["content"])
+            self.assertEqual("Make this priority 90.", context["operator_prompt"])
+            self.assertEqual(current, context["current_goal"])
+            self.assertEqual("EXAMPLE", context["validation_feedback"][0]["code"])
+            self.assertIn("operator_confirmed", messages[0]["content"])
 
     def test_planner_receives_explicit_financial_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

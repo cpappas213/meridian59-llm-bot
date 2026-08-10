@@ -3014,6 +3014,175 @@ class BotController:
         )
         return {"event": event, **deferred}
 
+    def _goal_draft_character_state(self) -> dict[str, Any]:
+        observation = self.last_observation or {}
+        inventory = deep_get(observation, "inventory.items", [])
+        abilities = observation.get("abilities")
+        active = self.storage.active_goal()
+        ability_summary: dict[str, list[dict[str, Any]]] = {}
+        for group in ("skills", "spells"):
+            rows = abilities.get(group) if isinstance(abilities, dict) else None
+            if isinstance(rows, list):
+                ability_summary[group] = [
+                    {
+                        "name": item.get("name"),
+                        "ability": item.get("ability"),
+                    }
+                    for item in rows[:40]
+                    if isinstance(item, dict)
+                ]
+        return redact(
+            {
+                "character": self._character_name(observation),
+                "location": {
+                    "name": deep_get(
+                        observation,
+                        "look.room.name",
+                        deep_get(observation, "look.room"),
+                    ),
+                    "room_id": deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    ),
+                },
+                "vitals": deep_get(
+                    observation,
+                    "status.vitals",
+                    deep_get(observation, "look.vitals", {}),
+                ),
+                "inventory": [
+                    {
+                        "name": item.get("name"),
+                        "amount": item.get("amount", 1),
+                    }
+                    for item in inventory[:40]
+                    if isinstance(item, dict)
+                ]
+                if isinstance(inventory, list)
+                else [],
+                "abilities": ability_summary,
+                "active_goal": {
+                    key: active.get(key)
+                    for key in ("id", "title", "objective", "priority", "status")
+                }
+                if active
+                else None,
+            }
+        )
+
+    def _goal_draft_grounding_hints(
+        self, prompt: str, current_goal: dict[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        query = " ".join(
+            part
+            for part in (
+                prompt,
+                str((current_goal or {}).get("title") or ""),
+                str((current_goal or {}).get("objective") or ""),
+            )
+            if part
+        )[:4000]
+        if not query or not self.knowledge.available:
+            return []
+        matches = self.knowledge.search(query, limit=8).get("matches", [])
+        return [
+            {
+                "id": item.get("id"),
+                "kind": item.get("kind"),
+                "canonical_name": item.get("canonical_name"),
+                "summary": item.get("summary"),
+                "room_id": (
+                    item.get("facts", {}).get("room_id")
+                    if isinstance(item.get("facts"), dict)
+                    else None
+                ),
+            }
+            for item in matches
+            if isinstance(item, dict)
+        ]
+
+    def draft_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create and statically validate an inert model-authored goal draft."""
+
+        allowed_request_fields = {"prompt", "current_goal"}
+        unknown = sorted(set(payload) - allowed_request_fields)
+        if unknown:
+            raise ValueError(
+                f"unknown goal draft field(s): {', '.join(unknown)}"
+            )
+        prompt_value = payload.get("prompt")
+        if not isinstance(prompt_value, str):
+            raise ValueError("goal draft prompt must be a string")
+        prompt = prompt_value.strip()
+        if not prompt:
+            raise ValueError("goal draft prompt is required")
+        if len(prompt) > 4000:
+            raise ValueError("goal draft prompt must be at most 4000 characters")
+        current_value = payload.get("current_goal")
+        if current_value is not None and not isinstance(current_value, dict):
+            raise ValueError("current_goal must be an object")
+        if current_value is not None and len(canonical_json(current_value)) > 32_000:
+            raise ValueError("current_goal is too large")
+
+        draft_fields = {
+            "title",
+            "objective",
+            "success_criteria",
+            "constraints",
+            "priority",
+            "activation",
+        }
+        unknown_current_fields = (
+            sorted(set(current_value) - draft_fields)
+            if isinstance(current_value, dict)
+            else []
+        )
+        if unknown_current_fields:
+            raise ValueError(
+                "unknown current_goal field(s): "
+                + ", ".join(unknown_current_fields)
+            )
+        current_goal = (
+            {key: value for key, value in current_value.items() if key in draft_fields}
+            if isinstance(current_value, dict)
+            else None
+        )
+        character_state = self._goal_draft_character_state()
+        grounding_hints = self._goal_draft_grounding_hints(prompt, current_goal)
+        validation_feedback: list[dict[str, Any]] = []
+        validation: dict[str, Any] | None = None
+        candidate = current_goal
+        for _ in range(3):
+            generated = self.model.draft_goal(
+                prompt=prompt,
+                current_goal=candidate,
+                validation_feedback=validation_feedback,
+                verified_character_state=character_state,
+                grounding_hints=grounding_hints,
+            )
+            candidate = {
+                key: value for key, value in generated.items() if key in draft_fields
+            }
+            validation = self.knowledge.validate_goal(candidate)
+            if validation.get("valid"):
+                return {
+                    "goal": validation["canonical_goal"],
+                    "validation": {
+                        "warnings": validation.get("warnings", []),
+                        "resolved_entities": validation.get("resolved_entities", []),
+                        "corpus": validation.get("corpus", {}),
+                    },
+                    "model": self.config.model.name,
+                }
+            validation_feedback = [
+                item
+                for item in validation.get("errors", [])
+                if isinstance(item, dict)
+            ]
+        assert validation is not None
+        raise KnowledgeValidationError(validation)
+
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         onboarding = self._onboarding_status(self.last_observation or {})
         if not onboarding.get("ready_for_goals"):
@@ -10098,6 +10267,164 @@ class BotController:
             "position": redact(live.get("position")),
             "vitals": redact(vitals),
         }
+
+    def character_status(self) -> dict[str, Any]:
+        """Return a complete, read-only character snapshot for the local TUI."""
+
+        observation, _ = self._foreground_status_observation(
+            self.last_observation or {}
+        )
+        health = None
+        try:
+            health = self.broker.health(timeout=1)
+        except BrokerError:
+            pass
+
+        raw_inventory = deep_get(observation, "inventory.items")
+        inventory_items = []
+        for item in raw_inventory if isinstance(raw_inventory, list) else []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            quantity = next(
+                (
+                    item.get(key)
+                    for key in ("amount", "quantity", "count")
+                    if item.get(key) is not None
+                ),
+                1,
+            )
+            inventory_items.append(
+                {
+                    "id": item.get("id"),
+                    "name": " ".join(str(item.get("name")).split()),
+                    "quantity": quantity,
+                    "slot": item.get("slot"),
+                    "equipped": bool(
+                        item.get("equipped")
+                        or item.get("in_use")
+                        or item.get("worn")
+                        or (
+                            isinstance(item.get("can"), list)
+                            and any(
+                                str(value).casefold() == "unuse"
+                                for value in item["can"]
+                            )
+                        )
+                    ),
+                }
+            )
+
+        raw_abilities = observation.get("abilities")
+        raw_abilities = raw_abilities if isinstance(raw_abilities, dict) else {}
+
+        def ability_rows(group: str) -> list[dict[str, Any]]:
+            rows = raw_abilities.get(group)
+            if not isinstance(rows, list):
+                return []
+            return [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "name",
+                        "ability",
+                        "school",
+                        "level",
+                        "mana",
+                        "targets",
+                    )
+                    if item.get(key) is not None
+                }
+                for item in rows
+                if isinstance(item, dict) and item.get("name")
+            ]
+
+        spell_catalog = observation.get("spells")
+        spell_catalog = spell_catalog if isinstance(spell_catalog, dict) else {}
+        raw_spell_readiness = spell_catalog.get("spells")
+        spell_readiness = [
+            {
+                key: item.get(key)
+                for key in (
+                    "name",
+                    "school",
+                    "level",
+                    "mana",
+                    "targets",
+                    "reagents",
+                    "castable",
+                    "blocked_by",
+                )
+                if item.get(key) is not None
+            }
+            for item in (
+                raw_spell_readiness
+                if isinstance(raw_spell_readiness, list)
+                else []
+            )
+            if isinstance(item, dict) and item.get("name")
+        ]
+        readiness = self.learning.readiness_summary(observation)
+        observed_at = observation.get("observed_at")
+        now_text = timestamp()
+        return redact(
+            {
+                "now_utc": now_text,
+                "now_local": self.notifications.journal.local_datetime(
+                    now_text
+                ).isoformat(timespec="seconds"),
+                "timezone": self.config.deployment.timezone,
+                "game": {
+                    "connection": (
+                        "joined"
+                        if health
+                        and self.config.game.agent in health.get("sessions", [])
+                        else "disconnected"
+                    ),
+                    "character_name": self._character_name(observation),
+                    "location": deep_get(
+                        observation,
+                        "look.room.name",
+                        deep_get(observation, "look.room"),
+                    ),
+                    "room_id": deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    ),
+                    "position": deep_get(observation, "status.position"),
+                    "vitals": deep_get(
+                        observation,
+                        "status.vitals",
+                        deep_get(observation, "look.vitals", {}),
+                    ),
+                    "attributes": deep_get(
+                        observation,
+                        "status.attributes",
+                        deep_get(observation, "look.attributes", {}),
+                    ),
+                    "risk": self._risk(observation),
+                    "carried_currency": self._carried_currency(observation),
+                    "observation_age_seconds": self._age_seconds(observed_at),
+                },
+                "abilities": {
+                    "ability_scale": "0-100",
+                    "freshness": raw_abilities.get("freshness", {}),
+                    "skills": ability_rows("skills"),
+                    "spells": ability_rows("spells"),
+                    "spell_readiness": spell_readiness,
+                },
+                "inventory": {
+                    "known": isinstance(raw_inventory, list),
+                    "items": inventory_items,
+                    "capacity": self._inventory_capacity_context(observation),
+                },
+                "equipment": {
+                    "state": readiness.get("equipment_state"),
+                    "equipped": readiness.get("equipped", []),
+                    "wielded_weapons": readiness.get("wielded_weapons", []),
+                },
+            }
+        )
 
     def status(self, *, detail: str = "summary", include_recent_events: int = 3) -> dict[str, Any]:
         if detail not in {"supervision", "summary", "goal", "diagnostic"}:

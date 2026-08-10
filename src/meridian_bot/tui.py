@@ -1,0 +1,1077 @@
+from __future__ import annotations
+
+import json
+import os
+import select
+import shutil
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from typing import Any
+
+from .config import BotConfig
+from .utils import uuid7
+
+
+ANSI_RESET = "\x1b[0m"
+ANSI_STYLES = {
+    "bold": "\x1b[1m",
+    "dim": "\x1b[2m",
+    "red": "\x1b[31m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "blue": "\x1b[34m",
+    "magenta": "\x1b[35m",
+    "cyan": "\x1b[36m",
+    "bright_cyan": "\x1b[1;36m",
+    "bright_white": "\x1b[1;97m",
+}
+
+
+class ControllerApiError(RuntimeError):
+    """The local controller API rejected or could not service a TUI request."""
+
+
+class ControllerApi:
+    def __init__(self, config: BotConfig, *, timeout: float = 4.0):
+        host = "[::1]" if config.controller.control_bind == "::1" else "127.0.0.1"
+        self.base_url = f"http://{host}:{config.controller.control_port}"
+        self.token = config.control_token
+        self.timeout = timeout
+        # Goal drafting permits three schema/grounding attempts, and each model
+        # request may use the client's one JSON-repair retry.
+        self.model_timeout = max(
+            timeout, config.model.planner_timeout_seconds * 6 + 5
+        )
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers={
+                "authorization": f"Bearer {self.token}",
+                "content-type": "application/json",
+            },
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
+                value = json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.load(exc)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                error = {}
+            code = error.get("code", f"HTTP_{exc.code}") if isinstance(error, dict) else f"HTTP_{exc.code}"
+            message = error.get("message", exc.reason) if isinstance(error, dict) else exc.reason
+            raise ControllerApiError(f"{code}: {message}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise ControllerApiError(f"controller unavailable at {self.base_url}: {reason}") from exc
+        if not isinstance(value, dict):
+            raise ControllerApiError("controller returned a non-object response")
+        return value
+
+    def status(self) -> dict[str, Any]:
+        return self.request(
+            "GET", "/v1/status?detail=supervision&include_recent_events=0"
+        )
+
+    def character_status(self) -> dict[str, Any]:
+        return self.request("GET", "/v1/character")
+
+    def goals(self) -> list[dict[str, Any]]:
+        value = self.request("GET", "/v1/goals")
+        goals = value.get("goals")
+        return [item for item in goals if isinstance(item, dict)] if isinstance(goals, list) else []
+
+    def events(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        value = self.request(
+            "GET", f"/v1/events?interesting_only=true&limit={max(1, min(limit, 20))}"
+        )
+        events = value.get("events")
+        return [item for item in events if isinstance(item, dict)] if isinstance(events, list) else []
+
+    def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/v1/goals", payload)
+
+    def draft_goal(
+        self,
+        prompt: str,
+        *,
+        current_goal: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"prompt": prompt}
+        if current_goal is not None:
+            payload["current_goal"] = current_goal
+        return self.request(
+            "POST",
+            "/v1/goals/draft",
+            payload,
+            timeout=self.model_timeout,
+        )
+
+    def manage_goal(self, goal_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        encoded = urllib.parse.quote(goal_id, safe="")
+        return self.request("POST", f"/v1/goals/{encoded}/commands", payload)
+
+
+def _paint(value: Any, style: str, enabled: bool) -> str:
+    text = str(value)
+    code = ANSI_STYLES.get(style)
+    return f"{code}{text}{ANSI_RESET}" if enabled and code else text
+
+
+def _state_style(value: Any) -> str:
+    state = str(value or "").casefold()
+    if state in {
+        "running",
+        "joined",
+        "ready",
+        "active",
+        "succeeded",
+        "low",
+        "known",
+    }:
+        return "green"
+    if state in {
+        "starting",
+        "reconciling",
+        "degraded",
+        "queued",
+        "paused",
+        "elevated",
+        "warning",
+        "notice",
+    }:
+        return "yellow"
+    if state in {
+        "blocked",
+        "critical",
+        "disconnected",
+        "incompatible",
+        "stopping",
+        "stopped",
+        "failed",
+        "error",
+        "cancelled",
+    }:
+        return "red"
+    return "cyan"
+
+
+def _vital_style(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "cyan"
+    current = value.get("current", value.get("value"))
+    maximum = value.get("max", value.get("maximum", value.get("scale_max")))
+    if not isinstance(current, (int, float)) or not isinstance(
+        maximum, (int, float)
+    ) or maximum <= 0:
+        return "cyan"
+    fraction = current / maximum
+    return "green" if fraction >= 0.7 else "yellow" if fraction >= 0.4 else "red"
+
+
+def _terminal_colors_enabled() -> bool:
+    return "NO_COLOR" not in os.environ and bool(
+        getattr(sys.stdout, "isatty", lambda: False)()
+    )
+
+
+def _one_line(value: Any, *, limit: int = 100) -> str:
+    text = " ".join(str(value or "-").split())
+    return textwrap.shorten(text, width=max(8, limit), placeholder="...")
+
+
+def _meter(vitals: dict[str, Any], name: str) -> str:
+    value = vitals.get(name)
+    if isinstance(value, dict):
+        current = value.get("current", value.get("value"))
+        maximum = value.get("max", value.get("maximum", value.get("scale_max")))
+        if current is not None and maximum is not None:
+            return f"{current}/{maximum}"
+        if current is not None:
+            return str(current)
+    return str(value) if value is not None else "-"
+
+
+def _human_label(value: Any) -> str:
+    return str(value).replace("_", " ").strip().title()
+
+
+def _human_number(value: Any) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _first_record_value(record: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if record.get(name) is not None:
+            return record[name]
+    return None
+
+
+def _format_vital(name: Any, value: Any) -> str:
+    """Turn a harness vital record into a compact operator-facing sentence."""
+
+    label = _human_label(name)
+    if not isinstance(value, dict):
+        return f"{label}: {_human_number(value) if value is not None else '-'}"
+    current = _first_record_value(value, "current", "value")
+    maximum = _first_record_value(value, "max", "maximum", "scale_max")
+    if current is None:
+        primary = "unavailable"
+    elif maximum is None:
+        primary = _human_number(current)
+    else:
+        primary = f"{_human_number(current)} / {_human_number(maximum)}"
+
+    details: list[str] = []
+    percentage = _first_record_value(value, "pct", "percent", "percentage")
+    if percentage is not None:
+        details.append(f"{_human_number(percentage)}%")
+    if value.get("rested") is not None:
+        details.append("rested" if value.get("rested") else "not rested")
+    if value.get("rest_threshold") is not None:
+        details.append(
+            f"rest threshold {_human_number(value['rest_threshold'])}"
+        )
+    return f"{label}: {primary}" + (f" ({'; '.join(details)})" if details else "")
+
+
+def _format_attribute(name: Any, value: Any) -> str:
+    """Render an attribute record without leaking its Python/JSON representation."""
+
+    label = _human_label(name)
+    if not isinstance(value, dict):
+        return f"{label}: {_human_number(value) if value is not None else '-'}"
+    current = _first_record_value(value, "current", "value", "effective", "base")
+    primary = _human_number(current) if current is not None else "unavailable"
+    details: list[str] = []
+    known_details = (
+        ("display_scale", "display scale"),
+        ("hard_cap", "hard cap"),
+        ("max", "maximum"),
+        ("maximum", "maximum"),
+        ("modifier", "modifier"),
+        ("bonus", "bonus"),
+    )
+    used = {"current", "value", "effective", "base"}
+    for key, detail_label in known_details:
+        if key in used or value.get(key) is None:
+            continue
+        details.append(f"{detail_label} {_human_number(value[key])}")
+        used.add(key)
+    for key, item in value.items():
+        if key in used or item is None or isinstance(item, (dict, list, tuple, set)):
+            continue
+        details.append(f"{key.replace('_', ' ')} {_human_number(item)}")
+    return f"{label}: {primary}" + (f" ({'; '.join(details)})" if details else "")
+
+
+def _ability_lines(development: dict[str, Any], group: str, *, limit: int = 8) -> list[str]:
+    rows = development.get(group)
+    rows = rows if isinstance(rows, list) else []
+    result = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        ability = row.get("ability")
+        result.append(f"{row.get('name', '?')} {ability if ability is not None else '-'}")
+    omitted = int(development.get(f"{group}_omitted", 0) or 0)
+    if omitted:
+        result.append(f"+{omitted} more")
+    return result
+
+
+def render_dashboard(
+    status: dict[str, Any],
+    goals: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    message: str = "",
+    width: int | None = None,
+    color: bool = False,
+) -> str:
+    width = width or shutil.get_terminal_size((110, 32)).columns
+    width = max(72, width)
+    controller = status.get("controller") if isinstance(status.get("controller"), dict) else {}
+    game = status.get("game") if isinstance(status.get("game"), dict) else {}
+    onboarding = status.get("onboarding") if isinstance(status.get("onboarding"), dict) else {}
+    campaign = status.get("campaign") if isinstance(status.get("campaign"), dict) else {}
+    development = campaign.get("development") if isinstance(campaign.get("development"), dict) else {}
+    readiness = campaign.get("readiness") if isinstance(campaign.get("readiness"), dict) else {}
+    vitals = game.get("vitals") if isinstance(game.get("vitals"), dict) else {}
+    active = next((goal for goal in goals if goal.get("status") == "active"), None)
+    displayed_goal = status.get("goal") if isinstance(status.get("goal"), dict) else active
+    queue = [goal for goal in goals if goal.get("status") == "queued"]
+    paused = [goal for goal in goals if goal.get("status") in {"paused", "blocked"}]
+    rule = _paint("-" * width, "blue", color)
+    heavy_rule = _paint("=" * width, "blue", color)
+
+    lines = [
+        _paint("MERIDIAN 59 BOT CONSOLE".center(width), "bright_cyan", color),
+        heavy_rule,
+        (
+            f"Controller {_paint(controller.get('state', 'unknown'), _state_style(controller.get('state')), color)} | "
+            f"Game {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
+            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
+            f"Location {_paint(_one_line(game.get('location'), limit=36), 'cyan', color)}"
+        ),
+        (
+            f"{_paint('HP ' + _meter(vitals, 'health'), _vital_style(vitals.get('health')), color)}  "
+            f"{_paint('Mana ' + _meter(vitals, 'mana'), 'blue', color)}  "
+            f"{_paint('Vigor ' + _meter(vitals, 'vigor'), _vital_style(vitals.get('vigor')), color)}  "
+            f"Risk {_paint(game.get('risk', '-'), _state_style(game.get('risk')), color)}  "
+            f"Currency {_paint(game.get('carried_currency', '-'), 'yellow', color)}"
+        ),
+        (
+            f"Onboarding {_paint(onboarding.get('status', '-'), _state_style(onboarding.get('status')), color)} | "
+            f"Control {controller.get('control_owner', '-')} | "
+            f"Observation age {game.get('observation_age_seconds', '-')}s"
+        ),
+        rule,
+        _paint("CURRENT GOAL", "bright_cyan", color),
+    ]
+    if displayed_goal:
+        lines.extend(
+            [
+                (
+                    f"{_paint('[' + str(displayed_goal.get('status', '-')) + ']', _state_style(displayed_goal.get('status')), color)} "
+                    f"{_one_line(displayed_goal.get('title'), limit=width - 28)} "
+                    f"(priority {_paint(displayed_goal.get('priority', '-'), 'magenta', color)}, "
+                    f"{_paint(str(displayed_goal.get('progress_percent', 0)) + '%', 'green', color)})"
+                ),
+                f"  {_one_line(displayed_goal.get('objective'), limit=width - 4)}",
+            ]
+        )
+        summary = displayed_goal.get("progress_summary")
+        if summary:
+            lines.append(f"  Progress: {_one_line(summary, limit=width - 12)}")
+        criteria = displayed_goal.get("criteria")
+        if isinstance(criteria, list):
+            for criterion in criteria[:4]:
+                if isinstance(criterion, dict):
+                    mark = "x" if criterion.get("met") else " "
+                    detail = criterion.get("detail") or criterion.get("kind")
+                    lines.append(
+                        _paint(
+                            f"  [{mark}] {_one_line(detail, limit=width - 8)}",
+                            "green" if criterion.get("met") else "dim",
+                            color,
+                        )
+                    )
+    else:
+        lines.append("No active, paused, or blocked goal. The bot is strategically idle.")
+
+    lines.extend([rule, _paint("GOAL QUEUE", "bright_cyan", color)])
+    if queue:
+        for index, goal in enumerate(queue[:8], 1):
+            lines.append(
+                f"{index:>2}. {_paint('P' + str(goal.get('priority', '-')).rjust(3), 'magenta', color)}  "
+                f"{_one_line(goal.get('title'), limit=width - 14)}"
+            )
+    else:
+        lines.append("Queue is empty.")
+    if paused:
+        lines.append(
+            "Paused/blocked: "
+            + "; ".join(
+                f"{goal.get('title', '?')} [{goal.get('status')}]" for goal in paused[:4]
+            )
+        )
+
+    skill_text = ", ".join(_ability_lines(development, "skills")) or "none observed"
+    spell_text = ", ".join(_ability_lines(development, "spells")) or "none observed"
+    lines.extend(
+        [
+            rule,
+            _paint("CHARACTER DEVELOPMENT", "bright_cyan", color),
+            f"Skills: {_one_line(skill_text, limit=width - 8)}",
+            f"Spells: {_one_line(spell_text, limit=width - 8)}",
+            (
+                f"Equipment {readiness.get('equipment_state', '-')} | "
+                f"Healing supplies {readiness.get('healing_supply_count', '-')} | "
+                f"Recent deaths {readiness.get('recent_combat_deaths', '-')}"
+            ),
+            rule,
+            _paint("RECENT EVENTS", "bright_cyan", color),
+        ]
+    )
+    if events:
+        for event in events[-5:]:
+            severity = event.get("severity", "info")
+            lines.append(
+                f"{str(event.get('occurred_at', ''))[11:19]} "
+                f"{_paint(f'{str(severity):>7}', _state_style(severity), color)}  "
+                f"{_one_line(event.get('summary'), limit=width - 20)}"
+            )
+    else:
+        lines.append("No interesting events yet.")
+    lines.extend(
+        [
+            heavy_rule,
+            (
+                f"{_paint('[N]', 'bright_cyan', color)} New goal   "
+                f"{_paint('[M]', 'bright_cyan', color)} Manage goal/queue   "
+                f"{_paint('[S]', 'bright_cyan', color)} Character status   "
+                f"{_paint('[R]', 'bright_cyan', color)} Refresh   "
+                f"{_paint('[H]', 'bright_cyan', color)} Help   "
+                f"{_paint('[Q]', 'bright_cyan', color)} Quit"
+            ),
+        ]
+    )
+    if message:
+        message_style = (
+            "red"
+            if any(
+                word in message.casefold()
+                for word in ("failed", "error", "unavailable", "unknown")
+            )
+            else "green"
+        )
+        lines.append(
+            f"Status: {_paint(_one_line(message, limit=width - 8), message_style, color)}"
+        )
+    return "\n".join(lines)
+
+
+def _equipment_label(item: Any) -> str:
+    if isinstance(item, dict):
+        name = str(item.get("name") or item.get("id") or "unknown item")
+        slot = item.get("slot")
+        return f"{name} ({slot})" if slot else name
+    return str(item)
+
+
+def _ability_value_style(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "dim"
+    return "green" if value >= 70 else "yellow" if value >= 30 else "cyan"
+
+
+def render_character_status(
+    detail: dict[str, Any], *, width: int | None = None, color: bool = False
+) -> str:
+    """Render the complete on-demand character detail returned by the controller."""
+
+    width = max(72, width or shutil.get_terminal_size((110, 32)).columns)
+    game = detail.get("game") if isinstance(detail.get("game"), dict) else {}
+    abilities = (
+        detail.get("abilities") if isinstance(detail.get("abilities"), dict) else {}
+    )
+    inventory = (
+        detail.get("inventory") if isinstance(detail.get("inventory"), dict) else {}
+    )
+    equipment = (
+        detail.get("equipment") if isinstance(detail.get("equipment"), dict) else {}
+    )
+    rule = _paint("-" * width, "blue", color)
+    heavy_rule = _paint("=" * width, "blue", color)
+    lines = [
+        _paint("DETAILED CHARACTER STATUS".center(width), "bright_cyan", color),
+        heavy_rule,
+        (
+            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
+            f"Connection {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
+            f"Location {_paint(_one_line(game.get('location'), limit=42), 'cyan', color)} "
+            f"(room {game.get('room_id', '-')})"
+        ),
+        (
+            f"Observed {game.get('observation_age_seconds', '-')}s ago | "
+            f"Risk {_paint(game.get('risk', '-'), _state_style(game.get('risk')), color)} | "
+            f"Currency {_paint(game.get('carried_currency', '-'), 'yellow', color)}"
+        ),
+        rule,
+        _paint("VITALS", "bright_cyan", color),
+    ]
+
+    vitals = game.get("vitals") if isinstance(game.get("vitals"), dict) else {}
+    preferred_vitals = ["health", "mana", "vigor"]
+    vital_names = preferred_vitals + [
+        str(name) for name in vitals if str(name) not in preferred_vitals
+    ]
+    if vital_names:
+        lines.extend(
+            "  "
+            + _paint(
+                _format_vital(name, vitals.get(name)),
+                _vital_style(vitals.get(name)),
+                color,
+            )
+            for name in vital_names
+        )
+    else:
+        lines.append(_paint("  Vitals unavailable.", "dim", color))
+    lines.append(_paint("ATTRIBUTES", "bright_cyan", color))
+    attributes = game.get("attributes")
+    if isinstance(attributes, dict) and attributes:
+        lines.extend(
+            f"  {_format_attribute(name, value)}"
+            for name, value in attributes.items()
+        )
+    elif isinstance(attributes, list) and attributes:
+        lines.extend(f"  {_one_line(value, limit=width - 4)}" for value in attributes)
+    else:
+        lines.append(_paint("  Attributes unavailable.", "dim", color))
+
+    lines.extend([rule, _paint("EQUIPMENT", "bright_cyan", color)])
+    lines.append(
+        f"  Verification: {_paint(equipment.get('state', 'unknown'), _state_style(equipment.get('state')), color)}"
+    )
+    wielded = equipment.get("wielded_weapons")
+    wielded = wielded if isinstance(wielded, list) else []
+    lines.append(
+        "  Wielding: "
+        + (
+            ", ".join(_paint(_equipment_label(item), "green", color) for item in wielded)
+            if wielded
+            else _paint("nothing verified", "dim", color)
+        )
+    )
+    equipped = equipment.get("equipped")
+    equipped = equipped if isinstance(equipped, list) else []
+    if equipped:
+        lines.append("  Equipped:")
+        lines.extend(
+            f"    - {_paint(_equipment_label(item), 'green', color)}"
+            for item in equipped
+        )
+    else:
+        lines.append(_paint("  No equipped items were verified.", "dim", color))
+
+    items = inventory.get("items")
+    items = items if isinstance(items, list) else []
+    lines.extend(
+        [rule, _paint(f"INVENTORY ({len(items)} entries)", "bright_cyan", color)]
+    )
+    if items:
+        for item in sorted(
+            (item for item in items if isinstance(item, dict)),
+            key=lambda item: str(item.get("name") or "").casefold(),
+        ):
+            quantity = item.get("quantity", 1)
+            marker = " [equipped]" if item.get("equipped") else ""
+            lines.append(
+                f"  {_paint(str(quantity).rjust(5), 'yellow', color)} x "
+                f"{_equipment_label(item)}{_paint(marker, 'green', color) if marker else ''}"
+            )
+    else:
+        lines.append(_paint("  Inventory is empty or unavailable.", "dim", color))
+    capacity = inventory.get("capacity")
+    if isinstance(capacity, dict) and capacity.get("known") is True:
+        load_parts = []
+        for label, current_key, maximum_key in (
+            ("items", "items", None),
+            ("weight", "weight", "weight_max"),
+            ("bulk", "bulk", "bulk_max"),
+        ):
+            current = capacity.get(current_key)
+            maximum = capacity.get(maximum_key) if maximum_key else None
+            if current is not None:
+                load_parts.append(
+                    f"{label} {current}/{maximum}" if maximum is not None else f"{label} {current}"
+                )
+        if load_parts:
+            lines.append("  Carry capacity: " + ", ".join(load_parts))
+
+    readiness_rows = abilities.get("spell_readiness")
+    readiness_rows = readiness_rows if isinstance(readiness_rows, list) else []
+    readiness_by_name = {
+        str(item.get("name") or "").casefold(): item
+        for item in readiness_rows
+        if isinstance(item, dict) and item.get("name")
+    }
+
+    def append_abilities(group: str, heading: str) -> None:
+        rows = abilities.get(group)
+        rows = rows if isinstance(rows, list) else []
+        lines.extend(
+            [rule, _paint(f"{heading} ({len(rows)} known; scale 0-100)", "bright_cyan", color)]
+        )
+        if not rows:
+            lines.append(_paint(f"  No {group} were reported.", "dim", color))
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _one_line(row.get("name"), limit=32)
+            value = row.get("ability")
+            value_text = f"{value}/100" if value is not None else "unknown"
+            metadata = []
+            for label, key in (("school", "school"), ("level", "level"), ("mana", "mana")):
+                if row.get(key) is not None:
+                    metadata.append(f"{label} {row[key]}")
+            if group == "spells":
+                ready = readiness_by_name.get(str(row.get("name") or "").casefold())
+                if isinstance(ready, dict) and ready.get("castable") is not None:
+                    metadata.append("castable" if ready["castable"] else "not castable")
+                    blockers = ready.get("blocked_by")
+                    if isinstance(blockers, list) and blockers:
+                        metadata.append("blocked: " + ", ".join(str(item) for item in blockers))
+            suffix = f"  ({'; '.join(metadata)})" if metadata else ""
+            lines.append(
+                f"  {name:<32} "
+                f"{_paint(value_text.rjust(9), _ability_value_style(value), color)}"
+                f"{suffix}"
+            )
+
+    append_abilities("skills", "SKILLS")
+    append_abilities("spells", "SPELLS")
+    lines.extend(
+        [
+            heavy_rule,
+            _paint("Press Esc or Enter to return to the live console.", "dim", color),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _read_terminal_line(prompt: str) -> str | None:
+    """Read an editable terminal line, returning None immediately on Escape."""
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    characters: list[str] = []
+
+    if os.name == "nt":
+        import msvcrt
+
+        while True:
+            key = msvcrt.getwch()
+            if key in {"\x00", "\xe0"}:
+                msvcrt.getwch()
+                continue
+            if key == "\x1b":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            if key in {"\r", "\n"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(characters)
+            if key == "\x03":
+                raise KeyboardInterrupt
+            if key == "\b":
+                if characters:
+                    characters.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if key.isprintable():
+                characters.append(key)
+                sys.stdout.write(key)
+                sys.stdout.flush()
+
+    import termios
+    import tty
+
+    descriptor = sys.stdin.fileno()
+    original = termios.tcgetattr(descriptor)
+    try:
+        tty.setraw(descriptor)
+        while True:
+            key = sys.stdin.read(1)
+            if key == "\x1b":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            if key in {"\r", "\n"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(characters)
+            if key == "\x03":
+                raise KeyboardInterrupt
+            if key in {"\x7f", "\b"}:
+                if characters:
+                    characters.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if key.isprintable():
+                characters.append(key)
+                sys.stdout.write(key)
+                sys.stdout.flush()
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
+
+
+def _form_input(
+    prompt: str, input_fn: Callable[[str], str]
+) -> str | None:
+    """Use immediate Escape handling interactively while keeping tests injectable."""
+
+    if (
+        input_fn is input
+        and bool(getattr(sys.stdin, "isatty", lambda: False)())
+        and bool(getattr(sys.stdout, "isatty", lambda: False)())
+    ):
+        return _read_terminal_line(prompt)
+    value = input_fn(prompt)
+    return None if value == "\x1b" else value
+
+
+def _prompt_required(
+    prompt: str, input_fn: Callable[[str], str]
+) -> str | None:
+    while True:
+        raw = _form_input(prompt, input_fn)
+        if raw is None:
+            return None
+        value = raw.strip()
+        if value:
+            return value
+        print("A value is required.")
+
+
+def _prompt_integer(
+    prompt: str,
+    input_fn: Callable[[str], str],
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    while True:
+        entered = _form_input(prompt, input_fn)
+        if entered is None:
+            return None
+        raw = entered.strip()
+        try:
+            value = int(raw) if raw else default
+        except ValueError:
+            print(f"Enter a whole number from {minimum} through {maximum}.")
+            continue
+        if minimum <= value <= maximum:
+            return value
+        print(f"Enter a whole number from {minimum} through {maximum}.")
+
+
+def prompt_new_goal(
+    api: ControllerApi,
+    *,
+    input_fn: Callable[[str], str] = input,
+) -> dict[str, Any] | None:
+    print("\nCreate a durable goal")
+    print("Describe the outcome in plain language. The configured model will build the typed goal.")
+    print("Press Esc at any prompt to cancel and return to the live console.")
+    prompt = _prompt_required("What should the character accomplish? ", input_fn)
+    if prompt is None:
+        print("Goal creation cancelled; nothing was submitted.")
+        return None
+    current_goal: dict[str, Any] | None = None
+
+    while True:
+        print("\nAsking the configured model to construct and validate the goal...")
+        response = api.draft_goal(prompt, current_goal=current_goal)
+        draft = response.get("goal")
+        if not isinstance(draft, dict):
+            raise ControllerApiError("controller returned no structured goal draft")
+
+        model_name = str(response.get("model") or "configured model")
+        print(f"\nStructured goal draft from {model_name}")
+        print("Nothing has been submitted yet.")
+        print("Higher priority numbers run first: 0 is lowest, 100 is highest.")
+        print(json.dumps(draft, indent=2, ensure_ascii=False, sort_keys=True))
+        warnings = response.get("validation", {}).get("warnings", [])
+        if isinstance(warnings, list) and warnings:
+            print("\nValidation warnings")
+            for warning in warnings:
+                if isinstance(warning, dict):
+                    print(f"- {warning.get('message', warning.get('code', 'warning'))}")
+
+        while True:
+            action = _prompt_required(
+                "\n[A]pprove, [M]odify, [C]ancel, or [Esc] back: ",
+                input_fn,
+            )
+            if action is None:
+                print("Goal creation cancelled; nothing was submitted.")
+                return None
+            action = action.casefold()
+            if action in {"a", "approve"}:
+                return {**draft, "request_id": f"tui-goal-{uuid7()}"}
+            if action in {"c", "cancel"}:
+                print("Goal creation cancelled; nothing was submitted.")
+                return None
+            if action in {"m", "modify"}:
+                prompt = _prompt_required(
+                    "Describe what the model should change ([Esc] back): ", input_fn
+                )
+                if prompt is None:
+                    print("Goal creation cancelled; nothing was submitted.")
+                    return None
+                current_goal = draft
+                break
+            print("Choose A to approve, M to modify, or C to cancel.")
+
+
+def prompt_goal_command(
+    goals: list[dict[str, Any]],
+    *,
+    input_fn: Callable[[str], str] = input,
+) -> tuple[str, dict[str, Any]] | None:
+    open_goals = [
+        goal
+        for goal in goals
+        if goal.get("status") in {"active", "queued", "paused", "blocked"}
+    ]
+    if not open_goals:
+        print("There are no open goals to manage.")
+        return None
+    print("\nManage a goal")
+    print("Press Esc at any prompt to cancel and return to the live console.")
+    for index, goal in enumerate(open_goals, 1):
+        print(
+            f"{index:>2}. [{goal.get('status', '-')}] P{goal.get('priority', '-')} "
+            f"{goal.get('title', '?')}"
+        )
+    selected = _prompt_integer(
+        "Goal number ([Esc] back): ",
+        input_fn,
+        default=1,
+        minimum=1,
+        maximum=len(open_goals),
+    )
+    if selected is None:
+        return None
+    goal = open_goals[selected - 1]
+    status = str(goal.get("status"))
+    choices = ["reprioritize", "cancel"]
+    if status in {"active", "queued"}:
+        choices.insert(0, "pause")
+    if status in {"paused", "blocked"}:
+        choices.insert(0, "resume")
+    success_criteria = goal.get("success_criteria")
+    success_criteria = success_criteria if isinstance(success_criteria, list) else []
+    if any(
+        isinstance(item, dict) and item.get("kind") == "operator_confirmed"
+        for item in success_criteria
+    ):
+        choices.append("confirm_complete")
+    action_keys = {
+        "pause": "p",
+        "resume": "r",
+        "reprioritize": "e",
+        "cancel": "c",
+        "confirm_complete": "f",
+    }
+    action_labels = {
+        "pause": "[P]ause",
+        "resume": "[R]esume",
+        "reprioritize": "[E]dit priority",
+        "cancel": "[C]ancel",
+        "confirm_complete": "Con[F]irm operator criterion",
+    }
+    print(
+        "Actions: "
+        + ", ".join(action_labels[choice] for choice in choices)
+    )
+    raw_action = _prompt_required("Action ([Esc] back): ", input_fn)
+    if raw_action is None:
+        return None
+    raw_action = raw_action.casefold()
+    action = next(
+        (
+            choice
+            for choice in choices
+            if raw_action in {choice, action_keys[choice]}
+        ),
+        None,
+    )
+    if action is None:
+        print("Unknown action.")
+        return None
+    payload: dict[str, Any] = {
+        "request_id": f"tui-goal-command-{uuid7()}",
+        "expected_version": int(goal.get("version", 0)),
+        "action": action,
+        "reason": "Operator command from the local goal console.",
+    }
+    if action == "reprioritize":
+        priority = _prompt_integer(
+            "New priority (0 lowest, 100 highest) [50; Esc to go back]: ",
+            input_fn,
+            default=50,
+            minimum=0,
+            maximum=100,
+        )
+        if priority is None:
+            return None
+        payload["priority"] = priority
+    if action == "cancel":
+        confirmation = _form_input(
+            "Type CANCEL to confirm permanent cancellation ([Esc] back): ",
+            input_fn,
+        )
+        if confirmation is None:
+            return None
+        if confirmation.strip() != "CANCEL":
+            print("Cancellation aborted.")
+            return None
+        payload["cause"] = "operator_requested"
+    if action == "confirm_complete":
+        confirmation = _form_input(
+            "Type CONFIRM to verify the operator criterion ([Esc] back): ",
+            input_fn,
+        )
+        if confirmation is None:
+            return None
+        if confirmation.strip() != "CONFIRM":
+            print("Confirmation aborted.")
+            return None
+    return str(goal.get("id")), payload
+
+
+def read_key(timeout: float) -> str | None:
+    deadline = time.monotonic() + max(0.0, timeout)
+    if os.name == "nt":
+        import msvcrt
+
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key in {"\x00", "\xe0"}:
+                    msvcrt.getwch()
+                    continue
+                return key.casefold()
+            time.sleep(0.05)
+        return None
+    remaining = max(0.0, deadline - time.monotonic())
+    ready, _, _ = select.select([sys.stdin], [], [], remaining)
+    return sys.stdin.read(1).casefold() if ready else None
+
+
+def _enable_virtual_terminal() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except (AttributeError, OSError, ValueError):
+        return
+
+
+def _draw(value: str) -> None:
+    sys.stdout.write(ANSI_RESET + "\x1b[?25l\x1b[2J\x1b[H" + value)
+    sys.stdout.flush()
+
+
+def _form_screen() -> None:
+    sys.stdout.write(ANSI_RESET + "\x1b[?25h\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+
+def run_tui(
+    api: ControllerApi,
+    *,
+    refresh_seconds: float = 2.0,
+    key_reader: Callable[[float], str | None] = read_key,
+    input_fn: Callable[[str], str] = input,
+) -> int:
+    _enable_virtual_terminal()
+    color = _terminal_colors_enabled()
+    status: dict[str, Any] = {}
+    goals: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    message = "Connecting to the controller..."
+    try:
+        while True:
+            try:
+                status = api.status()
+                goals = api.goals()
+                events = api.events()
+                if message == "Connecting to the controller..." or message.startswith(
+                    "controller unavailable"
+                ):
+                    message = "Controller connection restored."
+            except ControllerApiError as exc:
+                message = str(exc)
+            _draw(
+                render_dashboard(
+                    status, goals, events, message=message, color=color
+                )
+            )
+            key = key_reader(refresh_seconds)
+            if key is None or key == "r":
+                continue
+            if key == "\x1b":
+                message = "Main console already active."
+                continue
+            if key == "q":
+                return 0
+            if key == "h":
+                message = (
+                    "N turns a plain-language request into a model-authored goal for your approval; "
+                    "M manages goals; S shows complete skills, spells, inventory, and equipment; "
+                    "Esc cancels any subpage and returns here."
+                )
+                continue
+            if key == "s":
+                _form_screen()
+                try:
+                    detail = api.character_status()
+                    print(render_character_status(detail, color=color))
+                    _form_input("", input_fn)
+                    message = "Returned from detailed character status."
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Character status failed: {exc}"
+                continue
+            if key == "n":
+                _form_screen()
+                try:
+                    payload = prompt_new_goal(api, input_fn=input_fn)
+                    if payload is None:
+                        message = "Goal creation cancelled; nothing was submitted."
+                    else:
+                        result = api.submit_goal(payload)
+                        goal = result.get("goal") if isinstance(result.get("goal"), dict) else {}
+                        message = f"Goal stored: {goal.get('title', goal.get('id', 'new goal'))}"
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Goal submission failed: {exc}"
+                continue
+            if key == "m":
+                _form_screen()
+                try:
+                    command = prompt_goal_command(goals, input_fn=input_fn)
+                    if command is None:
+                        message = "No goal change was made."
+                    else:
+                        goal_id, payload = command
+                        result = api.manage_goal(goal_id, payload)
+                        changed = result.get("goal") if isinstance(result.get("goal"), dict) else {}
+                        message = f"Goal is now {changed.get('status', 'updated')}: {changed.get('title', goal_id)}"
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Goal command failed: {exc}"
+                continue
+            message = f"Unknown key {key!r}; press H for help."
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        sys.stdout.write(f"{ANSI_RESET}\x1b[?25h\n")
+        sys.stdout.flush()

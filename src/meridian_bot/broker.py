@@ -87,6 +87,13 @@ CONTROLLER_ONLY_TOOLS = {
     "pilot",
     "spread",
     "quartermaster",
+    # The upstream RTS gateway owns these asynchronous intent/token APIs. The
+    # single-character planner uses ordinary synchronous broker tools and must
+    # not compete with a separate controller for packet authority.
+    "attack_intent",
+    "move_intent",
+    "context_intent",
+    "cancel_action",
 }
 
 
@@ -150,6 +157,44 @@ class BrokerClient:
             "--dashboard",
             str(self.config.harness.dashboard_port),
         ]
+
+    def _launch_environment(self) -> dict[str, str]:
+        """Build native harness paths without relying on URL pathname defaults."""
+
+        env = os.environ.copy()
+        substrate = self.config.harness.root / "substrate"
+        env.update(
+            {
+                "M59_HOST": self.config.game.host,
+                "M59_PORT": str(self.config.game.port),
+                "M59_STATE_FILE": str(self.config.harness.state_file),
+                "M59_BIND": "127.0.0.1",
+                "M59_RSC_DIR": str(self.config.harness.state_file.parent / "rsc"),
+                # Some upstream modules still derive defaults from
+                # URL.pathname. Those paths remain percent-encoded when a
+                # Windows checkout contains spaces, so provide every
+                # broker-imported filesystem store in native Path form.
+                "M59_MAP": str(substrate / "m59-map.json"),
+                "M59_MAP_FILE": str(substrate / "m59-map.json"),
+                "M59_CODE_EXITS": str(substrate / "m59-codeexits.json"),
+                "M59_BAD_EXITS": str(substrate / "m59-badexits.json"),
+                "M59_SPAWN_FILE": str(substrate / "m59-spawns.json"),
+                "M59_SAFESPOT_FILE": str(substrate / "m59-safespots.json"),
+                "M59_MERCHANTS": str(substrate / "m59-merchants.json"),
+                "M59_SPELLS": str(substrate / "m59-spells.json"),
+                "M59_ABILITY_DIR": str(substrate / "abilities"),
+                "M59_BANK_DIR": str(substrate / "banks"),
+                "M59_DESC_DIR": str(substrate / "descriptions"),
+                "M59_HITS_DIR": str(substrate / "hits"),
+                "M59_POSTMORTEM_DIR": str(substrate / "postmortems"),
+                "M59_TRANSIT_DIR": str(substrate / "transits"),
+                "M59_UPTIME_FILE": str(substrate / "keeper-uptime.jsonl"),
+                "M59_ACTIVE_FILE": str(substrate / "keeper-active.json"),
+                "M59_LEDGER_DIR": str(self.config.harness.state_file.parent / "history"),
+                "M59_RECORD_DIR": str(self.config.harness.state_file.parent / "recordings"),
+            }
+        )
+        return env
 
     def rpc(self, method: str, params: dict[str, Any] | None = None, timeout: float = 30) -> Any:
         payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method}
@@ -338,28 +383,7 @@ class BrokerClient:
         if not script.is_file():
             raise HarnessIncompatible(f"broker script missing under configured harness root: {script}")
         port = int(self.config.harness.control_url.rsplit(":", 1)[-1])
-        env = os.environ.copy()
-        env.update(
-            {
-                "M59_HOST": self.config.game.host,
-                "M59_PORT": str(self.config.game.port),
-                "M59_STATE_FILE": str(self.config.harness.state_file),
-                "M59_BIND": "127.0.0.1",
-                "M59_RSC_DIR": str(self.config.harness.state_file.parent / "rsc"),
-                # Several harness defaults are derived from URL.pathname. On
-                # Windows that leaves spaces percent-encoded, so pass concrete
-                # filesystem paths for the bundled substrate instead.
-                "M59_MAP": str(self.config.harness.root / "substrate" / "m59-map.json"),
-                "M59_MAP_FILE": str(self.config.harness.root / "substrate" / "m59-map.json"),
-                "M59_CODE_EXITS": str(self.config.harness.root / "substrate" / "m59-codeexits.json"),
-                "M59_SPAWN_FILE": str(self.config.harness.root / "substrate" / "m59-spawns.json"),
-                "M59_SAFESPOT_FILE": str(self.config.harness.root / "substrate" / "m59-safespots.json"),
-                "M59_MERCHANTS": str(self.config.harness.root / "substrate" / "m59-merchants.json"),
-                "M59_SPELLS": str(self.config.harness.root / "substrate" / "m59-spells.json"),
-                "M59_LEDGER_DIR": str(self.config.harness.state_file.parent / "history"),
-                "M59_RECORD_DIR": str(self.config.harness.state_file.parent / "recordings"),
-            }
-        )
+        env = self._launch_environment()
         log_path = self.config.deployment.log_dir / "harness-broker.log"
         if self._log_handle is not None:
             self._log_handle.close()
