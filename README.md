@@ -144,7 +144,9 @@ broker remain loopback-only.
 4. Press `N` in the terminal dashboard and describe the first high-level goal in
    plain language. The configured model constructs a validated structured draft
    for approval. Press `M` to pause, resume, cancel, reprioritize, or confirm an
-   operator criterion.
+   operator criterion. To provide that confirmation, press `M`, select the goal,
+   press `F`, and type `CONFIRM`. The controller accepts it only after every
+   observable criterion in that goal is already verified.
 
 To run or revise persona setup independently, use `setup-persona`. With no
 arguments it prompts for the name, voice, traits, speech style, values, taboos,

@@ -225,6 +225,22 @@ class TuiTests(unittest.TestCase):
         self.assertIn("\x1b[32mrunning\x1b[0m", rendered)
         self.assertIn("\x1b[1;36m", rendered)
 
+    def test_dashboard_explains_pending_manual_confirmation(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["goal"]["criteria"].append(
+            {
+                "id": "human",
+                "kind": "operator_confirmed",
+                "met": False,
+                "detail": "awaiting explicit operator confirmation",
+            }
+        )
+
+        rendered = render_dashboard(status, api.goals(), api.events(), width=110)
+
+        self.assertIn("press M, select this goal, then F", rendered)
+
     def test_detailed_character_status_lists_every_requested_category(self) -> None:
         api = FakeApi()
 
@@ -351,6 +367,29 @@ class TuiTests(unittest.TestCase):
             "New priority (0 lowest, 100 highest) [50; Esc to go back]: ",
             reprioritize_prompts,
         )
+
+        confirm_goals = [
+            {
+                "id": "goal-confirm",
+                "title": "Human verification",
+                "status": "active",
+                "version": 4,
+                "priority": 50,
+                "success_criteria": [
+                    {"id": "human", "kind": "operator_confirmed"}
+                ],
+            }
+        ]
+        confirm_answers = iter(["1", "f", "CONFIRM"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            goal_id, confirm = prompt_goal_command(
+                confirm_goals, input_fn=lambda _: next(confirm_answers)
+            ) or (None, None)
+        self.assertEqual("goal-confirm", goal_id)
+        self.assertEqual("confirm_complete", confirm["action"])
+        self.assertEqual(4, confirm["expected_version"])
+        self.assertIn("only after every observable criterion passes", output.getvalue())
 
     def test_escape_cancels_goal_creation_from_each_prompt_stage(self) -> None:
         initial = FakeApi()

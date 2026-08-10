@@ -232,7 +232,7 @@ class BotConfig:
             name=str(model_raw.get("name", "")),
             planner_timeout_seconds=int(model_raw.get("planner_timeout_seconds", 90)),
             responder_timeout_seconds=int(model_raw.get("responder_timeout_seconds", 45)),
-            max_output_tokens=int(model_raw.get("max_output_tokens", 1200)),
+            max_output_tokens=int(model_raw.get("max_output_tokens", 4096)),
             temperature=float(model_raw.get("temperature", 0.2)),
             json_mode=bool(model_raw.get("json_mode", True)),
             disable_thinking=bool(model_raw.get("disable_thinking", False)),

@@ -381,6 +381,19 @@ def render_dashboard(
                             color,
                         )
                     )
+            if any(
+                isinstance(criterion, dict)
+                and criterion.get("kind") == "operator_confirmed"
+                and criterion.get("met") is not True
+                for criterion in criteria
+            ):
+                lines.append(
+                    _paint(
+                        "  Manual confirmation pending: press M, select this goal, then F after the other criteria pass.",
+                        "yellow",
+                        color,
+                    )
+                )
     else:
         lines.append("No active, paused, or blocked goal. The bot is strategically idle.")
 
@@ -869,6 +882,9 @@ def prompt_goal_command(
         for item in success_criteria
     ):
         choices.append("confirm_complete")
+        print(
+            "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes."
+        )
     action_keys = {
         "pause": "p",
         "resume": "r",
@@ -881,7 +897,7 @@ def prompt_goal_command(
         "resume": "[R]esume",
         "reprioritize": "[E]dit priority",
         "cancel": "[C]ancel",
-        "confirm_complete": "Con[F]irm operator criterion",
+        "confirm_complete": "Con[F]irm manual criterion",
     }
     print(
         "Actions: "
@@ -932,7 +948,7 @@ def prompt_goal_command(
         payload["cause"] = "operator_requested"
     if action == "confirm_complete":
         confirmation = _form_input(
-            "Type CONFIRM to verify the operator criterion ([Esc] back): ",
+            "Type CONFIRM to attest the manual criterion and complete the goal ([Esc] back): ",
             input_fn,
         )
         if confirmation is None:
@@ -1028,7 +1044,8 @@ def run_tui(
             if key == "h":
                 message = (
                     "N turns a plain-language request into a model-authored goal for your approval; "
-                    "M manages goals; S shows complete skills, spells, inventory, and equipment; "
+                    "M manages goals (use F there to confirm a pending manual criterion); "
+                    "S shows complete skills, spells, inventory, and equipment; "
                     "Esc cancels any subpage and returns here."
                 )
                 continue

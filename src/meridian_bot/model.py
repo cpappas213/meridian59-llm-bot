@@ -14,6 +14,10 @@ class ModelError(RuntimeError):
     code = "MODEL_UNAVAILABLE"
 
 
+STRUCTURED_OUTPUT_TOKEN_FLOOR = 4096
+REASONING_RETRY_TOKEN_CEILING = 8192
+
+
 CRITERION_FIELD_GUIDE = "; ".join(
     f"{kind}=[{', '.join(sorted(fields))}]" for kind, fields in CRITERION_FIELDS_BY_KIND.items()
 )
@@ -456,15 +460,24 @@ class VllmClient:
             "advertised_model_count": len(model_ids),
         }
 
-    def _complete(self, messages: list[dict[str, str]], timeout: int, *, max_tokens: int | None = None) -> dict[str, Any]:
+    def _complete(
+        self,
+        messages: list[dict[str, str]],
+        timeout: int,
+        *,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
         headers = self._headers(content_type=True)
         request_messages = list(messages)
-        for attempt in range(2):
+        completion_budget = int(max_tokens or self.config.model.max_output_tokens)
+        reasoning_retry_attempted = False
+        json_repair_attempted = False
+        while True:
             payload: dict[str, Any] = {
                 "model": self.config.model.name,
                 "messages": request_messages,
                 "temperature": self.config.model.temperature,
-                "max_tokens": max_tokens or self.config.model.max_output_tokens,
+                "max_tokens": completion_budget,
             }
             if self.config.model.json_mode:
                 payload["response_format"] = {"type": "json_object"}
@@ -488,11 +501,37 @@ class VllmClient:
             if not isinstance(text, str) or not text.strip():
                 finish_reason = choice.get("finish_reason")
                 reasoning = message.get("reasoning") or message.get("reasoning_content")
+                retry_budget = min(
+                    REASONING_RETRY_TOKEN_CEILING,
+                    max(STRUCTURED_OUTPUT_TOKEN_FLOOR, completion_budget * 2),
+                )
+                if (
+                    finish_reason == "length"
+                    and reasoning
+                    and not reasoning_retry_attempted
+                    and retry_budget > completion_budget
+                ):
+                    reasoning_retry_attempted = True
+                    completion_budget = retry_budget
+                    request_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous attempt exhausted its completion budget before emitting the "
+                                "requested object. Return the final concise JSON object now, with minimal "
+                                "reasoning and no prose or markdown."
+                            ),
+                        },
+                    ]
+                    continue
                 detail = "model returned no response content"
                 if finish_reason:
                     detail += f" (finish_reason={finish_reason})"
                 if reasoning:
                     detail += "; the response contained reasoning but no final JSON"
+                if reasoning_retry_attempted:
+                    detail += f" after retrying with {completion_budget} completion tokens"
                 self.last_error = detail
                 raise ModelError(detail)
             try:
@@ -500,7 +539,8 @@ class VllmClient:
                 self.last_error = None
                 return value
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                if attempt == 0:
+                if not json_repair_attempted:
+                    json_repair_attempted = True
                     # A model may emit a truncated or syntactically malformed object.
                     # Give it one bounded repair
                     # turn with the original schema and its own output, then surface a
@@ -520,7 +560,6 @@ class VllmClient:
                     continue
                 self.last_error = str(exc)
                 raise ModelError(f"model request failed after one JSON repair: {exc}") from exc
-        raise ModelError("model request failed without a response")
 
     def draft_goal(
         self,
@@ -553,7 +592,10 @@ class VllmClient:
             # against the same completion budget. Goal contracts are compact,
             # but the model still needs enough room to finish its reasoning and
             # emit the structured object.
-            max_tokens=max(4096, self.config.model.max_output_tokens),
+            max_tokens=max(
+                STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                self.config.model.max_output_tokens,
+            ),
         )
 
     def plan(
@@ -595,7 +637,10 @@ class VllmClient:
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
             ],
             self.config.model.planner_timeout_seconds,
-            max_tokens=max(2400, self.config.model.max_output_tokens),
+            max_tokens=max(
+                STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                self.config.model.max_output_tokens,
+            ),
         )
         if result.get("decision") not in {"plan", "act", "wait", "propose_goal"}:
             raise ModelError("planner returned an invalid decision")
@@ -627,6 +672,10 @@ class VllmClient:
                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
             ],
             self.config.model.planner_timeout_seconds,
+            max_tokens=max(
+                STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                self.config.model.max_output_tokens,
+            ),
         )
         allowed = {
             "start_phase",
@@ -667,7 +716,10 @@ class VllmClient:
             # hundred tokens before emitting the small final JSON object.  A
             # 300-token cap can therefore produce content=null even though the
             # endpoint and model are healthy.
-            max_tokens=max(1200, self.config.model.max_output_tokens),
+            max_tokens=max(
+                STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                self.config.model.max_output_tokens,
+            ),
         )
         stats = str(result.get("stats", ""))
         loadout = str(result.get("loadout", ""))
