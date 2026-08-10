@@ -51,6 +51,8 @@ FOREGROUND_ROOM_TRANSITION_TOOLS = {"travel", "go_through"}
 
 TOS_BANK_ROOM_ID = 54
 TOS_INN_ROOM_ID = 52
+RAZA_INN_ROOM_ID = 1011
+RAZA_MAUSOLEUM_ROOM_ID = 1016
 TOS_INNKEEPER_NAME = "paddock"
 TOS_CHEESE_NAME = "wheel of cheese"
 TOS_CHEESE_VIGOR = 30
@@ -1525,25 +1527,37 @@ class BotController:
                 raise ModelError(
                     "the farm launch step must name the goal-owned prey and exact assigned room"
                 )
+            observation = self.last_observation or {}
             current_room = deep_get(
-                self.last_observation or {},
+                observation,
                 "look.room.num",
-                deep_get(self.last_observation or {}, "look.room_id"),
+                deep_get(observation, "look.room_id"),
             )
-            if str(current_room) != str(TOS_INN_ROOM_ID):
+            launch_origin = self._farm_launch_origin_room(goal, observation, farm_intent)
+            if str(current_room) != str(launch_origin):
                 prior_steps = normalized_steps[:launch_index]
+                launch_origin_name = (
+                    "Raza Inn"
+                    if launch_origin == RAZA_INN_ROOM_ID
+                    else "Tos Inn"
+                )
                 has_return_to_inn = any(
                     step.get("tool") == "travel"
                     and (
-                        str(TOS_INN_ROOM_ID) in canonical_json(step)
-                        or "tos inn" in normalize(canonical_json(step))
-                        or "familiars" in normalize(canonical_json(step))
+                        str(launch_origin) in canonical_json(step)
+                        or normalize(launch_origin_name) in normalize(canonical_json(step))
+                        or (
+                            launch_origin == TOS_INN_ROOM_ID
+                            and "familiars" in normalize(canonical_json(step))
+                        )
                     )
                     for step in prior_steps
                 )
                 if not has_return_to_inn:
                     raise ModelError(
-                        "the farm plan must travel to Tos Inn room 52 before its autopilot launch step"
+                        "the farm plan must travel to the verified regional "
+                        f"sanctuary ({launch_origin_name}, room {launch_origin}) "
+                        "before its autopilot launch step"
                     )
         value = {
             "schema_version": EXECUTION_PLAN_SCHEMA_VERSION,
@@ -4188,6 +4202,32 @@ class BotController:
             for key in keys
         }
 
+    def _farm_launch_origin_room(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        intent: dict[str, Any] | None = None,
+    ) -> int:
+        """Choose the sanctuary connected to the active farm phase.
+
+        Tos Inn is the normal mainland launch point. Raza is a separate route
+        component, so forcing a Raza character or the Raza Mausoleum phase to
+        stage through room 52 creates a permanent no-route loop.
+        """
+
+        farm_intent = intent or self._effective_farm_intent(goal)
+        current_room = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        assigned_room = farm_intent.get("assigned_room")
+        if str(current_room) == str(RAZA_INN_ROOM_ID) or str(assigned_room) == str(
+            RAZA_MAUSOLEUM_ROOM_ID
+        ):
+            return RAZA_INN_ROOM_ID
+        return TOS_INN_ROOM_ID
+
     def _structured_farm_launch_plan(
         self,
         goal: dict[str, Any],
@@ -4210,7 +4250,8 @@ class BotController:
         if intent.get("assigned_room") is None or not intent.get("hunt"):
             return None
         current_room = deep_get(observation, "look.room.num")
-        if str(current_room) != str(TOS_INN_ROOM_ID):
+        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
+        if str(current_room) != str(launch_origin):
             return None
 
         readiness = self.learning.readiness_summary(observation)
@@ -4243,8 +4284,9 @@ class BotController:
             "tool": "autopilot",
             "arguments": arguments,
             "rationale": (
-                "Launch the goal-owned bounded keeper from Tos Inn using the grounded "
-                "farm recipe; preparation and deterministic safety preflight are complete."
+                "Launch the goal-owned bounded keeper from the verified regional "
+                "sanctuary using the grounded farm recipe; preparation and "
+                "deterministic safety preflight are complete."
             ),
             "expected_observation": {
                 "autopilot.running": True,
@@ -4314,6 +4356,48 @@ class BotController:
         self, goal: dict[str, Any]
     ) -> dict[str, Any]:
         intent = self._effective_farm_intent(goal)
+        observation = self.last_observation or {}
+        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
+        if launch_origin == RAZA_INN_ROOM_ID:
+            return {
+                "summary": (
+                    "Prepare inside Raza Inn, launch the goal-owned keeper for "
+                    "the bounded regional farm, then verify the HP outcome."
+                ),
+                "steps": [
+                    {
+                        "id": "rest-for-farm",
+                        "outcome": "Rest safely to the ordinary 80-vigor threshold and stand again.",
+                        "tool": "rest_up",
+                        "verification": "Live vigor is at least 80 and the character is standing.",
+                    },
+                    {
+                        "id": "equip-before-farm",
+                        "outcome": "Ensure the best carried weapon is equipped before leaving Raza Inn.",
+                        "tool": "equip_best",
+                        "verification": "The equipment list reports a wielded weapon.",
+                    },
+                    {
+                        "id": "launch-goal-keeper",
+                        "outcome": (
+                            "Launch the grounded goal-owned keeper from Raza Inn "
+                            f"for {intent.get('hunt')} in assigned room "
+                            f"{intent.get('assigned_room')}."
+                        ),
+                        "tool": "autopilot",
+                        "verification": (
+                            "Keeper status reports running with this goal id, prey "
+                            f"{intent.get('hunt')}, and assigned room "
+                            f"{intent.get('assigned_room')}."
+                        ),
+                    },
+                ],
+                "assumptions": [],
+                "revision_reason": (
+                    "Use the sanctuary connected to the active Raza phase instead "
+                    "of attempting an unavailable route to Tos Inn."
+                ),
+            }
         return {
             "summary": (
                 "Provision only the food needed for the numeric vigor gate, "
@@ -4401,6 +4485,7 @@ class BotController:
             return None
 
         current_room = deep_get(observation, "look.room.num")
+        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
         readiness = self.learning.readiness_summary(observation)
         supply = self._combat_vigor_supply(observation)
         vigor = deep_get(
@@ -4476,6 +4561,11 @@ class BotController:
             }
 
         if nutrition_shortfall > 0 and not can_make_food:
+            if launch_origin != TOS_INN_ROOM_ID:
+                # Tos-specific Paddock/bank provisioning is not reachable from
+                # Raza. Let the tactical planner locate regional supplies rather
+                # than forcing an already-disproved cross-region route.
+                return None
             quote = self._recent_farm_food_quote(goal)
             if quote is None:
                 if str(current_room) != str(TOS_INN_ROOM_ID):
@@ -4530,12 +4620,12 @@ class BotController:
                 "Buy one verified wheel at a time until carried nutrition reaches the gate.",
             )
 
-        if str(current_room) != str(TOS_INN_ROOM_ID):
+        if str(current_room) != str(launch_origin):
             return action(
                 "travel",
-                {"to": TOS_INN_ROOM_ID},
+                {"to": launch_origin},
                 "farm-bank-transit",
-                "Return to Tos Inn before the keeper launch.",
+                "Return to the verified regional sanctuary before the keeper launch.",
             )
         rested = deep_get(
             observation,
@@ -6511,15 +6601,27 @@ class BotController:
                 execution_plan = self._execution_plan(goal)
                 if execution_plan is None:
                     structured_intent = self._effective_farm_intent(goal)
+                    launch_origin = self._farm_launch_origin_room(
+                        goal, observation, structured_intent
+                    )
+                    launch_origin_name = (
+                        "Raza Inn"
+                        if launch_origin == RAZA_INN_ROOM_ID
+                        else "Tos Inn"
+                    )
                     execution_plan = self._store_execution_plan(
                         goal,
                         {
-                            "summary": "Complete deterministic preparation, launch the goal-owned keeper, then verify the bounded outcome and home finish.",
+                            "summary": (
+                                "Launch the goal-owned keeper from the verified "
+                                "regional sanctuary, then verify the bounded outcome."
+                            ),
                             "steps": [
                                 {
                                     "id": "launch-goal-keeper",
                                     "outcome": (
-                                        "Launch the grounded goal-owned keeper from Tos Inn for "
+                                        "Launch the grounded goal-owned keeper from "
+                                        f"{launch_origin_name} for "
                                         f"{structured_intent.get('hunt')} in assigned room "
                                         f"{structured_intent.get('assigned_room')}."
                                     ),
@@ -6532,9 +6634,12 @@ class BotController:
                                 },
                                 {
                                     "id": "verify-goal-outcome",
-                                    "outcome": "Observe the deterministic success criteria and return-home criteria.",
+                                    "outcome": "Observe the deterministic success criteria.",
                                     "tool": None,
-                                    "verification": "The controller criteria evaluator reports all criteria met.",
+                                    "verification": (
+                                        "The controller criteria evaluator reports all "
+                                        "criteria met."
+                                    ),
                                 },
                             ],
                             "assumptions": [],

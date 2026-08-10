@@ -4842,6 +4842,85 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_raza_farm_launches_from_raza_inn_without_routing_to_tos(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_running = False
+                broker.room = {"num": 1011, "name": "Raza Inn"}
+                broker.vitals["health"] = {"value": 20, "max": 20}
+                broker.vitals["vigor"] = {
+                    "value": 100,
+                    "scale_max": 200,
+                    "rested": True,
+                }
+                broker.inventory_items[0]["in_use"] = True
+                controller.broker = broker
+                controller.model = FixedModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="raza-farm-fast-path",
+                        objective="Raise maximum HP to 25 before leaving Raza.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-25",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 25,
+                            },
+                            {"id": "left-raza", "kind": "operator_confirmed"},
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm mummies in the Raza Mausoleum.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-22",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 22,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 1016,
+                            "target": "mummy",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Use the regional sanctuary and nearby farm.",
+                    },
+                    mode="start",
+                )
+
+                planned = controller.turn()
+                self.assertTrue(planned["planned"])
+                result = controller.turn()
+
+                self.assertEqual("autopilot", result.get("action"), result)
+                self.assertFalse(any(name == "travel" for name, _ in broker.calls))
+                launch = next(
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                )
+                self.assertEqual("mummy", launch["hunt"])
+                self.assertEqual(1016, launch["assigned_room"])
+                plan = controller._execution_plan(goal)
+                self.assertEqual(phase["id"], plan["phase_id"])
+                self.assertNotIn("room 52", plan["summary"])
+            finally:
+                controller.storage.close()
+
     def test_structured_farm_preparation_resolves_zero_cash_food_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

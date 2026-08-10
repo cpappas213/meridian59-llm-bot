@@ -91,8 +91,11 @@ Choose the first applicable class:
    visibility; a separate second natural encounter is allowed, but never patrol
    or queue PvP to fill the two-per-day initiation cap.
 
-Every normal phase returns to room 52, column 8, row 8 at the Tos Inn bar. The
-adjacent `(8,7)` square is occupied by bar objects and is not a valid finish.
+Return to room 52, column 8, row 8 at the Tos Inn bar only when the human's goal
+explicitly requires that finish. The adjacent `(8,7)` square is occupied by bar
+objects and is not a valid finish. A character in the disconnected Raza region
+must use Raza Inn room 1011 as its farm-launch sanctuary; do not attempt a route
+to room 52 merely to stage a Raza farm.
 
 ## Combat goal notes
 

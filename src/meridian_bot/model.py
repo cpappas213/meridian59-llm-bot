@@ -233,12 +233,14 @@ hunting_grounds at most once for the selected prey. After both results are groun
 keeper or choose a materially different tactic; never loop on either read.
 When the durable goal already contains an exact `hunt=<canonical prey>; assigned_room=<numeric id>`
 recipe, do not call prey or hunting_grounds again. Complete any deliberately selected banking and required equipment preparation, then
-start the keeper with that recipe from Tos Inn; the controller may perform this launch directly once its
+start the keeper with that recipe from the verified regional sanctuary; the controller may perform this launch directly once its
 deterministic preflight passes.
-The persisted execution plan must reflect that same origin. If current room is not Tos Inn room 52,
-include a travel-to-room-52 step before the autopilot launch step. Never describe the bank as the launch
-origin. The launch step must name the goal-owned prey and exact assigned_room. The controller rejects a
-plan that omits or contradicts these facts before any action is permitted.
+The persisted execution plan must reflect that same origin. Use Tos Inn room 52 for connected mainland
+phases, but use Raza Inn room 1011 for the Raza Mausoleum room 1016 or when the character is already in
+Raza Inn. Never attempt the unavailable Raza-to-Tos route merely to stage a farm. If current room is not
+the selected regional sanctuary, include a travel-to-that-sanctuary step before the autopilot launch step.
+Never describe a bank as the launch origin. The launch step must name the goal-owned prey and exact
+assigned_room. The controller rejects a plan that omits or contradicts these facts before any action is permitted.
 If the HP/progression criterion is already met, omit every farm/autopilot launch step and plan only the
 remaining recovery and return-home criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
