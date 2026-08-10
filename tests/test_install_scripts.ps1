@@ -58,6 +58,7 @@ if ((Read-InstallTimezone "") -ne "America/Los_Angeles") {
 }
 
 $aclTestPath = Join-Path $projectRoot "runtime\acl-installer-test.tmp"
+[System.IO.Directory]::CreateDirectory((Split-Path -Parent $aclTestPath)) | Out-Null
 [System.IO.File]::WriteAllText($aclTestPath, "test")
 try {
     Protect-UserOnlyFile $aclTestPath
