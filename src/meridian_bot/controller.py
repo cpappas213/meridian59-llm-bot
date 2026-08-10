@@ -94,7 +94,7 @@ POLITICAL_FACTION_TROOP_ENTITY_IDS = frozenset(
 LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
-EXECUTION_PLAN_SCHEMA_VERSION = 2
+EXECUTION_PLAN_SCHEMA_VERSION = 3
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
@@ -6540,6 +6540,18 @@ class BotController:
                     "reconciled_goal_ids": [item["id"] for item in reconciled],
                     "onboarding": onboarding,
                 }
+            legacy_feedback = self._planner_feedback(goal)
+            legacy_feedback_message = str(
+                (legacy_feedback or {}).get("message") or ""
+            ).casefold()
+            if (
+                "farm plan must travel to the verified regional sanctuary"
+                in legacy_feedback_message
+            ):
+                # Schema v2 encoded the removed Tos/Raza staging policy. Do
+                # not keep presenting its rejected-plan message after the
+                # source-derived staging migration.
+                self._clear_planner_feedback()
             grounding = self.knowledge.validate_goal(goal)
             if not grounding["valid"]:
                 error_codes = {

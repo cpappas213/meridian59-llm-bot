@@ -5071,9 +5071,17 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="start",
                 )
+                controller._set_planner_feedback(
+                    goal,
+                    "The proposed execution plan failed deterministic verification: "
+                    "the farm plan must travel to the verified regional sanctuary "
+                    "(Raza Inn, room 1011) before its autopilot launch step.",
+                    consecutive_plan_rejections=1,
+                )
 
                 planned = controller.turn()
                 self.assertTrue(planned["planned"])
+                self.assertIsNone(controller._planner_feedback(goal))
                 result = controller.turn()
 
                 self.assertEqual("autopilot", result.get("action"), result)
