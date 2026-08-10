@@ -30,6 +30,7 @@ $wanted = @(
     "Resolve-IanaTimezoneAlias",
     "Test-IanaTimezone",
     "Read-InstallTimezone",
+    "Read-ModelThinkingPreference",
     "Protect-UserOnlyFile",
     "Get-OpenAiModelIds"
 )
@@ -55,6 +56,16 @@ function Read-Host {
 }
 if ((Read-InstallTimezone "") -ne "America/Los_Angeles") {
     throw "The Pacific Time menu choice did not return America/Los_Angeles"
+}
+function Read-Host {
+    param([string]$Prompt)
+    return ""
+}
+if (-not (Read-ModelThinkingPreference "qwen3.6-27b-heretic")) {
+    throw "Qwen did not default to disabled thinking"
+}
+if (Read-ModelThinkingPreference "generic-openai-compatible-model") {
+    throw "A generic model unexpectedly defaulted to disabled thinking"
 }
 
 $aclTestName = "m59-acl-installer-test-$([guid]::NewGuid().ToString('N')).tmp"

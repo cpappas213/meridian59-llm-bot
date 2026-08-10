@@ -35,7 +35,7 @@ max_output_tokens = 4096
 temperature = 0.2
 # Disable when the endpoint does not implement OpenAI JSON response format.
 json_mode = true
-# Enable only for servers/models that implement Qwen-style enable_thinking.
+# Recommended for Qwen. Enable only for models implementing Qwen-style enable_thinking.
 disable_thinking = false
 
 [controller]

@@ -15,6 +15,7 @@ param(
     [System.Security.SecureString]$ModelApiKey,
     [bool]$ModelJsonMode = $true,
     [switch]$ModelDisableThinking,
+    [switch]$ModelEnableThinking,
     [string]$ObsidianVaultPath = "",
     [string]$DashboardBind = "127.0.0.1",
     [string]$PersonaFile = "",
@@ -298,6 +299,23 @@ function Select-OpenAiModel {
     }
 }
 
+function Read-ModelThinkingPreference {
+    param([string]$ModelName)
+    $qwenRecommended = $ModelName -match '(?i)(^|[/_-])qwen'
+    $default = if ($qwenRecommended) { "1" } else { "2" }
+    Write-Host "Model reasoning mode:"
+    Write-Host "  [1] Disable thinking for fast structured controller JSON$(if ($qwenRecommended) { ' (recommended for Qwen)' } else { '' })"
+    Write-Host "  [2] Keep the model's thinking mode enabled"
+    Write-Host "Thinking tokens count against the completion limit and can delay or prevent the final JSON response."
+    while ($true) {
+        $entered = (Read-Host "Select reasoning mode [$default]").Trim()
+        if (-not $entered) { return $default -eq "1" }
+        if ($entered -eq "1") { return $true }
+        if ($entered -eq "2") { return $false }
+        Write-Warning "Choose 1 or 2."
+    }
+}
+
 $GameHost = Read-InstallSetting $GameHost "Meridian 59 server host" "127.0.0.1"
 $Timezone = Read-InstallTimezone $Timezone
 $ModelBaseUrl = Read-InstallSetting $ModelBaseUrl "OpenAI-compatible LLM base URL" "http://127.0.0.1:8000/v1"
@@ -319,6 +337,16 @@ if (-not $ModelName) {
         Write-Warning "No model list was available; enter the exact model ID manually."
         $ModelName = Read-InstallSetting $ModelName "LLM model ID"
     }
+}
+if ($ModelDisableThinking -and $ModelEnableThinking) {
+    throw "ModelDisableThinking and ModelEnableThinking cannot both be supplied"
+}
+$modelThinkingDisabled = if ($ModelDisableThinking) {
+    $true
+} elseif ($ModelEnableThinking) {
+    $false
+} else {
+    Read-ModelThinkingPreference $ModelName
 }
 foreach ($setting in @(
     @{ Name = "GameHost"; Value = $GameHost },
@@ -472,7 +500,7 @@ responder_timeout_seconds = 45
 max_output_tokens = 4096
 temperature = 0.2
 json_mode = $($ModelJsonMode.ToString().ToLowerInvariant())
-disable_thinking = $($ModelDisableThinking.IsPresent.ToString().ToLowerInvariant())
+disable_thinking = $($modelThinkingDisabled.ToString().ToLowerInvariant())
 
 [controller]
 control_bind = "127.0.0.1"

@@ -113,8 +113,11 @@ timezone names. Unix-like systems continue to use their system timezone data.
 
 The default request contract uses OpenAI JSON response mode. If an otherwise
 compatible endpoint does not implement `response_format`, set
-`model.json_mode=false`. `model.disable_thinking` is off by default and should be
-enabled only for servers/models that support Qwen-style `enable_thinking`.
+`model.json_mode=false`. Setup asks whether to disable model thinking and
+recommends doing so for Qwen models because reasoning tokens count against the
+completion budget and can delay controller actions. `model.disable_thinking`
+should be enabled only for servers/models that support Qwen-style
+`enable_thinking`; generic endpoints default to keeping their normal behavior.
 `model.auth_mode` accepts `none`, `bearer`, or `anthropic`; legacy configurations
 without it use `auto`, which sends Bearer auth only when a model key exists.
 
