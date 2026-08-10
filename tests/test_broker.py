@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from meridian_bot.broker import (
@@ -216,10 +217,21 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaises(HarnessIncompatible):
                 broker._check_root({"root": str(Path(temporary) / "other")})
 
-    def test_upstream_fleet_controls_are_hidden_but_evidence_tools_are_visible(self) -> None:
+    def test_upstream_control_surfaces_are_hidden_but_evidence_tools_are_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             broker = BrokerClient(config(Path(temporary)))
-            names = {"pilot", "spread", "quartermaster", "prey", "post_mortem", "cancel_movement"}
+            names = {
+                "pilot",
+                "spread",
+                "quartermaster",
+                "attack_intent",
+                "move_intent",
+                "context_intent",
+                "cancel_action",
+                "prey",
+                "post_mortem",
+                "cancel_movement",
+            }
             broker._manifest = {
                 name: Tool(name, f"Upstream {name} tool.", {"type": "object", "properties": {}})
                 for name in names
@@ -227,9 +239,46 @@ class BrokerTests(unittest.TestCase):
 
             visible = {tool["name"] for tool in broker.planner_tools()}
 
-            self.assertTrue({"pilot", "spread", "quartermaster"}.issubset(CONTROLLER_ONLY_TOOLS))
-            self.assertTrue({"pilot", "spread", "quartermaster"}.isdisjoint(visible))
+            controls = {
+                "pilot",
+                "spread",
+                "quartermaster",
+                "attack_intent",
+                "move_intent",
+                "context_intent",
+                "cancel_action",
+            }
+            self.assertTrue(controls.issubset(CONTROLLER_ONLY_TOOLS))
+            self.assertTrue(controls.isdisjoint(visible))
             self.assertTrue({"prey", "post_mortem", "cancel_movement"}.issubset(visible))
+
+    def test_managed_launch_uses_native_paths_for_upstream_runtime_stores(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="m59 bot ") as temporary:
+            root = Path(temporary)
+            value = config(root)
+            harness_root = root / "harness with spaces"
+            value = replace(value, harness=replace(value.harness, root=harness_root))
+            broker = BrokerClient(value)
+
+            env = broker._launch_environment()
+
+            substrate = harness_root / "substrate"
+            expected = {
+                "M59_BAD_EXITS": substrate / "m59-badexits.json",
+                "M59_ABILITY_DIR": substrate / "abilities",
+                "M59_BANK_DIR": substrate / "banks",
+                "M59_DESC_DIR": substrate / "descriptions",
+                "M59_HITS_DIR": substrate / "hits",
+                "M59_POSTMORTEM_DIR": substrate / "postmortems",
+                "M59_TRANSIT_DIR": substrate / "transits",
+                "M59_UPTIME_FILE": substrate / "keeper-uptime.jsonl",
+                "M59_ACTIVE_FILE": substrate / "keeper-active.json",
+            }
+            self.assertEqual(
+                {name: str(path) for name, path in expected.items()},
+                {name: env[name] for name in expected},
+            )
+            self.assertFalse(any("%20" in env[name] for name in expected))
 
 
 if __name__ == "__main__":

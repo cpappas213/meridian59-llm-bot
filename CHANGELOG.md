@@ -32,6 +32,8 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Updated the bundled `m59-harness` pin to the latest tested official upstream
+  revision and removed the stale integration-fork dependency.
 - Made `Esc` an immediate, consistent cancel/back control across character
   status, goal drafting/review, goal modification, goal management, priority
   editing, and destructive confirmations.

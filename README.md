@@ -6,9 +6,8 @@
 An experimental Windows control plane for an LLM-driven Meridian 59 character.
 This project supplies durable goals, policy, supervision, and an
 OpenAI-compatible model loop while the separately maintained
-[`m59-harness` integration fork](https://github.com/cpappas213/m59-harness)
-([upstream](https://github.com/tpeppers/m59-harness)) owns the ordinary game
-protocol and mechanical actions.
+[`m59-harness`](https://github.com/tpeppers/m59-harness) project owns the
+ordinary game protocol and mechanical actions.
 
 > [!IMPORTANT]
 > **Alpha status:** source publication and automated validation do not mean the

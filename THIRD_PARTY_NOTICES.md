@@ -3,13 +3,12 @@
 ## m59-harness
 
 This repository references `m59-harness` as a Git submodule at
-`vendor/m59-harness`. The configured submodule uses the public integration fork
-at <https://github.com/cpappas213/m59-harness>; the independently maintained
-upstream is <https://github.com/tpeppers/m59-harness>.
+`vendor/m59-harness`. The configured submodule uses the independently maintained
+upstream at <https://github.com/tpeppers/m59-harness>.
 
 The root MIT license does not relicense the submodule. No tracked `LICENSE`,
 `COPYING`, or package-license declaration was found at the pinned revision as of
-2026-08-07. GitHub availability and forkability do not grant redistribution
+2026-08-10. GitHub availability and forkability do not grant redistribution
 rights. Obtain or verify permission with the upstream maintainer before
 distributing a checkout that includes submodule contents.
 
