@@ -21,6 +21,30 @@ from meridian_bot.config import OnboardingConfig
 from .helpers import config, goal_payload
 
 
+def source_verify_safe_rooms(controller: BotController, *room_ids: int) -> None:
+    """Give focused controller tests explicit source-derived room facts."""
+
+    original = controller._pvp_room_policy
+    safe = {int(room_id) for room_id in room_ids}
+
+    def policy(room_id: int) -> dict[str, object] | None:
+        if int(room_id) in safe:
+            return {
+                "known": True,
+                "room_id": int(room_id),
+                "name": f"Safe staging {int(room_id)}",
+                "flags": ["ROOM_NO_COMBAT"],
+                "evidence": {
+                    "source_tier": "source-derived",
+                    "source_ref": "test fixture",
+                    "corpus_version": "test",
+                },
+            }
+        return original(room_id)
+
+    controller._pvp_room_policy = policy  # type: ignore[method-assign]
+
+
 class FixedModel:
     def plan(self, **kwargs: object) -> dict[str, object]:
         if kwargs.get("execution_plan") is None:
@@ -1080,6 +1104,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 52)
                 broker = SimulatedBroker()
                 broker.tools["walk_to"] = Tool(
                     "walk_to",
@@ -1624,7 +1649,22 @@ class ControllerTests(unittest.TestCase):
                                 "metric": "ability.skill.mace fighting",
                                 "operator": ">=",
                                 "value": 1,
-                            }
+                            },
+                            {
+                                "kind": "location_reached",
+                                "location": "Tos Inn",
+                                "room_id": 52,
+                            },
+                            {
+                                "kind": "state_equals",
+                                "path": "status.position.col",
+                                "value": 8,
+                            },
+                            {
+                                "kind": "state_equals",
+                                "path": "status.position.row",
+                                "value": 8,
+                            },
                         ],
                         constraints={
                             "purchase_plan": {
@@ -1638,7 +1678,12 @@ class ControllerTests(unittest.TestCase):
                     )
                 )["goal"]
                 incomplete = {
-                    "criteria": [{"id": "criterion_1", "met": False}],
+                    "criteria": [
+                        {"id": "criterion_1", "met": False},
+                        {"id": "criterion_2", "met": False},
+                        {"id": "criterion_3", "met": False},
+                        {"id": "criterion_4", "met": False},
+                    ],
                     "all_met": False,
                 }
 
@@ -1724,8 +1769,13 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(capacity_blocked)
 
                 complete = {
-                    "criteria": [{"id": "criterion_1", "met": True}],
-                    "all_met": True,
+                    "criteria": [
+                        {"id": "criterion_1", "met": True},
+                        {"id": "criterion_2", "met": False},
+                        {"id": "criterion_3", "met": False},
+                        {"id": "criterion_4", "met": False},
+                    ],
+                    "all_met": False,
                 }
                 return_home = controller._structured_purchase_preparation_action(
                     goal,
@@ -1901,6 +1951,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 54)
                 goal = controller.storage.submit_goal(
                     goal_payload(
                         request_id="combined-purchase-farm-plan",
@@ -1978,7 +2029,7 @@ class ControllerTests(unittest.TestCase):
                     revision=False,
                 )
                 self.assertEqual("verified", stored["verification"]["status"])
-                self.assertEqual(8, len(controller._structured_farm_controller_plan(goal)["steps"]))
+                self.assertEqual(4, len(controller._structured_farm_controller_plan(goal)["steps"]))
 
                 controller.last_observation["look"]["vitals"]["health"] = {
                     "current": 31,
@@ -1996,7 +2047,8 @@ class ControllerTests(unittest.TestCase):
                 )
                 return_step_ids = {step["id"] for step in return_plan["steps"]}
                 self.assertNotIn("launch-goal-keeper", return_step_ids)
-                self.assertIn("return-purchase-to-tos-inn", return_step_ids)
+                self.assertNotIn("finish-purchase-at-goal-location", return_step_ids)
+                self.assertNotIn("finish-purchase-at-goal-position", return_step_ids)
                 revised = controller._store_execution_plan(
                     goal,
                     return_plan,
@@ -2008,6 +2060,122 @@ class ControllerTests(unittest.TestCase):
                     revision=True,
                 )
                 self.assertEqual("verified", revised["verification"]["status"])
+            finally:
+                controller.storage.close()
+
+    def test_completed_purchase_has_no_implicit_home_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="purchase-without-finish",
+                        objective="Learn mace fighting from Rook.",
+                        success_criteria=[
+                            {
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 1,
+                            }
+                        ],
+                        constraints={
+                            "purchase_plan": {
+                                "offering_kind": "skill",
+                                "item": "mace fighting",
+                                "merchant_class": "CorNothSergeant",
+                                "room_id": 154,
+                                "maximum_price": 500,
+                            }
+                        },
+                    )
+                )["goal"]
+                completion = {
+                    "criteria": [{"id": "criterion_1", "met": True}],
+                    "all_met": True,
+                }
+
+                self.assertIsNone(
+                    controller._structured_purchase_preparation_action(
+                        goal,
+                        {"look": {"room": {"num": 154}}},
+                        completion,
+                        None,
+                    )
+                )
+                step_ids = {
+                    step["id"]
+                    for step in controller._structured_purchase_controller_plan(goal)[
+                        "steps"
+                    ]
+                }
+                self.assertNotIn("finish-purchase-at-goal-location", step_ids)
+                self.assertNotIn("finish-purchase-at-goal-position", step_ids)
+            finally:
+                controller.storage.close()
+
+    def test_completed_purchase_uses_non_tos_goal_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="purchase-with-explicit-finish",
+                        success_criteria=[
+                            {"kind": "inventory_contains", "item": "mace"},
+                            {
+                                "kind": "location_reached",
+                                "location": "Jasper Tavern",
+                                "room_id": 371,
+                            },
+                            {
+                                "kind": "state_equals",
+                                "path": "status.position.col",
+                                "value": 4,
+                            },
+                            {
+                                "kind": "state_equals",
+                                "path": "status.position.row",
+                                "value": 6,
+                            },
+                        ],
+                        constraints={
+                            "purchase_plan": {
+                                "item": "mace",
+                                "merchant_class": "CorNothSergeant",
+                                "room_id": 154,
+                                "maximum_price": 100,
+                            }
+                        },
+                    )
+                )["goal"]
+                completion = {
+                    "criteria": [
+                        {"id": "criterion_1", "met": True},
+                        {"id": "criterion_2", "met": False},
+                        {"id": "criterion_3", "met": False},
+                        {"id": "criterion_4", "met": False},
+                    ],
+                    "all_met": False,
+                }
+
+                travel = controller._structured_purchase_preparation_action(
+                    goal,
+                    {"look": {"room": {"num": 154}}},
+                    completion,
+                    None,
+                )
+                self.assertEqual({"to": 371}, travel["arguments"])
+                walk = controller._structured_purchase_preparation_action(
+                    goal,
+                    {
+                        "look": {"room": {"num": 371}},
+                        "status": {"position": {"col": 1, "row": 1}},
+                    },
+                    completion,
+                    None,
+                )
+                self.assertEqual({"col": 4, "row": 6}, walk["arguments"])
             finally:
                 controller.storage.close()
 
@@ -4787,6 +4955,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 52)
                 broker = BackgroundFarmBroker()
                 broker.farm_running = False
                 broker.room = {"num": 52, "name": "Familiars"}
@@ -4846,6 +5015,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 1011)
                 broker = BackgroundFarmBroker()
                 broker.farm_running = False
                 broker.room = {"num": 1011, "name": "Raza Inn"}
@@ -4925,6 +5095,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 52)
                 goal = controller.storage.submit_goal(
                     goal_payload(
                         request_id="structured-farm-provisioning",
@@ -5083,6 +5254,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 52)
                 goal = controller.storage.submit_goal(
                     goal_payload(
                         request_id="structured-farm-weapon-readiness",
@@ -5249,6 +5421,7 @@ class ControllerTests(unittest.TestCase):
             )
             controller = BotController(cfg)
             try:
+                source_verify_safe_rooms(controller, 52)
                 goal = controller.storage.submit_goal(
                     goal_payload(
                         request_id="structured-farm-bank-existing-cash",

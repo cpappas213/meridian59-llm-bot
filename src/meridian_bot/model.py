@@ -143,7 +143,7 @@ combine decision=plan with a tool call. Count the steps before returning JSON: e
 maximum. This is a per-phase limit, never a complete multi-hour campaign plan. Do not create tool=null waiting or monitoring steps; the controller continuously verifies
 criteria and keeper state without them. Consolidate preparation into bounded outcome steps when needed.
 The execution_plan must end with the active internal phase. Do not append work for a later phase or for
-strategic-goal completion, such as returning to Tos Inn or walking to its bar, while a farm phase is active;
+strategic-goal completion, such as an explicit final room or coordinate, while a farm phase is active;
 the campaign manager creates a return_home phase only after the progression criterion is verified.
 Proposals are inert optional future goals for the supervisor to accept or reject. They never replace,
 refine, unblock, or execute the active goal. Do not propose a plan, tactic, route, or subtask for
@@ -233,16 +233,16 @@ hunting_grounds at most once for the selected prey. After both results are groun
 keeper or choose a materially different tactic; never loop on either read.
 When the durable goal already contains an exact `hunt=<canonical prey>; assigned_room=<numeric id>`
 recipe, do not call prey or hunting_grounds again. Complete any deliberately selected banking and required equipment preparation, then
-start the keeper with that recipe from the verified regional sanctuary; the controller may perform this launch directly once its
+start the keeper with that recipe from the selected source-verified safe staging room; the controller may perform this launch directly once its
 deterministic preflight passes.
-The persisted execution plan must reflect that same origin. Use Tos Inn room 52 for connected mainland
-phases, but use Raza Inn room 1011 for the Raza Mausoleum room 1016 or when the character is already in
-Raza Inn. Never attempt the unavailable Raza-to-Tos route merely to stage a farm. If current room is not
-the selected regional sanctuary, include a travel-to-that-sanctuary step before the autopilot launch step.
-Never describe a bank as the launch origin. The launch step must name the goal-owned prey and exact
-assigned_room. The controller rejects a plan that omits or contradicts these facts before any action is permitted.
+The persisted execution plan must reflect grounded_knowledge.farm_safe_staging. The controller selects it
+from a source-verified ROOM_SANCTUARY or ROOM_NO_COMBAT room, preferring a safe room actually observed
+and remembered during this run; it never assumes a home city from the farm region. If the current room is
+not that selected safe staging room, include travel to its exact numeric room before the autopilot launch.
+The launch step must name the goal-owned prey and exact assigned_room. The controller rejects a plan that
+omits or contradicts these facts before any action is permitted.
 If the HP/progression criterion is already met, omit every farm/autopilot launch step and plan only the
-remaining recovery and return-home criteria. Never repeat hazardous work merely because the original
+remaining recovery and explicit finish criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
 Before starting, compare live numeric vigor with fight_above_vigor. Resting stops at 80 vigor and cannot
 by itself satisfy the 100-vigor gate. If verified edible food is carried, start the keeper from the sanctuary
@@ -255,7 +255,7 @@ Once it is running, do not issue travel, bank, equipment,
 combat, or another start call: the controller monitors it exclusively until the bounded HP target is
 reached, its flee threshold is reached, or the keeper reports a stall/error. The controller then pauses
 the phase; do not restart it until the disclosed retry predicate is met. Rerank prey whenever max HP reaches the prey's level
-and travel home for the completion criteria.
+and satisfy only the remaining explicit completion criteria.
 For PvE fight, never rely on the broker defaults. On an unproven or not-yet-safe encounter explicitly use
 rounds=1, swings_per_round=1, disengage_at at least 0.70, equip=true, and loot=true, then reobserve before
 another swing. Do not initiate danger while injured, under-rested, in the Underworld, or after an

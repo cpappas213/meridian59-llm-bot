@@ -32,6 +32,10 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Removed implicit Tos Inn/bar completion travel from purchase and training
+  flows. Finish destinations now come only from approved goal criteria, while
+  farm launch staging comes from source-verified safe-room flags and live state
+  instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to the latest tested official upstream
   revision and removed the stale integration-fork dependency.
 - Made `Esc` an immediate, consistent cancel/back control across character

@@ -145,6 +145,38 @@ def make_compendium(root: Path) -> Path:
                 "monsters": [],
                 "exits": [],
             },
+            "RazaInn": {
+                "slug": "raza-inn",
+                "name": "Raza Inn",
+                "disp": "Raza Inn",
+                "rid": "RID_RAZA_INN",
+                "ridValue": 1011,
+                "region": "Raza",
+                "file": "kod/razainn.kod",
+                "line": 11,
+                "terrain": ["TERRAIN_CITY", "TERRAIN_SHOP"],
+                "flags": ["ROOM_NO_COMBAT", "ROOM_SANCTUARY"],
+                "dims": {"rows": 10, "cols": 10},
+                "teleport": {},
+                "monsters": [],
+                "exits": [],
+            },
+            "RazaMausoleum": {
+                "slug": "raza-mausoleum",
+                "name": "Mausoleum (Raza)",
+                "disp": "Mausoleum (Raza)",
+                "rid": "RID_RAZA_MAUSOLEUM",
+                "ridValue": 1016,
+                "region": "Raza",
+                "file": "kod/razamausoleum.kod",
+                "line": 11,
+                "terrain": [],
+                "flags": [],
+                "dims": {"rows": 10, "cols": 10},
+                "teleport": {},
+                "monsters": [],
+                "exits": [],
+            },
         },
     }
     (compendium / "data" / "zones.json").write_text(json.dumps(zones), encoding="utf-8")
@@ -372,6 +404,23 @@ class KnowledgeTests(unittest.TestCase):
             )
             self.assertEqual("TosInn", inn["facts"]["flag_evidence"]["declaring_class"])
             self.assertIn("kod/tosinn.kod:43", inn["evidence"]["source_ref"])
+
+    def test_nearest_safe_location_comes_from_source_graph_and_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            knowledge = self.knowledge(Path(temporary))
+
+            staging = knowledge.nearest_safe_location(50)
+
+            self.assertEqual("found", staging["status"])
+            self.assertEqual(52, staging["room_id"])
+            self.assertEqual("source_connection_graph", staging["basis"])
+            self.assertEqual(1, staging["distance"])
+            self.assertIn("ROOM_SANCTUARY", staging["flags"])
+
+            regional = knowledge.nearest_safe_location(1016)
+            self.assertEqual(1011, regional["room_id"])
+            self.assertEqual("source_region", regional["basis"])
+            self.assertIsNone(regional["distance"])
 
     def test_goal_validation_canonicalizes_rooms_and_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

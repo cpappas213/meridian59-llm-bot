@@ -128,14 +128,14 @@ class GoalLearningTests(unittest.TestCase):
             readiness["farm_tactic_quarantines"][0]["effective_use_safe_spots"]
         )
 
-    def test_tos_coordinates_are_ignored_only_with_explicit_home_location(self) -> None:
+    def test_finish_coordinates_are_ignored_only_with_explicit_finish_location(self) -> None:
         self.assertTrue(
-            self.learning._is_tos_bar_coordinate(
+            self.learning._is_finish_coordinate(
                 {"kind": "state_equals", "path": "status.position.row", "value": 8}
             )
         )
-        self.assertFalse(
-            self.learning._is_tos_bar_coordinate(
+        self.assertTrue(
+            self.learning._is_finish_coordinate(
                 {"kind": "state_equals", "path": "status.position.row", "value": 7}
             )
         )

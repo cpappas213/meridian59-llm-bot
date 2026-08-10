@@ -93,9 +93,10 @@ Choose the first applicable class:
 
 Return to room 52, column 8, row 8 at the Tos Inn bar only when the human's goal
 explicitly requires that finish. The adjacent `(8,7)` square is occupied by bar
-objects and is not a valid finish. A character in the disconnected Raza region
-must use Raza Inn room 1011 as its farm-launch sanctuary; do not attempt a route
-to room 52 merely to stage a Raza farm.
+objects and is not a valid finish. Farm launch staging is independent of that
+optional destination: select a room whose source facts include
+`ROOM_SANCTUARY` or `ROOM_NO_COMBAT`, prefer one actually observed and remembered
+as safe, and never infer a home city from the farm region.
 
 ## Combat goal notes
 

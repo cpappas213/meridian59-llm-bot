@@ -36,8 +36,8 @@ Statuses are:
 - `resolved`: verified success of the goal family resolved the lesson.
 
 Goal-family identity is based on normalized deterministic outcome criteria. It
-ignores titles, criterion IDs, `event_occurred.after_cursor`, and the standard
-Tos Inn bar completion phase. Those fields cannot be changed to evade a lesson.
+ignores titles, criterion IDs, `event_occurred.after_cursor`, and ancillary
+finish-location/coordinate criteria. Those fields cannot be changed to evade a lesson.
 At most one equivalent active, queued, or paused goal is retained. A direct
 duplicate submission returns the existing canonical goal rather than creating
 another retry.

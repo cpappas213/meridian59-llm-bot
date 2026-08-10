@@ -134,7 +134,7 @@ revising tactics in service of the active goal.
   a deterministic retry predicate.
 - **FR-GOAL-014**: The controller shall reject a materially equivalent
   goal-scoped retry until ordinary-client observation satisfies its predicate.
-  Title, criterion-id, event-cursor, and default-home changes shall not bypass
+  Title, criterion-id, event-cursor, and ancillary finish-state changes shall not bypass
   equivalence.
 - **FR-GOAL-015**: A tactic-scoped lesson shall suppress only the same failed
   action shape and shall not prevent a different tactic or supporting campaign
@@ -149,6 +149,10 @@ revising tactics in service of the active goal.
   controller shall deterministically evaluate paused and blocked goals and mark
   any goal whose complete typed criterion set is verified as `succeeded`
   without invoking the planning model.
+- **FR-GOAL-019**: Controller-owned purchase and training flows shall perform
+  post-acquisition travel or positioning only when the approved goal contains
+  the corresponding location or coordinate success criteria. No city, inn, or
+  square shall be an implicit completion destination.
 
 ### 4.3 Autonomous play
 
@@ -173,6 +177,10 @@ revising tactics in service of the active goal.
 - **FR-PLAY-008**: A bounded harness autopilot may perform repetitive mechanical
   work selected by the planner, but the controller remains responsible for
   monitoring progress, detecting stalls, and changing tactics.
+- **FR-PLAY-018**: A farm keeper shall launch only from a room whose pinned
+  source facts include `ROOM_SANCTUARY` or `ROOM_NO_COMBAT`. The controller may
+  reuse source-revalidated live staging history or select a connected/same-region
+  safe candidate, but shall not infer a fixed home city from the farm region.
 - **FR-PLAY-012**: A PvP search shall visit multiple grounded public rooms and
   acquire an attack target only from a fresh local observation. A global online
   list shall not establish local attackability. The controller shall immediately

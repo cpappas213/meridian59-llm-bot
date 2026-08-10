@@ -42,7 +42,7 @@ RECOVERABLE_PREPARATION_TOOLS = {
     "hunting_grounds",
     "knowledge_search",
 }
-HOME_EVENT_KINDS = {"goal.returned_to_tos_inn", "goal.home_reached"}
+HOME_EVENT_KINDS = {"goal.home_reached"}
 COMBAT_MEMORY_KEY = "combat_outcomes_v1"
 WEAPON_WORDS = ("mace", "hammer", "sword", "axe", "dagger", "bow", "staff", "club")
 ARMOR_WORDS = ("armor", "armour", "shield", "gauntlet", "glove", "pants", "breeches", "vest", "mail", "helm")
@@ -94,29 +94,24 @@ class GoalLearning:
         return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).split())
 
     @classmethod
-    def _is_tos_home_location(cls, criterion: dict[str, Any]) -> bool:
+    def _is_finish_location(cls, criterion: dict[str, Any]) -> bool:
         kind = criterion.get("kind")
         if kind == "location_reached":
-            named = cls._normal_text(criterion.get("location") or criterion.get("room") or "")
-            room_id = str(criterion.get("room_id", "")).strip()
-            return "tos inn" in named or room_id == "52"
+            return True
         if kind == "event_occurred":
             event_kind = str(criterion.get("event_kind", "")).casefold()
-            return event_kind in HOME_EVENT_KINDS or ("tos" in event_kind and "inn" in event_kind)
+            return event_kind in HOME_EVENT_KINDS or event_kind.startswith("goal.returned_to_")
         if kind == "state_equals":
             path = str(criterion.get("path", "")).casefold()
-            value = cls._normal_text(criterion.get("value", ""))
-            return "room" in path and "tos inn" in value
+            return "room" in path
         return False
 
     @staticmethod
-    def _is_tos_bar_coordinate(criterion: dict[str, Any]) -> bool:
+    def _is_finish_coordinate(criterion: dict[str, Any]) -> bool:
         if criterion.get("kind") != "state_equals":
             return False
         path = str(criterion.get("path", "")).casefold()
-        return criterion.get("value") == 8 and path.endswith(
-            ("position.col", "position.row")
-        )
+        return path.endswith(("position.col", "position.row"))
 
     @classmethod
     def _criterion_identity(cls, criterion: dict[str, Any]) -> dict[str, Any]:
@@ -138,12 +133,12 @@ class GoalLearning:
             for item in goal.get("success_criteria", [])
             if isinstance(item, dict)
         ]
-        has_tos_home = any(cls._is_tos_home_location(item) for item in source_criteria)
+        has_finish_location = any(cls._is_finish_location(item) for item in source_criteria)
         criteria = [
             cls._criterion_identity(item)
             for item in source_criteria
-            if not cls._is_tos_home_location(item)
-            and not (has_tos_home and cls._is_tos_bar_coordinate(item))
+            if not cls._is_finish_location(item)
+            and not (has_finish_location and cls._is_finish_coordinate(item))
         ]
         criteria.sort(key=canonical_json)
         if criteria:
@@ -946,13 +941,13 @@ class GoalLearning:
     def _suggested_goals(classification: str, profile: dict[str, Any]) -> list[str]:
         if classification in {"insufficient_combat_power", "missing_capability"}:
             return [
-                f"Raise max HP above {profile.get('max_health')} through safer progression, then return to the Tos Inn bar.",
-                "Acquire or improve combat equipment, a relevant trained skill, or verified healing supplies, then return to the Tos Inn bar.",
+                f"Raise max HP above {profile.get('max_health')} through safer progression, then satisfy any explicit finish criteria.",
+                "Acquire or improve combat equipment, a relevant trained skill, or verified healing supplies, then satisfy any explicit finish criteria.",
             ]
         if classification == "invalid_reference":
             return ["Choose a verified destination or target from knowledge_search; do not invent aliases."]
         if classification == "route_unavailable":
-            return ["Reach a connected staging room using verified numeric exits, then return to the Tos Inn bar."]
+            return ["Reach a connected source-verified safe staging room using verified numeric exits, then satisfy any explicit finish criteria."]
         if classification == "world_unavailable":
             return ["Pursue safe progression while waiting for the required player, NPC, or world condition."]
         return ["Choose a materially different tactic or supporting progression goal before retrying."]

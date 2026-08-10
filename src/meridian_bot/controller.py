@@ -50,9 +50,10 @@ MOVEMENT_TOOLS = {
 FOREGROUND_ROOM_TRANSITION_TOOLS = {"travel", "go_through"}
 
 TOS_BANK_ROOM_ID = 54
-TOS_INN_ROOM_ID = 52
-RAZA_INN_ROOM_ID = 1011
-RAZA_MAUSOLEUM_ROOM_ID = 1016
+# These IDs describe one concrete provisioning adapter, not a default home or
+# completion destination. Goal policy and farm staging must never derive from
+# them.
+TOS_PROVISION_ROOM_ID = 52
 TOS_INNKEEPER_NAME = "paddock"
 TOS_CHEESE_NAME = "wheel of cheese"
 TOS_CHEESE_VIGOR = 30
@@ -62,6 +63,8 @@ RESTED_VIGOR_FLOOR = 80
 FARM_FIGHT_VIGOR = 100
 PVP_TOOL_NAMES = frozenset({PVP_TOOL_NAME, PVP_SEEK_TOOL_NAME})
 PVP_ROUTE_FAILURE_RUNTIME_KEY = "pvp_route_failure_v1"
+SAFE_STAGING_FLAGS = frozenset({"ROOM_SANCTUARY", "ROOM_NO_COMBAT"})
+SAFE_STAGING_RUNTIME_KEY = "verified_safe_staging_room_v1"
 
 # The broker's keeper retains this many shillings as walking money and does not
 # expose that value through its public autopilot schema.  Sending a positive
@@ -181,7 +184,10 @@ class BotController:
         )
 
     def _pvp_room_policy(self, room_id: int) -> dict[str, Any] | None:
-        result = self.knowledge.get(f"location:{int(room_id)}")
+        getter = getattr(self.knowledge, "get", None)
+        if not callable(getter):
+            return {"known": False, "room_id": int(room_id)}
+        result = getter(f"location:{int(room_id)}")
         if result.get("status") != "found" or not isinstance(result.get("entity"), dict):
             return {"known": False, "room_id": int(room_id)}
         entity = result["entity"]
@@ -200,6 +206,45 @@ class BotController:
                 "corpus_version": evidence.get("corpus_version"),
             },
         }
+
+    @staticmethod
+    def _is_verified_safe_staging(policy: dict[str, Any] | None) -> bool:
+        if not isinstance(policy, dict) or policy.get("known") is not True:
+            return False
+        flags = policy.get("flags")
+        return isinstance(flags, list) and bool(
+            SAFE_STAGING_FLAGS.intersection(str(value) for value in flags)
+        )
+
+    def _verified_safe_staging(self, room_id: Any) -> dict[str, Any] | None:
+        try:
+            numeric_room_id = int(room_id)
+        except (TypeError, ValueError):
+            return None
+        policy = self._pvp_room_policy(numeric_room_id)
+        if not self._is_verified_safe_staging(policy):
+            return None
+        assert isinstance(policy, dict)
+        return {
+            "room_id": numeric_room_id,
+            "name": str(policy.get("name") or f"room {numeric_room_id}"),
+            "flags": sorted(str(value) for value in policy.get("flags", [])),
+            "evidence": policy.get("evidence"),
+            "basis": "source_verified_current_or_remembered_room",
+        }
+
+    def _remember_safe_staging(self, observation: dict[str, Any]) -> dict[str, Any] | None:
+        room_id = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        staging = self._verified_safe_staging(room_id)
+        if staging is None:
+            return None
+        value = {**staging, "observed_at": timestamp()}
+        self.storage.set_runtime(SAFE_STAGING_RUNTIME_KEY, value)
+        return value
 
     def _verified_guild_eligibility(self) -> bool:
         """Return true only when ordinary client state positively proves membership."""
@@ -1533,30 +1578,28 @@ class BotController:
                 "look.room.num",
                 deep_get(observation, "look.room_id"),
             )
-            launch_origin = self._farm_launch_origin_room(goal, observation, farm_intent)
-            if str(current_room) != str(launch_origin):
-                prior_steps = normalized_steps[:launch_index]
-                launch_origin_name = (
-                    "Raza Inn"
-                    if launch_origin == RAZA_INN_ROOM_ID
-                    else "Tos Inn"
+            launch_origin = self._farm_launch_origin(goal, observation, farm_intent)
+            if launch_origin is None:
+                raise ModelError(
+                    "the farm plan has no source-verified safe staging room; "
+                    "observe or reach a ROOM_SANCTUARY/ROOM_NO_COMBAT location first"
                 )
+            launch_room = int(launch_origin["room_id"])
+            if str(current_room) != str(launch_room):
+                prior_steps = normalized_steps[:launch_index]
+                launch_origin_name = str(launch_origin["name"])
                 has_return_to_inn = any(
                     step.get("tool") == "travel"
                     and (
-                        str(launch_origin) in canonical_json(step)
+                        str(launch_room) in canonical_json(step)
                         or normalize(launch_origin_name) in normalize(canonical_json(step))
-                        or (
-                            launch_origin == TOS_INN_ROOM_ID
-                            and "familiars" in normalize(canonical_json(step))
-                        )
                     )
                     for step in prior_steps
                 )
                 if not has_return_to_inn:
                     raise ModelError(
-                        "the farm plan must travel to the verified regional "
-                        f"sanctuary ({launch_origin_name}, room {launch_origin}) "
+                        "the farm plan must travel to the source-verified safe "
+                        f"staging room ({launch_origin_name}, room {launch_room}) "
                         "before its autopilot launch step"
                     )
         value = {
@@ -1975,6 +2018,66 @@ class BotController:
                 return transaction_verified
         return False
 
+    def _goal_completion_location(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return only a destination explicitly approved in goal criteria."""
+
+        for index, criterion in enumerate(goal.get("success_criteria", [])):
+            if not isinstance(criterion, dict) or criterion.get("kind") != "location_reached":
+                continue
+            room_id = criterion.get("room_id")
+            name = str(
+                criterion.get("location") or criterion.get("room") or ""
+            ).strip()
+            if room_id is None and name:
+                resolver = getattr(self.knowledge, "resolve", None)
+                if not callable(resolver):
+                    continue
+                resolved = resolver(name, kinds=["location"])
+                entity = (
+                    resolved.get("entity")
+                    if resolved.get("status") in {"found", "found_fuzzy"}
+                    else None
+                )
+                facts = entity.get("facts") if isinstance(entity, dict) else None
+                if isinstance(facts, dict):
+                    room_id = facts.get("room_id")
+                    name = str(entity.get("canonical_name") or name)
+            try:
+                numeric_room_id = int(room_id)
+            except (TypeError, ValueError):
+                # Travel is numeric and the controller may not invent a room
+                # from prose. The ordinary planner can gather more evidence.
+                continue
+            return {
+                "criterion_id": str(criterion.get("id") or f"criterion_{index + 1}"),
+                "room_id": numeric_room_id,
+                "name": name or f"room {numeric_room_id}",
+            }
+        return None
+
+    @staticmethod
+    def _goal_completion_position(goal: dict[str, Any]) -> dict[str, int] | None:
+        """Read an exact finish square only from explicit state criteria."""
+
+        position: dict[str, int] = {}
+        accepted_paths = {
+            "status.position.col": "col",
+            "look.position.col": "col",
+            "status.position.row": "row",
+            "look.position.row": "row",
+        }
+        for criterion in goal.get("success_criteria", []):
+            if not isinstance(criterion, dict) or criterion.get("kind") != "state_equals":
+                continue
+            coordinate = accepted_paths.get(str(criterion.get("path") or ""))
+            value = criterion.get("value")
+            if coordinate is None or not isinstance(value, int) or isinstance(value, bool):
+                continue
+            position[coordinate] = value
+        return position if {"col", "row"}.issubset(position) else None
+
     def _structured_purchase_controller_plan(
         self,
         goal: dict[str, Any],
@@ -1987,63 +2090,54 @@ class BotController:
         room_id = int(purchase.get("room_id") or 0)
         budget = purchase.get("maximum_price")
         budget_text = f"{budget} shillings" if isinstance(budget, int) else "the bounded price"
+        destination = self._goal_completion_location(goal)
+        position = self._goal_completion_position(goal)
+        steps = [
+            {
+                "id": "travel-to-purchase-bank",
+                "outcome": f"Reach First Royal Bank of Tos (room {TOS_BANK_ROOM_ID}) if {budget_text} is not carried.",
+                "tool": "travel",
+                "verification": f"Current room id is {TOS_BANK_ROOM_ID}.",
+            },
+            {
+                "id": "withdraw-purchase-funds",
+                "outcome": f"Withdraw only the shortfall needed to carry at most {budget_text} for {offering}.",
+                "tool": "bank",
+                "verification": f"Carried shillings are at least {budget if isinstance(budget, int) else 'the authorized amount'}.",
+            },
+            {
+                "id": "travel-to-purchase-merchant",
+                "outcome": f"Travel with the bounded funds to {merchant} in exact room {room_id}.",
+                "tool": "travel",
+                "verification": f"Current room id is {room_id} and the expected merchant is visible.",
+            },
+            {
+                "id": "buy-planned-offering",
+                "outcome": f"Use a fresh quote and buy only exact {offering_kind} {offering} within {budget_text}.",
+                "tool": "shop",
+                "verification": (
+                    f"The live {'ability list reports ' + offering + ' at 1 or above' if offering_kind in {'skill', 'spell'} else 'inventory contains ' + offering}."
+                ),
+            },
+            {
+                "id": "recover-purchase-go-exit",
+                "outcome": "If ordinary travel stalls while already standing on a reachable go exit, explicitly activate that exit once.",
+                "tool": "act",
+                "verification": "The current room changes through the externally directed reachable go exit.",
+            },
+            {
+                "id": "recover-purchase-route-hop",
+                "outcome": "If travel selects an unusable duplicate exit, use a live reachable go exit to the exact failed next-hop room.",
+                "tool": "go_through",
+                "verification": "The current room changes to the same next-hop room named by the failed travel log.",
+            },
+        ]
         plan = {
             "summary": (
                 f"Fund, live-verify, and acquire the exact {offering_kind} {offering} from {merchant}, "
-                "then verify the actual item/ability result before returning home."
+                "then verify the actual item/ability result and only the finish state named by the goal."
             ),
-            "steps": [
-                {
-                    "id": "travel-to-purchase-bank",
-                    "outcome": f"Reach First Royal Bank of Tos (room {TOS_BANK_ROOM_ID}) if {budget_text} is not carried.",
-                    "tool": "travel",
-                    "verification": f"Current room id is {TOS_BANK_ROOM_ID}.",
-                },
-                {
-                    "id": "withdraw-purchase-funds",
-                    "outcome": f"Withdraw only the shortfall needed to carry at most {budget_text} for {offering}.",
-                    "tool": "bank",
-                    "verification": f"Carried shillings are at least {budget if isinstance(budget, int) else 'the authorized amount'}.",
-                },
-                {
-                    "id": "travel-to-purchase-merchant",
-                    "outcome": f"Travel with the bounded funds to {merchant} in exact room {room_id}.",
-                    "tool": "travel",
-                    "verification": f"Current room id is {room_id} and the expected merchant is visible.",
-                },
-                {
-                    "id": "buy-planned-offering",
-                    "outcome": f"Use a fresh quote and buy only exact {offering_kind} {offering} within {budget_text}.",
-                    "tool": "shop",
-                    "verification": (
-                        f"The live {'ability list reports ' + offering + ' at 1 or above' if offering_kind in {'skill', 'spell'} else 'inventory contains ' + offering}."
-                    ),
-                },
-                {
-                    "id": "recover-purchase-go-exit",
-                    "outcome": "If ordinary travel stalls while already standing on a reachable go exit, explicitly activate that exit once.",
-                    "tool": "act",
-                    "verification": "The current room changes through the externally directed reachable go exit.",
-                },
-                {
-                    "id": "recover-purchase-route-hop",
-                    "outcome": "If travel selects an unusable duplicate exit, use a live reachable go exit to the exact failed next-hop room.",
-                    "tool": "go_through",
-                    "verification": "The current room changes to the same next-hop room named by the failed travel log.",
-                },
-                {
-                    "id": "return-purchase-to-tos-inn",
-                    "outcome": "After the exact acquisition criterion is verified, travel back to Tos Inn (room 52).",
-                    "tool": "travel",
-                    "verification": "Current room id is 52.",
-                },
-                {
-                    "id": "finish-purchase-at-tos-bar",
-                    "outcome": "Walk to the verified bar-side square (8,8) inside Tos Inn.",
-                    "tool": "walk_to",
-                    "verification": "Current room id is 52 and position is column 8, row 8.",
-                },
-            ],
+            "steps": steps,
             "assumptions": [],
             "revision_reason": (
                 "Use controller-owned funding and exact live quote binding instead of conversational trial and error."
@@ -2059,17 +2153,37 @@ class BotController:
             and farm_intent.get("assigned_room") is not None
             and farm_intent.get("hunt")
         ):
-            # A combined acquire-then-farm goal still needs a plan that proves the
-            # hazardous phase is goal-owned. Drop the two optional legacy route-repair
-            # steps to stay within the eight-step contract; the broker now retries a
-            # totally silent go exit itself, and a concrete route failure can still
-            # cause a later state-specific plan revision.
+            staging = self._farm_launch_origin(
+                goal, self.last_observation or {}, farm_intent
+            )
+            if staging is None:
+                raise ModelError(
+                    "no source-verified safe staging room is available for the farm launch"
+                )
+            # A combined acquire-then-farm goal still needs to prove both the
+            # safe launch boundary and the hazardous phase's goal ownership.
+            # Route-repair steps are optional and omitted to stay within the
+            # eight-step contract.
             plan["steps"] = [
                 step
                 for step in plan["steps"]
                 if step["id"]
                 not in {"recover-purchase-go-exit", "recover-purchase-route-hop"}
             ]
+            plan["steps"].append(
+                {
+                    "id": "reach-farm-staging",
+                    "outcome": (
+                        f"Reach source-verified safe staging {staging['name']} "
+                        f"(room {staging['room_id']}) before keeper launch."
+                    ),
+                    "tool": "travel",
+                    "verification": (
+                        f"Current room id is {staging['room_id']} and source flags include "
+                        "ROOM_SANCTUARY or ROOM_NO_COMBAT."
+                    ),
+                }
+            )
             plan["steps"].append(
                 {
                     "id": "launch-goal-keeper",
@@ -2085,12 +2199,39 @@ class BotController:
                 }
             )
             plan["summary"] = (
-                f"Acquire the exact {offering_kind} {offering}, return to Tos Inn, "
-                f"then launch the grounded {farm_intent['hunt']} farm phase."
+                f"Acquire the exact {offering_kind} {offering}, reach source-verified "
+                f"safe staging, then launch the grounded {farm_intent['hunt']} farm phase."
             )
             plan["revision_reason"] = (
                 "Compose the controller-owned purchase prerequisite with the explicit "
                 "goal-owned farm launch required by this combined goal."
+            )
+        if destination is not None:
+            plan["steps"].append(
+                {
+                    "id": "finish-purchase-at-goal-location",
+                    "outcome": (
+                        "After prerequisite work is verified, travel to the goal's "
+                        f"explicit destination {destination['name']} "
+                        f"(room {destination['room_id']})."
+                    ),
+                    "tool": "travel",
+                    "verification": f"Current room id is {destination['room_id']}.",
+                }
+            )
+        if position is not None:
+            plan["steps"].append(
+                {
+                    "id": "finish-purchase-at-goal-position",
+                    "outcome": (
+                        "Walk to the goal's explicit finish square "
+                        f"({position['col']},{position['row']})."
+                    ),
+                    "tool": "walk_to",
+                    "verification": (
+                        f"Position is column {position['col']}, row {position['row']}."
+                    ),
+                }
             )
         return plan
 
@@ -2127,7 +2268,26 @@ class BotController:
             }
 
         if self._purchase_result_met(goal, completion):
-            if str(current_room) != str(TOS_INN_ROOM_ID):
+            farm_intent = self._effective_farm_intent(goal)
+            farm_work_remains = any(
+                item["result"].get("met") is not True
+                for item in self._health_progress_criteria(goal, completion)
+            )
+            if (
+                farm_work_remains
+                and farm_intent.get("assigned_room") is not None
+                and farm_intent.get("hunt")
+            ):
+                # The farm preparation path owns safe staging. An acquisition
+                # must not smuggle an unrelated implicit return-home trip in
+                # front of that goal-owned hazardous phase.
+                return None
+
+            destination = self._goal_completion_location(goal)
+            if destination is not None and str(current_room) != str(
+                destination["room_id"]
+            ):
+                destination_room = int(destination["room_id"])
                 blocked_actions = self.storage.get_runtime("blocked_actions", [])
                 blocked_actions = (
                     blocked_actions if isinstance(blocked_actions, list) else []
@@ -2140,7 +2300,7 @@ class BotController:
                     and (
                         blocked.get("tool") == "go_through"
                         or str(deep_get(blocked, "arguments.to"))
-                        == str(TOS_INN_ROOM_ID)
+                        == str(destination_room)
                     )
                     and "stood on the exit square and nothing happened"
                     in str(blocked.get("reason") or "").casefold()
@@ -2178,7 +2338,7 @@ class BotController:
                         if isinstance(event, dict)
                         and deep_get(event, "data.tool") == "travel"
                         and str(deep_get(event, "data.arguments.to"))
-                        == str(TOS_INN_ROOM_ID)
+                        == str(destination_room)
                         and str(deep_get(event, "data.room.num", deep_get(event, "data.room.id")))
                         == str(current_room)
                     ),
@@ -2228,10 +2388,13 @@ class BotController:
                     )
                 return action(
                     "travel",
-                    {"to": TOS_INN_ROOM_ID},
-                    "return-purchase-to-tos-inn",
-                    "The exact acquisition is verified; return to Tos Inn before final bar positioning.",
+                    {"to": destination_room},
+                    "finish-purchase-at-goal-location",
+                    "The exact acquisition is verified; travel only to the destination explicitly named by the approved goal.",
                 )
+            position = self._goal_completion_position(goal)
+            if position is None:
+                return None
             col = deep_get(
                 observation,
                 "status.position.col",
@@ -2242,12 +2405,12 @@ class BotController:
                 "status.position.row",
                 deep_get(observation, "look.position.row"),
             )
-            if str(col) != "8" or str(row) != "8":
+            if str(col) != str(position["col"]) or str(row) != str(position["row"]):
                 return action(
                     "walk_to",
-                    {"col": 8, "row": 8},
-                    "finish-purchase-at-tos-bar",
-                    "Finish the completed acquisition phase at the verified Tos Inn bar square.",
+                    {"col": position["col"], "row": position["row"]},
+                    "finish-purchase-at-goal-position",
+                    "Finish at the exact coordinates explicitly named by the approved goal.",
                 )
             return None
 
@@ -2958,6 +3121,7 @@ class BotController:
                 self.broker.ensure_joined()
             observation = self.broker.observe()
             self.last_observation = observation
+            self._remember_safe_staging(observation)
             self.storage.record_snapshot(redact(observation))
             self.dependencies["broker"] = "healthy"
             return observation
@@ -4202,18 +4366,13 @@ class BotController:
             for key in keys
         }
 
-    def _farm_launch_origin_room(
+    def _farm_launch_origin(
         self,
         goal: dict[str, Any],
         observation: dict[str, Any],
         intent: dict[str, Any] | None = None,
-    ) -> int:
-        """Choose the sanctuary connected to the active farm phase.
-
-        Tos Inn is the normal mainland launch point. Raza is a separate route
-        component, so forcing a Raza character or the Raza Mausoleum phase to
-        stage through room 52 creates a permanent no-route loop.
-        """
+    ) -> dict[str, Any] | None:
+        """Choose safe farm staging from evidence, never a regional default."""
 
         farm_intent = intent or self._effective_farm_intent(goal)
         current_room = deep_get(
@@ -4221,12 +4380,48 @@ class BotController:
             "look.room.num",
             deep_get(observation, "look.room_id"),
         )
-        assigned_room = farm_intent.get("assigned_room")
-        if str(current_room) == str(RAZA_INN_ROOM_ID) or str(assigned_room) == str(
-            RAZA_MAUSOLEUM_ROOM_ID
-        ):
-            return RAZA_INN_ROOM_ID
-        return TOS_INN_ROOM_ID
+        current = self._verified_safe_staging(current_room)
+        if current is not None:
+            value = {**current, "observed_at": timestamp()}
+            self.storage.set_runtime(SAFE_STAGING_RUNTIME_KEY, value)
+            return value
+
+        remembered = self.storage.get_runtime(SAFE_STAGING_RUNTIME_KEY, {})
+        remembered_room = (
+            remembered.get("room_id") if isinstance(remembered, dict) else None
+        )
+        finder = getattr(self.knowledge, "nearest_safe_location", None)
+        if callable(finder):
+            for seed in (current_room, farm_intent.get("assigned_room")):
+                try:
+                    candidate = finder(
+                        int(seed), preferred_room_id=remembered_room
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(candidate, dict) or candidate.get("status") != "found":
+                    continue
+                verified = self._verified_safe_staging(candidate.get("room_id"))
+                if verified is None:
+                    continue
+                return {
+                    **verified,
+                    "basis": candidate.get("basis") or "source_derived_safe_room",
+                    "distance": candidate.get("distance"),
+                    "from_room_id": candidate.get("from_room_id"),
+                }
+
+        # A source corpus can omit route edges. Reuse the last live-observed
+        # safe room only when no source-connected or same-region candidate can
+        # be established; live travel still verifies reachability.
+        verified_remembered = self._verified_safe_staging(remembered_room)
+        if verified_remembered is not None:
+            return {
+                **verified_remembered,
+                "observed_at": remembered.get("observed_at"),
+                "basis": "source_revalidated_last_observed_safe_room",
+            }
+        return None
 
     def _structured_farm_launch_plan(
         self,
@@ -4250,8 +4445,8 @@ class BotController:
         if intent.get("assigned_room") is None or not intent.get("hunt"):
             return None
         current_room = deep_get(observation, "look.room.num")
-        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
-        if str(current_room) != str(launch_origin):
+        launch_origin = self._farm_launch_origin(goal, observation, intent)
+        if launch_origin is None or str(current_room) != str(launch_origin["room_id"]):
             return None
 
         readiness = self.learning.readiness_summary(observation)
@@ -4284,8 +4479,8 @@ class BotController:
             "tool": "autopilot",
             "arguments": arguments,
             "rationale": (
-                "Launch the goal-owned bounded keeper from the verified regional "
-                "sanctuary using the grounded farm recipe; preparation and "
+                "Launch the goal-owned bounded keeper from a source-verified "
+                "safe staging room using the grounded farm recipe; preparation and "
                 "deterministic safety preflight are complete."
             ),
             "expected_observation": {
@@ -4357,78 +4552,55 @@ class BotController:
     ) -> dict[str, Any]:
         intent = self._effective_farm_intent(goal)
         observation = self.last_observation or {}
-        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
-        if launch_origin == RAZA_INN_ROOM_ID:
-            return {
-                "summary": (
-                    "Prepare inside Raza Inn, launch the goal-owned keeper for "
-                    "the bounded regional farm, then verify the HP outcome."
+        launch_origin = self._farm_launch_origin(goal, observation, intent)
+        if launch_origin is None:
+            raise ModelError(
+                "no source-verified safe staging room is available for the farm launch"
+            )
+        launch_room = int(launch_origin["room_id"])
+        launch_name = str(launch_origin["name"])
+        steps: list[dict[str, Any]] = [
+            {
+                "id": "farm-bank-transit",
+                "outcome": (
+                    f"Reach source-verified safe staging {launch_name} "
+                    f"(room {launch_room}) for the next preparation action."
                 ),
-                "steps": [
-                    {
-                        "id": "rest-for-farm",
-                        "outcome": "Rest safely to the ordinary 80-vigor threshold and stand again.",
-                        "tool": "rest_up",
-                        "verification": "Live vigor is at least 80 and the character is standing.",
-                    },
-                    {
-                        "id": "equip-before-farm",
-                        "outcome": "Ensure the best carried weapon is equipped before leaving Raza Inn.",
-                        "tool": "equip_best",
-                        "verification": "The equipment list reports a wielded weapon.",
-                    },
-                    {
-                        "id": "launch-goal-keeper",
-                        "outcome": (
-                            "Launch the grounded goal-owned keeper from Raza Inn "
-                            f"for {intent.get('hunt')} in assigned room "
-                            f"{intent.get('assigned_room')}."
-                        ),
-                        "tool": "autopilot",
-                        "verification": (
-                            "Keeper status reports running with this goal id, prey "
-                            f"{intent.get('hunt')}, and assigned room "
-                            f"{intent.get('assigned_room')}."
-                        ),
-                    },
-                ],
-                "assumptions": [],
-                "revision_reason": (
-                    "Use the sanctuary connected to the active Raza phase instead "
-                    "of attempting an unavailable route to Tos Inn."
+                "tool": "travel",
+                "verification": (
+                    f"Current room id is {launch_room} and its source flags include "
+                    "ROOM_SANCTUARY or ROOM_NO_COMBAT."
                 ),
             }
-        return {
-            "summary": (
-                "Provision only the food needed for the numeric vigor gate, "
-                "launch the goal-owned keeper from Tos Inn, then verify the "
-                "bounded HP outcome and home finish."
-            ),
-            "steps": [
-                {
-                    "id": "farm-bank-transit",
-                    "outcome": "Travel between Tos Inn and First Royal Bank of Tos (room 54) as farm funding and final banking require.",
-                    "tool": "travel",
-                    "verification": "Current room is the intended Tos Inn or bank endpoint for the next preparation action.",
-                },
-                {
-                    "id": "withdraw-provision-funds",
-                    "outcome": "Withdraw only the live quoted cost of the remaining farm food.",
-                    "tool": "bank",
-                    "verification": "Carried shillings increased by the requested amount.",
-                },
-                {
-                    "id": "deposit-before-farm",
-                    "outcome": "After provisioning is complete, deposit any carried shillings before the hazardous phase.",
-                    "tool": "bank",
-                    "verification": "A verified bank receipt permits the current carried amount for this phase.",
-                },
-                {
-                    "id": "buy-farm-food",
-                    "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {FARM_FIGHT_VIGOR}-vigor launch gate.",
-                    "tool": "shop",
-                    "verification": f"Verified carried food nutrition plus rested vigor reaches at least {FARM_FIGHT_VIGOR}.",
-                },
+        ]
+        if launch_room == TOS_PROVISION_ROOM_ID:
+            # This is a concrete food-vendor adapter selected only when that
+            # source-verified room is already the staging point. It is not a
+            # regional or completion default.
+            steps.extend(
+                [
+                    {
+                        "id": "withdraw-provision-funds",
+                        "outcome": "Withdraw only the live quoted cost of the remaining farm food.",
+                        "tool": "bank",
+                        "verification": "Carried shillings increased by the requested amount.",
+                    },
+                    {
+                        "id": "deposit-before-farm",
+                        "outcome": "After provisioning is complete, deposit any carried shillings before the hazardous phase.",
+                        "tool": "bank",
+                        "verification": "A verified bank receipt permits the current carried amount for this phase.",
+                    },
+                    {
+                        "id": "buy-farm-food",
+                        "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {FARM_FIGHT_VIGOR}-vigor launch gate.",
+                        "tool": "shop",
+                        "verification": f"Verified carried food nutrition plus rested vigor reaches at least {FARM_FIGHT_VIGOR}.",
+                    },
+                ]
+            )
+        steps.extend(
+            [
                 {
                     "id": "rest-for-farm",
                     "outcome": "Rest safely to the ordinary 80-vigor ceiling and stand again.",
@@ -4437,15 +4609,15 @@ class BotController:
                 },
                 {
                     "id": "equip-before-farm",
-                    "outcome": "Ensure the best carried weapon is equipped before leaving sanctuary.",
+                    "outcome": "Ensure the best carried weapon is equipped before leaving safe staging.",
                     "tool": "equip_best",
                     "verification": "The equipment list reports a wielded weapon.",
                 },
                 {
                     "id": "launch-goal-keeper",
                     "outcome": (
-                        "Launch the grounded goal-owned keeper from Tos Inn for "
-                        f"{intent.get('hunt')} in assigned room "
+                        f"Launch the grounded goal-owned keeper from {launch_name} "
+                        f"for {intent.get('hunt')} in assigned room "
                         f"{intent.get('assigned_room')}."
                     ),
                     "tool": "autopilot",
@@ -4455,17 +4627,18 @@ class BotController:
                         f"{intent.get('assigned_room')}."
                     ),
                 },
-                {
-                    "id": "finish-at-tos-bar",
-                    "outcome": "After the HP criterion is met, finish inside Tos Inn by the bar.",
-                    "tool": "walk_to",
-                    "verification": "All deterministic HP and return-home criteria are met.",
-                },
-            ],
+            ]
+        )
+        return {
+            "summary": (
+                f"Prepare in source-verified safe staging {launch_name}, launch "
+                "the goal-owned bounded keeper, then verify the HP outcome."
+            ),
+            "steps": steps,
             "assumptions": [],
             "revision_reason": (
-                "Replace model-selected preparation with a live-state-driven "
-                "bounded provisioning sequence."
+                "Bind launch staging to source safety facts and live state; use "
+                "the Tos food adapter only when its room is already that staging point."
             ),
         }
 
@@ -4485,7 +4658,10 @@ class BotController:
             return None
 
         current_room = deep_get(observation, "look.room.num")
-        launch_origin = self._farm_launch_origin_room(goal, observation, intent)
+        launch_origin = self._farm_launch_origin(goal, observation, intent)
+        if launch_origin is None:
+            return None
+        launch_room = int(launch_origin["room_id"])
         readiness = self.learning.readiness_summary(observation)
         supply = self._combat_vigor_supply(observation)
         vigor = deep_get(
@@ -4561,19 +4737,19 @@ class BotController:
             }
 
         if nutrition_shortfall > 0 and not can_make_food:
-            if launch_origin != TOS_INN_ROOM_ID:
-                # Tos-specific Paddock/bank provisioning is not reachable from
-                # Raza. Let the tactical planner locate regional supplies rather
-                # than forcing an already-disproved cross-region route.
+            if launch_room != TOS_PROVISION_ROOM_ID:
+                # The deterministic adapter only knows this exact vendor/bank
+                # pair. Let the tactical planner locate supplies elsewhere;
+                # never turn one provider into a regional travel policy.
                 return None
             quote = self._recent_farm_food_quote(goal)
             if quote is None:
-                if str(current_room) != str(TOS_INN_ROOM_ID):
+                if str(current_room) != str(TOS_PROVISION_ROOM_ID):
                     return action(
                         "travel",
-                        {"to": TOS_INN_ROOM_ID},
+                        {"to": TOS_PROVISION_ROOM_ID},
                         "farm-bank-transit",
-                        "Return to the safe inn to obtain a fresh food quote.",
+                        "Reach the selected safe staging room to obtain a fresh quote from its verified provisioner.",
                     )
                 seller = self._visible_tos_innkeeper(observation)
                 if seller is None:
@@ -4606,12 +4782,12 @@ class BotController:
                     "withdraw-provision-funds",
                     "Withdraw exactly the remaining live quoted food cost.",
                 )
-            if str(current_room) != str(TOS_INN_ROOM_ID):
+            if str(current_room) != str(TOS_PROVISION_ROOM_ID):
                 return action(
                     "travel",
-                    {"to": TOS_INN_ROOM_ID},
+                    {"to": TOS_PROVISION_ROOM_ID},
                     "farm-bank-transit",
-                    "Return to Paddock with the bounded provision funds.",
+                    "Return to the selected staging room's verified provisioner with the bounded funds.",
                 )
             return action(
                 "shop",
@@ -4620,12 +4796,12 @@ class BotController:
                 "Buy one verified wheel at a time until carried nutrition reaches the gate.",
             )
 
-        if str(current_room) != str(launch_origin):
+        if str(current_room) != str(launch_room):
             return action(
                 "travel",
-                {"to": launch_origin},
+                {"to": launch_room},
                 "farm-bank-transit",
-                "Return to the verified regional sanctuary before the keeper launch.",
+                "Reach the source-verified safe staging room before the keeper launch.",
             )
         rested = deep_get(
             observation,
@@ -6350,6 +6526,7 @@ class BotController:
         try:
             observation = self.broker.observe()
             self.last_observation = observation
+            self._remember_safe_staging(observation)
             self.storage.record_snapshot(redact(observation))
             self._record_character_progress(observation)
             self.dependencies["broker"] = "healthy"
@@ -6456,7 +6633,7 @@ class BotController:
                             "farm launch",
                             "autopilot launch",
                             "assigned room",
-                            "tos inn room 52",
+                            "safe staging room",
                         )
                     )
                 ):
@@ -6464,8 +6641,8 @@ class BotController:
             # A successfully learned skill/spell normally disappears from the
             # teacher's quote. Verify the durable transaction result first;
             # re-running stock preflight after acquisition would misclassify
-            # that expected disappearance as world_unavailable and block the
-            # required return-home phase.
+            # that expected disappearance as world_unavailable and block any
+            # remaining explicit completion criteria.
             purchase_result_met = self._purchase_result_met(goal, completion)
             purchase_preflight = (
                 None
@@ -6601,20 +6778,20 @@ class BotController:
                 execution_plan = self._execution_plan(goal)
                 if execution_plan is None:
                     structured_intent = self._effective_farm_intent(goal)
-                    launch_origin = self._farm_launch_origin_room(
+                    launch_origin = self._farm_launch_origin(
                         goal, observation, structured_intent
                     )
-                    launch_origin_name = (
-                        "Raza Inn"
-                        if launch_origin == RAZA_INN_ROOM_ID
-                        else "Tos Inn"
-                    )
+                    if launch_origin is None:
+                        raise ModelError(
+                            "no source-verified safe staging room is available for keeper launch"
+                        )
+                    launch_origin_name = str(launch_origin["name"])
                     execution_plan = self._store_execution_plan(
                         goal,
                         {
                             "summary": (
-                                "Launch the goal-owned keeper from the verified "
-                                "regional sanctuary, then verify the bounded outcome."
+                                "Launch the goal-owned keeper from source-verified "
+                                "safe staging, then verify the bounded outcome."
                             ),
                             "steps": [
                                 {
@@ -6664,6 +6841,11 @@ class BotController:
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
+            farm_intent = self._effective_farm_intent(goal)
+            if farm_intent.get("assigned_room") is not None and farm_intent.get("hunt"):
+                grounded_context["farm_safe_staging"] = self._farm_launch_origin(
+                    goal, observation, farm_intent
+                )
             if purchase_preflight is not None:
                 grounded_context["purchase_preflight"] = redact(purchase_preflight)
             execution_plan = self._execution_plan(goal)
@@ -7036,6 +7218,7 @@ class BotController:
             # Never authorize a hazardous start from that stale observation.
             observation = self.broker.observe()
             self.last_observation = observation
+            self._remember_safe_staging(observation)
             self.storage.record_snapshot(redact(observation))
             if direct_pvp is not None and tool == PVP_TOOL_NAME:
                 expired = self._expire_direct_pvp_opportunity(

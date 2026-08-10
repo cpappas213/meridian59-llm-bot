@@ -9,6 +9,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+from collections import defaultdict, deque
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
@@ -1295,6 +1296,132 @@ class KnowledgeBase:
         finally:
             connection.close()
 
+    def nearest_safe_location(
+        self, room_id: int, *, preferred_room_id: int | None = None
+    ) -> dict[str, Any]:
+        """Find a source-verified staging room without encoding a home city.
+
+        A live observation of a safe room remains stronger evidence and is
+        remembered by the controller. This lookup is the restart/failure
+        fallback: it ranks safe rooms connected in the pinned source graph,
+        then safe rooms in the same source region when a zone has no declared
+        exit graph (as happens for some isolated areas).
+        """
+
+        try:
+            numeric_room_id = int(room_id)
+        except (TypeError, ValueError):
+            return {"status": "invalid_room", "room_id": room_id}
+        if not self.available:
+            return {
+                "status": "unavailable",
+                "room_id": numeric_room_id,
+                "corpus": self.metadata(),
+            }
+
+        safe_flags = {"ROOM_SANCTUARY", "ROOM_NO_COMBAT"}
+        start_id = f"location:{numeric_room_id}"
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id,canonical_name,payload_json,source_ref FROM entities WHERE kind='location'"
+            ).fetchall()
+            locations: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                facts = json.loads(row["payload_json"])
+                flags = {
+                    str(value)
+                    for value in facts.get("flags", [])
+                    if str(value)
+                }
+                locations[str(row["id"])] = {
+                    "room_id": facts.get("room_id"),
+                    "name": row["canonical_name"],
+                    "region": facts.get("region"),
+                    "flags": sorted(flags),
+                    "source_ref": row["source_ref"],
+                }
+            start = locations.get(start_id)
+            if start is None:
+                return {
+                    "status": "unknown_room",
+                    "room_id": numeric_room_id,
+                    "corpus": self.metadata(),
+                }
+
+            adjacency: dict[str, set[str]] = defaultdict(set)
+            for relation in connection.execute(
+                "SELECT subject_id,object_id FROM relations WHERE predicate='connects_to'"
+            ):
+                subject = str(relation["subject_id"])
+                target = str(relation["object_id"])
+                # The source describes a room connection, while the live
+                # travel tool remains authoritative about usable direction.
+                adjacency[subject].add(target)
+                adjacency[target].add(subject)
+
+            distances = {start_id: 0}
+            queue = deque([start_id])
+            while queue:
+                current = queue.popleft()
+                for neighbor in adjacency.get(current, set()):
+                    if neighbor in distances:
+                        continue
+                    distances[neighbor] = distances[current] + 1
+                    queue.append(neighbor)
+
+            candidates: list[tuple[tuple[Any, ...], str, str]] = []
+            for entity_id, candidate in locations.items():
+                flags = set(candidate["flags"])
+                if not flags.intersection(safe_flags):
+                    continue
+                distance = distances.get(entity_id)
+                same_region = bool(start.get("region")) and (
+                    normalize(candidate.get("region"))
+                    == normalize(start.get("region"))
+                )
+                if distance is None and not same_region:
+                    continue
+                safety_score = (
+                    8 * ("ROOM_SANCTUARY" in flags)
+                    + 4 * ("ROOM_SAFELOGOFF" in flags)
+                    + 2 * ("ROOM_TRIPLE_HEAL" in flags)
+                    + ("ROOM_HOMETOWN" in flags)
+                    + ("ROOM_NO_COMBAT" in flags)
+                )
+                basis = "source_connection_graph" if distance is not None else "source_region"
+                rank = (
+                    0 if distance is not None else 1,
+                    distance if distance is not None else 0,
+                    0 if str(candidate.get("room_id")) == str(preferred_room_id) else 1,
+                    -safety_score,
+                    normalize(candidate.get("name")),
+                )
+                candidates.append((rank, entity_id, basis))
+
+            if not candidates:
+                return {
+                    "status": "not_found",
+                    "room_id": numeric_room_id,
+                    "corpus": self.metadata(),
+                }
+            _rank, entity_id, basis = min(candidates, key=lambda value: value[0])
+            selected = locations[entity_id]
+            return {
+                "status": "found",
+                **selected,
+                "distance": distances.get(entity_id),
+                "basis": basis,
+                "from_room_id": numeric_room_id,
+                "evidence": {
+                    "source_tier": "source-derived",
+                    "source_ref": selected.get("source_ref"),
+                    "corpus_version": self.corpus_version,
+                },
+            }
+        finally:
+            connection.close()
+
     def _room_spawn_table(
         self,
         connection: sqlite3.Connection,
@@ -2393,7 +2520,7 @@ class KnowledgeBase:
                 "Treat every candidate as progression-eligible, not proven safe; combine matchup, equipment, and empirical outcomes.",
                 "When selecting a wall strategy, compare safe_spot_evidence across rooms and require the keeper to re-verify the chosen square live.",
                 "Use live advancement and character observations to override static candidates.",
-                "Choose small milestones and return to the Tos Inn bar at goal completion when requested.",
+                "Choose small milestones and satisfy only finish criteria explicitly requested by the human.",
             ],
             "corpus": self.metadata(),
         }
