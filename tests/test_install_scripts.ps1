@@ -57,7 +57,8 @@ if ((Read-InstallTimezone "") -ne "America/Los_Angeles") {
     throw "The Pacific Time menu choice did not return America/Los_Angeles"
 }
 
-$aclTestPath = Join-Path $projectRoot "runtime\acl-installer-test.tmp"
+$aclTestName = "m59-acl-installer-test-$([guid]::NewGuid().ToString('N')).tmp"
+$aclTestPath = Join-Path ([System.IO.Path]::GetTempPath()) $aclTestName
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $aclTestPath)) | Out-Null
 [System.IO.File]::WriteAllText($aclTestPath, "test")
 try {

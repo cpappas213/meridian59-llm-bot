@@ -549,7 +549,11 @@ class VllmClient:
                 },
             ],
             self.config.model.planner_timeout_seconds,
-            max_tokens=max(1200, self.config.model.max_output_tokens),
+            # Thinking-capable models count their reasoning and the final JSON
+            # against the same completion budget. Goal contracts are compact,
+            # but the model still needs enough room to finish its reasoning and
+            # emit the structured object.
+            max_tokens=max(4096, self.config.model.max_output_tokens),
         )
 
     def plan(
