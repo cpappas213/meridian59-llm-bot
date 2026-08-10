@@ -1296,16 +1296,21 @@ class KnowledgeBase:
         finally:
             connection.close()
 
-    def nearest_safe_location(
-        self, room_id: int, *, preferred_room_id: int | None = None
+    def safe_location_candidates(
+        self,
+        room_id: int,
+        *,
+        preferred_room_id: int | None = None,
+        limit: int = 12,
     ) -> dict[str, Any]:
-        """Find a source-verified staging room without encoding a home city.
+        """List reachable source-verified safe rooms without choosing one.
 
         A live observation of a safe room remains stronger evidence and is
-        remembered by the controller. This lookup is the restart/failure
-        fallback: it ranks safe rooms connected in the pinned source graph,
-        then safe rooms in the same source region when a zone has no declared
-        exit graph (as happens for some isolated areas).
+        remembered by the controller. This lookup exposes safe rooms connected
+        in the pinned source graph, then safe rooms in the same source region
+        when a zone has no declared exit graph (as happens for some isolated
+        areas). The ordering is useful context, but the planner—not this
+        adapter—chooses the plan's ending location.
         """
 
         try:
@@ -1403,24 +1408,54 @@ class KnowledgeBase:
                 return {
                     "status": "not_found",
                     "room_id": numeric_room_id,
+                    "candidates": [],
                     "corpus": self.metadata(),
                 }
-            _rank, entity_id, basis = min(candidates, key=lambda value: value[0])
-            selected = locations[entity_id]
+            ranked: list[dict[str, Any]] = []
+            for _rank, entity_id, basis in sorted(
+                candidates, key=lambda value: value[0]
+            )[: max(1, min(int(limit), 50))]:
+                selected = locations[entity_id]
+                ranked.append(
+                    {
+                        **selected,
+                        "distance": distances.get(entity_id),
+                        "basis": basis,
+                        "from_room_id": numeric_room_id,
+                        "evidence": {
+                            "source_tier": "source-derived",
+                            "source_ref": selected.get("source_ref"),
+                            "corpus_version": self.corpus_version,
+                        },
+                    }
+                )
             return {
                 "status": "found",
-                **selected,
-                "distance": distances.get(entity_id),
-                "basis": basis,
                 "from_room_id": numeric_room_id,
-                "evidence": {
-                    "source_tier": "source-derived",
-                    "source_ref": selected.get("source_ref"),
-                    "corpus_version": self.corpus_version,
-                },
+                "candidates": ranked,
+                "corpus": self.metadata(),
             }
         finally:
             connection.close()
+
+    def nearest_safe_location(
+        self, room_id: int, *, preferred_room_id: int | None = None
+    ) -> dict[str, Any]:
+        """Select the first safe candidate for controller-owned fallback only."""
+
+        result = self.safe_location_candidates(
+            room_id,
+            preferred_room_id=preferred_room_id,
+            limit=1,
+        )
+        candidates = result.get("candidates")
+        if result.get("status") != "found" or not isinstance(candidates, list) or not candidates:
+            return {
+                key: value
+                for key, value in result.items()
+                if key != "candidates"
+            }
+        return {"status": "found", **candidates[0]}
 
     def _room_spawn_table(
         self,

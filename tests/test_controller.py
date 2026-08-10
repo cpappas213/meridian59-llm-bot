@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import tempfile
 import time
 import unittest
@@ -45,9 +46,146 @@ def source_verify_safe_rooms(controller: BotController, *room_ids: int) -> None:
     controller._pvp_room_policy = policy  # type: ignore[method-assign]
 
 
+def with_safe_ending(
+    plan: dict[str, object], room_id: int, *, step_id: str = "finish-safe"
+) -> dict[str, object]:
+    """Attach the required model-selected final safe travel to a test plan."""
+
+    steps = [
+        dict(step)
+        for step in plan.get("steps", [])
+        if isinstance(step, dict) and str(step.get("id") or "") != step_id
+    ]
+    steps.append(
+        {
+            "id": step_id,
+            "outcome": f"Finish in source-verified safe room {room_id}.",
+            "tool": "travel",
+            "verification": f"Current room id is {room_id}.",
+        }
+    )
+    return {
+        **plan,
+        "steps": steps,
+        "safe_ending": {
+            "room_id": room_id,
+            "step_id": step_id,
+            "rationale": "This safe room fits the test persona and verified route.",
+        },
+    }
+
+
 class FixedModel:
+    def manage_campaign(self, **kwargs: object) -> dict[str, object]:
+        goal = kwargs.get("goal")
+        constraints = (
+            goal.get("constraints")
+            if isinstance(goal, dict) and isinstance(goal.get("constraints"), dict)
+            else {}
+        )
+        notes = str(constraints.get("operator_notes") or "")
+        assigned_match = re.search(r"assigned_room\s*=\s*(\d+)", notes)
+        hunt_match = re.search(r"hunt\s*=\s*([^;]+)", notes)
+        if assigned_match and hunt_match:
+            phase = {
+                "kind": "farm",
+                "objective": "Run the exact grounded farm recipe.",
+                "success_criteria": list(goal.get("success_criteria", [])),
+                "abandon_predicates": [],
+                "budget": {"max_actions": 40, "max_minutes": 90},
+                "context": {
+                    "target": hunt_match.group(1).strip(),
+                    "room": int(assigned_match.group(1)),
+                    "use_safe_spots": "use_safe_spots=false" not in notes.casefold(),
+                    "flee_below": 0.60,
+                    "fight_above_vigor": 100,
+                },
+                "rationale": "Use the operator's grounded farm recipe.",
+            }
+        else:
+            phase = {
+                "kind": "general",
+                "objective": str(goal.get("objective") if isinstance(goal, dict) else "Advance."),
+                "success_criteria": list(goal.get("success_criteria", [])) if isinstance(goal, dict) else [],
+                "abandon_predicates": [],
+                "budget": {"max_actions": 24, "max_minutes": 45},
+                "context": {},
+                "rationale": "Use the compatibility test phase.",
+            }
+        return {
+            "decision": "start_phase",
+            "phase": phase,
+            "rationale": "Select a bounded test phase.",
+            "evidence": [],
+        }
+
     def plan(self, **kwargs: object) -> dict[str, object]:
+        grounded = kwargs.get("grounded_knowledge")
+        safe_context = (
+            grounded.get("safe_ending_candidates")
+            if isinstance(grounded, dict)
+            else None
+        )
+        candidates = (
+            safe_context.get("candidates")
+            if isinstance(safe_context, dict)
+            else None
+        )
+        ending = (
+            candidates[0]
+            if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict)
+            else {"room_id": 100}
+        )
+        ending_room = int(ending.get("room_id") or 100)
         if kwargs.get("execution_plan") is None:
+            campaign = kwargs.get("campaign_context")
+            active_phase = (
+                campaign.get("active_phase")
+                if isinstance(campaign, dict)
+                else None
+            )
+            farm = isinstance(active_phase, dict) and active_phase.get("kind") == "farm"
+            phase_context = (
+                active_phase.get("context")
+                if isinstance(active_phase, dict)
+                and isinstance(active_phase.get("context"), dict)
+                else {}
+            )
+            active_goal = kwargs.get("goal")
+            constraints = (
+                active_goal.get("constraints")
+                if isinstance(active_goal, dict)
+                and isinstance(active_goal.get("constraints"), dict)
+                else {}
+            )
+            notes = str(constraints.get("operator_notes") or "")
+            assigned_match = re.search(r"assigned_room\s*=\s*(\d+)", notes)
+            hunt_match = re.search(r"hunt\s*=\s*([^;]+)", notes)
+            if assigned_match and hunt_match:
+                farm = True
+                phase_context = {
+                    **phase_context,
+                    "room": int(assigned_match.group(1)),
+                    "target": hunt_match.group(1).strip(),
+                }
+            work_step = (
+                {
+                    "id": "launch-goal-keeper",
+                    "outcome": (
+                        f"Launch the farm for {phase_context.get('target')} in assigned "
+                        f"room {phase_context.get('room')}."
+                    ),
+                    "tool": "autopilot",
+                    "verification": "Keeper reports the requested goal-owned farm.",
+                }
+                if farm
+                else {
+                    "id": "drop-item",
+                    "outcome": "The requested item is dropped.",
+                    "tool": "act",
+                    "verification": "The item is absent from inventory.",
+                }
+            )
             return {
                 "decision": "plan",
                 "tool": None,
@@ -55,19 +193,24 @@ class FixedModel:
                 "rationale": "Plan before mutation.",
                 "expected_observation": {},
                 "proposal": None,
-                "execution_plan": {
+                "execution_plan": with_safe_ending({
                     "summary": "Drop the requested item and verify its absence.",
-                    "steps": [
-                        {
-                            "id": "drop-item",
-                            "outcome": "The requested item is dropped.",
-                            "tool": "act",
-                            "verification": "The item is absent from inventory.",
-                        }
-                    ],
+                    "steps": [work_step],
                     "assumptions": [],
                     "revision_reason": None,
-                },
+                }, ending_room),
+            }
+        if isinstance(grounded, dict) and isinstance(
+            grounded.get("goal_outcome_checkpoint"), dict
+        ):
+            return {
+                "decision": "act",
+                "tool": "travel",
+                "arguments": {"to": ending_room},
+                "rationale": "Withdraw to the verified safe ending.",
+                "expected_observation": {"room_id": ending_room},
+                "proposal": None,
+                "plan_step_id": "finish-safe",
             }
         return {"decision": "act", "tool": "act", "arguments": {"verb": "drop", "target": 1}, "rationale": "The goal explicitly requires the drop.", "expected_observation": {"inventory": "item absent"}, "proposal": None, "plan_step_id": "drop-item"}
 
@@ -81,6 +224,32 @@ class InvalidProposalModel:
             "rationale": "Try a follow-up.",
             "expected_observation": {},
             "proposal": {"objective": "Do something later.", "success_criteria": []},
+        }
+
+
+class SafeDestinationModel(FixedModel):
+    def plan(self, **kwargs: object) -> dict[str, object]:
+        if kwargs.get("execution_plan") is None:
+            return {
+                "decision": "plan",
+                "tool": None,
+                "arguments": {},
+                "rationale": "The safe destination is also the public goal.",
+                "expected_observation": {},
+                "proposal": None,
+                "execution_plan": with_safe_ending(
+                    {"summary": "Reach the requested safe destination.", "steps": []},
+                    100,
+                ),
+            }
+        return {
+            "decision": "act",
+            "tool": "travel",
+            "arguments": {"to": 100},
+            "rationale": "Reach the requested source-verified safe room.",
+            "expected_observation": {"room_id": 100},
+            "proposal": None,
+            "plan_step_id": "finish-safe",
         }
 
 
@@ -700,7 +869,9 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 100)
                 controller.broker = SimulatedBroker()
+                controller.last_observation = controller.broker.observe()
                 goal = controller.storage.submit_goal(
                     goal_payload(
                         request_id="inactive-completion",
@@ -717,6 +888,15 @@ class ControllerTests(unittest.TestCase):
                         ],
                     )
                 )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {"summary": "Finish at the selected safe room.", "steps": []},
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
                 controller.storage.manage_goal(
                     {
                         "request_id": "pause-inactive-completion",
@@ -737,7 +917,9 @@ class ControllerTests(unittest.TestCase):
                 self.assertIn("100 >= 33", criterion["detail"])
                 evidence_events = [
                     item
-                    for item in controller.storage.events(kinds=["goal.succeeded"])["events"]
+                    for item in controller.storage.events(
+                        kinds=["goal.inactive_completion_reconciled"]
+                    )["events"]
                     if item.get("data", {}).get("reconciled_from") == "paused"
                 ]
                 self.assertEqual(1, len(evidence_events))
@@ -997,6 +1179,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 100)
                 simulator = SimulatedBroker()
                 controller.broker = simulator
                 controller.model = FixedModel()  # type: ignore[assignment]
@@ -1013,58 +1196,156 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_goal_outcome_is_latched_until_model_selected_safe_ending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                simulator = SimulatedBroker()
+                simulator.room = {"num": 200, "name": "Unsafe test room"}
+                controller.broker = simulator
+                controller.model = FixedModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-ending-latch")
+                )["goal"]
+
+                planned = controller.turn()
+                self.assertEqual(100, planned["execution_plan"]["safe_ending"]["room_id"])
+
+                action = controller.turn()
+                self.assertEqual("act", action["action"])
+                current = controller.storage.goal(goal["id"])
+                self.assertEqual("active", current["status"])
+                self.assertTrue(controller.status()["goal"]["outcome_latched"])
+
+                returned = controller.turn()
+                self.assertEqual("travel", returned["action"])
+                self.assertEqual(100, simulator.room["num"])
+                self.assertEqual("succeeded", controller.storage.goal(goal["id"])["status"])
+            finally:
+                controller.storage.close()
+
+    def test_execution_plan_rejects_missing_or_unverified_safe_ending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                controller.broker = SimulatedBroker()
+                controller.last_observation = controller.broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-ending-validation")
+                )["goal"]
+                base = {
+                    "summary": "Drop the item, then withdraw safely.",
+                    "steps": [
+                        {
+                            "id": "drop-item",
+                            "outcome": "Drop the requested item.",
+                            "tool": "act",
+                            "verification": "The item is absent.",
+                        }
+                    ],
+                }
+
+                with self.assertRaisesRegex(ModelError, "safe_ending is required"):
+                    controller._store_execution_plan(
+                        goal,
+                        base,
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=False,
+                    )
+                with self.assertRaisesRegex(ModelError, "not source-verified"):
+                    controller._store_execution_plan(
+                        goal,
+                        with_safe_ending(base, 999),
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=False,
+                    )
+                nonfinal = with_safe_ending(base, 100)
+                nonfinal["steps"].append(
+                    {
+                        "id": "work-after-safety",
+                        "outcome": "Do more work after the claimed ending.",
+                        "tool": "act",
+                        "verification": "More work happened.",
+                    }
+                )
+                with self.assertRaisesRegex(ModelError, "final actionable"):
+                    controller._store_execution_plan(
+                        goal,
+                        nonfinal,
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=False,
+                    )
+                nontravel = {
+                    **base,
+                    "safe_ending": {
+                        "room_id": 100,
+                        "step_id": "drop-item",
+                        "rationale": "Claim the current safe room without final travel.",
+                    },
+                }
+                with self.assertRaisesRegex(ModelError, "must use the travel tool"):
+                    controller._store_execution_plan(
+                        goal,
+                        nontravel,
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=False,
+                    )
+
+                accepted = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(base, 100),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(100, accepted["safe_ending"]["room_id"])
+                self.assertEqual("finish-safe", accepted["steps"][-1]["id"])
+            finally:
+                controller.storage.close()
+
+    def test_safe_ending_travel_may_also_satisfy_the_public_location_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                simulator = SimulatedBroker()
+                simulator.room = {"num": 200, "name": "Starting room"}
+                controller.broker = simulator
+                controller.model = SafeDestinationModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="safe-destination-is-goal",
+                        objective="Reach safe room 100.",
+                        success_criteria=[
+                            {
+                                "id": "at-safe-room",
+                                "kind": "location_reached",
+                                "location": "Safe room 100",
+                                "room_id": 100,
+                            }
+                        ],
+                    )
+                )["goal"]
+
+                self.assertTrue(controller.turn()["planned"])
+                result = controller.turn()
+
+                self.assertEqual("travel", result["action"])
+                self.assertEqual("succeeded", controller.storage.goal(goal["id"])["status"])
+            finally:
+                controller.storage.close()
+
     def test_execution_plan_drops_toolless_monitor_step_when_qwen_returns_nine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 100)
                 broker = SimulatedBroker()
                 controller.broker = broker
                 controller.last_observation = broker.observe()
                 goal = controller.storage.submit_goal(
                     goal_payload(request_id="nine-step-plan")
-                )["goal"]
-                steps = [
-                    {
-                        "id": f"action-{index}",
-                        "outcome": f"Complete bounded action {index}.",
-                        "tool": "act",
-                        "verification": "Observe the requested inventory change.",
-                    }
-                    for index in range(8)
-                ]
-                steps.append(
-                    {
-                        "id": "wait-for-result",
-                        "outcome": "Wait for the controller to observe completion.",
-                        "tool": None,
-                        "verification": "The controller will monitor criteria.",
-                    }
-                )
-
-                stored = controller._store_execution_plan(
-                    goal,
-                    {"summary": "Execute the bounded goal.", "steps": steps},
-                    grounding=controller.knowledge.validate_goal(goal),
-                    revision=False,
-                )
-
-                self.assertEqual(8, len(stored["steps"]))
-                self.assertEqual(
-                    "removed_controller_owned_monitoring_steps",
-                    stored["normalizations"][0]["kind"],
-                )
-            finally:
-                controller.storage.close()
-
-    def test_execution_plan_drops_toolless_monitor_step_when_total_is_eight(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            controller = BotController(config(Path(temporary)))
-            try:
-                broker = SimulatedBroker()
-                controller.broker = broker
-                controller.last_observation = broker.observe()
-                goal = controller.storage.submit_goal(
-                    goal_payload(request_id="eight-step-plan-with-monitor")
                 )["goal"]
                 steps = [
                     {
@@ -1086,7 +1367,57 @@ class ControllerTests(unittest.TestCase):
 
                 stored = controller._store_execution_plan(
                     goal,
-                    {"summary": "Execute the bounded goal.", "steps": steps},
+                    with_safe_ending(
+                        {"summary": "Execute the bounded goal.", "steps": steps},
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                self.assertEqual(8, len(stored["steps"]))
+                self.assertEqual(
+                    "removed_controller_owned_monitoring_steps",
+                    stored["normalizations"][0]["kind"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_execution_plan_drops_toolless_monitor_step_when_total_is_eight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="eight-step-plan-with-monitor")
+                )["goal"]
+                steps = [
+                    {
+                        "id": f"action-{index}",
+                        "outcome": f"Complete bounded action {index}.",
+                        "tool": "act",
+                        "verification": "Observe the requested inventory change.",
+                    }
+                    for index in range(6)
+                ]
+                steps.append(
+                    {
+                        "id": "wait-for-result",
+                        "outcome": "Wait for the controller to observe completion.",
+                        "tool": None,
+                        "verification": "The controller will monitor criteria.",
+                    }
+                )
+
+                stored = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {"summary": "Execute the bounded goal.", "steps": steps},
+                        100,
+                    ),
                     grounding=controller.knowledge.validate_goal(goal),
                     revision=False,
                 )
@@ -1148,7 +1479,7 @@ class ControllerTests(unittest.TestCase):
 
                 stored = controller._store_execution_plan(
                     goal,
-                    {
+                    with_safe_ending({
                         "summary": "Farm now and return home after the strategic goal.",
                         "steps": [
                             {
@@ -1164,12 +1495,15 @@ class ControllerTests(unittest.TestCase):
                                 "verification": "TestHero is beside the bar.",
                             },
                         ],
-                    },
+                    }, 52),
                     grounding=controller.knowledge.validate_goal(goal),
                     revision=False,
                 )
 
-                self.assertEqual(["launch-farm"], [step["id"] for step in stored["steps"]])
+                self.assertEqual(
+                    ["launch-farm", "finish-safe"],
+                    [step["id"] for step in stored["steps"]],
+                )
                 self.assertEqual(
                     "removed_out_of_phase_steps",
                     stored["normalizations"][0]["kind"],
@@ -1182,6 +1516,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 52)
                 broker = SimulatedBroker()
                 broker.tools["travel"] = Tool(
                     "travel", "Travel to a room.", {"type": "object", "properties": {}}
@@ -1222,6 +1557,11 @@ class ControllerTests(unittest.TestCase):
                                 "verification": "TestHero is in room 52.",
                             },
                         ],
+                        "safe_ending": {
+                            "room_id": 52,
+                            "step_id": "travel-home",
+                            "rationale": "The quiet inn fits the test persona.",
+                        },
                     },
                     grounding=controller.knowledge.validate_goal(goal),
                     revision=False,
@@ -1242,6 +1582,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 100)
                 broker = SimulatedBroker()
                 broker.tools["bank"] = Tool(
                     "bank", "Manage carried currency.", {"type": "object", "properties": {}}
@@ -1259,7 +1600,7 @@ class ControllerTests(unittest.TestCase):
                 goal = controller.storage.submit_goal(payload)["goal"]
                 stored = controller._store_execution_plan(
                     goal,
-                    {
+                    with_safe_ending({
                         "summary": "Deposit money, act, then wait for verification.",
                         "steps": [
                             {
@@ -1275,7 +1616,7 @@ class ControllerTests(unittest.TestCase):
                                 "verification": "The action is observed.",
                             },
                         ],
-                    },
+                    }, 100),
                     grounding=controller.knowledge.validate_goal(goal),
                     revision=False,
                 )
@@ -1304,7 +1645,10 @@ class ControllerTests(unittest.TestCase):
 
                 repaired = controller._execution_plan(goal)
 
-                self.assertEqual(["act"], [step["id"] for step in repaired["steps"]])
+                self.assertEqual(
+                    ["act", "finish-safe"],
+                    [step["id"] for step in repaired["steps"]],
+                )
                 self.assertEqual(
                     "repaired_legacy_controller_owned_steps",
                     repaired["normalizations"][-1]["kind"],
@@ -2011,7 +2355,17 @@ class ControllerTests(unittest.TestCase):
                     "max": 30,
                 }
 
-                plan = controller._structured_purchase_controller_plan(goal)
+                selected_plan = with_safe_ending(
+                    {
+                        "summary": "Choose a safe ending after the work.",
+                        "steps": [],
+                        "assumptions": [],
+                    },
+                    54,
+                )
+                plan = controller._structured_purchase_controller_plan(
+                    goal, selected_plan=selected_plan
+                )
 
                 self.assertLessEqual(len(plan["steps"]), 8)
                 self.assertIn(
@@ -2029,7 +2383,14 @@ class ControllerTests(unittest.TestCase):
                     revision=False,
                 )
                 self.assertEqual("verified", stored["verification"]["status"])
-                self.assertEqual(4, len(controller._structured_farm_controller_plan(goal)["steps"]))
+                self.assertEqual(
+                    5,
+                    len(
+                        controller._structured_farm_controller_plan(
+                            goal, selected_plan=stored
+                        )["steps"]
+                    ),
+                )
 
                 controller.last_observation["look"]["vitals"]["health"] = {
                     "current": 31,
@@ -2043,7 +2404,7 @@ class ControllerTests(unittest.TestCase):
                     goal, controller.last_observation
                 )
                 return_plan = controller._structured_purchase_controller_plan(
-                    goal, completion
+                    goal, completion, selected_plan=stored
                 )
                 return_step_ids = {step["id"] for step in return_plan["steps"]}
                 self.assertNotIn("launch-goal-keeper", return_step_ids)
@@ -4994,7 +5355,7 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 planned = controller.turn()
-                self.assertTrue(planned["planned"])
+                self.assertTrue(planned.get("planned"), planned)
                 result = controller.turn()
 
                 self.assertEqual("autopilot", result["action"])
@@ -5501,6 +5862,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                source_verify_safe_rooms(controller, 100)
                 controller.broker = SimulatedBroker()
                 controller.model = InvalidRevisionModel()  # type: ignore[assignment]
                 goal = controller.storage.submit_goal(
@@ -5509,7 +5871,7 @@ class ControllerTests(unittest.TestCase):
                 grounding = controller.knowledge.validate_goal(goal)
                 controller._store_execution_plan(
                     goal,
-                    {
+                    with_safe_ending({
                         "summary": "Drop the requested item.",
                         "steps": [
                             {
@@ -5521,7 +5883,7 @@ class ControllerTests(unittest.TestCase):
                         ],
                         "assumptions": [],
                         "revision_reason": None,
-                    },
+                    }, 100),
                     grounding=grounding,
                     revision=False,
                 )

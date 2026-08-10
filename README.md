@@ -149,12 +149,19 @@ broker remain loopback-only.
    for approval. Press `M` to pause, resume, cancel, reprioritize, or confirm an
    operator criterion. To provide that confirmation, press `M`, select the goal,
    press `F`, and type `CONFIRM`. The controller accepts it only after every
-   observable criterion in that goal is already verified.
+   observable criterion in that goal is already verified. Confirmation latches
+   the outcome; the goal becomes terminal only after the character reaches the
+   model-selected, source-verified safe ending in its execution plan.
 
 To run or revise persona setup independently, use `setup-persona`. With no
 arguments it prompts for the name, voice, traits, speech style, values, taboos,
 relationship defaults, and reply limit. An existing persona is preserved unless
 `--update-existing` is explicit.
+
+The complete active persona is supplied to both long-horizon campaign planning
+and tactical planning. It can shape choices among equally safe, goal-compatible
+strategies—including which source-verified safe location ends a plan—but cannot
+override the operator's goal or controller policy.
 
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional

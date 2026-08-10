@@ -409,6 +409,19 @@ class KnowledgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             knowledge = self.knowledge(Path(temporary))
 
+            options = knowledge.safe_location_candidates(50, limit=8)
+            self.assertEqual("found", options["status"])
+            self.assertGreaterEqual(len(options["candidates"]), 1)
+            self.assertEqual(52, options["candidates"][0]["room_id"])
+            self.assertTrue(
+                all(
+                    {"ROOM_SANCTUARY", "ROOM_NO_COMBAT"}.intersection(
+                        candidate["flags"]
+                    )
+                    for candidate in options["candidates"]
+                )
+            )
+
             staging = knowledge.nearest_safe_location(50)
 
             self.assertEqual("found", staging["status"])

@@ -172,9 +172,11 @@ stateDiagram-v2
 
 Only the scheduler creates `active`. Resuming moves a goal to `queued`, then
 promotion enforces the single-active invariant. A model-free reconciliation
-pass may move paused or blocked work directly to `succeeded` when every typed
-criterion is true in a fresh broker observation. Terminal states are immutable;
-retry creates a new goal linked by `retry_of_goal_id`.
+pass may latch paused or blocked work when every typed criterion is true in a
+fresh broker observation, but it moves the goal to `succeeded` only when that
+observation also verifies the goal's retained model-selected safe ending.
+Terminal states are immutable; retry creates a new goal linked by
+`retry_of_goal_id`.
 
 Failed-goal retry eligibility is controller-owned. A materially equivalent
 goal-scoped submission or proposal acceptance returns `GOAL_DEFERRED` until its

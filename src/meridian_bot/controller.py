@@ -94,7 +94,8 @@ POLITICAL_FACTION_TROOP_ENTITY_IDS = frozenset(
 LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
-EXECUTION_PLAN_SCHEMA_VERSION = 3
+EXECUTION_PLAN_SCHEMA_VERSION = 4
+GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
@@ -245,6 +246,111 @@ class BotController:
         value = {**staging, "observed_at": timestamp()}
         self.storage.set_runtime(SAFE_STAGING_RUNTIME_KEY, value)
         return value
+
+    def _safe_ending_context(self, observation: dict[str, Any]) -> dict[str, Any]:
+        """Expose verified choices while leaving the destination choice to the model."""
+
+        room_id = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        finder = getattr(self.knowledge, "safe_location_candidates", None)
+        result: dict[str, Any] = {
+            "status": "unavailable",
+            "from_room_id": room_id,
+            "candidates": [],
+        }
+        if callable(finder) and room_id is not None:
+            try:
+                found = finder(int(room_id), limit=12)
+                if isinstance(found, dict):
+                    result = found
+            except (TypeError, ValueError):
+                pass
+        candidates = result.get("candidates")
+        candidates = (
+            [dict(item) for item in candidates if isinstance(item, dict)]
+            if isinstance(candidates, list)
+            else []
+        )
+        current = self._verified_safe_staging(room_id)
+        if current is not None and not any(
+            str(item.get("room_id")) == str(current["room_id"])
+            for item in candidates
+        ):
+            candidates.insert(
+                0,
+                {
+                    **current,
+                    "distance": 0,
+                    "from_room_id": room_id,
+                    "basis": "source_verified_current_room",
+                },
+            )
+        return {
+            **result,
+            "candidates": candidates[:12],
+            "selection_owner": "planning_model",
+            "required_source_flags": sorted(SAFE_STAGING_FLAGS),
+        }
+
+    def _validated_safe_ending(
+        self,
+        raw_plan: dict[str, Any],
+        steps: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Verify a model-selected terminal room and its final travel step."""
+
+        ending = raw_plan.get("safe_ending")
+        if not isinstance(ending, dict):
+            raise ModelError(
+                "execution_plan.safe_ending is required; choose one source-verified "
+                "safe ending from grounded_knowledge.safe_ending_candidates.candidates"
+            )
+        unknown = set(ending) - {"room_id", "step_id", "rationale"}
+        if unknown:
+            raise ModelError(
+                "execution_plan.safe_ending contains unknown field(s): "
+                + ", ".join(sorted(str(value) for value in unknown))
+            )
+        room_id = ending.get("room_id")
+        if not isinstance(room_id, int) or isinstance(room_id, bool) or room_id <= 0:
+            raise ModelError("execution_plan.safe_ending.room_id must be a positive integer")
+        step_id = str(ending.get("step_id") or "").strip()
+        rationale = " ".join(str(ending.get("rationale") or "").split())
+        if not step_id or not rationale:
+            raise ModelError(
+                "execution_plan.safe_ending requires step_id and a persona-aware rationale"
+            )
+        policy = self._pvp_room_policy(room_id)
+        if not self._is_verified_safe_staging(policy):
+            raise ModelError(
+                f"execution_plan.safe_ending room {room_id} is not source-verified with "
+                "ROOM_SANCTUARY or ROOM_NO_COMBAT"
+            )
+        if not steps or str(steps[-1].get("id") or "") != step_id:
+            raise ModelError(
+                "execution_plan.safe_ending.step_id must name the final actionable plan step"
+            )
+        final_step = steps[-1]
+        if final_step.get("tool") != "travel":
+            raise ModelError("the safe-ending step must use the travel tool")
+        final_text = canonical_json(final_step)
+        if re.search(rf"(?<!\d){room_id}(?!\d)", final_text) is None:
+            raise ModelError(
+                f"the final safe-ending travel step must name exact room id {room_id}"
+            )
+        assert isinstance(policy, dict)
+        flags = sorted(str(value) for value in policy.get("flags", []))
+        return {
+            "room_id": room_id,
+            "name": str(policy.get("name") or f"room {room_id}"),
+            "flags": flags,
+            "step_id": step_id,
+            "rationale": rationale[:1000],
+            "evidence": redact(policy.get("evidence")),
+        }
 
     def _verified_guild_eligibility(self) -> bool:
         """Return true only when ordinary client state positively proves membership."""
@@ -800,20 +906,13 @@ class BotController:
         self._clear_safety_suppression(goal["id"])
         self.last_observation = observation
         completion = self.criteria.evaluate(goal, observation)
-        self.storage.set_goal_completion(
-            goal["id"],
-            completion,
-            terminal="succeeded" if completion["all_met"] else None,
-        )
-        if completion["all_met"]:
-            self.storage.emit_event(
-                "goal.succeeded",
-                f"Goal succeeded: {goal['title']}",
-                interesting=True,
-                goal_id=goal["id"],
-                data={"completion": completion},
+        done = self._complete_goal_if_safe(goal, observation, completion)
+        if done is None:
+            checkpoint = self._goal_completion_checkpoint(goal)
+            self.storage.set_goal_completion(
+                goal["id"],
+                checkpoint["completion"] if checkpoint is not None else completion,
             )
-            self.learning.record_success(goal)
         return {
             "action": "bank",
             "result": result,
@@ -1067,11 +1166,13 @@ class BotController:
     def _reconcile_inactive_goal_completions(
         self, observation: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Retire paused/blocked goals whose outcomes are already verified.
+        """Latch inactive outcomes and retire only at their planned safe ending.
 
-        This is deliberately model-free.  Paused work can become complete while
-        a recovery or successor goal changes the world, so every fresh broker
-        observation gets one deterministic pass over inactive contracts.
+        This pass remains model-free. Paused work can achieve its public
+        outcome while another goal changes the world, but it becomes terminal
+        only if the same observation also verifies its previously selected
+        source-safe plan ending. Otherwise the outcome stays latched for a
+        later resume and safe return.
         """
         completed: list[dict[str, Any]] = []
         for goal in self.storage.goals(["paused", "blocked"]):
@@ -1079,28 +1180,17 @@ class BotController:
             if not completion["all_met"]:
                 continue
             prior_status = str(goal.get("status") or "inactive")
-            done = self.storage.set_goal_completion(
-                goal["id"],
-                completion,
-                terminal="succeeded",
-                reason=(
-                    "all deterministic criteria verified during inactive-goal "
-                    "reconciliation"
-                ),
-            )
-            self.storage.complete_campaign_run(goal["id"], status="succeeded")
+            done = self._complete_goal_if_safe(goal, observation, completion)
+            if done is None:
+                self.storage.set_goal_completion(goal["id"], completion)
+                continue
             self.storage.emit_event(
-                "goal.succeeded",
-                f"Goal succeeded: {goal['title']}",
-                interesting=True,
+                "goal.inactive_completion_reconciled",
+                f"Inactive goal completed at its planned safe ending: {goal['title']}",
+                interesting=False,
                 goal_id=goal["id"],
-                data={
-                    "completion": completion,
-                    "reconciled_from": prior_status,
-                    "model_used": False,
-                },
+                data={"reconciled_from": prior_status, "model_used": False},
             )
-            self.learning.record_success(done)
             completed.append(done)
         return completed
 
@@ -1387,6 +1477,137 @@ class BotController:
                 self._clear_planner_feedback()
         return value
 
+    @staticmethod
+    def _goal_contract(goal: dict[str, Any]) -> str:
+        return canonical_json(
+            {
+                key: goal.get(key)
+                for key in ("title", "objective", "success_criteria", "constraints")
+            }
+        )
+
+    def _goal_completion_checkpoint(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        values = self.storage.get_runtime(
+            GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict):
+            return None
+        value = values.get(str(goal.get("id") or ""))
+        if (
+            not isinstance(value, dict)
+            or value.get("goal_contract") != self._goal_contract(goal)
+            or not isinstance(value.get("completion"), dict)
+        ):
+            return None
+        return value
+
+    def _latch_goal_completion(
+        self, goal: dict[str, Any], completion: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        existing = self._goal_completion_checkpoint(goal)
+        if existing is not None:
+            return existing
+        if completion.get("all_met") is not True:
+            return None
+        values = self.storage.get_runtime(
+            GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        value = {
+            "goal_id": goal["id"],
+            "goal_contract": self._goal_contract(goal),
+            "completion": completion,
+            "verified_at": timestamp(),
+        }
+        values[goal["id"]] = value
+        self.storage.set_runtime(GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
+        self.storage.emit_event(
+            "goal.outcome_verified",
+            f"Goal outcome verified; returning to the planned safe ending: {goal['title']}",
+            interesting=False,
+            goal_id=goal["id"],
+            data={"completion": completion, "terminal_deferred": True},
+        )
+        return value
+
+    def _clear_goal_completion_checkpoint(self, goal_id: str) -> None:
+        values = self.storage.get_runtime(
+            GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or goal_id not in values:
+            return
+        values = dict(values)
+        values.pop(goal_id, None)
+        self.storage.set_runtime(GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
+
+    def _safe_ending_reached(
+        self, goal: dict[str, Any], observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        plan = self._execution_plan(goal)
+        ending = plan.get("safe_ending") if isinstance(plan, dict) else None
+        if not isinstance(ending, dict):
+            return {"met": False, "reason": "no verified safe ending plan"}
+        target = ending.get("room_id")
+        current = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        if str(current) != str(target):
+            return {
+                "met": False,
+                "reason": "planned safe ending has not been reached",
+                "current_room_id": current,
+                "safe_ending": redact(ending),
+            }
+        verified = self._verified_safe_staging(current)
+        if verified is None:
+            return {
+                "met": False,
+                "reason": "current room no longer has source-verified safe flags",
+                "current_room_id": current,
+                "safe_ending": redact(ending),
+            }
+        return {
+            "met": True,
+            "current_room_id": current,
+            "safe_ending": redact(ending),
+            "verified_room": redact(verified),
+        }
+
+    def _complete_goal_if_safe(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        checkpoint = self._latch_goal_completion(goal, completion)
+        if checkpoint is None:
+            return None
+        safety = self._safe_ending_reached(goal, observation)
+        if safety.get("met") is not True:
+            return None
+        latched_completion = checkpoint["completion"]
+        done = self.storage.set_goal_completion(
+            goal["id"],
+            latched_completion,
+            terminal="succeeded",
+            reason="all criteria verified and the model-selected safe ending reached",
+        )
+        self.storage.complete_campaign_run(goal["id"], status="succeeded")
+        self.storage.emit_event(
+            "goal.succeeded",
+            f"Goal succeeded safely: {goal['title']}",
+            interesting=True,
+            goal_id=goal["id"],
+            data={"completion": latched_completion, "safe_ending": safety},
+        )
+        self.learning.record_success(done)
+        self._clear_goal_completion_checkpoint(goal["id"])
+        return done
+
     def _invalidate_execution_plan(self, goal: dict[str, Any], reason: str) -> bool:
         """Retire a plan whose factual execution assumption was disproved."""
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
@@ -1602,6 +1823,7 @@ class BotController:
                         f"staging room ({launch_origin_name}, room {launch_room}) "
                         "before its autopilot launch step"
                     )
+        safe_ending = self._validated_safe_ending(raw_plan, normalized_steps)
         value = {
             "schema_version": EXECUTION_PLAN_SCHEMA_VERSION,
             "goal_id": goal["id"],
@@ -1617,6 +1839,7 @@ class BotController:
             ),
             "summary": summary[:1000],
             "steps": normalized_steps,
+            "safe_ending": safe_ending,
             "assumptions": [str(value).strip()[:500] for value in assumptions if str(value).strip()][:20],
             "normalizations": plan_normalizations,
             "revision_reason": str(raw_plan.get("revision_reason") or "").strip()[:1000] or None,
@@ -2078,10 +2301,66 @@ class BotController:
             position[coordinate] = value
         return position if {"col", "row"}.issubset(position) else None
 
+    @staticmethod
+    def _with_selected_safe_ending(
+        plan: dict[str, Any], selected_plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Preserve the model's safe destination when deterministic adapters add steps."""
+
+        ending = selected_plan.get("safe_ending")
+        source_steps = selected_plan.get("steps")
+        if not isinstance(ending, dict) or not isinstance(source_steps, list):
+            raise ModelError("a verified model-selected safe ending is required")
+        step_id = str(ending.get("step_id") or "")
+        ending_step = next(
+            (
+                dict(step)
+                for step in source_steps
+                if isinstance(step, dict) and str(step.get("id") or "") == step_id
+            ),
+            None,
+        )
+        if ending_step is None:
+            raise ModelError("the selected safe-ending step is missing from the verified plan")
+        steps = [
+            dict(step)
+            for step in plan.get("steps", [])
+            if isinstance(step, dict) and str(step.get("id") or "") != step_id
+        ]
+        optional_recovery_ids = {
+            "recover-purchase-go-exit",
+            "recover-purchase-route-hop",
+        }
+        while len(steps) >= 8:
+            removable = next(
+                (
+                    index
+                    for index, step in enumerate(steps)
+                    if str(step.get("id") or "") in optional_recovery_ids
+                ),
+                None,
+            )
+            if removable is None:
+                raise ModelError(
+                    "controller-owned plan cannot preserve the required safe ending within eight steps"
+                )
+            steps.pop(removable)
+        return {
+            **plan,
+            "steps": [*steps, ending_step],
+            "safe_ending": {
+                "room_id": ending.get("room_id"),
+                "step_id": step_id,
+                "rationale": ending.get("rationale"),
+            },
+        }
+
     def _structured_purchase_controller_plan(
         self,
         goal: dict[str, Any],
         completion: dict[str, Any] | None = None,
+        *,
+        selected_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         purchase = self._purchase_plan(goal) or {}
         offering_kind = str(purchase.get("offering_kind", "item"))
@@ -2233,7 +2512,11 @@ class BotController:
                     ),
                 }
             )
-        return plan
+        return (
+            self._with_selected_safe_ending(plan, selected_plan)
+            if selected_plan is not None
+            else plan
+        )
 
     def _structured_purchase_preparation_action(
         self,
@@ -3776,6 +4059,29 @@ class BotController:
                 )
         result = self.storage.manage_goal(payload)
         resulting_goal = result.get("goal") if isinstance(result, dict) else None
+        if (
+            payload.get("action") == "confirm_complete"
+            and isinstance(resulting_goal, dict)
+            and isinstance(self.last_observation, dict)
+        ):
+            completion = self.criteria.evaluate(
+                resulting_goal, self.last_observation
+            )
+            done = self._complete_goal_if_safe(
+                resulting_goal, self.last_observation, completion
+            )
+            if done is not None:
+                result["goal"] = done
+                result["completed_at_safe_ending"] = True
+                resulting_goal = done
+            else:
+                checkpoint = self._goal_completion_checkpoint(resulting_goal)
+                result["goal"] = self.storage.set_goal_completion(
+                    resulting_goal["id"],
+                    checkpoint["completion"] if checkpoint is not None else completion,
+                )
+                result["safe_ending_pending"] = checkpoint is not None
+                resulting_goal = result["goal"]
         if payload.get("action") == "resume":
             # Resume is an explicit request to try the strategic outcome again,
             # not to replay the tactical plan and feedback that led to the
@@ -4548,7 +4854,10 @@ class BotController:
         return None
 
     def _structured_farm_controller_plan(
-        self, goal: dict[str, Any]
+        self,
+        goal: dict[str, Any],
+        *,
+        selected_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         intent = self._effective_farm_intent(goal)
         observation = self.last_observation or {}
@@ -4629,7 +4938,7 @@ class BotController:
                 },
             ]
         )
-        return {
+        plan = {
             "summary": (
                 f"Prepare in source-verified safe staging {launch_name}, launch "
                 "the goal-owned bounded keeper, then verify the HP outcome."
@@ -4641,6 +4950,11 @@ class BotController:
                 "the Tos food adapter only when its room is already that staging point."
             ),
         }
+        return (
+            self._with_selected_safe_ending(plan, selected_plan)
+            if selected_plan is not None
+            else plan
+        )
 
     def _structured_farm_preparation_action(
         self,
@@ -6176,10 +6490,18 @@ class BotController:
             if hasattr(self.knowledge, "context_for")
             else {}
         )
+        grounded_context["safe_ending_candidates"] = self._safe_ending_context(
+            observation
+        )
         learned = self.learning.context_for(goal, redact(observation))
         financial = self._financial_context(observation)
         progression: dict[str, Any] | None = None
-        if any(
+        durable_farm_intent = self._goal_farm_intent(goal)
+        has_complete_durable_farm_recipe = (
+            durable_farm_intent.get("assigned_room") is not None
+            and bool(durable_farm_intent.get("hunt"))
+        )
+        if not has_complete_durable_farm_recipe and any(
             str(criterion.get("metric") or "").casefold()
             in {
                 "max_health",
@@ -6207,6 +6529,7 @@ class BotController:
                 learned_failures=learned,
                 financial_context=financial,
                 progression_context=progression,
+                persona=self.storage.persona(),
             )
             self.dependencies["model"] = "healthy"
         else:
@@ -6614,18 +6937,22 @@ class BotController:
                 return {"blocked": True, "goal": blocked, "grounding": grounding}
             self._reconcile_purchase_transaction(goal)
             completion = self.criteria.evaluate(goal, observation)
-            if completion["all_met"]:
-                done = self.storage.set_goal_completion(goal["id"], completion, terminal="succeeded", reason="all deterministic criteria verified")
-                self.storage.complete_campaign_run(goal["id"], status="succeeded")
-                self.storage.emit_event("goal.succeeded", f"Goal succeeded: {goal['title']}", interesting=True, goal_id=goal["id"], data={"completion": completion})
-                self.learning.record_success(goal)
+            done = self._complete_goal_if_safe(goal, observation, completion)
+            if done is not None:
                 return {"goal": done, "completed": True}
+            completion_checkpoint = self._goal_completion_checkpoint(goal)
+            if completion_checkpoint is not None:
+                # Criteria such as location_reached may become false again as
+                # the character leaves the achieved target. Keep the verified
+                # outcome latched while the final safe travel executes.
+                completion = completion_checkpoint["completion"]
             goal = self.storage.set_goal_completion(goal["id"], completion)
-            phase_completion = self._reconcile_existing_campaign_phase(
-                goal, observation
-            )
-            if phase_completion is not None:
-                return phase_completion
+            if completion_checkpoint is None:
+                phase_completion = self._reconcile_existing_campaign_phase(
+                    goal, observation
+                )
+                if phase_completion is not None:
+                    return phase_completion
             expired_opportunity = self._expire_direct_pvp_opportunity(
                 goal, observation, completion
             )
@@ -6748,108 +7075,101 @@ class BotController:
             )
             if structured_purchase is not None:
                 execution_plan = self._execution_plan(goal)
-                step_ids = {
-                    str(step.get("id") or "")
-                    for step in execution_plan.get("steps", [])
-                    if isinstance(step, dict)
-                } if isinstance(execution_plan, dict) else set()
-                step_id = str(structured_purchase.get("plan_step_id") or "")
-                if step_id not in step_ids:
-                    stored_plan = self._store_execution_plan(
-                        goal,
-                        self._structured_purchase_controller_plan(goal, completion),
-                        grounding=grounding,
-                        revision=execution_plan is not None,
-                    )
-                    return {"planned": True, "execution_plan": stored_plan}
-                return self._execute(goal, observation, structured_purchase)
+                if execution_plan is not None:
+                    step_ids = {
+                        str(step.get("id") or "")
+                        for step in execution_plan.get("steps", [])
+                        if isinstance(step, dict)
+                    }
+                    step_id = str(structured_purchase.get("plan_step_id") or "")
+                    if step_id not in step_ids:
+                        stored_plan = self._store_execution_plan(
+                            goal,
+                            self._structured_purchase_controller_plan(
+                                goal,
+                                completion,
+                                selected_plan=execution_plan,
+                            ),
+                            grounding=grounding,
+                            revision=True,
+                        )
+                        return {"planned": True, "execution_plan": stored_plan}
+                    return self._execute(goal, observation, structured_purchase)
             structured_preparation = self._structured_farm_preparation_action(
                 goal, observation, completion
             )
             if structured_preparation is not None:
                 execution_plan = self._execution_plan(goal)
-                step_ids = {
-                    str(step.get("id") or "")
-                    for step in execution_plan.get("steps", [])
-                    if isinstance(step, dict)
-                } if isinstance(execution_plan, dict) else set()
-                step_id = str(structured_preparation.get("plan_step_id") or "")
-                if step_id not in step_ids:
-                    stored_plan = self._store_execution_plan(
-                        goal,
-                        self._structured_farm_controller_plan(goal),
-                        grounding=grounding,
-                        revision=execution_plan is not None,
-                    )
-                    return {"planned": True, "execution_plan": stored_plan}
-                return self._execute(goal, observation, structured_preparation)
+                if execution_plan is not None:
+                    step_ids = {
+                        str(step.get("id") or "")
+                        for step in execution_plan.get("steps", [])
+                        if isinstance(step, dict)
+                    }
+                    step_id = str(structured_preparation.get("plan_step_id") or "")
+                    if step_id not in step_ids:
+                        stored_plan = self._store_execution_plan(
+                            goal,
+                            self._structured_farm_controller_plan(
+                                goal,
+                                selected_plan=execution_plan,
+                            ),
+                            grounding=grounding,
+                            revision=True,
+                        )
+                        return {"planned": True, "execution_plan": stored_plan}
+                    return self._execute(goal, observation, structured_preparation)
             structured_launch = self._structured_farm_launch_plan(
                 goal, observation, completion
             )
             if structured_launch is not None:
                 execution_plan = self._execution_plan(goal)
-                if execution_plan is None:
-                    structured_intent = self._effective_farm_intent(goal)
-                    launch_origin = self._farm_launch_origin(
-                        goal, observation, structured_intent
-                    )
-                    if launch_origin is None:
-                        raise ModelError(
-                            "no source-verified safe staging room is available for keeper launch"
-                        )
-                    launch_origin_name = str(launch_origin["name"])
-                    execution_plan = self._store_execution_plan(
-                        goal,
-                        {
-                            "summary": (
-                                "Launch the goal-owned keeper from source-verified "
-                                "safe staging, then verify the bounded outcome."
+                if execution_plan is not None:
+                    step_ids = {
+                        str(step.get("id") or "")
+                        for step in execution_plan.get("steps", [])
+                        if isinstance(step, dict)
+                    }
+                    if "launch-goal-keeper" not in step_ids:
+                        stored_plan = self._store_execution_plan(
+                            goal,
+                            self._structured_farm_controller_plan(
+                                goal,
+                                selected_plan=execution_plan,
                             ),
-                            "steps": [
-                                {
-                                    "id": "launch-goal-keeper",
-                                    "outcome": (
-                                        "Launch the grounded goal-owned keeper from "
-                                        f"{launch_origin_name} for "
-                                        f"{structured_intent.get('hunt')} in assigned room "
-                                        f"{structured_intent.get('assigned_room')}."
-                                    ),
-                                    "tool": structured_launch.get("tool"),
-                                    "verification": (
-                                        "Keeper status reports running with this goal id, prey "
-                                        f"{structured_intent.get('hunt')}, and assigned room "
-                                        f"{structured_intent.get('assigned_room')}."
-                                    ),
-                                },
-                                {
-                                    "id": "verify-goal-outcome",
-                                    "outcome": "Observe the deterministic success criteria.",
-                                    "tool": None,
-                                    "verification": (
-                                        "The controller criteria evaluator reports all "
-                                        "criteria met."
-                                    ),
-                                },
-                            ],
-                            "assumptions": [],
-                            "revision_reason": None,
-                        },
-                        grounding=grounding,
-                        revision=False,
-                    )
-                    return {"planned": True, "execution_plan": execution_plan}
-                structured_launch = {
-                    **structured_launch,
-                    "plan_step_id": "launch-goal-keeper",
-                }
-                return self._execute(goal, observation, structured_launch)
-            campaign_run, campaign_phase, _campaign_selection = self._campaign_turn_state(
-                goal, observation, grounding
-            )
+                            grounding=grounding,
+                            revision=True,
+                        )
+                        return {"planned": True, "execution_plan": stored_plan}
+                    structured_launch = {
+                        **structured_launch,
+                        "plan_step_id": "launch-goal-keeper",
+                    }
+                    return self._execute(goal, observation, structured_launch)
+            if completion_checkpoint is not None:
+                campaign_run, campaign_phase = self.campaign.ensure(goal)
+                _campaign_selection = None
+            else:
+                campaign_run, campaign_phase, _campaign_selection = self._campaign_turn_state(
+                    goal, observation, grounding
+                )
             page = self.storage.events(after_cursor=max(0, self.storage.get_runtime("planner_event_cursor", 0) - 12), limit=20)
             pending_proposals = self.storage.proposals()[:10]
             planner_feedback = self._planner_feedback(goal)
             grounded_context = self.knowledge.context_for(goal, redact(observation))
+            grounded_context["safe_ending_candidates"] = self._safe_ending_context(
+                observation
+            )
+            completion_checkpoint = self._goal_completion_checkpoint(goal)
+            if completion_checkpoint is not None:
+                grounded_context["goal_outcome_checkpoint"] = {
+                    "verified": True,
+                    "verified_at": completion_checkpoint.get("verified_at"),
+                    "instruction": (
+                        "The public goal outcome is latched. Stop/release any keeper and "
+                        "execute only the verified plan's final safe-ending travel."
+                    ),
+                }
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
@@ -6967,6 +7287,71 @@ class BotController:
                     for step in execution_plan.get("steps", [])
                     if isinstance(step, dict) and str(step.get("id") or "") == step_id
                 )
+                safe_step_id = str(
+                    deep_get(execution_plan, "safe_ending.step_id", "")
+                )
+                if completion_checkpoint is not None and step_id != safe_step_id:
+                    self._set_planner_feedback(
+                        goal,
+                        "The public goal outcome is already verified. Select only the final "
+                        f"safe-ending step {safe_step_id!r}; do not repeat completed work.",
+                    )
+                    return {
+                        "safe_ending_required": True,
+                        "action_suppressed": True,
+                        "required_plan_step_id": safe_step_id,
+                    }
+                safe_step_is_goal_destination = any(
+                    isinstance(criterion, dict)
+                    and criterion.get("kind") == "location_reached"
+                    and criterion.get("room_id") is not None
+                    and str(criterion.get("room_id"))
+                    == str(deep_get(execution_plan, "safe_ending.room_id"))
+                    for criterion in goal.get("success_criteria", [])
+                )
+                if (
+                    completion_checkpoint is None
+                    and step_id == safe_step_id
+                    and not safe_step_is_goal_destination
+                ):
+                    self._set_planner_feedback(
+                        goal,
+                        "The final safe-ending step is reserved for after the public goal "
+                        "outcome is verified. Advance an earlier plan step first.",
+                    )
+                    return {
+                        "safe_ending_premature": True,
+                        "action_suppressed": True,
+                    }
+                if step_id == safe_step_id:
+                    expected_room = deep_get(
+                        execution_plan, "safe_ending.room_id"
+                    )
+                    arguments = (
+                        decision.get("arguments")
+                        if isinstance(decision.get("arguments"), dict)
+                        else {}
+                    )
+                    requested_room = next(
+                        (
+                            arguments.get(key)
+                            for key in ("to", "destination", "room", "room_id")
+                            if arguments.get(key) is not None
+                        ),
+                        None,
+                    )
+                    if str(requested_room) != str(expected_room):
+                        self._set_planner_feedback(
+                            goal,
+                            "The final safe-ending travel must target the exact verified "
+                            f"room id {expected_room}; received {requested_room!r}.",
+                        )
+                        return {
+                            "safe_ending_target_mismatch": True,
+                            "action_suppressed": True,
+                            "expected_room_id": expected_room,
+                            "selected_room_id": requested_room,
+                        }
                 selected_tool = selected_step.get("tool")
                 if not selected_tool or selected_tool != decision.get("tool"):
                     self._set_planner_feedback(
@@ -8061,11 +8446,15 @@ class BotController:
                     },
                 )
             completion = self.criteria.evaluate(goal, self.last_observation)
-            self.storage.set_goal_completion(goal["id"], completion, terminal="succeeded" if completion["all_met"] else None)
-            if completion["all_met"]:
-                self.storage.complete_campaign_run(goal["id"], status="succeeded")
-                self.storage.emit_event("goal.succeeded", f"Goal succeeded: {goal['title']}", interesting=True, goal_id=goal["id"], data={"completion": completion})
-                self.learning.record_success(goal)
+            done = self._complete_goal_if_safe(
+                goal, self.last_observation, completion
+            )
+            if done is None:
+                checkpoint = self._goal_completion_checkpoint(goal)
+                self.storage.set_goal_completion(
+                    goal["id"],
+                    checkpoint["completion"] if checkpoint is not None else completion,
+                )
             return {"action": tool, "result": redact(result), "completion": completion}
         except ToolCallError as exc:
             self.storage.update_action_attempt(attempt_id, "failed", error_code=exc.code)
@@ -10379,12 +10768,15 @@ class BotController:
                 "progress_percent": completion.get("percent_estimate", 0),
                 "progress_summary": completion.get("summary"),
                 "criteria": criteria,
+                "outcome_latched": self._goal_completion_checkpoint(current)
+                is not None,
                 "execution_plan": None
                 if execution_plan is None
                 else {
                     "status": deep_get(execution_plan, "verification.status"),
                     "summary": execution_plan.get("summary"),
                     "steps": execution_plan.get("steps", []),
+                    "safe_ending": execution_plan.get("safe_ending"),
                     "last_action": execution_plan.get("last_action"),
                     "updated_at": execution_plan.get("updated_at"),
                 },
@@ -10790,7 +11182,7 @@ class BotController:
                 "observation_age_seconds": round(max(0.0, time.time() - float(observation.get("observed_at", time.time()))), 1),
             },
             "onboarding": self._onboarding_status(observation),
-            "goal": None if not active else {"id": active["id"], "title": active["title"], "status": active["status"], "progress_percent": active["completion"].get("percent_estimate", 0), "current_step": active["completion"].get("summary")},
+            "goal": None if not active else {"id": active["id"], "title": active["title"], "status": active["status"], "progress_percent": active["completion"].get("percent_estimate", 0), "current_step": active["completion"].get("summary"), "outcome_latched": self._goal_completion_checkpoint(active) is not None},
             "queue": {"count": len(queued), "next_title": queued[0]["title"] if queued else None},
             "attention": {
                 "pending_proposals": len(self.storage.proposals()),

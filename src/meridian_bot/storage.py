@@ -1033,6 +1033,7 @@ class Storage:
             prior = self._idempotent_result(connection, request_id, "manage_goal", payload)
             if prior is not None:
                 return prior
+            confirmation_recorded = False
             row = connection.execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone()
             if row is None:
                 raise NotFound(f"goal not found: {goal_id}")
@@ -1074,7 +1075,19 @@ class Storage:
                         raise InvalidTransition(
                             "observable criteria are not verified: " + ", ".join(unmet_observable)
                         )
-                    goal = self._transition_in_tx(connection, row, "succeeded", reason, "operator_agent")
+                    self._event_in_tx(
+                        connection,
+                        "goal.operator_confirmed",
+                        f"Operator confirmed the goal outcome: {row['title']}",
+                        interesting=True,
+                        goal_id=goal_id,
+                        data={
+                            "reason": reason,
+                            "terminal_deferred_for_safe_ending": True,
+                        },
+                    )
+                    goal = self._goal_from_row(row)
+                    confirmation_recorded = True
                 elif action in targets:
                     if action == "resume" and row["status"] == "blocked":
                         # Pre-0.2 campaign state could leave an active phase
@@ -1089,6 +1102,8 @@ class Storage:
                     raise ValueError("action must be pause, resume, cancel, reprioritize, or confirm_complete")
             self._promote_in_tx(connection)
             response = {"goal": goal}
+            if confirmation_recorded:
+                response["confirmation_recorded"] = True
             self._save_idempotent(connection, request_id, "manage_goal", payload, response)
             return response
 

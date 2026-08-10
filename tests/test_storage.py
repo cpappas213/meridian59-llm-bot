@@ -715,7 +715,17 @@ class StorageTests(unittest.TestCase):
                 storage.manage_goal({"request_id": "pause-1", "goal_id": goal["id"], "action": "cancel"})
                 operator = storage.goal(operator["id"])
                 result = storage.manage_goal({"request_id": "confirm-2", "goal_id": operator["id"], "expected_version": operator["version"], "action": "confirm_complete"})
-                self.assertEqual("succeeded", result["goal"]["status"])
+                self.assertEqual("active", result["goal"]["status"])
+                self.assertTrue(result["confirmation_recorded"])
+                self.assertEqual(
+                    1,
+                    len(
+                        storage.events(
+                            kinds=["goal.operator_confirmed"],
+                            goal_id=operator["id"],
+                        )["events"]
+                    ),
+                )
 
     def test_action_attempt_insert_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

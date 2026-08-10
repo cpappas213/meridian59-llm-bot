@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
-from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, VllmClient
+from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, PLANNER_SYSTEM, VllmClient
 from meridian_bot.obsidian import ObsidianJournal
 from meridian_bot.policy import PolicyEngine
 from meridian_bot.controller import BotController
@@ -328,6 +328,53 @@ class PolicyAndJournalTests(unittest.TestCase):
                     financial_context=None,
                 )
             self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+
+    def test_campaign_manager_and_planner_receive_full_planning_persona(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            persona = {
+                "version": 4,
+                "name": "Sable",
+                "character_voice": "A guarded pilgrim who prefers quiet sanctuaries.",
+                "traits": ["wary", "curious"],
+                "speech_style": ["concise"],
+                "values": ["self-reliance"],
+                "taboos": ["boasting"],
+                "relationship_defaults": "Polite but slow to trust.",
+                "max_reply_characters": 360,
+            }
+
+            with patch.object(
+                client, "_complete", return_value={"decision": "start_phase"}
+            ) as complete:
+                client.manage_campaign(
+                    goal={},
+                    observation={},
+                    campaign_context={},
+                    grounded_knowledge=None,
+                    learned_failures=None,
+                    financial_context=None,
+                    persona=persona,
+                )
+            manager_context = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual(persona, manager_context["planning_persona"])
+
+            with patch.object(
+                client, "_complete", return_value={"decision": "wait"}
+            ) as complete:
+                client.plan(
+                    goal={},
+                    observation={},
+                    tools=[],
+                    persona=persona,
+                    recent_events=[],
+                    pending_proposals=[],
+                    planner_feedback=None,
+                    policy_summary={},
+                )
+            planner_context = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual(persona, planner_context["planning_persona"])
+            self.assertIn("safe_ending.rationale", PLANNER_SYSTEM)
 
             with patch.object(
                 client, "_complete", return_value={"decision": "wait"}

@@ -67,7 +67,21 @@ class CriteriaEvaluator:
     def _simple(self, criterion_id: str, item: dict[str, Any], goal: dict[str, Any], observation: dict[str, Any]) -> CriterionResult:
         kind = item["kind"]
         if kind == "operator_confirmed":
-            return CriterionResult(criterion_id, kind, False, "awaiting explicit operator confirmation")
+            page = self.storage.events(
+                after_cursor=int(self.storage.goal_event_anchor(str(goal.get("id", ""))) or 0),
+                limit=1,
+                kinds=["goal.operator_confirmed"],
+                goal_id=str(goal.get("id", "")) or None,
+            )
+            met = bool(page.get("events"))
+            return CriterionResult(
+                criterion_id,
+                kind,
+                met,
+                "explicit operator confirmation recorded"
+                if met
+                else "awaiting explicit operator confirmation",
+            )
         if kind == "state_equals":
             actual = deep_get(observation, str(item.get("path", item.get("metric", ""))))
             expected = item.get("value")

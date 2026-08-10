@@ -349,12 +349,19 @@ Completion transaction:
 1. freeze new ordinary actions for the goal;
 2. obtain fresh evidence for all volatile criteria;
 3. evaluate every criterion;
-4. if all pass, persist terminal transition and completion event atomically;
-5. place character in a safe stable state when practical; and
-6. notify, journal, then allow scheduler promotion of the next goal.
+4. if all pass, durably latch the verified public outcome even if a volatile
+   location criterion becomes false during withdrawal;
+5. require the configured model's accepted execution plan to name an exact
+   source-grounded safe ending and final travel step;
+6. allow only that ending step, then freshly verify both room id and
+   `ROOM_SANCTUARY`/`ROOM_NO_COMBAT` source flags;
+7. persist the terminal transition and completion event atomically; and
+8. notify, journal, then allow scheduler promotion of the next goal.
 
-If evidence is incomplete, the controller resumes planning or becomes blocked;
-it does not lower the criterion.
+If criterion evidence is incomplete, the controller resumes planning or becomes
+blocked; it does not lower the criterion. If the outcome is latched but safe
+arrival is incomplete, the goal remains non-terminal and ordinary goal work may
+not restart.
 
 ## 13. Non-progress and self-correction
 
