@@ -377,6 +377,10 @@ campaign, grounded_knowledge, progression_context, learned_failures, financial_c
 are fact namespaces, not callable tools. In particular, never copy context labels such as room_options_by_candidate,
 room_spawn_tables, safe_spot_evidence, combat_readiness, tactic_ledger, external_blocker, or room_info into tools.
 Internal phases never ask for operator confirmation.
+For a max-health research_progression phase, the action target must be exactly
+{{"type":"phase_action_succeeded","tools":["hunting_grounds"]}}. The prey and knowledge_search tools may provide
+supporting evidence, but only hunting_grounds returns the typed room/prey candidates that the controller can
+validate and hand off as an executable farm recipe. Do not combine those aliases in the completion target.
 Phase budgets are normalized to at least 8 actions and 30 minutes; repeated equivalent semantic failure can end
 a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot.
 Each abandon_predicates entry is an OR trigger: if any one becomes deterministically true, the controller ends only

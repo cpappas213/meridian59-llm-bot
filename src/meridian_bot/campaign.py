@@ -740,6 +740,18 @@ class CampaignCoordinator:
                         "tools": ["hunting_grounds"],
                     }
                 elif (
+                    phase_kind == "research_progression"
+                    and value.get("kind") == PHASE_ACTION_SUCCEEDED
+                    and isinstance(value.get("tools"), list)
+                    and "hunting_grounds" in value["tools"]
+                ):
+                    # Only hunting_grounds returns the typed room/prey payload
+                    # consumed by the deterministic farm-recipe handoff. A
+                    # broad "any research tool succeeded" target can complete
+                    # on prey or prose knowledge while yielding no executable
+                    # recipe, so narrow mixed legacy/model output here.
+                    value["tools"] = ["hunting_grounds"]
+                elif (
                     value.get("kind") in {"numeric_threshold", "numeric_delta"}
                     and str(value.get("metric") or "").casefold()
                     in {
@@ -808,6 +820,28 @@ class CampaignCoordinator:
                 "farm phase cannot complete merely because an action launched; "
                 "require an observable farming outcome such as a max-health milestone"
             )
+        max_health_goal = any(
+            isinstance(criterion, dict)
+            and criterion.get("kind") in {"numeric_threshold", "numeric_delta"}
+            and str(criterion.get("metric") or "")
+            in {"max_health", "status.vitals.health.max", "look.vitals.health.max"}
+            for criterion in goal.get("success_criteria", [])
+        )
+        if phase_kind == "research_progression" and max_health_goal:
+            invalid_research_tools = [
+                criterion.get("tools")
+                for criterion in criteria
+                if isinstance(criterion, dict)
+                and criterion.get("kind") == PHASE_ACTION_SUCCEEDED
+                and criterion.get("tools") != ["hunting_grounds"]
+            ]
+            if invalid_research_tools:
+                raise ValueError(
+                    "max-health progression research must require exactly "
+                    "phase_action_succeeded.tools=['hunting_grounds']; prey and "
+                    "knowledge_search do not return the typed farm recipe needed "
+                    "for deterministic handoff"
+                )
         if public_criteria:
             # Reuse the public criterion validator without creating a public goal.
             self.storage._validate_goal(

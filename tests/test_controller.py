@@ -3324,7 +3324,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_durable_lesson_immediately_ends_only_the_reselected_campaign_phase(self) -> None:
+    def test_durable_lesson_allows_one_plan_revision_before_phase_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -3358,7 +3358,7 @@ class ControllerTests(unittest.TestCase):
                     }
                 )  # type: ignore[assignment]
 
-                result = controller._execute(
+                first = controller._execute(
                     goal,
                     broker.observe(),
                     {
@@ -3369,14 +3369,36 @@ class ControllerTests(unittest.TestCase):
                     },
                 )
 
-                self.assertTrue(result["campaign_breaker"]["breaker_tripped"])
-                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertTrue(first["retry_suppressed"])
+                self.assertNotIn("campaign_breaker", first)
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertEqual(
+                    phase["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+                feedback = controller.storage.get_runtime("planner_feedback")
+                self.assertIn("Choose different arguments or a different tool", feedback["message"])
+
+                repeated = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "inventory",
+                        "arguments": {},
+                        "rationale": "Ignore the feedback and retry unchanged.",
+                        "expected_observation": {"inventory": "changed"},
+                    },
+                )
+
+                self.assertTrue(repeated["campaign_breaker"]["breaker_tripped"])
+                self.assertTrue(repeated["strategic_goal_preserved"])
                 self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
                 self.assertEqual(
                     "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
                 )
-                self.assertEqual(phase["id"], result["campaign_breaker"]["phase_id"])
+                self.assertEqual(
+                    phase["id"], repeated["campaign_breaker"]["phase_id"]
+                )
             finally:
                 controller.storage.close()
 
@@ -4014,6 +4036,58 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual("hunting_grounds", action["tool"])
                 self.assertEqual({"for_level": 24, "limit": 6}, action["arguments"])
+                self.assertEqual("find-prey", action["plan_step_id"])
+            finally:
+                controller.storage.close()
+
+    def test_manager_research_executes_required_hunting_grounds_despite_prey_alias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                phase = {
+                    "kind": "research_progression",
+                    "success_criteria": [
+                        {
+                            "id": "candidate",
+                            "kind": "phase_action_succeeded",
+                            "tools": ["hunting_grounds"],
+                        }
+                    ],
+                    "context": {},
+                }
+                observation = {
+                    "look": {
+                        "room": {"num": 106, "name": "Brownestone Inn"},
+                        "vitals": {"health": {"value": 34, "max": 34}},
+                    },
+                    "status": {
+                        "vitals": {"health": {"value": 34, "max": 34}}
+                    },
+                }
+                execution_plan = {
+                    "steps": [
+                        {
+                            "id": "find-prey",
+                            "tool": "prey",
+                            "outcome": "Find eligible prey for the current level.",
+                        },
+                        {
+                            "id": "finish-safe",
+                            "tool": "travel",
+                            "outcome": "Remain safely at Brownestone Inn.",
+                        },
+                    ],
+                    "safe_ending": {"room_id": 106, "step_id": "finish-safe"},
+                }
+
+                action = controller._structured_research_progression_action(
+                    phase, observation, execution_plan
+                )
+
+                self.assertEqual("hunting_grounds", action["tool"])
+                self.assertEqual({"for_level": 34, "limit": 6}, action["arguments"])
                 self.assertEqual("find-prey", action["plan_step_id"])
             finally:
                 controller.storage.close()
@@ -10276,11 +10350,18 @@ class ControllerTests(unittest.TestCase):
                 )[goal["id"]]
                 self.assertEqual(3, retained["repeat_count"])
                 self.assertEqual(
-                    controller._research_retry_state_fingerprint(goal, changed),
+                    controller._research_retry_state_fingerprint(goal, observation),
                     retained["retry_state_fingerprint"],
+                )
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, changed),
+                    retained["retry_pending_state_fingerprint"],
                 )
                 self.assertIsNone(
                     controller.storage.campaign_run(goal["id"])["external_blocker"]
+                )
+                self.assertTrue(
+                    controller._research_retry_gate(goal, changed)["allowed"]
                 )
 
                 repeated = controller._record_research_recipe_exhaustion(
@@ -10327,11 +10408,27 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 migrated = controller._research_retry_gate(goal, observation)
+                still_pending = controller._research_retry_gate(goal, observation)
+
+                consumed = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "three"},
+                    {
+                        "status": "no_usable_candidate",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
                 repeated = controller._research_retry_gate(goal, observation)
 
                 self.assertTrue(migrated["allowed"])
                 self.assertTrue(migrated["migration_retry"])
+                self.assertTrue(still_pending["allowed"])
+                self.assertTrue(still_pending["migration_retry"])
                 self.assertFalse(repeated["allowed"])
+                self.assertEqual(3, consumed["repeat_count"])
                 stored = controller.storage.get_runtime(
                     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
                 )[goal["id"]]
@@ -10339,12 +10436,7 @@ class ControllerTests(unittest.TestCase):
                     RESEARCH_RETRY_STATE_SCHEMA_VERSION,
                     stored["retry_state_schema"],
                 )
-                self.assertTrue(stored["retry_migration_consumed_at"])
-                self.assertIsNone(
-                    controller.storage.campaign_run(goal["id"])[
-                        "external_blocker"
-                    ]
-                )
+                self.assertNotIn("retry_migration_pending_at", stored)
             finally:
                 controller.storage.close()
 

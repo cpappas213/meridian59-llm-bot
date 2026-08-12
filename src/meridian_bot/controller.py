@@ -96,7 +96,7 @@ PVP_ROUTE_FAILURE_RUNTIME_KEY = "pvp_route_failure_v1"
 SAFE_STAGING_FLAGS = frozenset({"ROOM_SANCTUARY", "ROOM_NO_COMBAT"})
 SAFE_STAGING_RUNTIME_KEY = "verified_safe_staging_room_v1"
 RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY = "research_recipe_exhaustion_v1"
-RESEARCH_RETRY_STATE_SCHEMA_VERSION = 2
+RESEARCH_RETRY_STATE_SCHEMA_VERSION = 3
 
 # The broker's keeper retains this many shillings as walking money and does not
 # expose that value through its public autopilot schema.  Sending a positive
@@ -9484,17 +9484,20 @@ class BotController:
             or not isinstance(recorded_state, dict)
         ):
             # Legacy fingerprints included the research loop's own lessons and
-            # failed actions, so they cannot be compared safely with v2. Capture
+            # failed actions, so they cannot be compared safely with v3. Capture
             # the current state as a baseline and authorize one bounded lookup.
             # This lets a support phase completed while the old controller was
             # running hand back to research without making every later failure
-            # look like a new material change.
+            # look like a new material change. Merely reading this gate does not
+            # consume the authorization: a typed hunting-grounds result either
+            # clears exhaustion or records the new closed baseline.
             record = {
                 **record,
                 "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
                 "retry_state": current_state,
                 "retry_state_fingerprint": current,
-                "retry_migration_consumed_at": timestamp(),
+                "retry_migration_pending_at": timestamp(),
+                "retry_migration_consumed_at": None,
             }
             values[goal_id] = record
             self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
@@ -9523,6 +9526,16 @@ class BotController:
                 "state_changed": False,
                 "migration_retry": True,
             }
+        if record.get("retry_migration_pending_at"):
+            return {
+                "allowed": True,
+                "reason": (
+                    "one bounded legacy migration retry remains pending until a "
+                    "typed hunting-grounds result is validated"
+                ),
+                "state_changed": False,
+                "migration_retry": True,
+            }
         enabling_changes = self._research_retry_enabling_changes(
             recorded_state,
             current_state,
@@ -9532,17 +9545,20 @@ class BotController:
             # while retaining the prior candidate-set history. If that lookup
             # returns the same candidates, it strengthens (rather than erases)
             # the exhaustion evidence and closes the gate again immediately.
-            record = {
-                **record,
-                "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
-                "retry_state": current_state,
-                "retry_state_fingerprint": current,
-                "retry_reopened_from": record.get("retry_state_fingerprint"),
-                "retry_reopened_at": timestamp(),
-                "retry_reopened_by": enabling_changes,
-            }
-            values[goal_id] = record
-            self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
+            newly_pending = record.get("retry_pending_state_fingerprint") != current
+            if newly_pending:
+                record = {
+                    **record,
+                    "retry_pending_state": current_state,
+                    "retry_pending_state_fingerprint": current,
+                    "retry_reopened_from": record.get("retry_state_fingerprint"),
+                    "retry_reopened_at": timestamp(),
+                    "retry_reopened_by": enabling_changes,
+                }
+                values[goal_id] = record
+                self.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values
+                )
             run = self.storage.campaign_run(goal_id)
             blocker = run.get("external_blocker") if isinstance(run, dict) else None
             if (
@@ -9551,20 +9567,21 @@ class BotController:
                 and blocker.get("kind") == "no_usable_farm_recipe"
             ):
                 self.storage.clear_campaign_external_blocker(str(run["id"]))
-            self.storage.emit_event(
-                "campaign.research.retry_reopened",
-                "Reopened progression research after material capability or world evidence changed",
-                severity="notice",
-                interesting=False,
-                goal_id=goal_id,
-                data={
-                    "prior_retry_state_fingerprint": record.get(
-                        "retry_reopened_from"
-                    ),
-                    "current_retry_state_fingerprint": current,
-                    "enabling_changes": enabling_changes,
-                },
-            )
+            if newly_pending:
+                self.storage.emit_event(
+                    "campaign.research.retry_reopened",
+                    "Reopened progression research after material capability or world evidence changed",
+                    severity="notice",
+                    interesting=False,
+                    goal_id=goal_id,
+                    data={
+                        "prior_retry_state_fingerprint": record.get(
+                            "retry_reopened_from"
+                        ),
+                        "current_retry_state_fingerprint": current,
+                        "enabling_changes": enabling_changes,
+                    },
+                )
             return {
                 "allowed": True,
                 "reason": "material capability or enabling world evidence changed",
@@ -10150,27 +10167,27 @@ class BotController:
                 return step_id
             return None
 
+        successful_tools: set[str] = set()
+        if phase.get("id"):
+            successful_tools = {
+                str(attempt.get("semantic_action") or "")
+                for attempt in self.storage.phase_attempts(
+                    str(phase["id"]), limit=200
+                )
+                if attempt.get("status") == "succeeded"
+            }
+        requires_hunting_grounds = any(
+            isinstance(criterion, dict)
+            and criterion.get("kind") == "phase_action_succeeded"
+            and "hunting_grounds" in criterion.get("tools", [])
+            for criterion in phase.get("success_criteria", [])
+        )
+        max_health = deep_get(
+            observation,
+            "status.vitals.health.max",
+            deep_get(observation, "look.vitals.health.max"),
+        )
         if context.get("deterministic_fallback") is True:
-            successful_tools: set[str] = set()
-            if phase.get("id"):
-                successful_tools = {
-                    str(attempt.get("semantic_action") or "")
-                    for attempt in self.storage.phase_attempts(
-                        str(phase["id"]), limit=200
-                    )
-                    if attempt.get("status") == "succeeded"
-                }
-            requires_hunting_grounds = any(
-                isinstance(criterion, dict)
-                and criterion.get("kind") == "phase_action_succeeded"
-                and "hunting_grounds" in criterion.get("tools", [])
-                for criterion in phase.get("success_criteria", [])
-            )
-            max_health = deep_get(
-                observation,
-                "status.vitals.health.max",
-                deep_get(observation, "look.vitals.health.max"),
-            )
             if (
                 requires_hunting_grounds
                 and "hunting_grounds" not in successful_tools
@@ -10198,6 +10215,32 @@ class BotController:
                 return action
 
         destination = context.get("first_exit_room")
+        if (
+            not isinstance(destination, int)
+            and requires_hunting_grounds
+            and "hunting_grounds" not in successful_tools
+            and isinstance(max_health, (int, float))
+            and not isinstance(max_health, bool)
+        ):
+            # Manager-created research phases do not always need a staging
+            # exit. Their trusted criterion still names the only adapter whose
+            # result can become a farm recipe. Honor a planner's broader prey
+            # alias as authorization for that exact read-only lookup rather
+            # than allowing the alias to satisfy an incompatible outcome.
+            step_id = plan_step("hunting_grounds") or plan_step("prey")
+            if step_id is not None:
+                return {
+                    "tool": "hunting_grounds",
+                    "arguments": {"for_level": int(max_health), "limit": 6},
+                    "rationale": (
+                        "Collect the exact typed progression candidates required "
+                        "by the active farm-recipe research phase."
+                    ),
+                    "expected_observation": {
+                        "progression_candidates": "returned"
+                    },
+                    "plan_step_id": step_id,
+                }
         if not isinstance(destination, int) or isinstance(destination, bool):
             return None
 
@@ -12330,28 +12373,6 @@ class BotController:
                 verification={"durably_deferred": True},
                 reason=failure_reason or "tactic is durably deferred",
             )
-            if campaign_phase is not None and not phase_result.get("breaker_tripped"):
-                # A durable tactic lesson already represents the required repeated,
-                # unchanged failure evidence. Do not spend two more phase attempts
-                # rediscovering it just because the campaign manager selected a new
-                # phase wrapper around the same semantic action.
-                phase_result = self.campaign.trip_breaker(
-                    goal,
-                    campaign_phase,
-                    signature=self.campaign.action_signature(
-                        campaign_phase,
-                        tool,
-                        arguments,
-                        observation,
-                        plan.get("expected_observation"),
-                    ),
-                    semantic_action=tool,
-                    failure_count=self.campaign.ACTION_FAILURE_LIMIT,
-                    reason=(
-                        failure_reason
-                        or "the selected tactic remains durably deferred in unchanged state"
-                    ),
-                )
             self._set_planner_feedback(
                 goal,
                 (

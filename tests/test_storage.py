@@ -430,6 +430,83 @@ class StorageTests(unittest.TestCase):
             {tool["name"] for tool in selected},
         )
 
+    def test_max_health_research_compiles_only_executable_recipe_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(
+                    goal_payload(
+                        request_id="typed-hp-research-adapter",
+                        objective="Raise maximum HP to at least 100.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                    )
+                )["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Find an executable farm recipe.",
+                            "targets": [
+                                {
+                                    "id": "recipe",
+                                    "type": "phase_action_succeeded",
+                                    "tools": [
+                                        "prey",
+                                        "knowledge_search",
+                                        "hunting_grounds",
+                                    ],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                        },
+                    },
+                )
+
+                self.assertEqual(
+                    ["hunting_grounds"],
+                    phase["success_criteria"][0]["tools"],
+                )
+
+                storage.transition_campaign_phase(
+                    phase["id"], "failed", reason="exercise invalid target"
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "must require exactly.*hunting_grounds"
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "research_progression",
+                                "objective": "Use an incompatible evidence alias.",
+                                "targets": [
+                                    {
+                                        "id": "alias-only",
+                                        "type": "phase_action_succeeded",
+                                        "tools": ["prey"],
+                                    }
+                                ],
+                                "abandon_predicates": [],
+                            },
+                        },
+                    )
+
     def test_purchase_and_training_phases_allow_guarded_go_exit_recovery(self) -> None:
         tools = [
             {"name": "map"},
