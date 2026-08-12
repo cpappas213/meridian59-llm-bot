@@ -127,8 +127,7 @@ python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" doc
 
 # Scheduled controller
 Get-ScheduledTask -TaskName "Meridian59 LLM Bot"
-Stop-ScheduledTask -TaskName "Meridian59 LLM Bot"
-Start-ScheduledTask -TaskName "Meridian59 LLM Bot"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-controller.ps1
 
 # Reattach the interactive goal/status console
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch.ps1
@@ -143,17 +142,35 @@ ambiguity.
 
 ## 7. Backup and restore
 
-Stop the scheduled task before copying runtime state. Back up `bot.toml`,
+Use `scripts/restart-controller.ps1` for routine maintenance; it waits for a
+full-health, low-risk boundary with no foreground action, then asks the
+controller to stop itself and its owned broker before starting the scheduled
+task again. A raw `Stop-ScheduledTask` can terminate only the PowerShell wrapper
+and leave its Python and Node children holding the instance lock and ports.
+
+Gracefully stop the controller before copying runtime state. Back up `bot.toml`,
 `secrets.env`, `data/controller.sqlite3`, its WAL/SHM files when present, and
 the harness fleet-state file to an encrypted private location. Restore them only
 to a trusted machine, verify ACLs, then run `doctor` before starting the task.
+
+To leave the controller stopped for a backup, first use `status` to confirm a
+safe boundary, run the authenticated stop command, and wait for the task state
+to become `Ready`:
+
+```powershell
+python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" status
+python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" stop
+Get-ScheduledTask -TaskName "Meridian59 LLM Bot"
+```
 
 Never publish runtime state or diagnostics; both may identify accounts, private
 servers, players, inventory, or tokens.
 
 ## 8. Updating
 
-1. Stop the scheduled task.
+1. At a full-health, low-risk boundary, run
+   `m59-bot --config <path> stop` and wait for the scheduled task to become
+   `Ready`. Do not use `Stop-ScheduledTask`.
 2. Back up private state.
 3. Pull the root repository and update submodules to the committed gitlink.
 4. Confirm the submodule has no local modifications.
