@@ -16,7 +16,7 @@ autojoin = true
 
 [harness]
 root = "../vendor/m59-harness"
-expected_revision = "1d27f5d45f631521a193feac4f50fd8eec95e1fe"
+expected_revision = "f19549e86be52cd861ec6151be5f7b19d882d7d5"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
