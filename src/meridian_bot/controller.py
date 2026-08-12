@@ -1882,6 +1882,49 @@ class BotController:
                 )
         return None
 
+    @classmethod
+    def _map_step_error(
+        cls,
+        phase: dict[str, Any] | None,
+        step: dict[str, Any],
+    ) -> str | None:
+        """Reject plans that mistake room-name search for creature grounding."""
+
+        if str(step.get("tool") or "") != "map":
+            return None
+        text = " ".join(
+            (
+                str(step.get("outcome") or ""),
+                str(step.get("verification") or ""),
+            )
+        ).casefold()
+        if not re.search(r"\b(?:find|search|locate|discover|identify|list)\b", text):
+            return None
+        context = (
+            phase.get("context")
+            if isinstance(phase, dict) and isinstance(phase.get("context"), dict)
+            else {}
+        )
+        target = str(context.get("target") or "").strip().casefold()
+        target_pattern = (
+            re.compile(rf"\b{re.escape(target)}s?\b") if target else None
+        )
+        creature_discovery = bool(
+            re.search(
+                r"\b(?:creature|monster|prey|spawn|hunting ground|farm target)\b",
+                text,
+            )
+            or (target_pattern is not None and target_pattern.search(text))
+        )
+        if not creature_discovery:
+            return None
+        return (
+            "uses map to discover creature occupancy. Purpose: map.search only "
+            "matches room names and cannot prove that prey spawns there; call "
+            "hunting_grounds for the exact creature, then use map with the returned "
+            "numeric room id to verify a route"
+        )
+
     @staticmethod
     def _is_plan_purchase_step(step: dict[str, Any]) -> bool:
         if step.get("tool") != "shop":
@@ -2109,6 +2152,22 @@ class BotController:
         )
         if invalid_protected_sale_step is not None:
             step, error = invalid_protected_sale_step
+            self._invalidate_execution_plan(
+                goal,
+                f"stored step {step.get('id')!r} {error}",
+            )
+            return None
+        invalid_map_step = next(
+            (
+                (step, error)
+                for step in value.get("steps", [])
+                if isinstance(step, dict)
+                if (error := self._map_step_error(phase, step)) is not None
+            ),
+            None,
+        )
+        if invalid_map_step is not None:
+            step, error = invalid_map_step
             self._invalidate_execution_plan(
                 goal,
                 f"stored step {step.get('id')!r} {error}",
@@ -3373,6 +3432,12 @@ class BotController:
                 raise ModelError(
                     f"execution_plan step {step_id} {protected_sale_error}"
                 )
+            map_error = self._map_step_error(
+                phase,
+                {"tool": tool, "outcome": outcome, "verification": verification},
+            )
+            if map_error is not None:
+                raise ModelError(f"execution_plan step {step_id} {map_error}")
             ids.add(step_id)
             normalized_steps.append(
                 {
@@ -12197,6 +12262,32 @@ class BotController:
                 "only if the returned offered_price is acceptable"
             )
 
+    @staticmethod
+    def _guard_map_semantics(
+        phase: dict[str, Any] | None,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        if tool != "map" or not isinstance(arguments.get("search"), str):
+            return
+        context = (
+            phase.get("context")
+            if isinstance(phase, dict) and isinstance(phase.get("context"), dict)
+            else {}
+        )
+        target = str(context.get("target") or "").strip().casefold()
+        search = str(arguments.get("search") or "").strip().casefold()
+        if not target or not search:
+            return
+        if target not in search and search not in target:
+            return
+        raise ModelError(
+            f"map rejected creature search {search!r} for phase target {target!r}. "
+            "Purpose: map.search only matches room names and its substring results "
+            "cannot establish creature occupancy; call hunting_grounds with creature="
+            f"{target!r}, then map the returned numeric room id for route evidence"
+        )
+
     def _record_prepare_combat_sell_quote(
         self,
         goal: dict[str, Any],
@@ -12252,6 +12343,7 @@ class BotController:
             if campaign_run
             else None
         )
+        self._guard_map_semantics(campaign_phase, tool, arguments)
         self._guard_prepare_combat_sale(
             goal,
             campaign_phase,
@@ -14071,6 +14163,23 @@ class BotController:
                 )[:500]
         if tool in {"map", KNOWLEDGE_TOOL_NAME} and result.get("matches") == []:
             return "authoritative lookup returned no matches"
+        if tool == "map" and (arguments or {}).get("to") is not None:
+            destination = deep_get(result, "destination.num")
+            before_room = deep_get(
+                observation,
+                "look.room.num",
+                deep_get(observation, "status.room.num"),
+            )
+            route = result.get("route")
+            if (
+                destination is not None
+                and str(destination) != str(before_room)
+                and (not isinstance(route, list) or not route)
+            ):
+                return (
+                    f"map resolved destination room {destination} but found no route "
+                    f"from current room {before_room} in the graph"
+                )[:500]
         if tool == "shop" and isinstance(result.get("bought"), list):
             received = result.get("got")
             if not isinstance(received, list) or not received:

@@ -548,6 +548,15 @@ class StorageTests(unittest.TestCase):
                     {tool["name"] for tool in selected},
                 )
 
+        training = CampaignCoordinator.tools_for_phase(
+            {"kind": "train_ability"},
+            [{"name": "prey"}, {"name": "hunting_grounds"}],
+        )
+        self.assertEqual(
+            {"prey", "hunting_grounds"},
+            {tool["name"] for tool in training},
+        )
+
     def test_return_home_phase_can_use_the_one_way_raza_exit(self) -> None:
         selected = CampaignCoordinator.tools_for_phase(
             {"kind": "return_home"},

@@ -1940,6 +1940,51 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_train_ability_rejects_map_as_creature_spawn_search(self) -> None:
+        phase = {
+            "kind": "train_ability",
+            "context": {"target": "ant", "room": 6},
+        }
+        error = BotController._map_step_error(
+            phase,
+            {
+                "tool": "map",
+                "outcome": "Use map to find a reachable ant room.",
+                "verification": "Map lists a candidate room with ants.",
+            },
+        )
+        valid = BotController._map_step_error(
+            phase,
+            {
+                "tool": "map",
+                "outcome": "Verify the route to exact room 6.",
+                "verification": "Map returns a non-empty route to room 6.",
+            },
+        )
+
+        self.assertIn("map.search only matches room names", error or "")
+        self.assertIsNone(valid)
+        with self.assertRaisesRegex(ModelError, "cannot establish creature occupancy"):
+            BotController._guard_map_semantics(
+                phase,
+                "map",
+                {"search": "ants"},
+            )
+        BotController._guard_map_semantics(phase, "map", {"to": 6})
+
+    def test_map_route_lookup_without_a_route_is_no_progress(self) -> None:
+        reason = BotController._no_progress_reason(
+            {
+                "destination": {"num": 6, "name": "The Deep Dark Woods of Marion"},
+                "route": None,
+            },
+            {"look": {"room": {"num": 103, "name": "The Bhrama & Falcon"}}},
+            tool="map",
+            arguments={"to": 6},
+        )
+
+        self.assertIn("found no route from current room 103", reason or "")
+
     def test_direct_prepare_combat_capability_highlights_create_weapon(self) -> None:
         context = BotController._direct_phase_capabilities(
             {"kind": "prepare_combat"},

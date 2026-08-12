@@ -133,6 +133,11 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
     "train_ability": {
         "abilities",
         "spells",
+        # Combat training needs the source spawn index to choose prey and a
+        # real room. `map.search` only matches room names and cannot establish
+        # that a creature lives there.
+        "prey",
+        "hunting_grounds",
         "inventory",
         "merchants",
         "map",

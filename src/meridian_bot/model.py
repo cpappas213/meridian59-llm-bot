@@ -218,6 +218,10 @@ act on it or change the plan.
 For shopping, merchants searches item catalogs and map searches rooms: query merchants with the exact
 desired item/class, then resolve the returned merchant or shop name to a canonical numeric room and use
 travel. Never use an item category such as "armor" as a map search or invent bank/shop coordinates. A
+map search is only a case-insensitive substring match against room names; it cannot discover monsters,
+spawns, prey, items, or merchants. For combat-driven train_ability phases, use prey to rank a target and
+hunting_grounds with the exact creature to establish its spawn rooms, then call map with a returned numeric
+room id only to verify route connectivity. Never interpret room-name substring matches as spawn evidence. A
 merchant catalogue result with room=null or available=false is source-only/unplaced negative evidence:
 do not infer a shop from its city, class name, or lore. An explicit purchase or newly learned paid
 ability goal is valid only when goal.constraints.purchase_plan contains offering_kind (item, skill,
