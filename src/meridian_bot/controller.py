@@ -108,6 +108,12 @@ BROKER_WALKING_MONEY = 400
 # begins earlier, and the separate emergency survival fallback remains more
 # conservative. This is the operator-approved combat-risk boundary for farms.
 FARM_FLEE_THRESHOLD = 0.60
+# Foreground fights are reduced to one observable swing and re-evaluated on
+# every controller turn. Requiring exactly 100% health before each swing makes
+# combat impossible in rooms where ambient aggression lands during model
+# inference. Keep a controller-owned buffer above the normalized disengage
+# floor instead; autonomous farming still launches only at full health.
+MANUAL_COMBAT_START_MARGIN = 0.10
 
 # The ordinary client advertises ATTACK as an affordance for faction troops
 # because the player is allowed to initiate combat with them.  That is not an
@@ -4779,8 +4785,44 @@ class BotController:
         if self._underworld(observation):
             blockers.append({"kind": "recover_from_underworld", "guidance": "escape through a functioning portal before combat"})
         health = self._vital_fraction(observation, "health")
-        if health is not None and health < 1.0:
-            blockers.append({"kind": "recover_health", "health_fraction": health, "guidance": "return to full health before combat"})
+        if health is not None:
+            if tool == "fight":
+                try:
+                    disengage_at = float(
+                        arguments.get(
+                            "disengage_at",
+                            self.config.policy.rest_health_fraction,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    disengage_at = self.config.policy.rest_health_fraction
+                minimum_start = min(
+                    0.99,
+                    max(self.config.policy.rest_health_fraction, disengage_at)
+                    + MANUAL_COMBAT_START_MARGIN,
+                )
+                if health <= minimum_start:
+                    blockers.append(
+                        {
+                            "kind": "recover_health",
+                            "health_fraction": health,
+                            "minimum_start_fraction": minimum_start,
+                            "disengage_at": disengage_at,
+                            "guidance": (
+                                "recover above the manual-combat start floor before "
+                                f"another one-swing fight ({minimum_start:.0%}; the "
+                                f"verified disengage floor is {disengage_at:.0%})"
+                            ),
+                        }
+                    )
+            elif health < 1.0:
+                blockers.append(
+                    {
+                        "kind": "recover_health",
+                        "health_fraction": health,
+                        "guidance": "return to full health before launching autonomous combat",
+                    }
+                )
         mana = self._vital_fraction(observation, "mana")
         if mana is not None and mana < 1.0:
             blockers.append({"kind": "recover_mana", "mana_fraction": mana, "guidance": "return to full mana before a new hazardous encounter"})

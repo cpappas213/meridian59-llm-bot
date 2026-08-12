@@ -7901,6 +7901,54 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_manual_fight_uses_margin_above_disengage_instead_of_full_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="manual-combat-start-margin")
+                )["goal"]
+                broker = CombatBroker()
+                observation = broker.observe()
+                observation["status"]["vitals"]["health"] = {
+                    "current": 85,
+                    "max": 100,
+                }
+                observation["look"]["vitals"]["health"] = {
+                    "current": 85,
+                    "max": 100,
+                }
+
+                manual = controller._combat_preflight(
+                    "fight",
+                    {"target": "giant rat", "disengage_at": 0.7},
+                    observation,
+                    goal,
+                )
+                autonomous = controller._combat_preflight(
+                    "autopilot",
+                    {"action": "start", "mode": "farm", "hunt": "giant rat"},
+                    observation,
+                    goal,
+                )
+
+                self.assertNotIn("recover_health", {item["kind"] for item in manual})
+                self.assertIn("recover_health", {item["kind"] for item in autonomous})
+
+                observation["status"]["vitals"]["health"]["current"] = 79
+                observation["look"]["vitals"]["health"]["current"] = 79
+                low = controller._combat_preflight(
+                    "fight",
+                    {"target": "giant rat", "disengage_at": 0.7},
+                    observation,
+                    goal,
+                )
+                blocker = next(item for item in low if item["kind"] == "recover_health")
+                self.assertAlmostEqual(0.8, blocker["minimum_start_fraction"])
+                self.assertIn("one-swing fight", blocker["guidance"])
+            finally:
+                controller.storage.close()
+
     def test_running_background_farm_exclusively_owns_hp_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

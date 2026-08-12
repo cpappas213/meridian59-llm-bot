@@ -222,6 +222,10 @@ map search is only a case-insensitive substring match against room names; it can
 spawns, prey, items, or merchants. For combat-driven train_ability phases, use prey to rank a target and
 hunting_grounds with the exact creature to establish its spawn rooms, then call map with a returned numeric
 room id only to verify route connectivity. Never interpret room-name substring matches as spawn evidence. A
+foreground fight is one observable swing and may begin above the controller-disclosed manual start floor;
+it need not wait for exactly 100% health in an actively hostile room. Respect its normalized disengage_at and
+recover or retreat when feedback reports the start floor is not met. Autonomous farm launches remain subject
+to their stricter full-health preparation gate.
 merchant catalogue result with room=null or available=false is source-only/unplaced negative evidence:
 do not infer a shop from its city, class name, or lore. An explicit purchase or newly learned paid
 ability goal is valid only when goal.constraints.purchase_plan contains offering_kind (item, skill,

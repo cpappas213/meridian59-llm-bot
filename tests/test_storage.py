@@ -550,10 +550,14 @@ class StorageTests(unittest.TestCase):
 
         training = CampaignCoordinator.tools_for_phase(
             {"kind": "train_ability"},
-            [{"name": "prey"}, {"name": "hunting_grounds"}],
+            [
+                {"name": "prey"},
+                {"name": "hunting_grounds"},
+                {"name": "rest_up"},
+            ],
         )
         self.assertEqual(
-            {"prey", "hunting_grounds"},
+            {"prey", "hunting_grounds", "rest_up"},
             {tool["name"] for tool in training},
         )
 

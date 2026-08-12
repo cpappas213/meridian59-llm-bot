@@ -148,6 +148,7 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "bank",
         "cast",
         "fight",
+        "rest_up",
         "equip_best",
         "knowledge_search",
     },
