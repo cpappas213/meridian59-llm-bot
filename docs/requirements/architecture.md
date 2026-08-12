@@ -43,7 +43,8 @@ flowchart LR
 ### 2.1 Harness checkout
 
 The deployment shall use an independent checkout of
-[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), pinned to an
+[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), consumed through
+the public integration fork and pinned to an
 explicit tested commit. The preferred implementation is a Git submodule at
 `vendor/m59-harness`; a configured external checkout is also allowed for local
 development.
