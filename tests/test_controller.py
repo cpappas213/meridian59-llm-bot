@@ -10222,12 +10222,18 @@ class ControllerTests(unittest.TestCase):
                     goal_payload(request_id="research-retry-state")
                 )["goal"]
                 run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
                 record = {
                     "fingerprint": "same-candidate-set",
                     "repeat_count": 3,
                     "phase_ids": ["one", "two", "three"],
                     "candidate_count": 1,
                     "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": baseline,
+                    "retry_state_fingerprint": controller._research_retry_state_fingerprint(
+                        goal, observation
+                    ),
                 }
                 controller.storage.set_runtime(
                     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
@@ -10291,6 +10297,53 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(4, repeated["repeat_count"])
                 self.assertFalse(
                     controller._research_retry_gate(goal, changed)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_legacy_research_exhaustion_gets_one_bounded_migration_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-research-retry-migration")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                record = {
+                    "fingerprint": "legacy-candidate-set",
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 0,
+                    "rejected": [],
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                migrated = controller._research_retry_gate(goal, observation)
+                repeated = controller._research_retry_gate(goal, observation)
+
+                self.assertTrue(migrated["allowed"])
+                self.assertTrue(migrated["migration_retry"])
+                self.assertFalse(repeated["allowed"])
+                stored = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertEqual(
+                    RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    stored["retry_state_schema"],
+                )
+                self.assertTrue(stored["retry_migration_consumed_at"])
+                self.assertIsNone(
+                    controller.storage.campaign_run(goal["id"])[
+                        "external_blocker"
+                    ]
                 )
             finally:
                 controller.storage.close()
@@ -10525,12 +10578,15 @@ class ControllerTests(unittest.TestCase):
                 state_fingerprint = controller._research_retry_state_fingerprint(
                     goal, observation
                 )
+                state = controller._research_retry_state(goal, observation)
                 record = {
                     "fingerprint": "closed-candidate-set",
                     "repeat_count": 2,
                     "phase_ids": ["one", "two"],
                     "candidate_count": 1,
                     "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": state,
                     "retry_state_fingerprint": state_fingerprint,
                 }
                 controller.storage.set_runtime(

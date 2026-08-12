@@ -9484,13 +9484,17 @@ class BotController:
             or not isinstance(recorded_state, dict)
         ):
             # Legacy fingerprints included the research loop's own lessons and
-            # failed actions. Migrating them by comparison would manufacture a
-            # false "material change", so capture a conservative v2 baseline.
+            # failed actions, so they cannot be compared safely with v2. Capture
+            # the current state as a baseline and authorize one bounded lookup.
+            # This lets a support phase completed while the old controller was
+            # running hand back to research without making every later failure
+            # look like a new material change.
             record = {
                 **record,
                 "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
                 "retry_state": current_state,
                 "retry_state_fingerprint": current,
+                "retry_migration_consumed_at": timestamp(),
             }
             values[goal_id] = record
             self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
@@ -9501,16 +9505,24 @@ class BotController:
                 and isinstance(blocker, dict)
                 and blocker.get("kind") == "no_usable_farm_recipe"
             ):
-                self.storage.update_campaign_memory(
-                    run["id"],
-                    external_blocker={
-                        **blocker,
-                        "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
-                        "retry_state": current_state,
-                        "retry_state_fingerprint": current,
-                    },
-                )
-            recorded_state = current_state
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+            self.storage.emit_event(
+                "campaign.research.retry_reopened",
+                "Authorized one bounded progression lookup while migrating legacy exhaustion state",
+                severity="notice",
+                interesting=False,
+                goal_id=goal_id,
+                data={
+                    "current_retry_state_fingerprint": current,
+                    "migration_retry": True,
+                },
+            )
+            return {
+                "allowed": True,
+                "reason": "one bounded retry is authorized while migrating legacy exhaustion state",
+                "state_changed": False,
+                "migration_retry": True,
+            }
         enabling_changes = self._research_retry_enabling_changes(
             recorded_state,
             current_state,

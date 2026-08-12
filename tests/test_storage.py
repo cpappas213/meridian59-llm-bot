@@ -12,6 +12,60 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_inventory_not_full_uses_known_broker_capacity_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                evaluator = CriteriaEvaluator(storage)
+                goal = {
+                    "id": "inventory-capacity-compatibility",
+                    "success_criteria": [
+                        {
+                            "id": "capacity",
+                            "kind": "state_equals",
+                            "path": "inventory.full",
+                            "value": False,
+                        }
+                    ],
+                }
+
+                available = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": True,
+                                "room_for": {"weight": 2566, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+                full = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": True,
+                                "room_for": {"weight": 0, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+                unknown = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": False,
+                                "room_for": {"weight": 2566, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+
+                self.assertTrue(available["all_met"])
+                self.assertFalse(full["all_met"])
+                self.assertFalse(unknown["all_met"])
+
     def test_higher_priority_preemption_requeues_and_automatically_resumes_goal(
         self,
     ) -> None:

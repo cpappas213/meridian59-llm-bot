@@ -83,7 +83,9 @@ class CriteriaEvaluator:
                 else "awaiting explicit operator confirmation",
             )
         if kind == "state_equals":
-            actual = deep_get(observation, str(item.get("path", item.get("metric", ""))))
+            actual = self._state_value(
+                observation, str(item.get("path", item.get("metric", "")))
+            )
             expected = item.get("value")
             return CriterionResult(criterion_id, kind, actual == expected, f"observed {actual!r}; expected {expected!r}")
         if kind in {"numeric_threshold", "numeric_delta"}:
@@ -135,6 +137,50 @@ class CriteriaEvaluator:
                 f"matching goal-scoped durable events: {len(page['events'])}{anchor_note}",
             )
         return CriterionResult(criterion_id, kind, False, "unsupported verifier")
+
+    @staticmethod
+    def _state_value(observation: dict[str, Any], path: str) -> Any:
+        """Resolve stable state paths, including broker compatibility aliases."""
+
+        if path != "inventory.full":
+            return deep_get(observation, path)
+
+        inventory = observation.get("inventory")
+        if not isinstance(inventory, dict):
+            return None
+        if "full" in inventory:
+            return inventory["full"]
+
+        # Current broker snapshots expose capacity as remaining weight and bulk
+        # rather than the older synthetic ``inventory.full`` flag used by
+        # campaign criteria. Keep that criterion stable for persisted phases and
+        # derive the flag only when the carry snapshot is explicitly known.
+        carry = inventory.get("carry")
+        if not isinstance(carry, dict) or carry.get("known") is not True:
+            return None
+        room_for = carry.get("room_for")
+        if isinstance(room_for, dict):
+            weight = room_for.get("weight")
+            bulk = room_for.get("bulk")
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (weight, bulk)
+            ):
+                return bool(weight <= 0 or bulk <= 0)
+
+        load = carry.get("load")
+        maximum = carry.get("max")
+        if isinstance(load, dict) and isinstance(maximum, dict):
+            weight = load.get("weight")
+            bulk = load.get("bulk")
+            weight_max = maximum.get("weight")
+            bulk_max = maximum.get("bulk")
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (weight, bulk, weight_max, bulk_max)
+            ):
+                return bool(weight >= weight_max or bulk >= bulk_max)
+        return None
 
     @staticmethod
     def _numeric_metric(observation: dict[str, Any], metric: str) -> Any:
