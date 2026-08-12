@@ -341,6 +341,16 @@ def render_dashboard(
     game = status.get("game") if isinstance(status.get("game"), dict) else {}
     onboarding = status.get("onboarding") if isinstance(status.get("onboarding"), dict) else {}
     campaign = status.get("campaign") if isinstance(status.get("campaign"), dict) else {}
+    campaign_execution = (
+        campaign.get("execution")
+        if isinstance(campaign.get("execution"), dict)
+        else {}
+    )
+    active_phase = (
+        campaign_execution.get("active_phase")
+        if isinstance(campaign_execution.get("active_phase"), dict)
+        else None
+    )
     development = campaign.get("development") if isinstance(campaign.get("development"), dict) else {}
     readiness = campaign.get("readiness") if isinstance(campaign.get("readiness"), dict) else {}
     vitals = game.get("vitals") if isinstance(game.get("vitals"), dict) else {}
@@ -418,6 +428,46 @@ def render_dashboard(
                 )
     else:
         lines.append("No active, paused, or blocked goal. The bot is strategically idle.")
+
+    if displayed_goal and campaign_execution:
+        lines.extend([rule, _paint("CURRENT PHASE", "bright_cyan", color)])
+        if active_phase is not None:
+            ordinal = active_phase.get("ordinal")
+            phase_number = f"#{ordinal} " if ordinal is not None else ""
+            phase_kind = _human_label(active_phase.get("kind") or "internal work")
+            phase_status = str(active_phase.get("status") or "-")
+            attempt_count = active_phase.get("attempt_count", 0)
+            lines.extend(
+                [
+                    (
+                        f"{_paint(phase_number + phase_kind, 'bright_white', color)} "
+                        f"{_paint('[' + phase_status + ']', _state_style(phase_status), color)} | "
+                        f"Attempts {_paint(attempt_count, 'magenta', color)} | "
+                        f"Campaign {_paint(campaign_execution.get('status', '-'), _state_style(campaign_execution.get('status')), color)}"
+                    ),
+                    f"  {_one_line(active_phase.get('objective'), limit=width - 4)}",
+                ]
+            )
+            execution_plan = (
+                displayed_goal.get("execution_plan")
+                if isinstance(displayed_goal.get("execution_plan"), dict)
+                else {}
+            )
+            plan_summary = execution_plan.get("summary")
+            if plan_summary:
+                plan_status = execution_plan.get("status") or "pending"
+                lines.append(
+                    f"  Plan [{_paint(plan_status, _state_style(plan_status), color)}]: "
+                    f"{_one_line(plan_summary, limit=width - 14)}"
+                )
+        else:
+            lines.append(
+                _paint(
+                    "No active internal phase; the campaign manager is selecting the next phase.",
+                    "yellow",
+                    color,
+                )
+            )
 
     lines.extend([rule, _paint("GOAL QUEUE", "bright_cyan", color)])
     if queue:
