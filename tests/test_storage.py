@@ -840,6 +840,40 @@ class StorageTests(unittest.TestCase):
                         },
                     )
 
+    def test_campaign_manager_rejects_action_only_mutating_combat_preparation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+
+                with self.assertRaisesRegex(
+                    ValueError, "mutating action success alone.*cast"
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "prepare_combat",
+                                "objective": "Create food for later combat.",
+                                "targets": [
+                                    {
+                                        "id": "cast-returned",
+                                        "type": "phase_action_succeeded",
+                                        "tools": ["cast"],
+                                    }
+                                ],
+                                "abandon_predicates": [],
+                            },
+                        },
+                    )
+
     def test_legacy_shilling_array_metric_migrates_and_completes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:

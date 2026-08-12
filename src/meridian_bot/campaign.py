@@ -820,6 +820,25 @@ class CampaignCoordinator:
                 "farm phase cannot complete merely because an action launched; "
                 "require an observable farming outcome such as a max-health milestone"
             )
+        preparation_mutations = {
+            tool
+            for criterion in criteria
+            if isinstance(criterion, dict)
+            and criterion.get("kind") == PHASE_ACTION_SUCCEEDED
+            for tool in criterion.get("tools", [])
+            if tool in {"act", "cast", "sell", "sell_all", "shop"}
+        }
+        if (
+            phase_kind == "prepare_combat"
+            and preparation_mutations
+            and not public_criteria
+        ):
+            raise ValueError(
+                "prepare_combat cannot use mutating action success alone for "
+                + ", ".join(sorted(preparation_mutations))
+                + "; require an observable target such as item_count_at_least, "
+                "wielding_equals, equipment_known, or inventory_not_full"
+            )
         max_health_goal = any(
             isinstance(criterion, dict)
             and criterion.get("kind") in {"numeric_threshold", "numeric_delta"}

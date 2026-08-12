@@ -3722,6 +3722,54 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_persisted_action_only_mutating_preparation_is_retired(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="persisted-action-only-preparation")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Legacy equipment and food preparation.",
+                        "success_criteria": [
+                            {
+                                "id": "equip-returned",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["equip_best"],
+                            },
+                            {
+                                "id": "cast-returned",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["cast"],
+                            },
+                        ],
+                        "abandon_predicates": [],
+                        "context": {},
+                    },
+                    mode="start",
+                )
+
+                outcome = controller._evaluate_campaign_phase(
+                    goal, run, phase, SimulatedBroker().observe()
+                )
+
+                self.assertTrue(outcome.failed)
+                self.assertEqual("failed", outcome.phase["status"])
+                self.assertEqual(
+                    "invalid_prepare_combat_phase_outcome",
+                    outcome.detail["grounding_blocker"]["kind"],
+                )
+                self.assertIn(
+                    "observable equipment, inventory, or capacity state",
+                    outcome.detail["reason"],
+                )
+            finally:
+                controller.storage.close()
+
     def test_research_prefers_recent_successful_farm_tactic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

@@ -2311,7 +2311,11 @@ class BotController:
         )
         if (
             isinstance(persisted_blocker, dict)
-            and persisted_blocker.get("kind") == "invalid_farm_phase_outcome"
+            and persisted_blocker.get("kind")
+            in {
+                "invalid_farm_phase_outcome",
+                "invalid_prepare_combat_phase_outcome",
+            }
         ):
             # This guard must run before completion-checkpoint reconciliation.
             # Older controller builds could persist and latch a farm whose sole
@@ -2330,7 +2334,7 @@ class BotController:
             )
             self.storage.emit_event(
                 "campaign.phase.grounding_rejected",
-                "Retired a persisted launch-only farm phase before execution",
+                "Retired a persisted phase whose action-only outcome was not observable",
                 severity="warning",
                 interesting=False,
                 goal_id=goal.get("id"),
@@ -9867,7 +9871,7 @@ class BotController:
         avoid_rooms: set[str] | None = None,
         goal_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Reject a farm phase that contradicts retained hard tactic evidence.
+        """Reject a phase with an unobservable outcome or hard tactic conflict.
 
         Tactical planning cannot replace a durable campaign phase.  Accepting a
         phase for a quarantined room/prey/strategy therefore traps the planner
@@ -9878,7 +9882,41 @@ class BotController:
         preference; it is never itself a grounding blocker.
         """
 
-        if not isinstance(phase, dict) or phase.get("kind") != "farm":
+        if not isinstance(phase, dict):
+            return None
+        criteria = [
+            criterion
+            for criterion in phase.get("success_criteria", [])
+            if isinstance(criterion, dict)
+        ]
+        if phase.get("kind") == "prepare_combat" and criteria and all(
+            criterion.get("kind") == "phase_action_succeeded"
+            for criterion in criteria
+        ):
+            mutating_tools = sorted(
+                {
+                    tool
+                    for criterion in criteria
+                    for tool in (
+                        criterion.get("tools", [])
+                        if isinstance(criterion.get("tools"), list)
+                        else []
+                    )
+                    if tool in {"act", "cast", "sell", "sell_all", "shop"}
+                }
+            )
+            if mutating_tools:
+                return {
+                    "kind": "invalid_prepare_combat_phase_outcome",
+                    "tools": mutating_tools,
+                    "guidance": (
+                        "combat preparation cannot be verified by mutating adapter "
+                        "success alone; require observable equipment, inventory, or "
+                        "capacity state for "
+                        + ", ".join(mutating_tools)
+                    ),
+                }
+        if phase.get("kind") != "farm":
             return None
         intent = self._campaign_phase_farm_intent(phase)
         assigned_room = intent.get("assigned_room")
@@ -9903,11 +9941,6 @@ class BotController:
                     + " instead of relying on rationale prose"
                 ),
             }
-        criteria = [
-            criterion
-            for criterion in phase.get("success_criteria", [])
-            if isinstance(criterion, dict)
-        ]
         if criteria and all(
             criterion.get("kind") == "phase_action_succeeded"
             for criterion in criteria
