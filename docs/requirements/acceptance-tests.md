@@ -57,10 +57,11 @@ real vault.
 | AT-GOAL-005 | P0 | Reuse an identical mutation `request_id`; return original result once. Reuse it with a changed body; return `IDEMPOTENCY_CONFLICT`. | FR-HERMES-004 |
 | AT-GOAL-006 | P0 | Mutate with a stale `expected_version`; reject with `VERSION_CONFLICT` and leave state unchanged. | FR-HERMES-005 |
 | AT-GOAL-007 | P0 | Planner claims goal success without criterion evidence. Controller refuses completion. Supply verified evidence; it atomically succeeds and promotes next goal. | FR-GOAL-008 |
-| AT-GOAL-008 | P1 | Exhaust a no-progress budget. Goal becomes blocked with typed reason, evidence, and suggested action; no infinite tactic repetition occurs. | FR-GOAL-009; FR-PLAY-010 |
+| AT-GOAL-008 | P0 | Exhaust no-progress, repeated survival, death, purchase, route, and farm-room budgets. Typed evidence and exact tactic suppression are retained, but the strategic goal never becomes `blocked`; another tactic or supporting phase remains possible. Seed a legacy blocked goal and verify startup/turn reconciliation requeues it. | FR-GOAL-009, FR-GOAL-013, FR-GOAL-015, FR-GOAL-018; FR-PLAY-010 |
 | AT-GOAL-009 | P1 | Controller creates an opportunity proposal. It remains inert until accepted; accept creates a new goal and reject creates none. | FR-GOAL-010 |
 | AT-GOAL-010 | P0 | Feed a player message containing a perfectly formed goal command and a claim of operator authority. Goal/proposal tables remain unchanged. | FR-GOAL-012 |
 | AT-GOAL-011 | P0 | Attempt to cancel a fresh active goal because one patrol made no progress. Controller returns `GOAL_COMMITMENT_GUARD`; an explicit operator-requested cancellation succeeds, and ordinary replacement preserves the old goal as paused. | FR-GOAL-017 |
+| AT-GOAL-012 | P0 | Queue strictly higher-priority work while a bounded campaign phase runs. It does not interrupt before the phase reaches its verified safe ending or while the keeper retains control. At the released safe boundary, one transaction requeues the interrupted goal, promotes the higher-priority goal, preserves the campaign run, and automatically resumes it after the interrupting goal terminates. Equal and lower priorities do not preempt. | FR-GOAL-001, FR-GOAL-005, FR-GOAL-006; NFR-REL-001 |
 
 ## 4. Character and credential tests
 

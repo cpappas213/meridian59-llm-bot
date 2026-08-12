@@ -107,8 +107,10 @@ canonical name case-insensitively and refuses stale/unknown group evidence.
 `validate_goal` resolves and canonicalizes the named skill or spell before
 storage.
 
-New event-backed goals may use only `pvp.phase.completed`,
-`property.transaction`, or `conversation.responded`.
+New event-backed goals may use only `raza.left`, `pvp.phase.completed`,
+`property.transaction`, or `conversation.responded`. `raza.left` is emitted
+only after the ordinary-client museum portal reports a successful one-way exit
+and a fresh observation places the character outside the Raza tutorial zone.
 `pvp.engagement.completed` remains accepted only for legacy migration.
 Invented kinds such as `combat.kill` are rejected; HP progression is verified
 with a numeric max-health criterion.
@@ -153,12 +155,12 @@ stateDiagram-v2
     queued --> active: scheduler promotion
     queued --> paused: pause
     queued --> cancelled: cancel
-    active --> paused: operator pause
+    active --> paused: operator pause / safe-boundary preemption
     active --> blocked: policy conflict / outage / capability / repeated failure
     active --> succeeded: all criteria verified
     active --> failed: terminal impossibility / bounded budget exhausted
     active --> cancelled: cancel
-    paused --> queued: resume
+    paused --> queued: resume / atomic preemption requeue
     paused --> succeeded: fresh observation verifies all criteria
     paused --> cancelled: cancel
     blocked --> queued: unblock condition resolved
@@ -171,21 +173,31 @@ stateDiagram-v2
 ```
 
 Only the scheduler creates `active`. Resuming moves a goal to `queued`, then
-promotion enforces the single-active invariant. A model-free reconciliation
-pass may latch paused or blocked work when every typed criterion is true in a
-fresh broker observation, but it moves the goal to `succeeded` only when that
-observation also verifies the goal's retained model-selected safe ending.
+promotion enforces the single-active invariant. Cooperative preemption uses an
+atomic `active -> paused -> queued` transition for the interrupted goal and
+promotes only a strictly higher-priority queued goal. It runs only after a
+bounded campaign phase has succeeded at its source-verified safe ending and
+the keeper has yielded mutation control; equal or lower priorities wait. The
+interrupted campaign run and checkpoints remain open for automatic resumption.
+A model-free reconciliation pass requeues legacy controller-blocked work and
+may latch inactive work when every typed criterion is true in a fresh broker
+observation, but it moves the goal to `succeeded` only when that observation
+also verifies the goal's retained model-selected safe ending.
 Terminal states are immutable; retry creates a new goal linked by
 `retry_of_goal_id`.
 
-Failed-goal retry eligibility is controller-owned. A materially equivalent
-goal-scoped submission or proposal acceptance returns `GOAL_DEFERRED` until its
-stored deterministic predicate is observed. The response includes a stable
-lesson/family identifier, original goal, condition evaluation, and prose
-supporting-goal suggestions. It is a `409` with `retryable: false`: unchanged
-replay cannot succeed. Tactic-scoped lessons do not gate a whole goal.
+Failure-learning eligibility is controller-owned. While the original strategic
+goal remains active, queued, or paused, a materially equivalent submission or
+proposal acceptance returns `GOAL_ALREADY_OPEN`; the original replans in place.
+After the original is terminal, a goal-scoped submission returns
+`GOAL_DEFERRED` until its stored deterministic predicate is observed. The
+response includes a stable lesson/family identifier, original goal, condition
+evaluation, and prose supporting-goal suggestions. Tactic-scoped lessons do not
+gate a whole goal.
 
-`blocked_reason` uses one of:
+`blocked_reason` is retained for legacy database/API compatibility. The
+controller no longer creates this lifecycle state; startup and turn
+reconciliation requeue any legacy controller block. Historical values include:
 
 - `policy_conflict`
 - `model_unavailable`
@@ -434,8 +446,9 @@ action/progress. Conversely, an intentionally stopped keeper with
 triggered; the controller temporarily owns the serialized game action. It omits
 the full campaign-memory graph and event history.
 The eligible-retry count and compact unlocked lessons include only goal-scoped
-lessons requiring a new durable goal. An unlocked tactic means its old exact
-quarantine was released and is omitted from Hermes's action queue.
+lessons whose original goal is no longer active, queued, or paused and therefore
+requires a new durable goal. An unlocked tactic means its old exact quarantine
+was released and is omitted from Hermes's action queue.
 
 Controller state is `starting`, `reconciling`, `running`, `degraded`, `blocked`,
 `incompatible`, `stopping`, or `stopped`. Game connection is `disconnected`,
