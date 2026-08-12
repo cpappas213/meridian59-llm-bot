@@ -443,7 +443,21 @@ class BrokerClient:
     def ensure_joined(self) -> Any:
         health = self.health()
         if self.config.game.agent in health.get("sessions", []):
-            return {"already_joined": True}
+            # `/health.sessions` is meant to contain only live sessions, but a
+            # startup race in older harnesses exposed the Session object while
+            # its asynchronous login was still running. Verify with an ordinary
+            # read before authorizing startup mutations such as autopilot.
+            try:
+                self.call_tool(
+                    "status",
+                    {"agent": self.config.game.agent, "brief": True},
+                    timeout=10,
+                )
+            except ToolCallError as exc:
+                if "not in game" not in str(exc).casefold():
+                    raise
+            else:
+                return {"already_joined": True}
         username = self.config.secrets.get("M59_ACCOUNT_USERNAME")
         password = self.config.secrets.get("M59_ACCOUNT_PASSWORD")
         if not username or not password:

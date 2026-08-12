@@ -11,6 +11,7 @@ from meridian_bot.broker import (
     CONTROLLER_ONLY_TOOLS,
     HarnessIncompatible,
     Tool,
+    ToolCallError,
 )
 
 from .helpers import config
@@ -71,6 +72,57 @@ class BrokerTests(unittest.TestCase):
             health = broker.ensure_started()
 
             self.assertTrue(health["dashboard"]["readonly"])
+
+    def test_ensure_joined_verifies_health_session_before_startup_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker.health = lambda timeout=3: {  # type: ignore[method-assign]
+                "ok": True,
+                "sessions": ["primary"],
+            }
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            def fake_call(name: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                calls.append((name, dict(arguments)))
+                return {"character": "TestHero"}
+
+            broker.call_tool = fake_call  # type: ignore[method-assign]
+
+            result = broker.ensure_joined()
+
+            self.assertEqual({"already_joined": True}, result)
+            self.assertEqual(
+                [("status", {"agent": "primary", "brief": True})],
+                calls,
+            )
+
+    def test_ensure_joined_rejoins_health_session_that_is_not_in_game(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker.config.secrets.update(
+                {
+                    "M59_ACCOUNT_USERNAME": "account",
+                    "M59_ACCOUNT_PASSWORD": "password",
+                }
+            )
+            broker.health = lambda timeout=3: {  # type: ignore[method-assign]
+                "ok": True,
+                "sessions": ["primary"],
+            }
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            def fake_call(name: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                calls.append((name, dict(arguments)))
+                if name == "status":
+                    raise ToolCallError('agent "primary" is not in game — call join first')
+                return {"joined": True}
+
+            broker.call_tool = fake_call  # type: ignore[method-assign]
+
+            result = broker.ensure_joined()
+
+            self.assertEqual({"joined": True}, result)
+            self.assertEqual(["status", "join"], [name for name, _ in calls])
 
     def test_observe_includes_compact_live_minimap_without_vector_walls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
