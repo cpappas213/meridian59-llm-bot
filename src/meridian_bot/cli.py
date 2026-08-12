@@ -19,7 +19,7 @@ from .mcp import serve as serve_mcp
 from .knowledge_mcp import serve as serve_knowledge_mcp
 from .persona import PERSONA_FIELDS
 from .singleton import InstanceLock
-from .tui import ControllerApi, run_tui
+from .tui import ControllerApi, ControllerApiError, run_tui
 from .utils import uuid7
 
 
@@ -30,6 +30,13 @@ def parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run the controller, APIs, and game loop")
     run.add_argument("--no-connect", action="store_true", help="start APIs without broker/game startup (diagnostics only)")
     sub.add_parser("doctor", help="validate configuration and inspect local dependencies")
+    status = sub.add_parser("status", help="read compact status from the running controller")
+    status.add_argument(
+        "--require-joined",
+        action="store_true",
+        help="return failure unless the controller is running and the game is joined",
+    )
+    sub.add_parser("stop", help="ask the running controller and owned broker to stop gracefully")
     sub.add_parser("once", help="run startup and one planning turn")
     persona = sub.add_parser(
         "setup-persona",
@@ -312,6 +319,80 @@ def run_controller(config: BotConfig, *, no_connect: bool = False, once: bool = 
     return 0
 
 
+def runtime_command(config: BotConfig, command: str, *, require_joined: bool = False) -> int:
+    api = ControllerApi(config)
+    try:
+        value = api.status() if command == "status" else api.safe_stop()
+    except ControllerApiError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    displayed = value
+    if command == "status":
+        controller = value.get("controller") if isinstance(value.get("controller"), dict) else {}
+        game = value.get("game") if isinstance(value.get("game"), dict) else {}
+        goal = value.get("goal") if isinstance(value.get("goal"), dict) else {}
+        attention = value.get("attention") if isinstance(value.get("attention"), dict) else {}
+        displayed = {
+            "controller": {
+                key: controller.get(key)
+                for key in (
+                    "state",
+                    "since",
+                    "last_heartbeat_at",
+                    "foreground_action",
+                )
+                if key in controller
+            },
+            "game": {
+                key: game.get(key)
+                for key in (
+                    "connection",
+                    "character_name",
+                    "location",
+                    "room_id",
+                    "vitals",
+                    "risk",
+                )
+                if key in game
+            },
+            "goal": {
+                key: goal.get(key)
+                for key in (
+                    "id",
+                    "title",
+                    "status",
+                    "priority",
+                    "progress_percent",
+                    "progress_summary",
+                )
+                if key in goal
+            },
+            "attention": {
+                key: attention.get(key)
+                for key in (
+                    "warnings",
+                    "pending_proposals",
+                    "deferred_goal_count",
+                    "eligible_retry_count",
+                )
+                if key in attention
+            },
+        }
+        displayed = {key: item for key, item in displayed.items() if item}
+    # Windows PowerShell captures scheduled maintenance output with its legacy
+    # console encoding. Escaping non-ASCII status prose keeps the command usable
+    # even when a room, lesson, or planner message contains an arrow or em dash.
+    print(json.dumps(displayed, ensure_ascii=True, indent=2))
+    if command == "status" and require_joined:
+        controller = value.get("controller")
+        game = value.get("game")
+        if not isinstance(controller, dict) or not isinstance(game, dict):
+            return 1
+        if controller.get("state") != "running" or game.get("connection") != "joined":
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "mcp":
@@ -336,6 +417,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "doctor":
         return doctor(config)
+    if args.command == "status":
+        return runtime_command(config, "status", require_joined=args.require_joined)
+    if args.command == "stop":
+        return runtime_command(config, "stop")
     if args.command == "once":
         return run_controller(config, once=True)
     if args.command == "run":

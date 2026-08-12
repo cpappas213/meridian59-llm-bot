@@ -169,6 +169,21 @@ public goal becomes complete, the controller latches that result, permits only
 the declared safe-ending step, and advances only after fresh room and safety
 verification.
 
+## Controller maintenance
+
+Use the supported restart command for upgrades or routine maintenance:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-controller.ps1
+```
+
+It waits for a full-health, low-risk maintenance boundary with no foreground
+action, authenticates to the running controller, lets the controller stop its
+owned broker, waits for the scheduled action to exit, starts it again, and
+verifies a joined game session. Do not substitute a raw `Stop-ScheduledTask`;
+Windows can stop only the PowerShell wrapper and leave Python and Node holding
+the instance lock and network ports.
+
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional
 tone, social presence, and a useful tension or flaw. Setup explains that this

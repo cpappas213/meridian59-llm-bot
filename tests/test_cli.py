@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from meridian_bot.cli import parser, prompt_persona, setup_persona
+from meridian_bot.cli import parser, prompt_persona, runtime_command, setup_persona
 from meridian_bot.config import OnboardingConfig
 from meridian_bot.controller import BotController
 
@@ -14,6 +16,59 @@ from .helpers import config
 
 
 class CliTests(unittest.TestCase):
+    def test_parser_exposes_authenticated_runtime_commands(self) -> None:
+        status = parser().parse_args(["status", "--require-joined"])
+        stop = parser().parse_args(["stop"])
+
+        self.assertEqual("status", status.command)
+        self.assertTrue(status.require_joined)
+        self.assertEqual("stop", stop.command)
+
+    def test_runtime_status_can_require_a_joined_game(self) -> None:
+        class FakeControllerApi:
+            def __init__(self, _config: object) -> None:
+                pass
+
+            def status(self) -> dict[str, object]:
+                return {
+                    "controller": {"state": "running"},
+                    "game": {"connection": "joining"},
+                }
+
+        with patch("meridian_bot.cli.ControllerApi", FakeControllerApi):
+            output = io.StringIO()
+            with patch("sys.stdout", new=output):
+                result = runtime_command(
+                    config(Path(".")), "status", require_joined=True
+                )
+
+        self.assertEqual(1, result)
+        self.assertEqual(
+            {
+                "controller": {"state": "running"},
+                "game": {"connection": "joining"},
+            },
+            json.loads(output.getvalue()),
+        )
+
+    def test_runtime_stop_uses_controller_safe_stop(self) -> None:
+        calls: list[str] = []
+
+        class FakeControllerApi:
+            def __init__(self, _config: object) -> None:
+                pass
+
+            def safe_stop(self) -> dict[str, bool]:
+                calls.append("safe_stop")
+                return {"stopping": True}
+
+        with patch("meridian_bot.cli.ControllerApi", FakeControllerApi):
+            with patch("sys.stdout", new=io.StringIO()):
+                result = runtime_command(config(Path(".")), "stop")
+
+        self.assertEqual(0, result)
+        self.assertEqual(["safe_stop"], calls)
+
     def test_parser_exposes_local_persona_setup(self) -> None:
         args = parser().parse_args(
             [

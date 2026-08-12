@@ -32,6 +32,9 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Added authenticated `status` and graceful `stop` CLI commands plus a supported
+  scheduled-controller restart script, preventing raw Task Scheduler stops from
+  orphaning the Python controller or its owned Node broker on Windows.
 - Removed implicit Tos Inn/bar completion travel from purchase and training
   flows. Finish destinations now come only from approved goal criteria, while
   farm launch staging comes from source-verified safe-room flags and live state

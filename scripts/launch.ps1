@@ -71,11 +71,19 @@ $task = Get-ScheduledTask -TaskName "Meridian59 LLM Bot" -ErrorAction SilentlyCo
 if (-not $task) {
     throw "The controller scheduled task is missing. Re-run setup from option 2."
 }
-if ($task.State -ne "Running") {
+$env:PYTHONPATH = Join-Path $resolvedProjectRoot "src"
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    $null = & $PythonExecutable -m meridian_bot.cli --config $resolvedConfigPath status 2>$null
+    $controllerAvailable = $LASTEXITCODE -eq 0
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($task.State -ne "Running" -and -not $controllerAvailable) {
     Start-ScheduledTask -TaskName "Meridian59 LLM Bot"
 }
 
-$env:PYTHONPATH = Join-Path $resolvedProjectRoot "src"
 Set-Location -LiteralPath $resolvedProjectRoot
 & $PythonExecutable -m meridian_bot.cli --config $resolvedConfigPath tui
 exit $LASTEXITCODE

@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $installerPath = Join-Path $projectRoot "scripts\install.ps1"
 $launcherPath = Join-Path $projectRoot "scripts\launch.ps1"
+$restartPath = Join-Path $projectRoot "scripts\restart-controller.ps1"
 
 function Read-ScriptAst {
     param([string]$Path)
@@ -26,6 +27,19 @@ function Read-ScriptAst {
 
 $installerAst = Read-ScriptAst $installerPath
 $null = Read-ScriptAst $launcherPath
+$null = Read-ScriptAst $restartPath
+$restartSource = Get-Content -LiteralPath $restartPath -Raw
+if ($restartSource -match "Stop-ScheduledTask") {
+    throw "The supported restart script must not orphan child processes with Stop-ScheduledTask"
+}
+if ($restartSource -notmatch 'Invoke-ControllerCli @\("stop"\)' -or
+    $restartSource -notmatch 'status", "--require-joined') {
+    throw "The restart script must gracefully stop and verify a joined replacement"
+}
+if ($restartSource -notmatch 'health\.value -eq \$health\.max' -or
+    $restartSource -notmatch 'game\.risk -eq "low"') {
+    throw "The restart script must wait for a full-health, low-risk boundary"
+}
 $wanted = @(
     "Resolve-IanaTimezoneAlias",
     "Test-IanaTimezone",
