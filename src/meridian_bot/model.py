@@ -194,9 +194,25 @@ the observed cause, and relevant state; it intentionally does not prescribe a re
 Infer and verify the revised plan yourself from the current observation and available tools.
 Every act decision is executed. Never call a mutation that you expect to fail in order to "trigger",
 demonstrate, remember, or communicate a prerequisite. If a bank, merchant, target, or room is required,
-call map/merchants/knowledge_search or travel there directly. After an insufficient-funds shop result,
-inspect actual inventory, query merchants for what the character carries, obtain a quote or sell accepted
-ordinary loot, then retry the purchase; do not perform a knowingly invalid bank call from the shop.
+call map/merchants/knowledge_search or travel there directly.
+Treat controller rejections and execution failures as corrective constraints, not generic obstacles. A
+rejection explains the invariant being protected and the required kind of correction. Do not resubmit the
+same tactic under different wording: change its tool, ordering, target, or prerequisite so the corrected
+plan actually satisfies that invariant.
+Keep commerce tool semantics exact. shop only inspects a merchant's stock or buys from that merchant; it
+cannot sell player inventory. Use sell for a targeted quote or sale and sell_all for guarded bulk
+liquidation. During prepare_combat, preserve the configured loadout: never set ignore_loadout=true and do
+not impose a weapon cap while selling. Prefer a targeted sell quote with confirm=false before committing an
+uncertain sale. Use sell_all only for ordinary excess loot when its loadout protections are appropriate.
+After an insufficient-funds shop result, the current purchase tactic is invalid until funds have actually
+increased. Inspect actual inventory, query merchants for what the character carries, and use sell or guarded
+sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly
+inspect the same shop catalogue until a funding action succeeds; do not perform a knowingly invalid bank
+call from the shop.
+Prefer verified direct capabilities over speculative commerce. If a castable self-production spell such as
+Create Weapon directly supplies the missing phase requirement, use cast before constructing a buy-and-sell
+detour. A successful read-only catalogue or status lookup is evidence, not progress; after learning it once,
+act on it or change the plan.
 For shopping, merchants searches item catalogs and map searches rooms: query merchants with the exact
 desired item/class, then resolve the returned merchant or shop name to a canonical numeric room and use
 travel. Never use an item category such as "armor" as a map search or invent bank/shop coordinates. A

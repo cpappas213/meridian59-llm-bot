@@ -1259,6 +1259,10 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("`pvp_engage only` defines a closed, expiring local opportunity", PLANNER_SYSTEM)
         self.assertIn("If pvp_seek reports route_unavailable or travel_error", PLANNER_SYSTEM)
         self.assertIn("phase_outcome_checkpoint", PLANNER_SYSTEM)
+        self.assertIn("corrective constraints, not generic obstacles", PLANNER_SYSTEM)
+        self.assertIn("shop only inspects a merchant's stock", PLANNER_SYSTEM)
+        self.assertIn("Create Weapon directly supplies", PLANNER_SYSTEM)
+        self.assertIn("read-only catalogue or status lookup is evidence, not progress", PLANNER_SYSTEM)
 
     def test_exactly_six_mcp_tools(self) -> None:
         self.assertEqual({"status", "submit_goal", "manage_goal", "proposals", "persona", "events"}, {tool["name"] for tool in TOOLS})
@@ -1718,6 +1722,177 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("succeeded", controller.storage.goal(goal["id"])["status"])
             finally:
                 controller.storage.close()
+
+    def test_execution_plan_enforces_commerce_semantics_and_funding_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                for name in ("shop", "sell", "sell_all", "merchants"):
+                    broker.tools[name] = Tool(
+                        name,
+                        f"Test {name} capability.",
+                        {"type": "object", "properties": {}},
+                    )
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="commerce-plan-semantics")
+                )["goal"]
+                grounding = controller.knowledge.validate_goal(goal)
+
+                mislabeled_sale = with_safe_ending(
+                    {
+                        "summary": "Sell loot and withdraw safely.",
+                        "steps": [
+                            {
+                                "id": "sell-mushrooms",
+                                "outcome": "Sell mushrooms to the merchant.",
+                                "tool": "shop",
+                                "verification": "The merchant bought the loot and shillings increased.",
+                            }
+                        ],
+                    },
+                    100,
+                )
+                with self.assertRaisesRegex(ModelError, "cannot produce its stated outcome"):
+                    controller._store_execution_plan(
+                        goal,
+                        mislabeled_sale,
+                        grounding=grounding,
+                        revision=False,
+                    )
+
+                unfunded_purchase = with_safe_ending(
+                    {
+                        "summary": "Buy a mace and withdraw safely.",
+                        "steps": [
+                            {
+                                "id": "buy-mace",
+                                "outcome": "Purchase a mace from the merchant.",
+                                "tool": "shop",
+                                "verification": "Inventory contains the purchased mace.",
+                            }
+                        ],
+                    },
+                    100,
+                )
+                with self.assertRaisesRegex(ModelError, "zero carried shillings"):
+                    controller._store_execution_plan(
+                        goal,
+                        unfunded_purchase,
+                        grounding=grounding,
+                        revision=False,
+                    )
+
+                funded_purchase = copy.deepcopy(unfunded_purchase)
+                funded_purchase["steps"].insert(
+                    0,
+                    {
+                        "id": "fund-purchase",
+                        "outcome": "Sell ordinary mushrooms to raise purchase funds.",
+                        "tool": "sell",
+                        "verification": "The sale transfers mushrooms and increases shillings.",
+                    },
+                )
+                stored = controller._store_execution_plan(
+                    goal,
+                    funded_purchase,
+                    grounding=grounding,
+                    revision=False,
+                )
+                self.assertEqual("sell", stored["steps"][0]["tool"])
+                self.assertEqual("shop", stored["steps"][1]["tool"])
+            finally:
+                controller.storage.close()
+
+    def test_prepare_combat_sale_guards_preserve_loadout_and_require_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="prepare-combat-sale-guards")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Acquire a working weapon.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                observation = {
+                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}}
+                }
+
+                with self.assertRaisesRegex(ModelError, "preserve goal-relevant equipment"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell_all",
+                        {"merchant": 10, "ignore_loadout": True},
+                        observation,
+                    )
+                with self.assertRaisesRegex(ModelError, "preserve all candidate weapons"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell_all",
+                        {"merchant": 10, "max_weapons": 1},
+                        observation,
+                    )
+
+                sale = {"to": 10, "items": [77], "confirm": True}
+                with self.assertRaisesRegex(ModelError, "unquoted targeted sale"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        sale,
+                        observation,
+                    )
+                quote = {**sale, "confirm": False}
+                controller._record_prepare_combat_sell_quote(
+                    goal,
+                    phase,
+                    quote,
+                    observation,
+                    {"sold": False, "offered_price": 12},
+                )
+                controller._guard_prepare_combat_sale(
+                    goal,
+                    phase,
+                    "sell",
+                    sale,
+                    observation,
+                )
+            finally:
+                controller.storage.close()
+
+    def test_direct_prepare_combat_capability_highlights_create_weapon(self) -> None:
+        context = BotController._direct_phase_capabilities(
+            {"kind": "prepare_combat"},
+            {
+                "spells": {
+                    "spells": [
+                        {
+                            "name": "Create Weapon",
+                            "mana": 15,
+                            "reagents": [],
+                            "castable": True,
+                        },
+                        {"name": "Blink", "castable": True},
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNotNone(context)
+        self.assertEqual("cast", context["preferred_tool"])
+        self.assertEqual("Create Weapon", context["capabilities"][0]["name"])
 
     def test_execution_plan_drops_toolless_monitor_step_when_qwen_returns_nine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4569,6 +4744,44 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_identical_read_only_shop_catalogue_replay_invalidates_purchase_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = {
+                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}}
+                }
+                arguments = {"seller": 10}
+                result = {"items": [{"id": 348, "name": "mace", "cost": 40}]}
+
+                first = controller._repeated_evidence_reason(
+                    "shop", arguments, result, observation
+                )
+                second = controller._repeated_evidence_reason(
+                    "shop", arguments, result, observation
+                )
+
+                self.assertIsNone(first)
+                self.assertIn("identical evidence lookup", second or "")
+                self.assertTrue(
+                    controller._failure_invalidates_plan("shop", second)
+                )
+                guidance = controller._no_progress_guidance("shop", second or "")
+                self.assertIn("read-only success is evidence, not progress", guidance)
+
+                # A real purchase remains a mutation and is never classified
+                # as a repeated catalogue lookup by this guard.
+                self.assertIsNone(
+                    controller._repeated_evidence_reason(
+                        "shop",
+                        {"seller": 10, "buy_ids": [348]},
+                        result,
+                        observation,
+                    )
+                )
+            finally:
+                controller.storage.close()
+
     def test_server_refusal_message_is_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
             {"verb": "get", "messages": ["You're unable to pick up Paddock."]},
@@ -4653,6 +4866,15 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Do not retry this purchase at any quantity", guidance)
         self.assertIn("sell confirm:false", guidance)
         self.assertIn("verified bank", guidance)
+        reason = 'Frisconar says, "Come back when you have enough money for the flask."'
+        self.assertTrue(BotController._failure_invalidates_plan("shop", reason))
+        context = BotController._failure_context(
+            "shop",
+            reason,
+            {"inventory": {"items": []}},
+        )
+        self.assertEqual("purchase_funds_insufficient", context["kind"])
+        self.assertIn("Invalidate the current purchase tactic", context["purpose"])
 
     def test_inventory_capacity_feedback_reports_cause_without_prescribing_solution(self) -> None:
         observation = {

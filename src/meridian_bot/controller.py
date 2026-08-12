@@ -1802,6 +1802,121 @@ class BotController:
             )
         )
 
+    @staticmethod
+    def _commerce_step_error(step: dict[str, Any]) -> str | None:
+        """Return a corrective error when a plan assigns commerce to the wrong tool."""
+
+        tool = str(step.get("tool") or "")
+        outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+        verification = " ".join(
+            str(step.get("verification") or "").split()
+        ).casefold()
+        if tool == "shop" and (
+            re.match(r"^(?:sell|liquidate|dispose)\b", outcome)
+            or re.search(r"\b(?:item|loot|property) (?:was |is )?sold\b", verification)
+            or re.search(r"\bmerchant (?:bought|buys)\b", verification)
+            or re.search(r"\bshillings? (?:increased|received|gained)\b", verification)
+        ):
+            return (
+                "assigns a player-inventory sale to shop. Purpose: shop only reads "
+                "merchant stock or buys from it, so this step cannot produce its stated "
+                "outcome; use sell for a targeted quote/sale or guarded sell_all for "
+                "ordinary excess loot"
+            )
+        if tool in {"sell", "sell_all"} and re.match(
+            r"^(?:buy|purchase)\b", outcome
+        ):
+            return (
+                f"assigns a merchant-stock purchase to {tool}. Purpose: sell tools only "
+                "transfer player inventory to a merchant; use shop for a purchase"
+            )
+        return None
+
+    @staticmethod
+    def _is_plan_purchase_step(step: dict[str, Any]) -> bool:
+        if step.get("tool") != "shop":
+            return False
+        outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+        verification = " ".join(
+            str(step.get("verification") or "").split()
+        ).casefold()
+        return bool(
+            re.search(r"\b(?:buy|purchase|acquire|obtain)\b", outcome)
+            or re.search(r"\b(?:bought|purchased|acquired)\b", verification)
+        )
+
+    @staticmethod
+    def _is_plan_funding_step(step: dict[str, Any]) -> bool:
+        tool = step.get("tool")
+        if tool in {"sell", "sell_all"}:
+            return True
+        return tool == "bank" and bool(
+            re.search(
+                r"\bwithdraw\b",
+                str(step.get("outcome") or ""),
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _plan_funding_error(
+        cls,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> str | None:
+        if cls._carried_currency(observation) > 0:
+            return None
+        funding_seen = False
+        for step in steps:
+            if cls._is_plan_funding_step(step):
+                funding_seen = True
+            if cls._is_plan_purchase_step(step) and not funding_seen:
+                return (
+                    f"execution_plan step {step.get('id')} purchases from a shop with "
+                    "zero carried shillings and no preceding funding step. Purpose: an "
+                    "unfunded purchase cannot change inventory; precede it with sell, "
+                    "guarded sell_all, or a verified bank withdrawal, or replace the "
+                    "purchase with a verified castable self-production capability"
+                )
+        return None
+
+    @staticmethod
+    def _direct_phase_capabilities(
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Make directly useful live capabilities conspicuous to the tactical model."""
+
+        if str((phase or {}).get("kind") or "") != "prepare_combat":
+            return None
+        spells = deep_get(observation, "spells.spells", [])
+        direct = [
+            {
+                key: spell.get(key)
+                for key in ("name", "mana", "reagents", "castable", "blocked_by")
+                if spell.get(key) is not None
+            }
+            for spell in (spells if isinstance(spells, list) else [])
+            if isinstance(spell, dict)
+            and spell.get("castable") is True
+            and re.search(
+                r"\b(?:create|conjure|summon)\s+weapon\b",
+                str(spell.get("name") or ""),
+                re.IGNORECASE,
+            )
+        ]
+        if not direct:
+            return None
+        return {
+            "purpose": (
+                "These live, castable capabilities can directly satisfy the current "
+                "equipment prerequisite. Prefer them before speculative shopping or "
+                "liquidation detours."
+            ),
+            "preferred_tool": "cast",
+            "capabilities": direct,
+        }
+
     def _execution_plan(self, goal: dict[str, Any]) -> dict[str, Any] | None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
         if not isinstance(values, dict):
@@ -1913,6 +2028,32 @@ class BotController:
                 "stored step "
                 f"{invalid_observation_step.get('id')!r} uses act for an observation-only outcome",
             )
+            return None
+        invalid_commerce_step = next(
+            (
+                (step, error)
+                for step in value.get("steps", [])
+                if isinstance(step, dict)
+                if (error := self._commerce_step_error(step)) is not None
+            ),
+            None,
+        )
+        if invalid_commerce_step is not None:
+            step, error = invalid_commerce_step
+            self._invalidate_execution_plan(
+                goal,
+                f"stored step {step.get('id')!r} {error}",
+            )
+            return None
+        stored_steps = [
+            step for step in value.get("steps", []) if isinstance(step, dict)
+        ]
+        funding_error = self._plan_funding_error(
+            stored_steps,
+            self.last_observation or {},
+        )
+        if funding_error is not None:
+            self._invalidate_execution_plan(goal, funding_error)
             return None
         try:
             self._validate_direct_pvp_plan(
@@ -3094,6 +3235,17 @@ class BotController:
                     "use the appropriate read-only tool (such as look, status, or inventory), "
                     "and reserve act for use, unuse, get, drop, activate, eat, or go"
                 )
+            commerce_error = self._commerce_step_error(
+                {
+                    "tool": tool,
+                    "outcome": outcome,
+                    "verification": verification,
+                }
+            )
+            if commerce_error is not None:
+                raise ModelError(
+                    f"execution_plan step {step_id} {commerce_error}"
+                )
             ids.add(step_id)
             normalized_steps.append(
                 {
@@ -3103,6 +3255,12 @@ class BotController:
                     "verification": verification[:600],
                 }
             )
+        funding_error = self._plan_funding_error(
+            normalized_steps,
+            self.last_observation or {},
+        )
+        if funding_error is not None:
+            raise ModelError(funding_error)
         purchase = grounding.get("purchase_verification")
         if isinstance(purchase, dict) and not purchase.get("static_verified"):
             raise ModelError("execution plan cannot be verified because purchase feasibility is invalid")
@@ -10744,6 +10902,12 @@ class BotController:
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
+            direct_capabilities = self._direct_phase_capabilities(
+                campaign_phase,
+                observation,
+            )
+            if direct_capabilities is not None:
+                grounded_context["direct_phase_capabilities"] = direct_capabilities
             farm_intent = self._effective_farm_intent(goal)
             if farm_intent.get("assigned_room") is not None and farm_intent.get("hunt"):
                 grounded_context["farm_safe_staging"] = self._farm_launch_origin(
@@ -10867,12 +11031,40 @@ class BotController:
                     else:
                         feedback_message = (
                             f"The proposed execution plan failed deterministic verification: {exc}. "
-                            "Return one corrected plan before selecting a tool."
+                            "This rejection prevents a plan whose declared tool cannot produce its "
+                            "outcome or whose required prerequisite is absent. Treat the stated "
+                            "invariant as a hard corrective constraint, not as an obstacle to retry "
+                            "under different wording. Return one materially corrected plan before "
+                            "selecting a tool."
                         )
                     self._set_planner_feedback(
                         goal,
                         feedback_message,
                         consecutive_plan_rejections=plan_rejections,
+                        failure_context=(
+                            {
+                                "kind": "rejected_optional_plan_revision",
+                                "invariant": str(exc)[:1000],
+                                "purpose": "Preserve the existing verified execution plan.",
+                                "required_response": (
+                                    "Act on an existing actionable step; do not submit another "
+                                    "optional revision."
+                                ),
+                            }
+                            if execution_plan is not None
+                            else {
+                                "kind": "invalid_execution_plan",
+                                "invariant": str(exc)[:1000],
+                                "purpose": (
+                                    "Prevent execution of a plan whose tool semantics, ordering, "
+                                    "or prerequisites cannot produce the declared outcome."
+                                ),
+                                "required_response": (
+                                    "Change the tool, ordering, target, or prerequisite that "
+                                    "violated the invariant; do not merely paraphrase the rejected plan."
+                                ),
+                            }
+                        ),
                     )
                     self.storage.emit_event(
                         "planner.plan.rejected",
@@ -11398,6 +11590,14 @@ class BotController:
                 "plan_fingerprint": fingerprint,
                 "plan_step_id": decision.get("plan_step_id"),
                 "reason": reason[:500],
+                "purpose": (
+                    "Prevent a structurally invalid or unsafe tool call before it can "
+                    "mutate game state. The reason names the invariant to satisfy."
+                ),
+                "required_response": (
+                    "Correct the rejected arguments or prerequisite; do not repeat the "
+                    "same action under different wording."
+                ),
             },
         )
         self.storage.emit_event(
@@ -11458,6 +11658,113 @@ class BotController:
             minimums.get(tool, 0.0),
         )
 
+    def _sell_quote_signature(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        arguments: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> str:
+        semantic_arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"agent", "confirm"}
+        }
+        return canonical_json(
+            {
+                "goal_id": goal.get("id"),
+                "phase_id": (phase or {}).get("id"),
+                "room": self._observation_room(observation),
+                "arguments": semantic_arguments,
+            }
+        )
+
+    def _guard_prepare_combat_sale(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        tool: str,
+        arguments: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> None:
+        if str((phase or {}).get("kind") or "") != "prepare_combat":
+            return
+        if tool == "sell_all":
+            if arguments.get("ignore_loadout") is True:
+                raise ModelError(
+                    "prepare_combat rejected sell_all with ignore_loadout=true. Purpose: "
+                    "preserve goal-relevant equipment and the character loadout while raising "
+                    "funds; omit ignore_loadout or set it false"
+                )
+            if arguments.get("max_weapons") is not None:
+                raise ModelError(
+                    "prepare_combat rejected sell_all with a weapon cap. Purpose: preserve all "
+                    "candidate weapons until combat setup has selected a working one; omit "
+                    "max_weapons"
+                )
+            arguments["ignore_loadout"] = False
+            return
+        if tool != "sell" or arguments.get("confirm") is False:
+            return
+        signature = self._sell_quote_signature(
+            goal,
+            phase,
+            arguments,
+            observation,
+        )
+        quotes = self.storage.get_runtime("prepare_combat_sell_quotes_v1", [])
+        verified = any(
+            isinstance(item, dict)
+            and item.get("signature") == signature
+            and isinstance(item.get("offered_price"), (int, float))
+            and item.get("offered_price") > 0
+            for item in (quotes if isinstance(quotes, list) else [])
+        )
+        if not verified:
+            raise ModelError(
+                "prepare_combat rejected an unquoted targeted sale. Purpose: confirm that this "
+                "exact merchant accepts these exact inventory items before transferring them; "
+                "call sell once with the same to/items and confirm=false, then confirm the sale "
+                "only if the returned offered_price is acceptable"
+            )
+
+    def _record_prepare_combat_sell_quote(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        arguments: dict[str, Any],
+        observation: dict[str, Any],
+        result: Any,
+    ) -> None:
+        if (
+            str((phase or {}).get("kind") or "") != "prepare_combat"
+            or arguments.get("confirm") is not False
+            or not isinstance(result, dict)
+            or not isinstance(result.get("offered_price"), (int, float))
+            or result.get("offered_price") <= 0
+        ):
+            return
+        signature = self._sell_quote_signature(
+            goal,
+            phase,
+            arguments,
+            observation,
+        )
+        quotes = self.storage.get_runtime("prepare_combat_sell_quotes_v1", [])
+        values = [
+            item
+            for item in (quotes if isinstance(quotes, list) else [])
+            if isinstance(item, dict) and item.get("signature") != signature
+        ]
+        values.append(
+            {
+                "signature": signature,
+                "offered_price": result.get("offered_price"),
+                "quoted_at": timestamp(),
+            }
+        )
+        self.storage.set_runtime("prepare_combat_sell_quotes_v1", values[-30:])
+
     def _execute(self, goal: dict[str, Any], observation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         tool = str(plan.get("tool") or "")
         arguments = plan.get("arguments")
@@ -11469,6 +11776,19 @@ class BotController:
         # Agent ids are controller-owned routing metadata. The planner never
         # chooses them, even if an older model context emits one.
         arguments.pop("agent", None)
+        campaign_run = self.storage.campaign_run(goal["id"])
+        campaign_phase = (
+            self.storage.active_campaign_phase(campaign_run["id"])
+            if campaign_run
+            else None
+        )
+        self._guard_prepare_combat_sale(
+            goal,
+            campaign_phase,
+            tool,
+            arguments,
+            observation,
+        )
         direct_pvp = self._direct_pvp_contract(goal)
         if direct_pvp is not None:
             if tool == PVP_SEEK_TOOL_NAME:
@@ -11591,12 +11911,6 @@ class BotController:
                         "action_suppressed": True,
                         **expired,
                     }
-        campaign_run = self.storage.campaign_run(goal["id"])
-        campaign_phase = (
-            self.storage.active_campaign_phase(campaign_run["id"])
-            if campaign_run
-            else None
-        )
         phase_attempt_id, repeated_signature = self.campaign.prepare_attempt(
             campaign_phase,
             tool=tool,
@@ -12408,6 +12722,14 @@ class BotController:
                 and post_action is not None
             ):
                 self._record_bank_receipt(goal, observation, post_action)
+            if tool == "sell":
+                self._record_prepare_combat_sell_quote(
+                    goal,
+                    campaign_phase,
+                    arguments,
+                    observation,
+                    result,
+                )
             # Feedback describes the immediately previous failed/suppressed
             # tactic. Once any concrete action succeeds it is stale and can
             # mislead both the next planner turn and supervisor status into
@@ -12877,7 +13199,8 @@ class BotController:
         is_bank_balance = tool == "bank" and str(
             arguments.get("action") or ""
         ).casefold() == "balance"
-        if tool not in evidence_tools and not is_bank_balance:
+        is_shop_catalogue = tool == "shop" and not arguments.get("buy_ids")
+        if tool not in evidence_tools and not is_bank_balance and not is_shop_catalogue:
             return None
         active_phase_id = None
         active_goal = self.storage.active_goal()
@@ -12958,21 +13281,108 @@ class BotController:
         reason: str,
         observation: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        if tool != "shop" or not is_inventory_capacity_refusal(reason):
-            return None
+        text = str(reason or "").casefold()
+        if tool == "shop" and is_inventory_capacity_refusal(reason):
+            return {
+                "kind": "inventory_capacity_refused",
+                "source": "merchant_message",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Invalidate the unchanged purchase because the merchant verified "
+                    "that no item transferred at the current carried load."
+                ),
+                "item_transfer_verified": False,
+                "inventory_capacity": cls._inventory_capacity_context(observation),
+            }
+        if tool == "shop" and any(
+            marker in text
+            for marker in ("enough money", "insufficient fund", "cannot afford")
+        ):
+            return {
+                "kind": "purchase_funds_insufficient",
+                "source": "merchant_message",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Invalidate the current purchase tactic until an earlier action "
+                    "verifiably increases carried shillings."
+                ),
+                "carried_shillings": cls._carried_currency(observation or {}),
+                "required_response": (
+                    "Fund the purchase with sell, guarded sell_all, or bank withdrawal, "
+                    "or use a verified direct capability instead."
+                ),
+            }
+        if tool == "shop" and "identical evidence lookup" in text:
+            return {
+                "kind": "merchant_catalogue_already_known",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "A repeated read-only shop result cannot satisfy a mutation outcome "
+                    "or make an unaffordable purchase affordable."
+                ),
+                "required_response": (
+                    "Act on the known catalogue with valid funds, perform a real funding "
+                    "action, or choose a different plan."
+                ),
+            }
+        if tool == "sell_all" and "merchant bought zero" in text:
+            return {
+                "kind": "bulk_sale_transferred_nothing",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Invalidate this merchant/liquidation tactic because it neither raised "
+                    "funds nor reduced carried inventory."
+                ),
+                "required_response": (
+                    "Use merchant evidence to choose a compatible buyer or use a targeted "
+                    "sell quote for a materially different ordinary item."
+                ),
+            }
+        if tool in {"sell", "sell_all"} and any(
+            marker in text
+            for marker in ("not interested", "did not buy", "no counteroffer")
+        ):
+            return {
+                "kind": "merchant_rejected_sale",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Reject only this item/merchant tactic; the refusal does not block "
+                    "other inventory items, merchants, or direct equipment capabilities."
+                ),
+                "required_response": (
+                    "Change the offered item or buyer using live merchant evidence."
+                ),
+            }
         return {
-            "kind": "inventory_capacity_refused",
-            "source": "merchant_message",
+            "kind": "action_made_no_progress",
             "reason": str(reason)[:500],
-            "item_transfer_verified": False,
-            "inventory_capacity": cls._inventory_capacity_context(observation),
+            "purpose": (
+                "Mark the exact failed tactic as non-progress so it is not replayed in "
+                "unchanged state. This is not a goal-wide block."
+            ),
+            "required_response": (
+                "Use the observed cause to change the tool, prerequisite, target, route, "
+                "or other causal argument before retrying."
+            ),
         }
 
     @staticmethod
     def _failure_invalidates_plan(tool: str, reason: Any) -> bool:
         text = str(reason or "").casefold()
         return (
-            tool == "shop" and is_inventory_capacity_refusal(text)
+            tool == "shop"
+            and (
+                is_inventory_capacity_refusal(text)
+                or any(
+                    marker in text
+                    for marker in (
+                        "enough money",
+                        "insufficient fund",
+                        "cannot afford",
+                        "identical evidence lookup",
+                    )
+                )
+            )
         ) or (
             tool == "sell_all" and "merchant bought zero" in text
         ) or (
@@ -13041,6 +13451,13 @@ class BotController:
                 "until carried shillings increase. Inspect inventory, quote a different ordinary loot item with sell "
                 "confirm:false and confirm an accepted offer, or travel to a verified bank and withdraw its confirmed "
                 "balance; only then return and buy the remaining needed quantity."
+            )
+        if tool == "shop" and "identical evidence lookup" in text:
+            return (
+                prefix
+                + "The merchant catalogue is already known. This read-only success is evidence, not progress: "
+                "do not inspect the same stock again. Act on it with sufficient carried funds, use sell or "
+                "guarded sell_all to fund the purchase, use a verified direct capability, or replace the plan."
             )
         if tool == "shop" and is_inventory_capacity_refusal(reason):
             capacity = cls._inventory_capacity_context(observation)

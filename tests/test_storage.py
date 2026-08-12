@@ -337,12 +337,24 @@ class StorageTests(unittest.TestCase):
                 {"name": "inventory"},
                 {"name": "act"},
                 {"name": "equip_best"},
+                {"name": "merchants"},
+                {"name": "shop"},
+                {"name": "sell"},
+                {"name": "sell_all"},
                 {"name": "fight"},
             ],
         )
 
         self.assertEqual(
-            {"inventory", "act", "equip_best"},
+            {
+                "inventory",
+                "act",
+                "equip_best",
+                "merchants",
+                "shop",
+                "sell",
+                "sell_all",
+            },
             {tool["name"] for tool in selected},
         )
 
