@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from meridian_bot.broker import Tool, ToolCallError
+from meridian_bot.campaign import CampaignCoordinator
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
@@ -9934,6 +9935,94 @@ class ControllerTests(unittest.TestCase):
                 controller._degrade("model", ModelError("different failure"))
                 events = controller.storage.events(kinds=["dependency.model.unhealthy"])["events"]
                 self.assertEqual(2, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_campaign_tactic_ledger_deduplicates_research_rejections(self) -> None:
+        rejected = {
+            "room": 583,
+            "target": "slime",
+            "blocker": {
+                "kind": "quarantined_farm_phase",
+                "evidence": {
+                    "reasons": ["repeated safe-spot failures"],
+                    "large_raw_snapshot": "x" * 20_000,
+                },
+            },
+        }
+        history = [
+            {
+                "id": f"research-{index}",
+                "kind": "research_progression",
+                "status": "failed",
+                "context": {
+                    "recipe_validation": {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "same-candidate-set",
+                        "candidate_count": 1,
+                        "rejected": [copy.deepcopy(rejected)],
+                    }
+                },
+            }
+            for index in range(8)
+        ]
+
+        projected = CampaignCoordinator._tactic_ledger(history, None)
+
+        self.assertEqual(1, len(projected["unique_rejected_candidates"]))
+        self.assertEqual(1, len(projected["research_candidate_sets"]))
+        self.assertNotIn("large_raw_snapshot", repr(projected))
+
+    def test_research_retry_gate_requires_material_state_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="research-retry-state")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                record = {
+                    "fingerprint": "same-candidate-set",
+                    "repeat_count": 3,
+                    "phase_ids": ["one", "two", "three"],
+                    "candidate_count": 1,
+                    "rejected": [],
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                unchanged = controller._research_retry_gate(goal, observation)
+                self.assertFalse(unchanged["allowed"])
+                stored = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertTrue(stored["retry_state_fingerprint"])
+
+                changed = copy.deepcopy(observation)
+                changed["inventory"]["items"].append(
+                    {"id": 2, "name": "leather armor", "amount": 1}
+                )
+                reopened = controller._research_retry_gate(goal, changed)
+
+                self.assertTrue(reopened["allowed"])
+                self.assertTrue(reopened["state_changed"])
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime(
+                        RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                    ),
+                )
+                self.assertIsNone(
+                    controller.storage.campaign_run(goal["id"])["external_blocker"]
+                )
             finally:
                 controller.storage.close()
 

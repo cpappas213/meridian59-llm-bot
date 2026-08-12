@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from typing import Any
@@ -16,6 +17,12 @@ class ModelError(RuntimeError):
 
 STRUCTURED_OUTPUT_TOKEN_FLOOR = 4096
 REASONING_RETRY_TOKEN_CEILING = 8192
+CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET = 24_000
+CAMPAIGN_MANAGER_TIMEOUT_RECOVERY_TOKEN_BUDGET = 12_000
+PROMPT_ESTIMATED_CHARS_PER_TOKEN = 4
+
+
+LOG = logging.getLogger(__name__)
 
 
 CRITERION_FIELD_GUIDE = "; ".join(
@@ -368,6 +375,11 @@ A broken or absent wielded weapon may push acquire_item, then resume the parent 
 may push recover. Reuse a recent successful room/prey tactic while it remains level-eligible; seek a materially
 different grounded tactic only after durable safety, stagnation, or route evidence disproves the prior one.
 Treat phase.context.avoid_rooms as a soft diversity hint, never as proof that a room is unusable.
+When campaign.research_retry.allowed is false, the controller has already proved that an unchanged
+research_progression lookup returns the same fully rejected candidate set. Do not select
+research_progression again. Select a materially different capability, equipment, supplies, recovery,
+commerce, route-evidence, or other support phase. The strategic goal remains active. Research becomes
+eligible again only after the disclosed state fingerprint or retry predicate changes.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
@@ -455,6 +467,195 @@ class VllmClient:
         self.config = config
         self.last_error: str | None = None
         self.last_ok_at: str | None = None
+        self.last_prompt_metrics: dict[str, Any] | None = None
+
+    @staticmethod
+    def _trim_prompt_value(
+        value: Any,
+        *,
+        max_list: int = 24,
+        max_string: int = 1200,
+        depth: int = 0,
+    ) -> Any:
+        """Bound defensive fallback data without changing ordinary compact prompts."""
+
+        if depth >= 8:
+            return "[nested value omitted]"
+        if isinstance(value, str):
+            return value if len(value) <= max_string else value[:max_string] + "…"
+        if isinstance(value, list):
+            return [
+                VllmClient._trim_prompt_value(
+                    item,
+                    max_list=max_list,
+                    max_string=max_string,
+                    depth=depth + 1,
+                )
+                for item in value[:max_list]
+            ]
+        if isinstance(value, dict):
+            return {
+                str(key): VllmClient._trim_prompt_value(
+                    item,
+                    max_list=max_list,
+                    max_string=max_string,
+                    depth=depth + 1,
+                )
+                for key, item in value.items()
+            }
+        return value
+
+    @classmethod
+    def _minimal_campaign_manager_context(
+        cls, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        campaign = context.get("campaign")
+        campaign = campaign if isinstance(campaign, dict) else {}
+        observation = context.get("verified_observation")
+        observation = observation if isinstance(observation, dict) else {}
+        grounded = context.get("grounded_knowledge")
+        grounded = grounded if isinstance(grounded, dict) else {}
+        learned = context.get("learned_failures")
+        learned = learned if isinstance(learned, dict) else {}
+        financial = context.get("financial_context")
+        financial = financial if isinstance(financial, dict) else {}
+        progression = context.get("progression_context")
+        progression = progression if isinstance(progression, dict) else {}
+        minimal = {
+            "active_goal": context.get("active_goal"),
+            "verified_observation": observation,
+            "campaign": {
+                key: campaign.get(key)
+                for key in (
+                    "run",
+                    "active_phase",
+                    "tactic_ledger",
+                    "research_retry",
+                    "manager_feedback",
+                    "operator_contract",
+                    "instructions",
+                    "action_breaker_limit",
+                )
+                if campaign.get(key) is not None
+            },
+            "grounded_knowledge": {
+                key: grounded.get(key)
+                for key in (
+                    "corpus",
+                    "goal_validation",
+                    "relevant_entities",
+                    "room_spawn_tables",
+                    "hunt_room_options",
+                    "rules",
+                )
+                if grounded.get(key) is not None
+            },
+            "progression_context": progression,
+            "learned_failures": {
+                key: learned.get(key)
+                for key in (
+                    "goal_family",
+                    "lessons",
+                    "deferred_tactics",
+                    "combat_readiness",
+                    "combat_history",
+                )
+                if learned.get(key) is not None
+            },
+            "financial_context": financial,
+            "planning_persona": context.get("planning_persona"),
+        }
+        return cls._trim_prompt_value(minimal, max_list=16, max_string=800)
+
+    @staticmethod
+    def _estimated_prompt_tokens(system: str, user: str) -> int:
+        return max(
+            1,
+            (len(system) + len(user) + PROMPT_ESTIMATED_CHARS_PER_TOKEN - 1)
+            // PROMPT_ESTIMATED_CHARS_PER_TOKEN,
+        )
+
+    def _budget_campaign_manager_context(
+        self,
+        context: dict[str, Any],
+        *,
+        token_budget: int = CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET,
+        mode: str = "normal",
+    ) -> tuple[dict[str, Any], str]:
+        user = json.dumps(context, ensure_ascii=False)
+        estimated = self._estimated_prompt_tokens(CAMPAIGN_MANAGER_SYSTEM, user)
+        compacted = False
+        if estimated > token_budget:
+            context = self._minimal_campaign_manager_context(context)
+            user = json.dumps(context, ensure_ascii=False)
+            estimated = self._estimated_prompt_tokens(CAMPAIGN_MANAGER_SYSTEM, user)
+            compacted = True
+        if estimated > token_budget:
+            context = self._trim_prompt_value(context, max_list=8, max_string=300)
+            user = json.dumps(context, ensure_ascii=False)
+            estimated = self._estimated_prompt_tokens(CAMPAIGN_MANAGER_SYSTEM, user)
+            compacted = True
+        if estimated > token_budget:
+            # The goal, current observation, campaign ledger, and retry gate are
+            # the irreducible decision contract. Optional reference sections can
+            # be queried again inside the selected bounded phase.
+            campaign = context.get("campaign")
+            campaign = campaign if isinstance(campaign, dict) else {}
+            context = {
+                "active_goal": self._trim_prompt_value(
+                    context.get("active_goal"), max_list=12, max_string=500
+                ),
+                "verified_observation": self._trim_prompt_value(
+                    context.get("verified_observation"), max_list=8, max_string=300
+                ),
+                "campaign": self._trim_prompt_value(
+                    {
+                        key: campaign.get(key)
+                        for key in (
+                            "run",
+                            "active_phase",
+                            "tactic_ledger",
+                            "research_retry",
+                            "manager_feedback",
+                            "operator_contract",
+                        )
+                        if campaign.get(key) is not None
+                    },
+                    max_list=8,
+                    max_string=300,
+                ),
+                "progression_context": self._trim_prompt_value(
+                    context.get("progression_context"), max_list=6, max_string=300
+                ),
+                "planning_persona": self._trim_prompt_value(
+                    context.get("planning_persona"), max_list=8, max_string=300
+                ),
+                "prompt_budget_notice": (
+                    "Optional reference sections were omitted to keep this decision within the "
+                    "campaign-manager prompt budget. Select a bounded evidence-gathering or support "
+                    "phase when a required detail is absent."
+                ),
+            }
+            user = json.dumps(context, ensure_ascii=False)
+            estimated = self._estimated_prompt_tokens(CAMPAIGN_MANAGER_SYSTEM, user)
+            compacted = True
+        self.last_prompt_metrics = {
+            "kind": "campaign_manager",
+            "mode": mode,
+            "estimated_tokens": estimated,
+            "token_budget": token_budget,
+            "user_context_characters": len(user),
+            "compacted": compacted,
+        }
+        LOG.info(
+            "campaign manager prompt mode=%s estimated_tokens=%s budget=%s context_chars=%s compacted=%s",
+            mode,
+            estimated,
+            token_budget,
+            len(user),
+            compacted,
+        )
+        return context, user
 
     def _headers(self, *, content_type: bool = False) -> dict[str, str]:
         headers = {"accept": "application/json"}
@@ -718,17 +919,46 @@ class VllmClient:
             "financial_context": financial_context,
             "planning_persona": persona or None,
         }
-        result = self._complete(
-            [
-                {"role": "system", "content": CAMPAIGN_MANAGER_SYSTEM},
-                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
-            ],
-            self.config.model.planner_timeout_seconds,
-            max_tokens=max(
-                STRUCTURED_OUTPUT_TOKEN_FLOOR,
-                self.config.model.max_output_tokens,
-            ),
-        )
+        context, user = self._budget_campaign_manager_context(context)
+        try:
+            result = self._complete(
+                [
+                    {"role": "system", "content": CAMPAIGN_MANAGER_SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                self.config.model.planner_timeout_seconds,
+                max_tokens=max(
+                    STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                    self.config.model.max_output_tokens,
+                ),
+            )
+        except ModelError as exc:
+            if "timed out" not in str(exc).casefold():
+                raise
+            recovery = self._minimal_campaign_manager_context(context)
+            recovery["timeout_recovery"] = {
+                "prior_request_timed_out": True,
+                "instruction": (
+                    "Return the smallest valid next-phase decision using only the retained current "
+                    "facts. Do not restate history or evidence."
+                ),
+            }
+            recovery, recovery_user = self._budget_campaign_manager_context(
+                recovery,
+                token_budget=CAMPAIGN_MANAGER_TIMEOUT_RECOVERY_TOKEN_BUDGET,
+                mode="timeout_recovery",
+            )
+            result = self._complete(
+                [
+                    {"role": "system", "content": CAMPAIGN_MANAGER_SYSTEM},
+                    {"role": "user", "content": recovery_user},
+                ],
+                self.config.model.planner_timeout_seconds,
+                max_tokens=max(
+                    STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                    self.config.model.max_output_tokens,
+                ),
+            )
         allowed = {
             "start_phase",
             "replace_phase",

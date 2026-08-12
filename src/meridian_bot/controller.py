@@ -16,6 +16,7 @@ from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationEr
 from .contracts import parse_ability_metric
 from .learning import (
     ARMOR_WORDS,
+    HEALING_SUPPLY_WORDS,
     WEAPON_WORDS,
     GoalDeferredError,
     GoalLearning,
@@ -2234,7 +2235,7 @@ class BotController:
                     # not survive the migration and complete this phase later.
                     self._clear_phase_completion_checkpoint(str(phase["id"]))
                     exhaustion = self._record_research_recipe_exhaustion(
-                        goal, run, phase, validation
+                        goal, run, phase, validation, observation
                     )
                     reason = (
                         "progression lookup returned no executable non-quarantined "
@@ -2651,6 +2652,7 @@ class BotController:
         run: dict[str, Any],
         phase: dict[str, Any],
         validation: dict[str, Any],
+        observation: dict[str, Any],
     ) -> dict[str, Any]:
         """Count identical exhausted research results across replacement phases."""
 
@@ -2684,9 +2686,14 @@ class BotController:
         values = dict(values) if isinstance(values, dict) else {}
         prior = values.get(goal_id)
         prior = prior if isinstance(prior, dict) else {}
+        retry_state_fingerprint = self._research_retry_state_fingerprint(
+            goal, observation
+        )
         phase_ids = (
             list(prior.get("phase_ids", []))
             if prior.get("fingerprint") == fingerprint
+            and prior.get("retry_state_fingerprint")
+            == retry_state_fingerprint
             and isinstance(prior.get("phase_ids"), list)
             else []
         )
@@ -2699,6 +2706,7 @@ class BotController:
             "phase_ids": phase_ids[-10:],
             "candidate_count": validation.get("candidate_count", 0),
             "rejected": redact(validation.get("rejected", [])),
+            "retry_state_fingerprint": retry_state_fingerprint,
             "recorded_at": timestamp(),
             "guidance": (
                 "Every source-derived room/prey candidate conflicts with retained "
@@ -8670,11 +8678,21 @@ class BotController:
             if hasattr(self.knowledge, "context_for")
             else {}
         )
-        grounded_context["safe_ending_candidates"] = self._safe_ending_context(
-            observation
+        learned = self._campaign_manager_learning_context(
+            self.learning.context_for(goal, redact(observation))
         )
-        learned = self.learning.context_for(goal, redact(observation))
-        financial = self._financial_context(observation)
+        financial = self._campaign_manager_financial_context(
+            self._financial_context(observation)
+        )
+        manager_observation = self._campaign_manager_observation(
+            redact(observation)
+        )
+        retry_gate = self._research_retry_gate(goal, observation)
+        run = self.storage.campaign_run(goal["id"]) or run
+        manager_campaign_context = self._campaign_context(
+            run, None, audience="manager"
+        )
+        manager_campaign_context["research_retry"] = retry_gate
         progression: dict[str, Any] | None = None
         durable_farm_intent = self._goal_farm_intent(goal)
         has_complete_durable_farm_recipe = (
@@ -8703,14 +8721,38 @@ class BotController:
         if hasattr(self.model, "manage_campaign"):
             decision = self.model.manage_campaign(
                 goal=goal,
-                observation=redact(observation),
-                campaign_context=self._campaign_context(run, None),
+                observation=manager_observation,
+                campaign_context=manager_campaign_context,
                 grounded_knowledge=grounded_context,
                 learned_failures=learned,
                 financial_context=financial,
                 progression_context=progression,
                 persona=self.storage.persona(),
             )
+            proposed = decision.get("phase")
+            if (
+                retry_gate.get("allowed") is False
+                and isinstance(proposed, dict)
+                and proposed.get("kind") == "research_progression"
+            ):
+                manager_campaign_context = {
+                    **manager_campaign_context,
+                    "manager_feedback": (
+                        "The proposed research_progression phase is deterministically ineligible: "
+                        + str(retry_gate.get("reason") or "the candidate set is unchanged")
+                        + ". Select a materially different support phase now."
+                    ),
+                }
+                decision = self.model.manage_campaign(
+                    goal=goal,
+                    observation=manager_observation,
+                    campaign_context=manager_campaign_context,
+                    grounded_knowledge=grounded_context,
+                    learned_failures=learned,
+                    financial_context=financial,
+                    progression_context=progression,
+                    persona=self.storage.persona(),
+                )
             self.dependencies["model"] = "healthy"
         else:
             decision = {
@@ -8760,6 +8802,15 @@ class BotController:
 
         try:
             proposed_phase = decision.get("phase")
+            if (
+                retry_gate.get("allowed") is False
+                and isinstance(proposed_phase, dict)
+                and proposed_phase.get("kind") == "research_progression"
+            ):
+                raise ValueError(
+                    "unchanged progression research is ineligible until its material retry "
+                    "predicate changes"
+                )
             proposed_blocker = self._campaign_phase_grounding_blocker(
                 proposed_phase if isinstance(proposed_phase, dict) else None,
                 observation,
@@ -8786,9 +8837,14 @@ class BotController:
                 goal_id=goal["id"],
                 data={"decision": redact(decision), "strategic_goal_preserved": True},
             )
+            fallback_phase = (
+                self._research_exhaustion_support_phase(goal, retry_gate)
+                if retry_gate.get("allowed") is False
+                else self.campaign.fallback_phase(goal, observation)
+            )
             fallback = {
                 "decision": "start_phase",
-                "phase": self.campaign.fallback_phase(goal, observation),
+                "phase": fallback_phase,
                 "rationale": f"Compatibility fallback after invalid phase: {str(exc)[:300]}",
             }
             phase = self.campaign.apply_manager_decision(
@@ -8858,6 +8914,224 @@ class BotController:
         remaining = dict(values)
         remaining.pop(goal_id, None)
         self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, remaining)
+
+    def _research_retry_state_fingerprint(
+        self, goal: dict[str, Any], observation: dict[str, Any]
+    ) -> str:
+        """Fingerprint only facts that can materially reopen progression research."""
+
+        goal_id = str(goal.get("id") or "")
+        inventory = deep_get(observation, "inventory.items", [])
+        inventory = inventory if isinstance(inventory, list) else []
+        capability_item_words = (
+            *WEAPON_WORDS,
+            *ARMOR_WORDS,
+            *HEALING_SUPPLY_WORDS,
+            "potion",
+            "cheese",
+            "food",
+        )
+        items = sorted(
+            [
+                {
+                    "name": normalize(str(item.get("name") or "")),
+                    "amount": item.get(
+                        "amount", item.get("quantity", item.get("count", 1))
+                    ),
+                    "equipped": item.get("equipped"),
+                    "condition": item.get("condition"),
+                    "quality": item.get("quality"),
+                }
+                for item in inventory
+                if isinstance(item, dict)
+                and item.get("name")
+                and any(
+                    word in normalize(str(item.get("name") or ""))
+                    for word in capability_item_words
+                )
+            ],
+            key=lambda item: (str(item.get("name")), str(item.get("amount"))),
+        )
+        lessons = [
+            {
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "classification": item.get("classification"),
+                "tactic_key": item.get("tactic_key"),
+                "updated_at": item.get("updated_at"),
+            }
+            for item in self.storage.goal_lessons(
+                statuses=["deferred", "unlocked"], limit=200
+            )
+            if str(item.get("goal_id") or "") == goal_id
+            and item.get("scope") == "tactic"
+        ]
+        blocked_actions = self.storage.get_runtime("blocked_actions", [])
+        blocked_actions = blocked_actions if isinstance(blocked_actions, list) else []
+        route_evidence = [
+            {
+                "tool": item.get("tool"),
+                "room": item.get("room"),
+                "reason": item.get("reason"),
+            }
+            for item in blocked_actions
+            if isinstance(item, dict) and item.get("goal_id") == goal_id
+        ]
+        return json_hash(
+            {
+                "max_health": deep_get(
+                    observation,
+                    "status.vitals.health.max",
+                    deep_get(observation, "look.vitals.health.max"),
+                ),
+                "equipment": deep_get(
+                    observation,
+                    "equipment",
+                    deep_get(observation, "status.equipment"),
+                ),
+                "abilities": deep_get(
+                    observation,
+                    "abilities",
+                    {
+                        "abilities": deep_get(observation, "status.abilities"),
+                        "skills": deep_get(
+                            observation,
+                            "skills",
+                            deep_get(observation, "status.skills"),
+                        ),
+                        "spells": deep_get(
+                            observation,
+                            "spells",
+                            deep_get(observation, "status.spells"),
+                        ),
+                    },
+                ),
+                "inventory": items,
+                "tactic_lessons": lessons,
+                "route_evidence": route_evidence,
+                "knowledge_corpus_version": self.knowledge.corpus_version,
+            }
+        )
+
+    def _research_retry_gate(
+        self, goal: dict[str, Any], observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Prevent unchanged candidate exhaustion from spawning another lookup phase."""
+
+        goal_id = str(goal.get("id") or "")
+        values = self.storage.get_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {})
+        values = dict(values) if isinstance(values, dict) else {}
+        record = values.get(goal_id)
+        if not isinstance(record, dict):
+            return {"allowed": True, "reason": "no retained exhausted candidate set"}
+        try:
+            repeat_count = int(record.get("repeat_count", 0) or 0)
+        except (TypeError, ValueError):
+            repeat_count = 0
+        if repeat_count < 2:
+            return {
+                "allowed": True,
+                "reason": "candidate exhaustion has not repeated independently",
+                "repeat_count": repeat_count,
+                "candidate_fingerprint": record.get("fingerprint"),
+            }
+
+        current = self._research_retry_state_fingerprint(goal, observation)
+        recorded = str(record.get("retry_state_fingerprint") or "")
+        if not recorded:
+            # Existing installations predate retry-state fingerprints. Capture
+            # the current verified state as their conservative reopening base.
+            record = {**record, "retry_state_fingerprint": current}
+            values[goal_id] = record
+            self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(run, dict)
+                and isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={**blocker, "retry_state_fingerprint": current},
+                )
+            recorded = current
+        if recorded != current:
+            self._clear_research_recipe_exhaustion(goal_id)
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(run, dict)
+                and isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+            self.storage.emit_event(
+                "campaign.research.retry_reopened",
+                "Reopened progression research after material capability or world evidence changed",
+                severity="notice",
+                interesting=False,
+                goal_id=goal_id,
+                data={
+                    "prior_retry_state_fingerprint": recorded,
+                    "current_retry_state_fingerprint": current,
+                },
+            )
+            return {
+                "allowed": True,
+                "reason": "material capability or world evidence changed",
+                "state_changed": True,
+            }
+        return {
+            "allowed": False,
+            "reason": (
+                "the same fully rejected candidate set repeated without any equipment, ability, "
+                "inventory, route, quarantine, max-health, or knowledge-corpus change"
+            ),
+            "repeat_count": repeat_count,
+            "candidate_fingerprint": record.get("fingerprint"),
+            "retry_state_fingerprint": recorded,
+            "retry_requires": [
+                "equipment_change",
+                "ability_change",
+                "inventory_or_supplies_change",
+                "route_or_quarantine_evidence_change",
+                "max_health_change",
+                "knowledge_corpus_change",
+            ],
+        }
+
+    @staticmethod
+    def _research_exhaustion_support_phase(
+        goal: dict[str, Any], retry_gate: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Safe non-research fallback after an invalid repeated lookup choice."""
+
+        return {
+            "kind": "prepare_combat",
+            "objective": (
+                "Assess current combat capabilities and apply the best available equipment before "
+                "reconsidering exhausted progression research."
+            ),
+            "success_criteria": [
+                {
+                    "id": "capability-assessment-succeeded",
+                    "kind": "phase_action_succeeded",
+                    "tools": ["equipment", "abilities", "equip_best", "wear_best"],
+                }
+            ],
+            "abandon_predicates": [],
+            "budget": {"max_actions": 24, "max_minutes": 45},
+            "context": {
+                "research_exhaustion_support": True,
+                "candidate_fingerprint": retry_gate.get("candidate_fingerprint"),
+                "retry_requires": retry_gate.get("retry_requires", []),
+            },
+            "rationale": (
+                "An unchanged progression lookup is deterministically closed. Inspect and improve "
+                "combat capability instead of submitting the same research phase again."
+            ),
+        }
 
     def _reconcile_blocked_farm_exhaustion(
         self, observation: dict[str, Any]
@@ -9534,12 +9808,218 @@ class BotController:
             action["plan_step_id"] = step_id
         return action
 
+    @staticmethod
+    def _campaign_manager_observation(observation: dict[str, Any]) -> dict[str, Any]:
+        """Project verified state needed for phase choice, omitting raw room geometry."""
+
+        look = observation.get("look")
+        look = look if isinstance(look, dict) else {}
+        status = observation.get("status")
+        status = status if isinstance(status, dict) else {}
+        inventory = observation.get("inventory")
+        inventory = inventory if isinstance(inventory, dict) else {}
+
+        objects = look.get("objects")
+        compact_objects = [
+            {
+                key: item.get(key)
+                for key in (
+                    "id",
+                    "name",
+                    "type",
+                    "class",
+                    "is_player",
+                    "attackable",
+                    "relation",
+                    "hostile",
+                    "distance",
+                    "x",
+                    "y",
+                    "can",
+                )
+                if item.get(key) is not None
+            }
+            for item in (objects[:24] if isinstance(objects, list) else [])
+            if isinstance(item, dict)
+        ]
+        exits = look.get("exits")
+        compact_exits = [
+            {
+                key: item.get(key)
+                for key in (
+                    "kind",
+                    "to",
+                    "toRid",
+                    "name",
+                    "reachable",
+                    "steps_away",
+                    "id",
+                )
+                if item.get(key) is not None
+            }
+            for item in (exits[:24] if isinstance(exits, list) else [])
+            if isinstance(item, dict)
+        ]
+        raw_items = inventory.get("items")
+        compact_items = [
+            {
+                key: item.get(key)
+                for key in (
+                    "id",
+                    "name",
+                    "amount",
+                    "quantity",
+                    "count",
+                    "equipped",
+                    "condition",
+                    "quality",
+                    "value",
+                    "can",
+                )
+                if item.get(key) is not None
+            }
+            for item in (raw_items[:40] if isinstance(raw_items, list) else [])
+            if isinstance(item, dict)
+        ]
+        compact_status = {
+            key: status.get(key)
+            for key in (
+                "vitals",
+                "stats",
+                "attributes",
+                "level",
+                "karma",
+                "effects",
+                "resting",
+                "combat",
+                "load",
+                "equipment",
+                "abilities",
+                "skills",
+                "spells",
+            )
+            if status.get(key) is not None
+        }
+        value: dict[str, Any] = {
+            "id": observation.get("id"),
+            "observed_at": observation.get("observed_at"),
+            "look": {
+                key: look.get(key)
+                for key in ("room", "self", "vitals", "combat", "affordances")
+                if look.get(key) is not None
+            },
+            "status": compact_status,
+            "inventory": {
+                **{
+                    key: inventory.get(key)
+                    for key in ("carry", "capacity", "room_for", "full")
+                    if inventory.get(key) is not None
+                },
+                "items": compact_items,
+            },
+        }
+        if compact_objects:
+            value["look"]["objects"] = compact_objects
+        if compact_exits:
+            value["look"]["exits"] = compact_exits
+        for key in ("equipment", "abilities", "skills", "spells"):
+            if observation.get(key) is not None:
+                value[key] = observation.get(key)
+        return value
+
+    @staticmethod
+    def _campaign_manager_financial_context(value: dict[str, Any]) -> dict[str, Any]:
+        """Give the manager economic posture; defer full merchant catalogues to commerce."""
+
+        if not isinstance(value, dict):
+            return {}
+        compact = {
+            key: value.get(key)
+            for key in (
+                "carried_shillings",
+                "known_inventory_item_value",
+                "known_total_carried_value",
+                "valuation_complete",
+                "valuation_note",
+                "banking_policy",
+            )
+            if value.get(key) is not None
+        }
+        for key in ("valued_items", "unknown_value_items"):
+            items = value.get(key)
+            if isinstance(items, list):
+                compact[key] = items[:16]
+        buyers = value.get("buyer_candidates")
+        if isinstance(buyers, list):
+            compact["buyer_candidate_summary"] = [
+                {
+                    "item": item.get("item"),
+                    "item_kind": item.get("item_kind"),
+                    "candidate_count": len(item.get("candidates", []))
+                    if isinstance(item.get("candidates"), list)
+                    else 0,
+                }
+                for item in buyers[:16]
+                if isinstance(item, dict)
+            ]
+            compact["merchant_detail_deferred"] = (
+                "Select a commerce phase to retrieve exact buyers and live quotes."
+            )
+        return compact
+
+    @staticmethod
+    def _campaign_manager_learning_context(value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+
+        def lessons(name: str, limit: int) -> list[dict[str, Any]]:
+            rows = value.get(name)
+            rows = rows if isinstance(rows, list) else []
+            return [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "id",
+                        "scope",
+                        "classification",
+                        "status",
+                        "summary",
+                        "retry_evaluation",
+                        "unlock_condition",
+                        "tactic_key",
+                    )
+                    if item.get(key) is not None
+                }
+                for item in rows[:limit]
+                if isinstance(item, dict)
+            ]
+
+        return {
+            "goal_family": value.get("goal_family"),
+            "instructions": value.get("instructions"),
+            "lessons": lessons("lessons", 8),
+            "deferred_tactics": lessons("deferred_tactics", 12),
+            "combat_readiness": value.get("combat_readiness"),
+            "combat_history": (
+                value.get("combat_history", [])[:8]
+                if isinstance(value.get("combat_history"), list)
+                else value.get("combat_history")
+            ),
+        }
+
     def _campaign_context(
         self,
         run: dict[str, Any],
         phase: dict[str, Any] | None,
+        *,
+        audience: str = "tactical",
     ) -> dict[str, Any]:
-        value = self.campaign.context(run, phase)
+        if audience == "manager":
+            value = self.campaign.manager_context(run, phase)
+        elif audience == "tactical":
+            value = self.campaign.tactical_context(run, phase)
+        else:
+            raise ValueError("campaign context audience must be manager or tactical")
         value["operator_contract"] = {
             "primary": "Complete the active operator-supplied strategic goal through ordinary gameplay.",
             "pvp": (
@@ -10215,7 +10695,9 @@ class BotController:
                 learned_failures=self.learning.context_for(goal, redact(observation)),
                 execution_plan=redact(execution_plan) if execution_plan else None,
                 revision_authorization=revision_authorization,
-                campaign_context=self._campaign_context(campaign_run, campaign_phase),
+                campaign_context=self._campaign_context(
+                    campaign_run, campaign_phase, audience="tactical"
+                ),
             )
             self.dependencies["model"] = "healthy"
             self.storage.set_runtime("planner_event_cursor", page["next_cursor"])

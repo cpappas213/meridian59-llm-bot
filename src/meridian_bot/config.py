@@ -231,7 +231,7 @@ class BotConfig:
         model = ModelConfig(
             base_url=str(model_raw.get("base_url", "http://127.0.0.1:8000/v1")).rstrip("/"),
             name=str(model_raw.get("name", "")),
-            planner_timeout_seconds=int(model_raw.get("planner_timeout_seconds", 90)),
+            planner_timeout_seconds=int(model_raw.get("planner_timeout_seconds", 120)),
             responder_timeout_seconds=int(model_raw.get("responder_timeout_seconds", 45)),
             max_output_tokens=int(model_raw.get("max_output_tokens", 4096)),
             temperature=float(model_raw.get("temperature", 0.2)),

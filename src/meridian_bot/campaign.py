@@ -1250,26 +1250,411 @@ class CampaignCoordinator:
             ]
         return selected
 
-    def context(
+    @staticmethod
+    def _compact_research_rejection(value: Any) -> dict[str, Any] | None:
+        """Project one rejected farm candidate without nested duplicate evidence."""
+
+        if not isinstance(value, dict):
+            return None
+        blocker = value.get("blocker")
+        blocker = blocker if isinstance(blocker, dict) else {}
+        compact: dict[str, Any] = {
+            "room": value.get("room", blocker.get("assigned_room")),
+            "target": value.get("target", blocker.get("hunt")),
+            "reason": blocker.get("kind") or "unknown",
+        }
+        for key in ("danger_limit", "use_safe_spots"):
+            if blocker.get(key) is not None:
+                compact[key] = blocker.get(key)
+        reasons = deep_get(blocker, "evidence.reasons", blocker.get("reasons"))
+        if isinstance(reasons, list) and reasons:
+            compact["details"] = [str(item)[:240] for item in reasons[:4]]
+        hostiles = blocker.get("hostiles")
+        if isinstance(hostiles, list) and hostiles:
+            compact["hostiles"] = [
+                {
+                    key: hostile.get(key)
+                    for key in ("name", "level", "chance", "cap")
+                    if hostile.get(key) is not None
+                }
+                for hostile in hostiles[:6]
+                if isinstance(hostile, dict)
+            ]
+        return {key: item for key, item in compact.items() if item not in (None, "", [])}
+
+    @classmethod
+    def _compact_phase_context(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        compact = {
+            key: value.get(key)
+            for key in (
+                "target",
+                "room",
+                "use_safe_spots",
+                "flee_below",
+                "fight_above_vigor",
+                "next_hp_milestone",
+                "selection_basis",
+                "deterministic_fallback",
+                "deterministic_research_handoff",
+                "compatibility_phase",
+            )
+            if value.get(key) is not None
+        }
+        avoid_rooms = value.get("avoid_rooms")
+        if isinstance(avoid_rooms, list):
+            compact["avoid_rooms"] = avoid_rooms[:24]
+        constraints = value.get("constraints")
+        if isinstance(constraints, dict):
+            compact["constraints"] = {
+                str(key): item
+                for key, item in list(constraints.items())[:16]
+                if isinstance(item, (str, int, float, bool)) or item is None
+            }
+        recipe = value.get("farm_recipe")
+        if isinstance(recipe, dict):
+            compact["farm_recipe"] = {
+                key: recipe.get(key)
+                for key in (
+                    "target",
+                    "room",
+                    "use_safe_spots",
+                    "flee_below",
+                    "fight_above_vigor",
+                    "selection_basis",
+                )
+                if recipe.get(key) is not None
+            }
+        validation = value.get("recipe_validation")
+        if isinstance(validation, dict):
+            compact_validation: dict[str, Any] = {
+                key: validation.get(key)
+                for key in ("status", "fingerprint", "candidate_count")
+                if validation.get(key) is not None
+            }
+            selected = validation.get("recipe")
+            if isinstance(selected, dict):
+                compact_validation["selected"] = {
+                    key: selected.get(key)
+                    for key in ("target", "room", "use_safe_spots", "selection_basis")
+                    if selected.get(key) is not None
+                }
+            rejection_counts: dict[str, int] = {}
+            for rejected in validation.get("rejected", []):
+                projected = cls._compact_research_rejection(rejected)
+                if projected is not None:
+                    reason = str(projected.get("reason") or "unknown")
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+            if rejection_counts:
+                compact_validation["rejection_count"] = sum(rejection_counts.values())
+                compact_validation["rejection_reasons"] = rejection_counts
+            compact["recipe_validation"] = compact_validation
+        return compact
+
+    @classmethod
+    def _compact_phase(cls, phase: Any) -> dict[str, Any] | None:
+        if not isinstance(phase, dict):
+            return None
+        compact: dict[str, Any] = {
+            key: phase.get(key)
+            for key in (
+                "id",
+                "parent_phase_id",
+                "ordinal",
+                "kind",
+                "objective",
+                "status",
+                "attempt_count",
+                "created_at",
+                "updated_at",
+                "terminal_at",
+            )
+            if phase.get(key) is not None
+        }
+        criteria = phase.get("success_criteria")
+        if isinstance(criteria, list):
+            compact["success_criteria"] = [
+                {
+                    key: criterion.get(key)
+                    for key in (
+                        "id",
+                        "kind",
+                        "metric",
+                        "operator",
+                        "value",
+                        "tools",
+                        "path",
+                        "item",
+                        "room_id",
+                        "name",
+                    )
+                    if criterion.get(key) is not None
+                }
+                for criterion in criteria[:12]
+                if isinstance(criterion, dict)
+            ]
+        context = cls._compact_phase_context(phase.get("context"))
+        if context:
+            compact["context"] = context
+        failure = phase.get("last_failure")
+        if isinstance(failure, dict):
+            compact["last_failure"] = {
+                "reason": str(failure.get("reason") or "")[:500],
+                "recorded_at": failure.get("recorded_at"),
+            }
+        return compact
+
+    @classmethod
+    def _compact_external_blocker(cls, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        compact = {
+            key: value.get(key)
+            for key in (
+                "status",
+                "kind",
+                "fingerprint",
+                "repeat_count",
+                "candidate_count",
+                "recorded_at",
+                "retry_state_fingerprint",
+            )
+            if value.get(key) is not None
+        }
+        rejections = []
+        for rejected in value.get("rejected", []):
+            projected = cls._compact_research_rejection(rejected)
+            if projected is not None:
+                rejections.append(projected)
+        if rejections:
+            compact["rejected"] = rejections[:32]
+        guidance = " ".join(str(value.get("guidance") or "").split())
+        if guidance:
+            compact["guidance"] = guidance[:500]
+        return compact
+
+    @classmethod
+    def _tactic_ledger(
+        cls, history: list[dict[str, Any]], external_blocker: Any
+    ) -> dict[str, Any]:
+        successful: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        unique_rejections: dict[tuple[str, str, str], dict[str, Any]] = {}
+        research_fingerprints: dict[str, dict[str, Any]] = {}
+        for phase in history:
+            context = phase.get("context") if isinstance(phase.get("context"), dict) else {}
+            tactic = {
+                "phase_id": phase.get("id"),
+                "kind": phase.get("kind"),
+                "target": context.get("target"),
+                "room": context.get("room"),
+                "use_safe_spots": context.get("use_safe_spots"),
+                "attempt_count": phase.get("attempt_count"),
+            }
+            tactic = {key: value for key, value in tactic.items() if value is not None}
+            if phase.get("status") == "succeeded" and phase.get("kind") == "farm":
+                successful.append(tactic)
+            elif phase.get("status") == "failed" and phase.get("kind") == "farm":
+                failure = phase.get("last_failure")
+                if isinstance(failure, dict) and failure.get("reason"):
+                    tactic["reason"] = str(failure.get("reason"))[:500]
+                failed.append(tactic)
+
+            validation = context.get("recipe_validation")
+            if not isinstance(validation, dict):
+                continue
+            fingerprint = str(validation.get("fingerprint") or "")
+            if fingerprint:
+                research_fingerprints[fingerprint] = {
+                    "fingerprint": fingerprint,
+                    "status": validation.get("status"),
+                    "candidate_count": validation.get("candidate_count"),
+                }
+            for rejected in validation.get("rejected", []):
+                projected = cls._compact_research_rejection(rejected)
+                if projected is None:
+                    continue
+                key = (
+                    str(projected.get("room") or ""),
+                    str(projected.get("target") or "").casefold(),
+                    str(projected.get("reason") or ""),
+                )
+                unique_rejections[key] = projected
+
+        blocker = cls._compact_external_blocker(external_blocker)
+        if blocker is not None:
+            for rejected in blocker.get("rejected", []):
+                key = (
+                    str(rejected.get("room") or ""),
+                    str(rejected.get("target") or "").casefold(),
+                    str(rejected.get("reason") or ""),
+                )
+                unique_rejections[key] = rejected
+        return {
+            "successful_farms": successful[-8:],
+            "failed_farms": failed[-12:],
+            "unique_rejected_candidates": list(unique_rejections.values())[:32],
+            "research_candidate_sets": list(research_fingerprints.values())[-8:],
+            "external_blocker": blocker,
+        }
+
+    @staticmethod
+    def _compact_attempt(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        compact = {
+            key: value.get(key)
+            for key in (
+                "id",
+                "phase_id",
+                "semantic_action",
+                "signature",
+                "status",
+                "created_at",
+                "terminal_at",
+            )
+            if value.get(key) is not None
+        }
+        result = value.get("result")
+        if isinstance(result, dict):
+            compact_result = {
+                key: result.get(key)
+                for key in ("ok", "error", "reason", "for_level", "verification")
+                if result.get(key) is not None
+            }
+            prey = result.get("prey")
+            if isinstance(prey, list):
+                compact_result["prey"] = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "creature",
+                            "level",
+                            "best_room",
+                            "rooms",
+                            "chance",
+                            "cap",
+                            "risk",
+                        )
+                        if item.get(key) is not None
+                    }
+                    for item in prey[:12]
+                    if isinstance(item, dict)
+                ]
+            if compact_result:
+                compact["result"] = compact_result
+        return compact
+
+    @classmethod
+    def _compact_run(cls, run: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            key: run.get(key)
+            for key in ("id", "goal_id", "status", "strategy_summary", "created_at", "updated_at")
+            if run.get(key) is not None
+        }
+        checkpoint = run.get("progress_checkpoint")
+        if isinstance(checkpoint, dict):
+            completion = checkpoint.get("completion")
+            compact["progress_checkpoint"] = {
+                "phase_id": checkpoint.get("phase_id"),
+                "phase_kind": checkpoint.get("phase_kind"),
+                "recorded_at": checkpoint.get("recorded_at"),
+                "completion": (
+                    {
+                        key: completion.get(key)
+                        for key in ("percent_estimate", "summary", "all_met")
+                        if completion.get(key) is not None
+                    }
+                    if isinstance(completion, dict)
+                    else None
+                ),
+            }
+        blocker = cls._compact_external_blocker(run.get("external_blocker"))
+        if blocker is not None:
+            compact["external_blocker"] = blocker
+        memory = run.get("working_memory")
+        if isinstance(memory, dict):
+            compact["working_memory"] = {
+                str(key): item
+                for key, item in list(memory.items())[:20]
+                if isinstance(item, (str, int, float, bool)) or item is None
+            }
+        return compact
+
+    def manager_context(
         self,
         run: dict[str, Any],
         phase: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        history = self.storage.campaign_phases(run["id"])[-12:]
+        """Return decision-relevant campaign memory without raw phase payloads."""
+
+        history = self.storage.campaign_phases(run["id"])
         attempt_phase = phase or (history[-1] if history else None)
         attempts = (
-            self.storage.phase_attempts(attempt_phase["id"], limit=12)
+            self.storage.phase_attempts(attempt_phase["id"], limit=8)
             if attempt_phase
             else []
         )
         return {
-            "run": run,
-            "active_phase": phase,
-            "recent_phases": history,
-            "recent_phase_attempts": attempts,
+            "run": self._compact_run(run),
+            "active_phase": self._compact_phase(phase),
+            "recent_phase_summaries": [
+                projected
+                for value in history[-8:]
+                if (projected := self._compact_phase(value)) is not None
+            ],
+            "recent_phase_attempts": [
+                projected
+                for value in attempts
+                if (projected := self._compact_attempt(value)) is not None
+            ],
+            "tactic_ledger": self._tactic_ledger(history, run.get("external_blocker")),
             "action_breaker_limit": self.ACTION_FAILURE_LIMIT,
             "instructions": (
                 "Preserve the strategic goal across routine failures. Supporting preparation is an internal "
                 "child phase, never a public supervisor goal. Select a materially different tactic after a breaker."
             ),
         }
+
+    def tactical_context(
+        self,
+        run: dict[str, Any],
+        phase: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return only the active phase and compact facts needed to execute it."""
+
+        history = self.storage.campaign_phases(run["id"])
+        attempt_phase = phase or (history[-1] if history else None)
+        attempts = (
+            self.storage.phase_attempts(attempt_phase["id"], limit=8)
+            if attempt_phase
+            else []
+        )
+        return {
+            "run": self._compact_run(run),
+            "active_phase": self._compact_phase(phase),
+            "recent_phase_summaries": [
+                projected
+                for value in history[-3:]
+                if (projected := self._compact_phase(value)) is not None
+            ],
+            "recent_phase_attempts": [
+                projected
+                for value in attempts
+                if (projected := self._compact_attempt(value)) is not None
+            ],
+            "action_breaker_limit": self.ACTION_FAILURE_LIMIT,
+            "instructions": (
+                "Execute only the active bounded phase. Historical phases are summaries, not current state."
+            ),
+        }
+
+    def context(
+        self,
+        run: dict[str, Any],
+        phase: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Compatibility alias for callers that need tactical execution context."""
+
+        return self.tactical_context(run, phase)
