@@ -400,7 +400,10 @@ When campaign.research_retry.allowed is false, the controller has already proved
 research_progression lookup returns the same fully rejected candidate set. Do not select
 research_progression again. Select a materially different capability, equipment, supplies, recovery,
 commerce, route-evidence, or other support phase. The strategic goal remains active. Research becomes
-eligible again only after the disclosed state fingerprint or retry predicate changes.
+eligible again only after the controller reports a positive enabling change such as increased health or
+ability, newly available equipment/supplies, a changed knowledge corpus, or removal of retained route or
+quarantine evidence. A newly created failure lesson, retry suppression, quarantine, stagnation record, or
+other negative evidence narrows the available tactics and never authorizes another research lookup.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),

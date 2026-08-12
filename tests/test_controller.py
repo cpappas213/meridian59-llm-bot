@@ -14,11 +14,12 @@ from meridian_bot.campaign import CampaignCoordinator
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+    RESEARCH_RETRY_STATE_SCHEMA_VERSION,
     BotController,
 )
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.mcp import TOOLS
-from meridian_bot.model import ModelError, PLANNER_SYSTEM
+from meridian_bot.model import CAMPAIGN_MANAGER_SYSTEM, ModelError, PLANNER_SYSTEM
 from meridian_bot.persona import PERSONA_FIELDS
 from meridian_bot.simulator import SimulatedBroker
 from meridian_bot.config import OnboardingConfig
@@ -1263,6 +1264,10 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("shop only inspects a merchant's stock", PLANNER_SYSTEM)
         self.assertIn("Create Weapon directly supplies", PLANNER_SYSTEM)
         self.assertIn("read-only catalogue or status lookup is evidence, not progress", PLANNER_SYSTEM)
+        self.assertIn(
+            "negative evidence narrows the available tactics",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
 
     def test_exactly_six_mcp_tools(self) -> None:
         self.assertEqual({"status", "submit_goal", "manage_goal", "proposals", "persona", "events"}, {tool["name"] for tool in TOOLS})
@@ -10286,6 +10291,155 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(4, repeated["repeat_count"])
                 self.assertFalse(
                     controller._research_retry_gate(goal, changed)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_semantically_identical_empty_research_counts_across_raw_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="semantic-research-exhaustion")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {
+                        goal["id"]: {
+                            # Legacy records persisted the raw-result hash and
+                            # did not carry a canonical semantic identity.
+                            "fingerprint": "raw-result-and-avoid-set-one",
+                            "repeat_count": 1,
+                            "phase_ids": ["research-one"],
+                            "candidate_count": 0,
+                            "rejected": [],
+                        }
+                    },
+                )
+                second = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "research-two"},
+                    {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "different-raw-result-and-avoid-set",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
+                third = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "research-three"},
+                    {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "third-raw-result-variant",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
+
+                self.assertEqual(2, second["repeat_count"])
+                self.assertEqual(3, third["repeat_count"])
+                self.assertEqual(second["fingerprint"], third["fingerprint"])
+                self.assertEqual(
+                    ["research-one", "research-two"], second["phase_ids"]
+                )
+                self.assertFalse(
+                    controller._research_retry_gate(goal, observation)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_research_failures_do_not_reopen_gate_but_removed_route_blocker_does(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="negative-research-evidence")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
+                record = {
+                    "fingerprint": "closed-candidate-set",
+                    "semantic_identity": {
+                        "status": "no_usable_candidate",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": baseline,
+                    "retry_state_fingerprint": controller._research_retry_state_fingerprint(
+                        goal, observation
+                    ),
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="prey",
+                    arguments={"max_health": 34, "purpose": "advance"},
+                    reason="repeated identical evidence lookup returned no new evidence",
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                    block=False,
+                )
+                controller.storage.set_runtime(
+                    "blocked_actions",
+                    [
+                        {
+                            "goal_id": goal["id"],
+                            "tool": "prey",
+                            "arguments": {"max_health": 34},
+                            "room": 106,
+                            "reason": "identical evidence lookup",
+                        }
+                    ],
+                )
+
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, observation),
+                    record["retry_state_fingerprint"],
+                )
+                self.assertFalse(
+                    controller._research_retry_gate(goal, observation)["allowed"]
+                )
+
+                route = controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="travel",
+                    arguments={"to": 563},
+                    reason="route to 563 is unavailable from room 106",
+                    classification="route_unavailable",
+                    scope="tactic",
+                    block=False,
+                )["lesson"]
+                narrowed = controller._research_retry_gate(goal, observation)
+                self.assertFalse(narrowed["allowed"])
+
+                controller.storage.update_goal_lesson(route["id"], "resolved")
+                reopened = controller._research_retry_gate(goal, observation)
+                self.assertTrue(reopened["allowed"])
+                self.assertIn(
+                    "blocking_evidence_removed", reopened["enabling_changes"]
                 )
             finally:
                 controller.storage.close()

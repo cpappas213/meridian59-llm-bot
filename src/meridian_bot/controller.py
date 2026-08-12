@@ -96,6 +96,7 @@ PVP_ROUTE_FAILURE_RUNTIME_KEY = "pvp_route_failure_v1"
 SAFE_STAGING_FLAGS = frozenset({"ROOM_SANCTUARY", "ROOM_NO_COMBAT"})
 SAFE_STAGING_RUNTIME_KEY = "verified_safe_staging_room_v1"
 RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY = "research_recipe_exhaustion_v1"
+RESEARCH_RETRY_STATE_SCHEMA_VERSION = 2
 
 # The broker's keeper retains this many shillings as walking money and does not
 # expose that value through its public autopilot schema.  Sending a positive
@@ -2713,34 +2714,45 @@ class BotController:
                 }
             )
 
-        fingerprint = json_hash(
-            {
-                "results": [redact(attempt.get("result")) for attempt in attempts],
-                "avoid_rooms": sorted(avoid_rooms),
-                "rejected": [
-                    {
-                        "room": item.get("room"),
-                        "target": item.get("target"),
-                        "kind": deep_get(item, "blocker.kind"),
-                    }
-                    for item in rejected
-                ],
-                "selected": (
-                    {
-                        key: selected.get(key)
-                        for key in (
-                            "room",
-                            "target",
-                            "use_safe_spots",
-                            "flee_below",
-                            "fight_above_vigor",
-                        )
-                    }
-                    if selected is not None
-                    else None
-                ),
-            }
-        )
+        semantic_outcome = {
+            "status": "selected" if selected is not None else (
+                "no_usable_candidate" if attempts else "awaiting_hunting_grounds"
+            ),
+            "candidate_count": len(candidates),
+            "rejected": [
+                {
+                    "room": item.get("room"),
+                    "target": normalize(str(item.get("target") or "")),
+                    "kind": str(deep_get(item, "blocker.kind") or ""),
+                }
+                for item in sorted(
+                    rejected,
+                    key=lambda item: (
+                        str(item.get("room")),
+                        normalize(str(item.get("target") or "")),
+                        str(deep_get(item, "blocker.kind") or ""),
+                    ),
+                )
+            ],
+            "selected": (
+                {
+                    key: selected.get(key)
+                    for key in (
+                        "room",
+                        "target",
+                        "use_safe_spots",
+                        "flee_below",
+                        "fight_above_vigor",
+                    )
+                }
+                if selected is not None
+                else None
+            ),
+        }
+        # Research identity describes the decision-relevant candidate outcome.
+        # Raw adapter payloads, ordering, timestamps, and soft avoid-room hints
+        # must not let an equivalent empty/rejected set masquerade as new work.
+        fingerprint = json_hash(semantic_outcome)
         if selected is not None:
             self._clear_research_recipe_exhaustion(str(goal.get("id") or ""))
             return {
@@ -2751,13 +2763,40 @@ class BotController:
                 "rejected": rejected,
             }
         return {
-            "status": (
-                "no_usable_candidate" if attempts else "awaiting_hunting_grounds"
-            ),
+            "status": semantic_outcome["status"],
             "fingerprint": fingerprint,
             "candidate_count": len(candidates),
             "rejected": rejected,
             "attempt_ids": [attempt.get("id") for attempt in attempts],
+        }
+
+    @staticmethod
+    def _research_exhaustion_identity(value: dict[str, Any]) -> dict[str, Any]:
+        """Canonicalize only the semantic reason research produced no recipe."""
+
+        try:
+            candidate_count = max(0, int(value.get("candidate_count", 0) or 0))
+        except (TypeError, ValueError):
+            candidate_count = 0
+        rejected = sorted(
+            [
+                {
+                    "room": item.get("room"),
+                    "target": normalize(str(item.get("target") or "")),
+                    "kind": str(deep_get(item, "blocker.kind") or ""),
+                }
+                for item in value.get("rejected", [])
+                if isinstance(item, dict)
+            ],
+            key=canonical_json,
+        )
+        status = str(value.get("status") or "").strip()
+        if not status:
+            status = "no_usable_candidate"
+        return {
+            "status": status,
+            "candidate_count": candidate_count,
+            "rejected": rejected,
         }
 
     def _persist_research_recipe_validation(
@@ -2820,19 +2859,24 @@ class BotController:
             }
 
         goal_id = str(goal.get("id") or "")
-        fingerprint = str(validation.get("fingerprint") or "")
+        semantic_identity = self._research_exhaustion_identity(validation)
+        fingerprint = json_hash(semantic_identity)
         values = self.storage.get_runtime(
             RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
         )
         values = dict(values) if isinstance(values, dict) else {}
         prior = values.get(goal_id)
         prior = prior if isinstance(prior, dict) else {}
-        retry_state_fingerprint = self._research_retry_state_fingerprint(
-            goal, observation
+        prior_identity = (
+            prior.get("semantic_identity")
+            if isinstance(prior.get("semantic_identity"), dict)
+            else self._research_exhaustion_identity(prior)
         )
+        retry_state = self._research_retry_state(goal, observation)
+        retry_state_fingerprint = json_hash(retry_state)
         phase_ids = (
             list(prior.get("phase_ids", []))
-            if prior.get("fingerprint") == fingerprint
+            if prior_identity == semantic_identity
             and isinstance(prior.get("phase_ids"), list)
             else []
         )
@@ -2841,10 +2885,13 @@ class BotController:
             phase_ids.append(phase_id)
         record = {
             "fingerprint": fingerprint,
+            "semantic_identity": semantic_identity,
             "repeat_count": len(phase_ids),
             "phase_ids": phase_ids[-10:],
             "candidate_count": validation.get("candidate_count", 0),
             "rejected": redact(validation.get("rejected", [])),
+            "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+            "retry_state": retry_state,
             "retry_state_fingerprint": retry_state_fingerprint,
             "recorded_at": timestamp(),
             "guidance": (
@@ -9123,10 +9170,10 @@ class BotController:
         remaining.pop(goal_id, None)
         self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, remaining)
 
-    def _research_retry_state_fingerprint(
+    def _research_retry_state(
         self, goal: dict[str, Any], observation: dict[str, Any]
-    ) -> str:
-        """Fingerprint only facts that can materially reopen progression research."""
+    ) -> dict[str, Any]:
+        """Capture enabling capabilities and currently retained negative gates."""
 
         goal_id = str(goal.get("id") or "")
         raw_equipment = deep_get(
@@ -9137,12 +9184,15 @@ class BotController:
         raw_equipment = raw_equipment if isinstance(raw_equipment, dict) else {}
         equipped = raw_equipment.get("equipped", [])
         equipped = equipped if isinstance(equipped, list) else []
+        raw_wielding = raw_equipment.get("wielding", [])
+        if isinstance(raw_wielding, str):
+            raw_wielding = [raw_wielding]
+        raw_wielding = raw_wielding if isinstance(raw_wielding, list) else []
         equipment = {
             "known": raw_equipment.get("known"),
             "equipped": sorted(
                 [
                     {
-                        "id": item.get("id"),
                         "name": normalize(str(item.get("name") or "")),
                     }
                     for item in equipped
@@ -9152,11 +9202,9 @@ class BotController:
             ),
             "wielding": sorted(
                 normalize(str(item))
-                for item in raw_equipment.get("wielding", [])
+                for item in raw_wielding
                 if str(item).strip()
-            )
-            if isinstance(raw_equipment.get("wielding"), list)
-            else [],
+            ),
         }
         raw_abilities = deep_get(
             observation,
@@ -9182,7 +9230,6 @@ class BotController:
             return sorted(
                 [
                     {
-                        "id": item.get("id"),
                         "name": normalize(str(item.get("name") or "")),
                         "ability": item.get("ability"),
                     }
@@ -9227,53 +9274,183 @@ class BotController:
             ],
             key=lambda item: (str(item.get("name")), str(item.get("amount"))),
         )
-        lessons = sorted(
+        quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantines = quarantines if isinstance(quarantines, dict) else {}
+        quarantine_gates = sorted(
             [
                 {
-                    "id": item.get("id"),
-                    "status": item.get("status"),
-                    "classification": item.get("classification"),
-                    "tactic_key": item.get("tactic_key"),
+                    "key": str(key),
+                    "room": item.get("room", item.get("assigned_room")),
+                    "target": normalize(str(item.get("target") or "")),
+                    "use_safe_spots": item.get("use_safe_spots"),
+                }
+                for key, item in quarantines.items()
+                if isinstance(item, dict)
+            ],
+            key=canonical_json,
+        )
+        stagnations = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
+        stagnations = stagnations if isinstance(stagnations, dict) else {}
+        stagnation_gates = sorted(
+            [
+                {
+                    "key": str(key),
+                    "room": item.get("room", item.get("assigned_room")),
+                    "target": normalize(str(item.get("target") or "")),
+                }
+                for key, item in stagnations.items()
+                if isinstance(item, dict)
+                and str(key).startswith(f"{goal_id}|")
+                and self._farm_stagnation_blocks(item)
+            ],
+            key=canonical_json,
+        )
+        route_gates = sorted(
+            [
+                {
+                    "id": str(item.get("id") or ""),
+                    "summary": str(item.get("summary") or "")[:300],
                 }
                 for item in self.storage.goal_lessons(
                     statuses=["deferred", "unlocked"], limit=200
                 )
                 if str(item.get("goal_id") or "") == goal_id
-                and item.get("scope") == "tactic"
+                and item.get("classification") == "route_unavailable"
             ],
             key=canonical_json,
         )
-        blocked_actions = self.storage.get_runtime("blocked_actions", [])
-        blocked_actions = blocked_actions if isinstance(blocked_actions, list) else []
-        route_evidence = sorted(
-            [
-                {
-                    "tool": item.get("tool"),
-                    "room": item.get("room"),
-                    "reason": item.get("reason"),
-                }
-                for item in blocked_actions
-                if isinstance(item, dict) and item.get("goal_id") == goal_id
-            ],
-            key=canonical_json,
-        )
-        return json_hash(
-            {
-                "max_health": deep_get(
-                    observation,
-                    "status.vitals.health.max",
-                    deep_get(observation, "look.vitals.health.max"),
-                ),
-                # Broker cache ages and response notes change every observation;
-                # only actual equipped items and named ability values reopen work.
-                "equipment": equipment,
-                "abilities": abilities,
-                "inventory": items,
-                "tactic_lessons": lessons,
-                "route_evidence": route_evidence,
-                "knowledge_corpus_version": self.knowledge.corpus_version,
+        return {
+            "schema_version": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+            "max_health": deep_get(
+                observation,
+                "status.vitals.health.max",
+                deep_get(observation, "look.vitals.health.max"),
+            ),
+            # Broker cache ages and response notes are deliberately absent.
+            "equipment": equipment,
+            "abilities": abilities,
+            "inventory": items,
+            "knowledge_corpus_version": self.knowledge.corpus_version,
+            "negative_gates": {
+                "quarantines": quarantine_gates,
+                "stagnations": stagnation_gates,
+                "routes": route_gates,
+            },
+        }
+
+    def _research_retry_state_fingerprint(
+        self, goal: dict[str, Any], observation: dict[str, Any]
+    ) -> str:
+        """Hash the stable retry state for status and persistence."""
+
+        return json_hash(self._research_retry_state(goal, observation))
+
+    @staticmethod
+    def _research_retry_enabling_changes(
+        previous: dict[str, Any], current: dict[str, Any]
+    ) -> list[str]:
+        """Return only state changes that can make an excluded recipe executable."""
+
+        changes: list[str] = []
+        try:
+            prior_health = int(previous.get("max_health"))
+        except (TypeError, ValueError):
+            prior_health = -1
+        try:
+            current_health = int(current.get("max_health"))
+        except (TypeError, ValueError):
+            current_health = -1
+        if current_health > prior_health:
+            changes.append("max_health_increased")
+
+        prior_equipment = previous.get("equipment")
+        prior_equipment = prior_equipment if isinstance(prior_equipment, dict) else {}
+        current_equipment = current.get("equipment")
+        current_equipment = current_equipment if isinstance(current_equipment, dict) else {}
+        for key in ("equipped", "wielding"):
+            prior_values = {
+                canonical_json(item)
+                for item in prior_equipment.get(key, [])
+            } if isinstance(prior_equipment.get(key), list) else set()
+            current_values = {
+                canonical_json(item)
+                for item in current_equipment.get(key, [])
+            } if isinstance(current_equipment.get(key), list) else set()
+            if current_values - prior_values:
+                changes.append(f"equipment_{key}_added")
+
+        for kind in ("skills", "spells"):
+            prior_rows = deep_get(previous, f"abilities.{kind}", [])
+            current_rows = deep_get(current, f"abilities.{kind}", [])
+            prior_by_name = {
+                str(item.get("name") or ""): item.get("ability")
+                for item in (prior_rows if isinstance(prior_rows, list) else [])
+                if isinstance(item, dict) and item.get("name")
             }
-        )
+            for item in current_rows if isinstance(current_rows, list) else []:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                name = str(item["name"])
+                try:
+                    before = float(prior_by_name.get(name, -1))
+                    after = float(item.get("ability", -1))
+                except (TypeError, ValueError):
+                    continue
+                if after > before:
+                    changes.append(f"{kind}_increased")
+                    break
+
+        prior_items = previous.get("inventory")
+        prior_items = prior_items if isinstance(prior_items, list) else []
+        current_items = current.get("inventory")
+        current_items = current_items if isinstance(current_items, list) else []
+        prior_by_name = {
+            str(item.get("name") or ""): item
+            for item in prior_items if isinstance(item, dict) and item.get("name")
+        }
+        for item in current_items:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            name = str(item["name"])
+            prior = prior_by_name.get(name)
+            if prior is None:
+                changes.append("capability_inventory_added")
+                break
+            try:
+                prior_amount = float(prior.get("amount", 1) or 0)
+                current_amount = float(item.get("amount", 1) or 0)
+            except (TypeError, ValueError):
+                prior_amount = current_amount = 0
+            if current_amount > prior_amount or any(
+                prior.get(key) != item.get(key) for key in ("condition", "quality", "equipped")
+            ):
+                changes.append("capability_inventory_improved")
+                break
+
+        if previous.get("knowledge_corpus_version") != current.get(
+            "knowledge_corpus_version"
+        ):
+            changes.append("knowledge_corpus_changed")
+
+        prior_negative = previous.get("negative_gates")
+        prior_negative = prior_negative if isinstance(prior_negative, dict) else {}
+        current_negative = current.get("negative_gates")
+        current_negative = current_negative if isinstance(current_negative, dict) else {}
+        prior_gates = {
+            canonical_json(item)
+            for group in prior_negative.values()
+            if isinstance(group, list)
+            for item in group
+        }
+        current_gates = {
+            canonical_json(item)
+            for group in current_negative.values()
+            if isinstance(group, list)
+            for item in group
+        }
+        if prior_gates - current_gates:
+            changes.append("blocking_evidence_removed")
+        return list(dict.fromkeys(changes))
 
     def _research_retry_gate(
         self, goal: dict[str, Any], observation: dict[str, Any]
@@ -9298,12 +9475,23 @@ class BotController:
                 "candidate_fingerprint": record.get("fingerprint"),
             }
 
-        current = self._research_retry_state_fingerprint(goal, observation)
-        recorded = str(record.get("retry_state_fingerprint") or "")
-        if not recorded:
-            # Existing installations predate retry-state fingerprints. Capture
-            # the current verified state as their conservative reopening base.
-            record = {**record, "retry_state_fingerprint": current}
+        current_state = self._research_retry_state(goal, observation)
+        current = json_hash(current_state)
+        recorded_state = record.get("retry_state")
+        state_schema = record.get("retry_state_schema")
+        if (
+            state_schema != RESEARCH_RETRY_STATE_SCHEMA_VERSION
+            or not isinstance(recorded_state, dict)
+        ):
+            # Legacy fingerprints included the research loop's own lessons and
+            # failed actions. Migrating them by comparison would manufacture a
+            # false "material change", so capture a conservative v2 baseline.
+            record = {
+                **record,
+                "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                "retry_state": current_state,
+                "retry_state_fingerprint": current,
+            }
             values[goal_id] = record
             self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
             run = self.storage.campaign_run(goal_id)
@@ -9315,19 +9503,31 @@ class BotController:
             ):
                 self.storage.update_campaign_memory(
                     run["id"],
-                    external_blocker={**blocker, "retry_state_fingerprint": current},
+                    external_blocker={
+                        **blocker,
+                        "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                        "retry_state": current_state,
+                        "retry_state_fingerprint": current,
+                    },
                 )
-            recorded = current
-        if recorded != current:
+            recorded_state = current_state
+        enabling_changes = self._research_retry_enabling_changes(
+            recorded_state,
+            current_state,
+        )
+        if enabling_changes:
             # Authorize exactly one lookup against the materially changed state,
             # while retaining the prior candidate-set history. If that lookup
             # returns the same candidates, it strengthens (rather than erases)
             # the exhaustion evidence and closes the gate again immediately.
             record = {
                 **record,
+                "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                "retry_state": current_state,
                 "retry_state_fingerprint": current,
-                "retry_reopened_from": recorded,
+                "retry_reopened_from": record.get("retry_state_fingerprint"),
                 "retry_reopened_at": timestamp(),
+                "retry_reopened_by": enabling_changes,
             }
             values[goal_id] = record
             self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
@@ -9346,15 +9546,41 @@ class BotController:
                 interesting=False,
                 goal_id=goal_id,
                 data={
-                    "prior_retry_state_fingerprint": recorded,
+                    "prior_retry_state_fingerprint": record.get(
+                        "retry_reopened_from"
+                    ),
                     "current_retry_state_fingerprint": current,
+                    "enabling_changes": enabling_changes,
                 },
             )
             return {
                 "allowed": True,
-                "reason": "material capability or world evidence changed",
+                "reason": "material capability or enabling world evidence changed",
                 "state_changed": True,
+                "enabling_changes": enabling_changes,
             }
+        if record.get("retry_state_fingerprint") != current:
+            # New failure/quarantine evidence can only narrow the candidate set.
+            # Retain it as the new baseline without treating the loop's own
+            # negative evidence as authorization for more research.
+            record = {
+                **record,
+                "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                "retry_state": current_state,
+                "retry_state_fingerprint": current,
+            }
+            values[goal_id] = record
+            self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(run, dict)
+                and isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.update_campaign_memory(
+                    run["id"], external_blocker={**blocker, **record}
+                )
         return {
             "allowed": False,
             "reason": (
@@ -9363,12 +9589,12 @@ class BotController:
             ),
             "repeat_count": repeat_count,
             "candidate_fingerprint": record.get("fingerprint"),
-            "retry_state_fingerprint": recorded,
+            "retry_state_fingerprint": current,
             "retry_requires": [
                 "equipment_change",
                 "ability_change",
                 "inventory_or_supplies_change",
-                "route_or_quarantine_evidence_change",
+                "route_or_quarantine_blocker_removed",
                 "max_health_change",
                 "knowledge_corpus_change",
             ],
