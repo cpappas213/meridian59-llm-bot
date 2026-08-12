@@ -5,6 +5,7 @@ import io
 import unittest
 
 from meridian_bot.tui import (
+    ControllerApiError,
     prompt_goal_command,
     prompt_new_goal,
     render_character_status,
@@ -328,6 +329,73 @@ class TuiTests(unittest.TestCase):
 
         self.assertIsNotNone(payload)
         self.assertEqual(1, len(api.draft_requests))
+
+    def test_goal_validation_failure_stays_in_editor_and_retains_draft(self) -> None:
+        class FailingOnceApi(FakeApi):
+            def draft_goal(
+                self,
+                prompt: str,
+                *,
+                current_goal: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                self.draft_requests.append(
+                    {"prompt": prompt, "current_goal": current_goal}
+                )
+                if len(self.draft_requests) == 1:
+                    invalid = {
+                        "title": "Acquire slash",
+                        "objective": "Acquire the slash skill.",
+                        "success_criteria": [
+                            {
+                                "id": "slash",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.slash",
+                                "value": 1,
+                            }
+                        ],
+                        "constraints": {},
+                        "priority": 50,
+                        "activation": "queue",
+                    }
+                    raise ControllerApiError(
+                        "KNOWLEDGE_VALIDATION_FAILED: purchase plan required",
+                        code="KNOWLEDGE_VALIDATION_FAILED",
+                        details={
+                            "canonical_goal": invalid,
+                            "errors": [
+                                {
+                                    "code": "PURCHASE_PLAN_REQUIRED",
+                                    "message": "A verified training plan is required.",
+                                    "purchase_plan_candidates": [
+                                        {
+                                            "merchant_class": "CorNothSergeant",
+                                            "room_id": 50,
+                                            "maximum_price": 500,
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    )
+                return {
+                    "goal": self.drafts[0],
+                    "validation": {"warnings": []},
+                }
+
+        api = FailingOnceApi()
+        answers = iter(["Acquire slash.", "retry", "approve"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            payload = prompt_new_goal(api, input_fn=lambda _: next(answers))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(2, len(api.draft_requests))
+        self.assertEqual(
+            "Acquire slash",
+            api.draft_requests[1]["current_goal"]["title"],
+        )
+        self.assertIn("retained for repair", output.getvalue())
+        self.assertIn("CorNothSergeant in room 50", output.getvalue())
 
     def test_goal_management_uses_selected_version_and_explicit_cancel(self) -> None:
         goals = FakeApi().goals()

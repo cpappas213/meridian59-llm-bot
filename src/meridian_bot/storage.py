@@ -573,6 +573,109 @@ class Storage:
                     upgraded.append(goal)
         return upgraded
 
+    def upgrade_legacy_raza_exit_goal_criteria(self) -> list[dict[str, Any]]:
+        """Replace manual Raza-graduation checks with durable client evidence.
+
+        Early goal drafts used ``operator_confirmed`` for "leave Raza" because
+        the generic criterion language had no negative region predicate.  The
+        ordinary-client ``leave_raza`` adapter now provides an exact, goal-
+        scoped completion event, so retaining a manual check would leave an
+        otherwise autonomous tutorial goal permanently half complete.
+        """
+
+        upgraded: list[dict[str, Any]] = []
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM goals WHERE status IN ('queued','active','paused','blocked')"
+            ).fetchall()
+            for row in rows:
+                goal_text = f"{row['title']} {row['objective']}".casefold()
+                if "raza" not in goal_text or not any(
+                    marker in goal_text
+                    for marker in ("leave raza", "left raza", "out of raza", "outside raza")
+                ):
+                    continue
+                criteria = self._loads(row["success_criteria_json"], [])
+                if not isinstance(criteria, list):
+                    continue
+                replace_indexes = [
+                    index
+                    for index, item in enumerate(criteria)
+                    if isinstance(item, dict)
+                    and item.get("kind") == "operator_confirmed"
+                    and "raza"
+                    in str(item.get("id") or "").casefold().replace("-", "_")
+                ]
+                if not replace_indexes:
+                    continue
+                anchor_row = connection.execute(
+                    "SELECT MIN(cursor) AS cursor FROM events WHERE goal_id=? AND kind='goal.submitted'",
+                    (row["id"],),
+                ).fetchone()
+                anchor = (
+                    int(anchor_row["cursor"])
+                    if anchor_row and anchor_row["cursor"] is not None
+                    else int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(cursor), 0) AS cursor FROM events"
+                        ).fetchone()["cursor"]
+                    )
+                )
+                replace = set(replace_indexes)
+                rebuilt: list[dict[str, Any]] = []
+                for index, item in enumerate(criteria):
+                    if index in replace:
+                        rebuilt.append(
+                            {
+                                "id": item.get("id") or "left_raza",
+                                "kind": "event_occurred",
+                                "event_kind": "raza.left",
+                                "after_cursor": anchor,
+                            }
+                        )
+                    elif isinstance(item, dict):
+                        rebuilt.append(item)
+                now = timestamp()
+                version = int(row["version"]) + 1
+                connection.execute(
+                    "UPDATE goals SET success_criteria_json=?, completion_json=?, version=?, updated_at=? WHERE id=?",
+                    (
+                        canonical_json(rebuilt),
+                        canonical_json(
+                            {
+                                "percent_estimate": 0,
+                                "summary": "Raza exit criterion upgraded",
+                                "evidence_event_ids": [],
+                            }
+                        ),
+                        version,
+                        now,
+                        row["id"],
+                    ),
+                )
+                self._event_in_tx(
+                    connection,
+                    "goal.criteria.upgraded",
+                    f"Upgraded Raza exit evidence criterion: {row['title']}",
+                    severity="notice",
+                    interesting=True,
+                    goal_id=row["id"],
+                    data={
+                        "from_kind": "operator_confirmed",
+                        "to_kind": "event_occurred",
+                        "event_kind": "raza.left",
+                        "after_cursor": anchor,
+                    },
+                )
+                goal = self._goal_from_row(
+                    connection.execute(
+                        "SELECT * FROM goals WHERE id=?", (row["id"],)
+                    ).fetchone()
+                )
+                if goal is not None:
+                    upgraded.append(goal)
+        return upgraded
+
     def latest_events(
         self,
         *,
@@ -1018,6 +1121,88 @@ class Storage:
         with self.transaction() as connection:
             return self._promote_in_tx(connection)
 
+    def preempt_for_higher_priority(
+        self,
+        active_goal_id: str,
+        *,
+        reason: str,
+        phase_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically yield an active goal to strictly higher-priority work.
+
+        The controller calls this only after it has verified a safe campaign
+        phase boundary and released any keeper.  Requeueing the interrupted
+        goal in the same transaction preserves its campaign/checkpoints and
+        guarantees that it is eligible for automatic resumption when the
+        higher-priority goal becomes terminal.
+        """
+
+        with self.transaction() as connection:
+            active = connection.execute(
+                "SELECT * FROM goals WHERE id=? AND status='active'",
+                (active_goal_id,),
+            ).fetchone()
+            if active is None:
+                return None
+            candidate = connection.execute(
+                """SELECT * FROM goals
+                   WHERE status='queued' AND priority>?
+                   ORDER BY priority DESC,created_at ASC LIMIT 1""",
+                (int(active["priority"]),),
+            ).fetchone()
+            if candidate is None:
+                return None
+
+            detail = str(reason or "safe campaign boundary reached")[:1000]
+            paused = self._transition_in_tx(
+                connection,
+                active,
+                "paused",
+                detail,
+                "controller",
+            )
+            paused_row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (active_goal_id,)
+            ).fetchone()
+            if paused_row is None:
+                raise NotFound(active_goal_id)
+            requeued = self._transition_in_tx(
+                connection,
+                paused_row,
+                "queued",
+                "automatically requeued after cooperative priority preemption",
+                "controller",
+            )
+            promoted = self._promote_in_tx(connection)
+            if promoted is None or promoted.get("id") != candidate["id"]:
+                raise RuntimeError(
+                    "cooperative priority preemption did not promote the selected goal"
+                )
+            self._event_in_tx(
+                connection,
+                "goal.priority_preempted",
+                (
+                    f"Yielded {active['title']} to higher-priority goal "
+                    f"{candidate['title']} at a safe campaign boundary"
+                ),
+                severity="notice",
+                interesting=True,
+                goal_id=active_goal_id,
+                data={
+                    "preempted_goal_id": active_goal_id,
+                    "preempted_priority": int(active["priority"]),
+                    "activated_goal_id": candidate["id"],
+                    "activated_priority": int(candidate["priority"]),
+                    "phase_id": phase_id,
+                    "reason": detail,
+                },
+            )
+            return {
+                "preempted_goal": requeued,
+                "activated_goal": promoted,
+                "phase_id": phase_id,
+            }
+
     def manage_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._reject_unknown(
             payload,
@@ -1283,9 +1468,20 @@ class Storage:
                    resolution_goal_id=COALESCE(?,resolution_goal_id) WHERE id=?""",
                 (status, now, unlocked, resolved, resolution_goal_id, lesson_id),
             )
-            kind = "goal.retry_unlocked" if status == "unlocked" else "goal.lesson.resolved" if status == "resolved" else "goal.deferred"
+            is_tactic = row["scope"] == "tactic"
+            kind = (
+                ("tactic.retry_unlocked" if is_tactic else "goal.retry_unlocked")
+                if status == "unlocked"
+                else "goal.lesson.resolved"
+                if status == "resolved"
+                else "goal.deferred"
+            )
             summary = (
-                "Deferred goal is eligible for a revised retry"
+                (
+                    "Deferred tactic is eligible for a revised retry"
+                    if is_tactic
+                    else "Deferred goal is eligible for a revised retry"
+                )
                 if status == "unlocked"
                 else "Goal lesson resolved by verified success"
                 if status == "resolved"
@@ -1448,6 +1644,27 @@ class Storage:
             self._complete_campaign_run_in_tx(connection, goal_id, status="blocked")
             self._promote_in_tx(connection)
             return result
+
+    def requeue_repaired_blocker(
+        self, goal_id: str, *, blocked_reason: str, reason: str
+    ) -> dict[str, Any] | None:
+        """Requeue a goal only when its exact controller blocker was invalidated."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "blocked"
+                or row["blocked_reason"] != blocked_reason
+            ):
+                return self._goal_from_row(row)
+            repaired = self._transition_in_tx(
+                connection, row, "queued", reason, "controller"
+            )
+            promoted = self._promote_in_tx(connection)
+            return promoted if promoted and promoted.get("id") == goal_id else repaired
 
     def create_proposal(self, draft: dict[str, Any], reason: str, expected_value: str = "", risk_summary: str = "") -> dict[str, Any]:
         normalized = self._validate_goal({**draft, "activation": "queue"})
@@ -2165,6 +2382,24 @@ class Storage:
         )
         return self._campaign_run_from_row(
             self._connect().execute("SELECT * FROM campaign_runs WHERE id=?", (run_id,)).fetchone()
+        ) or {}
+
+    def clear_campaign_external_blocker(self, run_id: str) -> dict[str, Any]:
+        """Clear a campaign blocker after its supporting evidence is repaired."""
+
+        row = self._connect().execute(
+            "SELECT * FROM campaign_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"campaign run not found: {run_id}")
+        self._connect().execute(
+            "UPDATE campaign_runs SET external_blocker_json=NULL,updated_at=? WHERE id=?",
+            (timestamp(), run_id),
+        )
+        return self._campaign_run_from_row(
+            self._connect().execute(
+                "SELECT * FROM campaign_runs WHERE id=?", (run_id,)
+            ).fetchone()
         ) or {}
 
     def complete_campaign_run(self, goal_id: str, *, status: str = "succeeded") -> dict[str, Any] | None:

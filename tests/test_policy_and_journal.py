@@ -311,6 +311,7 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual(current, context["current_goal"])
             self.assertEqual("EXAMPLE", context["validation_feedback"][0]["code"])
             self.assertIn("operator_confirmed", messages[0]["content"])
+            self.assertIn("event_kind raza.left", messages[0]["content"])
             self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
 
     def test_campaign_manager_and_planner_reserve_reasoning_budget(self) -> None:

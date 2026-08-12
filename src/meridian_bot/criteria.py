@@ -139,6 +139,50 @@ class CriteriaEvaluator:
     @staticmethod
     def _numeric_metric(observation: dict[str, Any], metric: str) -> Any:
         """Resolve ordinary dot paths plus stable named skill/spell values."""
+        if metric == "carried_currency":
+            items = deep_get(observation, "inventory.items", [])
+            total = 0
+            for item in items if isinstance(items, list) else []:
+                if (
+                    not isinstance(item, dict)
+                    or "shilling" not in str(item.get("name") or "").casefold()
+                ):
+                    continue
+                amount = item.get(
+                    "amount", item.get("quantity", item.get("count", 1))
+                )
+                total += (
+                    int(amount)
+                    if isinstance(amount, (int, float))
+                    and not isinstance(amount, bool)
+                    and amount > 0
+                    else 1
+                )
+            return total
+        aliases = {
+            "max_health": (
+                "status.vitals.health.max",
+                "look.vitals.health.max",
+            ),
+            "current_health": (
+                "status.vitals.health.value",
+                "status.vitals.health.current",
+                "look.vitals.health.value",
+                "look.vitals.health.current",
+            ),
+            "vigor": (
+                "status.vitals.vigor.value",
+                "status.vitals.vigor.current",
+                "look.vitals.vigor.value",
+                "look.vitals.vigor.current",
+            ),
+        }
+        if metric in aliases:
+            for path in aliases[metric]:
+                value = deep_get(observation, path)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return value
+            return None
         parsed = parse_ability_metric(metric)
         if parsed is None:
             return deep_get(observation, metric)

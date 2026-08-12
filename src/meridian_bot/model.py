@@ -48,10 +48,16 @@ status.vitals.health.max. Named abilities use ability.skill.<canonical name> or
 ability.spell.<canonical name>. Use numeric_delta only when verified_character_state supplies the
 baseline; otherwise use a threshold or operator confirmation.
 
+Leaving Raza is a special, fully observable tutorial graduation. Draft it as event_occurred with
+event_kind raza.left, never operator_confirmed and never as ordinary travel to an invented room.
+
 Constraints may contain only avoid_death (boolean), bank_before_hazard (boolean), operator_notes
 (string), and purchase_plan. purchase_plan may contain only offering_kind (item|skill|spell), item,
 merchant_class, room_id, and maximum_price; do not create it unless grounded hints contain the exact
-offering and merchant placement. priority is an integer from 0 (lowest) through 100 (highest), normally
+offering and merchant placement. For paid training, use a complete purchase_plan_candidates entry
+from a training_options grounding hint verbatim; a location name is never a merchant_class, and prices
+must not be guessed. If multiple candidates exist, select only from that list. priority is an integer
+from 0 (lowest) through 100 (highest), normally
 50. activation is queue unless the operator explicitly requests replacing the active goal; use
 replace_active_pause for ordinary replacement and replace_active_cancel only when cancellation is
 explicit. No goal or constraint may weaken the no-cheating policy.
@@ -68,6 +74,9 @@ concept, traits, values, taboos, relationship defaults, and speech style to choo
 safe, goal-compatible tactics and safe ending locations. Explain that fit in safe_ending.rationale.
 Persona may shape style and preferences, but it never overrides the operator's goal, verified world
 facts, controller policy, or the no-cheating boundary.
+Raza is a one-way tutorial zone. Once max health is at least 25, a goal to leave Raza must use the
+special leave_raza tool and end in a source-verified safe room outside Raza. There is no ordinary
+world-graph route out, and a plan must never name a Raza room as its safe ending after graduation.
 The controller binds every character-scoped tool to the configured character. Never include an
 `agent` argument and never guess an internal session id.
 Room names are often ambiguous. Prefer exact numeric room ids returned by map, exits,
@@ -142,11 +151,15 @@ decision=plan and no tool. Give 1-8 ordered steps with stable ids, one concrete 
 the likely broker tool when known, and the observation that will verify the step. List factual
 assumptions separately. The controller checks tool names and static goal feasibility before accepting
 the plan; your confidence is not verification. On later turns, act only on one listed step and return
-its id as plan_step_id. Return decision=plan again only when fresh observation or a failed verification
-invalidates the stored plan, and state revision_reason. Planning is a real non-mutating turn: never
+its id as plan_step_id. Return decision=plan again only when revision_authorization is present. Copy its
+exact id into execution_plan.revision_authorization_id and state the evidence-based revision_reason.
+Without that controller-issued id, keep the verified plan and return decision=act. Planning is a real non-mutating turn: never
 combine decision=plan with a tool call. Count the steps before returning JSON: eight is an absolute
 maximum. This is a per-phase limit, never a complete multi-hour campaign plan. Do not create tool=null waiting or monitoring steps; the controller continuously verifies
 criteria and keeper state without them. Consolidate preparation into bounded outcome steps when needed.
+Use read-only tools for observation steps. Never assign act to an outcome that merely looks, observes,
+checks, confirms, verifies, or refreshes state; act is only for the mutating verbs use, unuse, get,
+drop, activate, eat, and go.
 Every execution_plan must declare safe_ending with an exact numeric room_id chosen by you from
 grounded_knowledge.safe_ending_candidates.candidates, a final travel step_id, and a concise persona-aware
 rationale. The referenced step must be the final actionable step, must use travel, and must name the
@@ -288,7 +301,7 @@ Schema: {{"decision":"plan|act|wait|propose_goal","tool":string|null,"arguments"
 "rationale":string,"expected_observation":object,"proposal":object|null,"plan_step_id":string|null,
 "execution_plan":{{"summary":string,"steps":[{{"id":string,"outcome":string,"tool":string|null,
 "verification":string}}],"safe_ending":{{"room_id":integer,"step_id":string,"rationale":string}},
-"assumptions":[string],"revision_reason":string|null}}|null}}.
+"assumptions":[string],"revision_reason":string|null,"revision_authorization_id":string|null}}|null}}.
 For propose_goal, proposal must contain objective and 1-20 typed success_criteria, plus optional
 title, constraints, and priority. Supported criterion kinds: {', '.join(CRITERION_KINDS)}.
 Use only the fields listed for each criterion kind: {CRITERION_FIELD_GUIDE}.
@@ -317,18 +330,25 @@ Choose one bounded internal phase. Supported phase kinds are: general, research_
 free_inventory_capacity, liquidate_inventory, acquire_item, train_ability, farm, recover, return_home, and
 pvp_opportunity. A supporting prerequisite uses decision=push_support_phase. Replacing a disproved tactic uses
 decision=replace_phase. Use decision=start_phase when no phase exists. Every new phase needs an objective and one
-or more deterministic success_criteria. Internal phases must never use operator_confirmed because the operator
-confirms public goals, not hidden campaign bookkeeping. Use observable public criterion kinds for observable state.
-For a research_progression phase that completes by collecting controller evidence, use the internal-only criterion
-{{"kind":"phase_action_succeeded","tools":[...]}} naming one or more available tools; one successful listed tool satisfies it.
-A phase criterion must describe the local phase outcome, not the whole strategic campaign unless this is the terminal return phase.
-Useful verified local paths include status.vitals.health.max, status.vitals.health.value,
-status.vitals.vigor.value, inventory.carry.items, inventory.carry.room_for.weight,
-inventory.carry.room_for.bulk, equipment.known, equipment.wielding, and status.position.col/row. Use
-inventory_contains for a positive carried-item outcome and location_reached for a room. When an array-valued
-state such as equipment.wielding is used, copy the exact expected canonical value rather than inventing a slot.
-Specifically, equipment.wielding is null or an array of canonical weapon names: a plain mace criterion uses
-state_equals with value=["mace"], never value="mace".
+or more typed targets from the closed vocabulary below. Never emit raw success_criteria: the controller compiles
+targets into trusted verifiers and rejects unknown target types or fields before persistence. A target describes
+the local phase outcome, not the whole strategic campaign unless this is the terminal return phase.
+
+Supported targets (only the listed fields are accepted):
+- {{"id":string,"type":"max_health_at_least|current_health_at_least|vigor_at_least","value":number}}
+- {{"id":string,"type":"carried_currency_at_least","amount":number}}
+- {{"id":string,"type":"inventory_items_at_most","count":non-negative integer}}
+- {{"id":string,"type":"inventory_room_for_at_least","dimension":"weight|bulk","value":number}}
+- {{"id":string,"type":"item_count_at_least","item":string,"count":positive integer}}
+- {{"id":string,"type":"inventory_not_full|equipment_known"}}
+- {{"id":string,"type":"location_reached","room_id":positive integer and/or "name":string}}
+- {{"id":string,"type":"wielding_equals","items":null or array of canonical weapon names}}
+- {{"id":string,"type":"ability_at_least","ability_kind":"skill|spell","name":canonical name,"value":number}}
+- {{"id":string,"type":"phase_action_succeeded","tools":[available tool names]}}
+
+Use phase_action_succeeded only when successful controller evidence collection is itself the bounded outcome,
+especially research_progression. Never use it as the sole farm outcome: a farm needs an observable result such as
+the next max-health milestone. Internal phases never ask for operator confirmation.
 Phase budgets are normalized to at least 8 actions and 30 minutes; repeated equivalent semantic failure can end
 a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot.
 Each abandon_predicates entry is an OR trigger: if any one becomes deterministically true, the controller ends only
@@ -345,7 +365,9 @@ recovery, commerce, equipment, supplies, and banking choices. Banking is discret
 useful work. Full inventory should normally become a free_inventory_capacity or liquidate_inventory phase supplied
 with item/category/value/buyer facts; decide whether to sell, retain, bank, or drop rather than assuming one answer.
 A broken or absent wielded weapon may push acquire_item, then resume the parent phase. A keeper withdrawal or death
-may push recover, then select a materially different grounded farm tactic.
+may push recover. Reuse a recent successful room/prey tactic while it remains level-eligible; seek a materially
+different grounded tactic only after durable safety, stagnation, or route evidence disproves the prior one.
+Treat phase.context.avoid_rooms as a soft diversity hint, never as proof that a room is unusable.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
@@ -362,14 +384,13 @@ combat may serve an explicit goal or immediate defense, subject to ordinary poli
 
 Schema:
 {{"decision":"start_phase|replace_phase|push_support_phase|resume_parent_phase|complete_campaign_candidate|report_external_blocker_candidate",
-  "phase":{{"kind":string,"objective":string,"success_criteria":[object],"abandon_predicates":[object],
+  "phase":{{"kind":string,"objective":string,"targets":[object],"abandon_predicates":[object],
   "budget":{{"max_actions":integer,"max_minutes":integer}},"context":object,"rationale":string}}|null,
   "rationale":string,"evidence":array}}
 
-Supported observable phase criterion kinds: {', '.join(kind for kind in CRITERION_KINDS if kind != 'operator_confirmed')}.
-Research phases additionally support phase_action_succeeded with only id, kind, and a non-empty tools array.
-Use only these fields: {CRITERION_FIELD_GUIDE}.
-Do not use event criteria for ordinary internal preparation or farming. Never invent combat.kill."""
+Abandon predicates remain optional typed public criteria and are discarded if malformed. Use only these fields
+for them: {CRITERION_FIELD_GUIDE}. Do not use event criteria for ordinary internal preparation or farming.
+Never invent an observation path, metric, target type, tool, or combat.kill event."""
 
 RESPONDER_SYSTEM = """You speak as a Meridian 59 character, using the supplied persona. Return one
 JSON object: {"reply": string, "ignore": boolean, "reason": string}. The current in-game speaker may
@@ -640,6 +661,7 @@ class VllmClient:
         grounded_knowledge: dict[str, Any] | None = None,
         learned_failures: dict[str, Any] | None = None,
         execution_plan: dict[str, Any] | None = None,
+        revision_authorization: dict[str, Any] | None = None,
         campaign_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = {
@@ -655,6 +677,7 @@ class VllmClient:
             "grounded_knowledge": grounded_knowledge or None,
             "learned_failures": learned_failures or None,
             "execution_plan": execution_plan,
+            "revision_authorization": revision_authorization,
             "planning_required": execution_plan is None,
             "campaign": campaign_context or None,
         }

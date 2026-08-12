@@ -53,7 +53,16 @@ def make_compendium(root: Path) -> Path:
                         "room": 50,
                         "markup": None,
                         "sells": [{"id": 425, "cls": "LeatherArmor", "quantity": None}],
-                        "teaches": [],
+                        "teaches": [
+                            {
+                                "kind": "skill",
+                                "skill": "slash",
+                                "price": 500,
+                                "level": 1,
+                                "num": 421,
+                                "constant": "SKID_SLASH",
+                            }
+                        ],
                         "buying_rule": {
                             "source": "kod/cornoth/sergeant.kod",
                             "kod": "if Send(Self,@IsObjectWearable,#what=what) OR Send(Self,@IsObjectWeapon,#what=what) { return True; }",
@@ -311,6 +320,11 @@ def make_compendium(root: Path) -> Path:
     (compendium / "skills" / "dodge.html").write_text(
         '<html><head><meta name="description" content="Avoid blows."></head>'
         '<body><main><h1>dodge</h1><p>Automatic skill.</p><p class="cite">kod/dodge.kod:11</p></main></body></html>',
+        encoding="utf-8",
+    )
+    (compendium / "skills" / "slash.html").write_text(
+        '<html><head><meta name="description" content="Fight effectively with slashing weapons."></head>'
+        '<body><main><h1>slash</h1><p>Weapon skill.</p><p class="cite">kod/slash.kod:11</p></main></body></html>',
         encoding="utf-8",
     )
     (compendium / "items" / "leatherarmor.html").write_text(
@@ -620,6 +634,38 @@ class KnowledgeTests(unittest.TestCase):
                 valid["canonical_goal"]["constraints"]["purchase_plan"]["item"],
             )
 
+            training = knowledge.training_candidates("skill", "slash")
+            self.assertEqual("found", training["status"])
+            self.assertEqual(1, len(training["candidates"]))
+            self.assertEqual(
+                {
+                    "offering_kind": "skill",
+                    "item": "slash",
+                    "merchant_class": "CorNothSergeant",
+                    "room_id": 50,
+                    "maximum_price": 500,
+                },
+                {
+                    key: training["candidates"][0][key]
+                    for key in (
+                        "offering_kind",
+                        "item",
+                        "merchant_class",
+                        "room_id",
+                        "maximum_price",
+                    )
+                },
+            )
+            merchant = knowledge.get("merchant:cor-noth-sergeant")["entity"]
+            self.assertEqual(500, merchant["facts"]["teaching_offers"][0]["price"])
+            self.assertIn(
+                ("teaches", "skill:slash"),
+                {
+                    (relation["predicate"], relation["entity"]["id"])
+                    for relation in merchant["relations"]
+                },
+            )
+
             strategic = knowledge.validate_goal(
                 {
                     "title": "Raise TestHero to 45 maximum HP",
@@ -659,11 +705,11 @@ class KnowledgeTests(unittest.TestCase):
 
             valid = knowledge.validate_goal(
                 {
-                    "objective": "Learn the Dodge skill from the verified teacher.",
+                    "objective": "Learn the Slash skill from the verified teacher.",
                     "success_criteria": [
                         {
                             "kind": "numeric_threshold",
-                            "metric": "ability.skill.DODGE",
+                            "metric": "ability.skill.SLASH",
                             "operator": ">=",
                             "value": 1,
                         }
@@ -671,7 +717,7 @@ class KnowledgeTests(unittest.TestCase):
                     "constraints": {
                         "purchase_plan": {
                             "offering_kind": "skill",
-                            "item": "DODGE",
+                            "item": "SLASH",
                             "merchant_class": "CorNothSergeant",
                             "room_id": 50,
                             "maximum_price": 500,
@@ -682,16 +728,51 @@ class KnowledgeTests(unittest.TestCase):
             self.assertTrue(valid["valid"], valid["errors"])
             self.assertTrue(valid["purchase_verification"]["static_verified"])
             self.assertEqual(
-                "ability.skill.dodge",
+                "ability.skill.slash",
                 valid["canonical_goal"]["success_criteria"][0]["metric"],
             )
             self.assertEqual(
-                "dodge",
+                "slash",
                 valid["canonical_goal"]["constraints"]["purchase_plan"]["item"],
             )
-            self.assertIn(
+            self.assertNotIn(
                 "TEACHER_STOCK_LIVE_VERIFICATION_REQUIRED",
                 {warning["code"] for warning in valid["warnings"]},
+            )
+
+            invented_teacher = knowledge.validate_goal(
+                {
+                    "objective": "Learn the Slash skill.",
+                    "success_criteria": [
+                        {
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.slash",
+                            "value": 1,
+                        }
+                    ],
+                    "constraints": {
+                        "purchase_plan": {
+                            "offering_kind": "skill",
+                            "item": "slash",
+                            "merchant_class": "Ye Olde Slasher Salesman",
+                            "room_id": 201,
+                            "maximum_price": 15,
+                        }
+                    },
+                }
+            )
+            teacher_error = next(
+                error
+                for error in invented_teacher["errors"]
+                if error["code"] == "UNKNOWN_MERCHANT_CLASS"
+            )
+            self.assertEqual(
+                "CorNothSergeant",
+                teacher_error["purchase_plan_candidates"][0]["merchant_class"],
+            )
+            self.assertEqual(
+                500,
+                teacher_error["purchase_plan_candidates"][0]["maximum_price"],
             )
 
             wrong_result = knowledge.validate_goal(
@@ -712,6 +793,83 @@ class KnowledgeTests(unittest.TestCase):
                 "ABILITY_RESULT_CRITERION_REQUIRED",
                 {error["code"] for error in wrong_result["errors"]},
             )
+
+    def test_goal_drafter_replaces_invented_teacher_with_unique_catalogue_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = config(root)
+            harness = make_compendium(root)
+            value = replace(
+                value,
+                harness=replace(
+                    value.harness,
+                    root=harness,
+                    expected_revision="fixture-revision",
+                ),
+            )
+            controller = BotController(value)
+
+            class InventedTeacherModel:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def draft_goal(self, **kwargs: object) -> dict[str, object]:
+                    self.calls.append(kwargs)
+                    return {
+                        "title": "Acquire the slash skill",
+                        "objective": "Ensure the character has the slash skill.",
+                        "success_criteria": [
+                            {
+                                "id": "slash_at_least_1",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.slash",
+                                "operator": ">=",
+                                "value": 1,
+                            }
+                        ],
+                        "constraints": {
+                            "purchase_plan": {
+                                "offering_kind": "skill",
+                                "item": "slash",
+                                "merchant_class": "Ye Olde Slasher Salesman",
+                                "room_id": 201,
+                                "maximum_price": 15,
+                            }
+                        },
+                        "priority": 50,
+                        "activation": "queue",
+                    }
+
+            model = InventedTeacherModel()
+            controller.model = model  # type: ignore[assignment]
+            try:
+                result = controller.draft_goal(
+                    {"prompt": "Acquire the slash skill at priority 50."}
+                )
+
+                plan = result["goal"]["constraints"]["purchase_plan"]
+                self.assertEqual("CorNothSergeant", plan["merchant_class"])
+                self.assertEqual(50, plan["room_id"])
+                self.assertEqual(500, plan["maximum_price"])
+                self.assertEqual(1, len(model.calls))
+                self.assertIn(
+                    "TRAINING_PLAN_GROUNDED",
+                    {
+                        warning["code"]
+                        for warning in result["validation"]["warnings"]
+                    },
+                )
+                training_hint = next(
+                    hint
+                    for hint in model.calls[0]["grounding_hints"]
+                    if hint.get("kind") == "training_options"
+                )
+                self.assertEqual(
+                    "CorNothSergeant",
+                    training_hint["purchase_plan_candidates"][0]["merchant_class"],
+                )
+            finally:
+                controller.storage.close()
 
     def test_progression_and_planner_context_are_grounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -960,7 +1118,7 @@ class KnowledgeTests(unittest.TestCase):
             self.assertFalse(evaluator.evaluate(goal, observation)["all_met"])
             storage.close()
 
-    def test_legacy_active_goal_with_unknown_location_is_blocked_before_planning(self) -> None:
+    def test_legacy_active_goal_with_unknown_location_is_paused_before_planning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = config(root)
@@ -979,9 +1137,10 @@ class KnowledgeTests(unittest.TestCase):
 
                 result = controller.turn()
 
-                self.assertTrue(result["blocked"])
-                self.assertEqual("blocked", controller.storage.goal(goal["id"])["status"])
-                self.assertEqual("invalid_game_reference", controller.storage.goal(goal["id"])["blocked_reason"])
+                self.assertTrue(result["paused"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertEqual("paused", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.goal(goal["id"])["blocked_reason"])
                 self.assertEqual([], controller.storage.events(kinds=["action.attempted"])["events"])
             finally:
                 controller.storage.close()

@@ -21,7 +21,7 @@ from .utils import canonical_json, deep_get, timestamp
 
 
 KNOWLEDGE_TOOL_NAME = "knowledge_search"
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 ENTITY_KINDS = (
     "location",
     "region",
@@ -802,6 +802,7 @@ class KnowledgeBase:
             room_ids: set[int] = set()
             stock_by_class: dict[str, dict[str, Any]] = {}
             teaches: list[str] = []
+            teaching_offers: list[dict[str, Any]] = []
             source_refs = ["harness/substrate/m59-merchants.json"]
             notes: list[str] = []
             markups: list[Any] = []
@@ -856,9 +857,30 @@ class KnowledgeBase:
                 buys_anything = buys_anything or record.get("buys_anything") is True
                 for taught in record.get("teaches", []) if isinstance(record.get("teaches"), list) else []:
                     if isinstance(taught, dict):
-                        teaches.extend(
-                            str(taught[key]) for key in ("spell", "skill") if taught.get(key)
-                        )
+                        offering_kind = str(taught.get("kind") or "").casefold()
+                        if offering_kind not in {"skill", "spell"}:
+                            offering_kind = next(
+                                (kind for kind in ("skill", "spell") if taught.get(kind)),
+                                "",
+                            )
+                        offering_name = str(
+                            taught.get(offering_kind) or taught.get("name") or ""
+                        ).strip()
+                        if offering_kind and offering_name:
+                            teaches.append(offering_name)
+                            offer = {
+                                "kind": offering_kind,
+                                "name": offering_name,
+                                **{
+                                    key: taught.get(key)
+                                    for key in ("level", "price", "num", "constant")
+                                    if taught.get(key) is not None
+                                },
+                            }
+                            if canonical_json(offer) not in {
+                                canonical_json(value) for value in teaching_offers
+                            }:
+                                teaching_offers.append(offer)
                 for stock in record.get("sells", []) if isinstance(record.get("sells"), list) else []:
                     if not isinstance(stock, dict) or not str(stock.get("cls") or "").strip():
                         continue
@@ -897,6 +919,8 @@ class KnowledgeBase:
                 )
                 + "; sells "
                 + (", ".join(value["name"] for value in stock_by_class.values()) or "nothing indexed")
+                + "; teaches "
+                + (", ".join(_unique(teaches)) or "nothing indexed")
                 + "; buys "
                 + (
                     "anything the NPC accepts"
@@ -926,6 +950,7 @@ class KnowledgeBase:
                 "sells": list(stock_by_class.values()),
                 "stock_classes": [value["class"] for value in stock_by_class.values()],
                 "teaches": _unique(teaches),
+                "teaching_offers": teaching_offers,
                 "catalog_markup": _unique(markups),
                 "buys_anything": buys_anything,
                 "buying_categories": sorted(buying_categories),
@@ -975,6 +1000,22 @@ class KnowledgeBase:
                                     )
                                 }
                             ),
+                        ),
+                    )
+            for offer in teaching_offers:
+                ability_id = self._exact_entity_id(
+                    connection,
+                    str(offer["name"]),
+                    {str(offer["kind"])},
+                )
+                if ability_id:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO relations(subject_id,predicate,object_id,payload_json) VALUES(?,?,?,?)",
+                        (
+                            entity_id,
+                            "teaches",
+                            ability_id,
+                            canonical_json(offer),
                         ),
                     )
 
@@ -1212,6 +1253,131 @@ class KnowledgeBase:
                     }
                 )
             return values
+        finally:
+            connection.close()
+
+    def training_candidates(
+        self,
+        offering_kind: str,
+        offering: str,
+        *,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Return complete, source-grounded destinations for paid training.
+
+        This is deliberately relation-driven rather than full-text search.  A
+        room whose display name happens to mention an ability is not a teacher,
+        and an unplaced source-only teacher is not a usable destination.
+        """
+
+        kind = str(offering_kind or "").casefold()
+        query = " ".join(str(offering or "").split())
+        if kind not in {"skill", "spell"}:
+            raise ValueError("offering_kind must be skill or spell")
+        if not query:
+            raise ValueError("offering is required")
+        if not self.available:
+            return {
+                "status": "unavailable",
+                "offering_kind": kind,
+                "query": query,
+                "candidates": [],
+                "corpus": self.metadata(),
+            }
+        ability_result = self.resolve(query, kinds=[kind])
+        ability = (
+            ability_result.get("entity")
+            if ability_result.get("status") == "found"
+            else None
+        )
+        if not isinstance(ability, dict):
+            return {
+                "status": ability_result.get("status", "not_found"),
+                "offering_kind": kind,
+                "query": query,
+                "candidates": [],
+                "suggestions": [
+                    value.get("canonical_name")
+                    for value in ability_result.get("matches", [])[:5]
+                    if isinstance(value, dict)
+                ],
+                "corpus": self.metadata(),
+            }
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT m.*, r.payload_json AS relation_payload_json
+                   FROM relations r
+                   JOIN entities m ON m.id=r.subject_id
+                   WHERE r.predicate='teaches' AND r.object_id=? AND m.kind='merchant'
+                   ORDER BY m.canonical_name""",
+                (ability["id"],),
+            ).fetchall()
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                merchant_facts = json.loads(row["payload_json"])
+                if merchant_facts.get("available") is not True:
+                    continue
+                offer = json.loads(row["relation_payload_json"])
+                if (
+                    str(offer.get("kind") or "").casefold() != kind
+                    or normalize(offer.get("name"))
+                    != normalize(ability.get("canonical_name"))
+                ):
+                    continue
+                raw_price = offer.get("price")
+                maximum_price = (
+                    int(raw_price)
+                    if isinstance(raw_price, (int, float))
+                    and not isinstance(raw_price, bool)
+                    and float(raw_price).is_integer()
+                    and raw_price > 0
+                    else None
+                )
+                room_ids = sorted(
+                    {
+                        int(value)
+                        for value in merchant_facts.get("room_ids", [])
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    }
+                )
+                for room_id in room_ids:
+                    candidate = {
+                        "offering_kind": kind,
+                        "item": ability["canonical_name"],
+                        "merchant_class": merchant_facts.get("merchant_class")
+                        or row["canonical_name"],
+                        "room_id": room_id,
+                        "maximum_price": maximum_price,
+                        "catalogue_price": maximum_price,
+                        "level": offer.get("level"),
+                        "merchant_entity_id": row["id"],
+                        "ability_entity_id": ability["id"],
+                        "price_basis": (
+                            "generated teacher catalogue; a fresh in-room quote is still required"
+                        ),
+                    }
+                    candidate["complete"] = maximum_price is not None
+                    candidates.append(candidate)
+            candidates.sort(
+                key=lambda value: (
+                    value.get("maximum_price") is None,
+                    value.get("maximum_price") or 0,
+                    value["room_id"],
+                    str(value["merchant_class"]).casefold(),
+                )
+            )
+            candidates = candidates[: max(1, min(int(limit), 20))]
+            return {
+                "status": "found" if candidates else "no_available_teacher",
+                "offering_kind": kind,
+                "query": query,
+                "offering": ability["canonical_name"],
+                "ability_entity_id": ability["id"],
+                "candidates": candidates,
+                "corpus": self.metadata(),
+            }
         finally:
             connection.close()
 
@@ -1756,16 +1922,27 @@ class KnowledgeBase:
         constraints = canonical.get("constraints")
         plan = constraints.get("purchase_plan") if isinstance(constraints, dict) else None
         if not isinstance(plan, dict):
-            errors.append(
-                {
-                    "code": "PURCHASE_PLAN_REQUIRED",
-                    "message": (
-                        "A goal whose declared outcome is buying an item or learning a paid skill/spell requires "
-                        "constraints.purchase_plan with exact offering, offering_kind, merchant_class, "
-                        "room_id, and a training budget when applicable."
-                    ),
-                }
-            )
+            missing_plan_error: dict[str, Any] = {
+                "code": "PURCHASE_PLAN_REQUIRED",
+                "message": (
+                    "A goal whose declared outcome is buying an item or learning a paid skill/spell requires "
+                    "constraints.purchase_plan with exact offering, offering_kind, merchant_class, "
+                    "room_id, and a training budget when applicable."
+                ),
+            }
+            if acquisition_intent and self.available:
+                for criterion in canonical.get("success_criteria", []):
+                    if not isinstance(criterion, dict):
+                        continue
+                    parsed = parse_ability_metric(criterion.get("metric"))
+                    if parsed is None:
+                        continue
+                    candidate_result = self.training_candidates(*parsed)
+                    candidates = candidate_result.get("candidates", [])
+                    if candidates:
+                        missing_plan_error["purchase_plan_candidates"] = candidates
+                    break
+            errors.append(missing_plan_error)
             if acquisition_intent and not any(
                 isinstance(criterion, dict)
                 and criterion.get("kind") == "numeric_threshold"
@@ -1854,6 +2031,16 @@ class KnowledgeBase:
                     ],
                 }
             )
+        training_result = (
+            self.training_candidates(offering_kind, str(item_entity.get("canonical_name")))
+            if offering_kind in {"skill", "spell"} and isinstance(item_entity, dict)
+            else None
+        )
+        training_candidates = (
+            training_result.get("candidates", [])
+            if isinstance(training_result, dict)
+            else []
+        )
         merchant_result = self.resolve(
             str(plan.get("merchant_class") or ""), kinds=["merchant"]
         )
@@ -1863,8 +2050,7 @@ class KnowledgeBase:
             else None
         )
         if not isinstance(merchant_entity, dict):
-            errors.append(
-                {
+            merchant_error = {
                     "code": "UNKNOWN_MERCHANT_CLASS"
                     if merchant_result.get("status") == "not_found"
                     else "AMBIGUOUS_MERCHANT_CLASS",
@@ -1876,7 +2062,9 @@ class KnowledgeBase:
                         for value in merchant_result.get("matches", [])[:5]
                     ],
                 }
-            )
+            if training_candidates:
+                merchant_error["purchase_plan_candidates"] = training_candidates
+            errors.append(merchant_error)
         if not isinstance(item_entity, dict) or not isinstance(merchant_entity, dict):
             return verification
 
@@ -1897,17 +2085,36 @@ class KnowledgeBase:
                 None,
             )
         else:
-            stock = merchant_facts.get("teaches", [])
-            stock = stock if isinstance(stock, list) else []
-            taught_name = next(
+            structured_stock = merchant_facts.get("teaching_offers", [])
+            structured_stock = structured_stock if isinstance(structured_stock, list) else []
+            stock_match = next(
                 (
-                    str(value)
-                    for value in stock
-                    if normalize(value) in {normalize(plan.get("item")), normalize(item_name)}
+                    value
+                    for value in structured_stock
+                    if isinstance(value, dict)
+                    and str(value.get("kind") or "").casefold() == offering_kind
+                    and normalize(value.get("name"))
+                    in {normalize(plan.get("item")), normalize(item_name)}
                 ),
                 None,
             )
-            stock_match = {"name": taught_name, "kind": offering_kind} if taught_name else None
+            stock = merchant_facts.get("teaches", [])
+            stock = stock if isinstance(stock, list) else []
+            if not isinstance(stock_match, dict):
+                taught_name = next(
+                    (
+                        str(value)
+                        for value in stock
+                        if normalize(value)
+                        in {normalize(plan.get("item")), normalize(item_name)}
+                    ),
+                    None,
+                )
+                stock_match = (
+                    {"name": taught_name, "kind": offering_kind}
+                    if taught_name
+                    else None
+                )
         room_ids = {
             int(value)
             for value in merchant_facts.get("room_ids", [])
@@ -1935,8 +2142,7 @@ class KnowledgeBase:
                 }
             )
         elif offering_kind in {"skill", "spell"} and stock and not isinstance(stock_match, dict):
-            errors.append(
-                {
+            ability_error = {
                     "code": "MERCHANT_ABILITY_UNAVAILABLE",
                     "item": item_name,
                     "offering_kind": offering_kind,
@@ -1944,7 +2150,9 @@ class KnowledgeBase:
                     "message": f"{merchant_class} does not teach the exact {offering_kind} {item_name}.",
                     "teaches": [str(value) for value in stock],
                 }
-            )
+            if training_candidates:
+                ability_error["purchase_plan_candidates"] = training_candidates
+            errors.append(ability_error)
         elif offering_kind in {"skill", "spell"} and not stock:
             # Older harness catalogues omit teacher offerings even though the
             # ordinary client's shop quote exposes them. Preserve the grounded
@@ -1966,15 +2174,16 @@ class KnowledgeBase:
             }
         room_id = plan.get("room_id")
         if isinstance(room_id, int) and room_ids and room_id not in room_ids:
-            errors.append(
-                {
+            room_error = {
                     "code": "MERCHANT_ROOM_MISMATCH",
                     "merchant_class": merchant_class,
                     "room_id": room_id,
                     "message": f"{merchant_class} is not instantiated in room {room_id}.",
                     "valid_room_ids": sorted(room_ids),
                 }
-            )
+            if training_candidates:
+                room_error["purchase_plan_candidates"] = training_candidates
+            errors.append(room_error)
         if offering_kind == "item":
             exact_inventory_criteria = [
                 criterion
@@ -2039,6 +2248,29 @@ class KnowledgeBase:
                             "Paid training requires a positive purchase_plan.maximum_price so the controller "
                             "can verify funds and withdraw the bounded amount before traveling to the teacher."
                         ),
+                    }
+                )
+            catalogue_price = (
+                stock_match.get("price") if isinstance(stock_match, dict) else None
+            )
+            if (
+                isinstance(maximum_price, int)
+                and not isinstance(maximum_price, bool)
+                and isinstance(catalogue_price, (int, float))
+                and not isinstance(catalogue_price, bool)
+                and maximum_price < catalogue_price
+            ):
+                errors.append(
+                    {
+                        "code": "ABILITY_BUDGET_BELOW_CATALOGUE_PRICE",
+                        "item": item_name,
+                        "maximum_price": maximum_price,
+                        "catalogue_price": catalogue_price,
+                        "message": (
+                            f"maximum_price {maximum_price} is below the generated catalogue price "
+                            f"{catalogue_price} for {item_name}."
+                        ),
+                        "purchase_plan_candidates": training_candidates,
                     }
                 )
             for criterion in exact_ability_criteria:
@@ -2446,6 +2678,7 @@ class KnowledgeBase:
                 "room_ids",
                 "sells",
                 "teaches",
+                "teaching_offers",
                 "catalog_markup",
                 "price_verification",
             ),

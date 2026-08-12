@@ -116,6 +116,7 @@ class LearningConfig:
     enabled: bool = True
     no_progress_budget: int = 6
     repeated_tactic_budget: int = 3
+    failure_evidence_window_seconds: int = 15 * 60
     wait_budget: int = 10
     survival_interrupt_budget: int = 3
     world_retry_cooldown_seconds: int = 30 * 60
@@ -348,6 +349,7 @@ class BotConfig:
                 "enabled",
                 "no_progress_budget",
                 "repeated_tactic_budget",
+                "failure_evidence_window_seconds",
                 "wait_budget",
                 "survival_interrupt_budget",
                 "world_retry_cooldown_seconds",
@@ -359,6 +361,9 @@ class BotConfig:
             enabled=bool(learning_raw.get("enabled", True)),
             no_progress_budget=int(learning_raw.get("no_progress_budget", 6)),
             repeated_tactic_budget=int(learning_raw.get("repeated_tactic_budget", 3)),
+            failure_evidence_window_seconds=int(
+                learning_raw.get("failure_evidence_window_seconds", 15 * 60)
+            ),
             wait_budget=int(learning_raw.get("wait_budget", 10)),
             survival_interrupt_budget=int(learning_raw.get("survival_interrupt_budget", 3)),
             world_retry_cooldown_seconds=int(learning_raw.get("world_retry_cooldown_seconds", 30 * 60)),
@@ -367,10 +372,11 @@ class BotConfig:
         if min(
             learning.no_progress_budget,
             learning.repeated_tactic_budget,
+            learning.failure_evidence_window_seconds,
             learning.wait_budget,
             learning.survival_interrupt_budget,
         ) < 1:
-            raise ValueError("learning failure budgets must be at least 1")
+            raise ValueError("learning failure budgets and evidence window must be at least 1")
         if min(learning.world_retry_cooldown_seconds, learning.generic_retry_cooldown_seconds) < 0:
             raise ValueError("learning retry cooldowns cannot be negative")
 

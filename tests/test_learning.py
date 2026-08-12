@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from meridian_bot.config import LearningConfig
 from meridian_bot.learning import GoalDeferredError, GoalLearning
@@ -151,7 +153,7 @@ class GoalLearningTests(unittest.TestCase):
             self.learning.goal_family(row_only), self.learning.goal_family(row_seven)
         )
 
-    def test_combat_goal_is_deferred_until_capability_changes_then_links_retry(self) -> None:
+    def test_combat_lesson_preserves_open_goal_when_capability_changes(self) -> None:
         original = campaign_goal("original")
         created = self.storage.submit_goal(original)["goal"]
         observation = self.broker.observe()
@@ -169,13 +171,17 @@ class GoalLearningTests(unittest.TestCase):
             self.learning.require_goal_eligible(campaign_goal("retry-too-soon"), observation)
         self.assertEqual(caught.exception.result["lesson"]["classification"], "insufficient_combat_power")
         self.assertFalse(caught.exception.result["lesson"]["retry_evaluation"]["met"])
+        self.assertEqual("active", self.storage.goal(created["id"])["status"])
+        self.assertFalse(result["goal_blocked"])
 
         self.broker.vitals["health"] = {"current": 26, "max": 26}
-        review = self.learning.require_goal_eligible(campaign_goal("retry-ready"), self.broker.observe())
-        self.assertEqual(review["retry_of_goal_id"], created["id"])
-        retry = self.storage.submit_goal(campaign_goal("retry-ready"), retry_of_goal_id=review["retry_of_goal_id"])["goal"]
-        self.storage.mark_retry_started(review["lesson_id"], retry["id"])
-        self.assertEqual(retry["retry_of_goal_id"], created["id"])
+        observation = self.broker.observe()
+        self.learning.refresh_unlocks(observation)
+        with self.assertRaises(GoalDeferredError) as ready:
+            self.learning.require_goal_eligible(campaign_goal("retry-ready"), observation)
+        self.assertEqual("GOAL_ALREADY_OPEN", ready.exception.result["code"])
+        self.assertIn("already active", ready.exception.result["message"])
+        self.assertEqual([], self.learning.status_summary(observation)["eligible_retries"])
         self.assertEqual(self.storage.goal_lesson(result["lesson"]["id"])["status"], "unlocked")  # type: ignore[index]
 
     def test_tactic_lesson_survives_goal_id_but_does_not_block_changed_tactic(self) -> None:
@@ -388,6 +394,201 @@ class GoalLearningTests(unittest.TestCase):
             known_empty["equipment_observation_hash"],
         )
 
+    def test_reconnect_item_id_churn_does_not_unlock_tactic_lesson(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("stable-equipment-id"))["goal"]
+        failed = self.broker.observe()
+        failed["equipment"] = {
+            "known": True,
+            "equipped": [{"id": 16283, "name": "Short sword"}],
+            "wielding": ["Short sword"],
+        }
+        deferred = self.learning.defer_goal(
+            goal,
+            failed,
+            tool="autopilot",
+            arguments={
+                "action": "start",
+                "mode": "farm",
+                "hunt": "ant",
+                "assigned_room": 563,
+                "use_safe_spots": True,
+            },
+            reason="farm tactic made no progress",
+            classification="ineffective_tactic",
+            scope="tactic",
+            block=False,
+        )
+        reconnected = self.broker.observe()
+        reconnected["equipment"] = {
+            "known": True,
+            "equipped": [{"id": 7861, "name": "Short sword"}],
+            "wielding": ["Short sword"],
+        }
+
+        before = self.learning.profile(failed)
+        after = self.learning.profile(reconnected)
+
+        self.assertEqual(before["equipment_hash"], after["equipment_hash"])
+        self.assertEqual(before["capability_hash"], after["capability_hash"])
+        self.assertFalse(
+            self.learning.evaluate_retry(deferred["lesson"], reconnected)["met"]
+        )
+        self.assertEqual([], self.learning.refresh_unlocks(reconnected))
+        self.assertEqual(
+            "deferred", self.storage.goal_lesson(deferred["lesson"]["id"])["status"]
+        )
+
+    def test_equipment_loss_after_death_does_not_unlock_farm_tactic(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("death-is-not-upgrade"))["goal"]
+        self.broker.vitals["health"] = {"current": 35, "max": 35}
+        failed = self.broker.observe()
+        failed["equipment"] = {
+            "known": True,
+            "equipped": [{"id": 16283, "name": "Short sword"}],
+            "wielding": ["Short sword"],
+        }
+        lesson = self.learning.defer_goal(
+            goal,
+            failed,
+            tool="autopilot",
+            arguments={
+                "action": "start",
+                "mode": "farm",
+                "hunt": "ant",
+                "assigned_room": 584,
+                "use_safe_spots": True,
+            },
+            reason="repeated retreat episodes reached the farm tactic safety limit",
+            classification="ineffective_tactic",
+            scope="tactic",
+            block=False,
+        )["lesson"]
+        self.storage.update_goal_lesson(lesson["id"], "unlocked")
+        self.storage.set_runtime(
+            "combat_outcomes_v1",
+            [
+                {
+                    "occurred_at": "2099-01-01T00:00:00Z",
+                    "room": {"id": 584, "name": "The Flatlands"},
+                    "target": "ant",
+                    "died": True,
+                }
+            ],
+        )
+        self.broker.vitals["health"] = {"current": 34, "max": 34}
+        current = self.broker.observe()
+        current["equipment"] = {"known": True, "equipped": [], "wielding": []}
+
+        evaluation = self.learning.evaluate_retry(lesson, current)
+        repaired = self.learning.repair_regressive_capability_unlocks(current)
+
+        self.assertFalse(evaluation["met"])
+        self.assertEqual([lesson["id"]], [item["id"] for item in repaired])
+        self.assertEqual("deferred", self.storage.goal_lesson(lesson["id"])["status"])
+        quarantine = self.storage.get_runtime("farm_tactic_quarantine_v1", {})["584"]
+        self.assertEqual("ant", quarantine["target"])
+        self.assertTrue(quarantine["use_safe_spots"])
+        self.assertEqual(goal["id"], quarantine["goal_id"])
+
+    def test_legacy_farm_survivability_cooldown_cannot_unlock_unchanged_tactic(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("no-safety-timeout"))["goal"]
+        observation = self.broker.observe()
+        lesson = self.learning.defer_goal(
+            goal,
+            observation,
+            tool="autopilot",
+            arguments={
+                "action": "start",
+                "mode": "farm",
+                "hunt": "ant",
+                "assigned_room": 584,
+                "use_safe_spots": True,
+            },
+            reason=(
+                "Background farming exceeded verified survivability in the assigned "
+                "room: repeated retreat episodes reached the farm tactic safety limit"
+            ),
+            classification="ineffective_tactic",
+            scope="tactic",
+            block=False,
+        )["lesson"]
+        lesson["retry_when"] = {
+            "mode": "any",
+            "conditions": [
+                {
+                    "kind": "capability_changed",
+                    "from": lesson["failed_state"]["capability_hash"],
+                },
+                {
+                    "kind": "cooldown_elapsed",
+                    "seconds": 1,
+                    "since": "2000-01-01T00:00:00Z",
+                },
+            ],
+        }
+
+        evaluation = self.learning.evaluate_retry(lesson, observation)
+
+        self.assertFalse(evaluation["met"])
+        self.assertFalse(
+            any(
+                item["condition"].get("kind") == "cooldown_elapsed"
+                for item in evaluation["conditions"]
+            )
+        )
+
+    def test_adding_equipment_is_a_monotonic_capability_gain(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("equipment-added"))["goal"]
+        failed = self.broker.observe()
+        failed["equipment"] = {
+            "known": True,
+            "equipped": [{"id": 1, "name": "Short sword"}],
+            "wielding": ["Short sword"],
+        }
+        lesson = self.learning.defer_goal(
+            goal,
+            failed,
+            tool="autopilot",
+            reason="too weak",
+            classification="insufficient_combat_power",
+            scope="tactic",
+            block=False,
+        )["lesson"]
+        improved = self.broker.observe()
+        improved["equipment"] = {
+            "known": True,
+            "equipped": [
+                {"id": 9, "name": "Short sword"},
+                {"id": 10, "name": "Leather armor", "slot": "torso"},
+            ],
+            "wielding": ["Short sword"],
+        }
+
+        self.assertTrue(self.learning.evaluate_retry(lesson, improved)["met"])
+
+    def test_tactic_unlock_event_is_not_reported_as_goal_unlock(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("tactic-unlock-event"))["goal"]
+        deferred = self.learning.defer_goal(
+            goal,
+            self.broker.observe(),
+            tool="travel",
+            arguments={"to": 54},
+            reason="route was unavailable",
+            classification="route_unavailable",
+            scope="tactic",
+            block=False,
+        )
+
+        self.storage.update_goal_lesson(deferred["lesson"]["id"], "unlocked")
+
+        events = self.storage.goal_events(
+            goal["id"], kinds=["goal.retry_unlocked", "tactic.retry_unlocked"], limit=10
+        )
+        self.assertEqual(["tactic.retry_unlocked"], [item["kind"] for item in events])
+        self.assertEqual(
+            "Deferred tactic is eligible for a revised retry", events[0]["summary"]
+        )
+
     def test_healing_supplies_are_readiness_and_retry_evidence(self) -> None:
         original = self.storage.submit_goal(campaign_goal("supplies-origin"))["goal"]
         result = self.learning.defer_goal(
@@ -459,6 +660,15 @@ class GoalLearningTests(unittest.TestCase):
             }
         )
         self.storage.update_goal_lesson(lesson["id"], "unlocked")
+        self.storage.manage_goal(
+            {
+                "request_id": "close-legacy-family-origin",
+                "goal_id": original["id"],
+                "expected_version": original["version"],
+                "action": "cancel",
+                "reason": "exercise retry lineage after the original is no longer open",
+            }
+        )
 
         retry = campaign_goal("legacy-family-retry")
         review = self.learning.submission_review(retry, self.broker.observe())
@@ -470,7 +680,7 @@ class GoalLearningTests(unittest.TestCase):
         self.assertEqual([lesson["id"]], [item["id"] for item in resolved])
         self.assertEqual("resolved", self.storage.goal_lesson(lesson["id"])["status"])
 
-    def test_started_retry_is_not_listed_eligible_or_duplicated(self) -> None:
+    def test_unlocked_lesson_does_not_duplicate_preserved_open_goal(self) -> None:
         original = self.storage.submit_goal(campaign_goal("retry-origin"))["goal"]
         self.learning.defer_goal(
             original,
@@ -482,15 +692,14 @@ class GoalLearningTests(unittest.TestCase):
         )
         self.broker.vitals["health"] = {"current": 26, "max": 26}
         observation = self.broker.observe()
-        review = self.learning.require_goal_eligible(campaign_goal("retry-one"), observation)
-        retry = self.storage.submit_goal(campaign_goal("retry-one"), retry_of_goal_id=review["retry_of_goal_id"])["goal"]
-        self.storage.mark_retry_started(review["lesson_id"], retry["id"])
+        self.learning.refresh_unlocks(observation)
 
         status = self.learning.status_summary(observation)
         self.assertEqual(status["eligible_retries"], [])
-        self.assertEqual(status["retries_in_progress"][0]["resolution_goal_id"], retry["id"])
+        self.assertEqual(status["retries_in_progress"], [])
         with self.assertRaises(GoalDeferredError) as caught:
             self.learning.require_goal_eligible(campaign_goal("retry-duplicate"), observation)
+        self.assertEqual("GOAL_ALREADY_OPEN", caught.exception.result["code"])
         self.assertIn("already active", caught.exception.result["message"])
 
     def test_repeated_tactic_budget_is_scoped_to_recorded_room(self) -> None:
@@ -514,6 +723,155 @@ class GoalLearningTests(unittest.TestCase):
                 reason="no exit",
                 event=event,
             )
+        )
+
+    def test_verified_action_success_resets_failure_budget(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("progress-reset"))["goal"]
+        observation = self.broker.observe()
+        arguments = {"destination": "North Gate"}
+
+        for _ in range(2):
+            self.storage.emit_event(
+                "action.no_progress",
+                "failed route",
+                goal_id=goal["id"],
+                data={
+                    "tool": "travel",
+                    "arguments": arguments,
+                    "room": observation["look"]["room"],
+                    "reason": "no exit",
+                },
+            )
+        self.storage.emit_event(
+            "action.succeeded",
+            "verified progress",
+            goal_id=goal["id"],
+            data={"tool": "look"},
+        )
+        for _ in range(2):
+            event = self.storage.emit_event(
+                "action.no_progress",
+                "failed route",
+                goal_id=goal["id"],
+                data={
+                    "tool": "travel",
+                    "arguments": arguments,
+                    "room": observation["look"]["room"],
+                    "reason": "no exit",
+                },
+            )
+
+        self.assertIsNone(
+            self.learning.maybe_defer(
+                goal,
+                observation,
+                tool="travel",
+                arguments=arguments,
+                reason="no exit",
+                event=event,
+            )
+        )
+
+    def test_old_failures_expire_outside_evidence_window(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("failure-expiry"))["goal"]
+        observation = self.broker.observe()
+        arguments = {"destination": "North Gate"}
+        for _ in range(self.learning.config.repeated_tactic_budget):
+            event = self.storage.emit_event(
+                "action.no_progress",
+                "failed route",
+                goal_id=goal["id"],
+                data={
+                    "tool": "travel",
+                    "arguments": arguments,
+                    "room": observation["look"]["room"],
+                    "reason": "no exit",
+                },
+            )
+
+        future = time.time() + self.learning.config.failure_evidence_window_seconds + 1
+        with patch("meridian_bot.learning.time.time", return_value=future):
+            deferred = self.learning.maybe_defer(
+                goal,
+                observation,
+                tool="travel",
+                arguments=arguments,
+                reason="no exit",
+                event=event,
+            )
+
+        self.assertIsNone(deferred)
+
+    def test_unlocked_farm_lesson_releases_matching_quarantine(self) -> None:
+        goal = self.storage.submit_goal(campaign_goal("farm-unlock-release"))["goal"]
+        observation = self.broker.observe()
+        self.storage.set_runtime(
+            "farm_tactic_quarantine_v1",
+            {
+                "535": {
+                    "room": 535,
+                    "assigned_room": 535,
+                    "target": "centipede",
+                    "use_safe_spots": True,
+                    "goal_id": goal["id"],
+                    "reasons": ["repeated retreat episodes reached the safety limit"],
+                }
+            },
+        )
+        self.storage.set_runtime(
+            "farm_tactic_retreat_incidents_v1",
+            {
+                "exact": {
+                    "goal_id": goal["id"],
+                    "assigned_room": 535,
+                    "target": "centipede",
+                    "use_safe_spots": True,
+                    "incidents": [{"at": time.time()}],
+                }
+            },
+        )
+        deferred = self.learning.defer_goal(
+            goal,
+            observation,
+            tool="autopilot",
+            arguments={
+                "action": "start",
+                "mode": "farm",
+                "hunt": "centipede",
+                "assigned_room": 535,
+                "use_safe_spots": True,
+            },
+            reason="repeated retreat episodes reached the safety limit",
+            classification="ineffective_tactic",
+            scope="tactic",
+            block=False,
+            retry_when={
+                "mode": "any",
+                "conditions": [
+                    {
+                        "kind": "numeric_increase",
+                        "field": "max_health",
+                        "from": 25,
+                    }
+                ],
+            },
+        )
+
+        self.broker.room = {"num": 101, "name": "Another Room"}
+        self.assertEqual([], self.learning.refresh_unlocks(self.broker.observe()))
+        self.assertIn(
+            "535", self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        )
+
+        self.broker.vitals["health"] = {"current": 26, "max": 26}
+        unlocked = self.learning.refresh_unlocks(self.broker.observe())
+
+        self.assertEqual([deferred["lesson"]["id"]], [item["id"] for item in unlocked])
+        self.assertEqual(
+            {}, self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        )
+        self.assertEqual(
+            {}, self.storage.get_runtime("farm_tactic_retreat_incidents_v1", {})
         )
 
     def test_aggregate_bank_failures_remain_tactic_scoped(self) -> None:
@@ -617,14 +975,14 @@ class GoalLearningTests(unittest.TestCase):
             classification="ineffective_tactic",
             scope="goal",
         )
-        self.assertEqual("blocked", self.storage.goal(goal["id"])["status"])
+        self.assertEqual("active", self.storage.goal(goal["id"])["status"])
         self.storage.update_goal_lesson(deferred["lesson"]["id"], "unlocked")
 
         repaired = self.learning.repair_preparation_goal_lessons()
 
         self.assertEqual([deferred["lesson"]["id"]], [item["id"] for item in repaired])
         self.assertEqual("resolved", self.storage.goal_lesson(deferred["lesson"]["id"])["status"])
-        self.assertEqual("blocked", self.storage.goal(goal["id"])["status"])
+        self.assertEqual("active", self.storage.goal(goal["id"])["status"])
         self.assertEqual([], self.storage.goals(["queued"]))
 
     def test_legacy_inventory_drop_goal_lesson_is_repaired(self) -> None:
@@ -709,6 +1067,19 @@ class GoalLearningTests(unittest.TestCase):
         self.assertEqual("route_unavailable", classification)
         self.assertEqual("tactic", scope)
         self.assertGreater(confidence, 0.9)
+
+    def test_silent_go_reply_is_dependency_failure_not_route_evidence(self) -> None:
+        classification, scope, confidence = GoalLearning.classify(
+            "travel",
+            (
+                "sent go and the server answered nothing at all — no room change and no "
+                "refusal, which is not a door problem but a lost packet or a reply that "
+                "did not arrive inside 4s"
+            ),
+        )
+        self.assertEqual("dependency_failure", classification)
+        self.assertEqual("tactic", scope)
+        self.assertGreaterEqual(confidence, 0.9)
 
     def test_success_resolves_all_lessons_for_family(self) -> None:
         created = self.storage.submit_goal(campaign_goal("success"))["goal"]
