@@ -9979,6 +9979,18 @@ class ControllerTests(unittest.TestCase):
             try:
                 broker = SimulatedBroker()
                 observation = broker.observe()
+                observation["equipment"] = {
+                    "known": True,
+                    "equipped": [{"id": 1, "name": "mace"}],
+                    "wielding": ["mace"],
+                    "fresh_ms": 100,
+                    "changed_ms": 500,
+                }
+                observation["abilities"] = {
+                    "skills": [{"id": 2, "name": "mace fighting", "ability": 30}],
+                    "spells": [],
+                    "freshness": {"age_ms": {"skills": 100, "spells": 200}},
+                }
                 goal = controller.storage.submit_goal(
                     goal_payload(request_id="research-retry-state")
                 )["goal"]
@@ -10006,6 +10018,18 @@ class ControllerTests(unittest.TestCase):
                 )[goal["id"]]
                 self.assertTrue(stored["retry_state_fingerprint"])
 
+                volatile_only = copy.deepcopy(observation)
+                volatile_only["equipment"]["fresh_ms"] = 900
+                volatile_only["equipment"]["changed_ms"] = 1300
+                volatile_only["abilities"]["freshness"]["age_ms"] = {
+                    "skills": 900,
+                    "spells": 1000,
+                }
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, observation),
+                    controller._research_retry_state_fingerprint(goal, volatile_only),
+                )
+
                 changed = copy.deepcopy(observation)
                 changed["inventory"]["items"].append(
                     {"id": 2, "name": "leather armor", "amount": 1}
@@ -10014,14 +10038,177 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertTrue(reopened["allowed"])
                 self.assertTrue(reopened["state_changed"])
-                self.assertNotIn(
-                    goal["id"],
-                    controller.storage.get_runtime(
-                        RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
-                    ),
+                retained = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertEqual(3, retained["repeat_count"])
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, changed),
+                    retained["retry_state_fingerprint"],
                 )
                 self.assertIsNone(
                     controller.storage.campaign_run(goal["id"])["external_blocker"]
+                )
+
+                repeated = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "four"},
+                    {
+                        "fingerprint": "same-candidate-set",
+                        "candidate_count": 1,
+                        "rejected": [],
+                    },
+                    changed,
+                )
+                self.assertEqual(4, repeated["repeat_count"])
+                self.assertFalse(
+                    controller._research_retry_gate(goal, changed)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_campaign_manager_retries_invalid_context_label_as_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="manager-tool-correction")
+                )["goal"]
+                calls: list[dict[str, object]] = []
+
+                def manage_campaign(**kwargs: object) -> dict[str, object]:
+                    calls.append(kwargs)
+                    tool = "room_info" if len(calls) == 1 else "hunting_grounds"
+                    return {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Collect one grounded progression result.",
+                            "targets": [
+                                {
+                                    "id": "research-result",
+                                    "type": "phase_action_succeeded",
+                                    "tools": [tool],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "budget": {"max_actions": 8, "max_minutes": 30},
+                            "context": {},
+                            "rationale": "Inspect progression evidence.",
+                        },
+                        "rationale": "Choose bounded research.",
+                        "evidence": [],
+                    }
+
+                controller.model = SimpleNamespace(
+                    manage_campaign=manage_campaign
+                )  # type: ignore[assignment]
+
+                _, phase, _ = controller._campaign_turn_state(
+                    goal, SimulatedBroker().observe(), {}
+                )
+
+                self.assertEqual(2, len(calls))
+                first_context = calls[0]["campaign_context"]
+                self.assertIsInstance(first_context, dict)
+                self.assertIn(
+                    "hunting_grounds",
+                    first_context["phase_capabilities"]["research_progression"],
+                )
+                self.assertNotIn(
+                    "room_info",
+                    first_context["phase_capabilities"]["research_progression"],
+                )
+                feedback = calls[1]["campaign_context"]["manager_feedback"]
+                self.assertIn("room_info", feedback["validation_error"])
+                self.assertEqual("research_progression", phase["kind"])
+                self.assertEqual(
+                    ["hunting_grounds"], phase["success_criteria"][0]["tools"]
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(
+                            kinds=["campaign.manager.revision_requested"]
+                        )["events"]
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_invalid_manager_output_cannot_reopen_exhausted_research(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="invalid-manager-closed-research")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                state_fingerprint = controller._research_retry_state_fingerprint(
+                    goal, observation
+                )
+                record = {
+                    "fingerprint": "closed-candidate-set",
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 1,
+                    "rejected": [],
+                    "retry_state_fingerprint": state_fingerprint,
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+                calls: list[dict[str, object]] = []
+
+                def invalid_manager(**kwargs: object) -> dict[str, object]:
+                    calls.append(kwargs)
+                    return {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Repeat the closed lookup.",
+                            "targets": [
+                                {
+                                    "id": "invalid-tool",
+                                    "type": "phase_action_succeeded",
+                                    "tools": ["room_options_by_candidate"],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "budget": {"max_actions": 8, "max_minutes": 30},
+                            "context": {},
+                        },
+                        "rationale": "Invalid test response.",
+                        "evidence": [],
+                    }
+
+                controller.model = SimpleNamespace(
+                    manage_campaign=invalid_manager
+                )  # type: ignore[assignment]
+
+                _, phase, _ = controller._campaign_turn_state(
+                    goal, observation, {}
+                )
+
+                self.assertEqual(2, len(calls))
+                self.assertEqual("prepare_combat", phase["kind"])
+                self.assertTrue(phase["context"]["research_exhaustion_support"])
+                self.assertEqual(
+                    0,
+                    len(
+                        [
+                            item
+                            for item in controller.storage.campaign_phases(run["id"])
+                            if item["kind"] == "research_progression"
+                        ]
+                    ),
                 )
             finally:
                 controller.storage.close()

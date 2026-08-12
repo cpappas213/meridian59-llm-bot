@@ -540,6 +540,140 @@ class CampaignCoordinator:
             compiled.append(criterion)
         return compiled
 
+    def validate_manager_decision(
+        self,
+        run: dict[str, Any],
+        goal: dict[str, Any],
+        decision: dict[str, Any],
+        observation: dict[str, Any] | None = None,
+    ) -> None:
+        """Validate manager output without mutating campaign state."""
+
+        action = str(decision.get("decision") or "").strip()
+        if action in {"start_phase", "replace_phase", "push_support_phase"}:
+            phase = decision.get("phase")
+            if not isinstance(phase, dict):
+                raise ValueError(f"{action} requires a phase object")
+            self._validated_manager_phase(goal, phase, observation)
+            return
+        if action in {
+            "resume_parent_phase",
+            "complete_campaign_candidate",
+            "report_external_blocker_candidate",
+        }:
+            return
+        raise ValueError(
+            "campaign manager decision must be start_phase, replace_phase, push_support_phase, "
+            "resume_parent_phase, complete_campaign_candidate, or report_external_blocker_candidate"
+        )
+
+    def _validated_manager_phase(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Compile and normalize one manager-selected phase without persisting it."""
+
+        kind = str(phase.get("kind") or "").strip()
+        if kind not in PHASE_KINDS:
+            raise ValueError(
+                f"unsupported campaign phase kind {kind!r}; supported: {', '.join(sorted(PHASE_KINDS))}"
+            )
+        raw_targets = phase.get("targets")
+        if raw_targets is not None:
+            if phase.get("success_criteria") is not None:
+                raise ValueError(
+                    "campaign phase must use targets or legacy success_criteria, not both"
+                )
+            criteria = self.compile_phase_targets(kind, raw_targets)
+        else:
+            criteria = phase.get("success_criteria")
+            if not isinstance(criteria, list) or not criteria:
+                raise ValueError("campaign phase requires at least one typed target")
+        if any(
+            isinstance(criterion, dict)
+            and criterion.get("kind") == "operator_confirmed"
+            for criterion in criteria
+        ):
+            raise ValueError(
+                "internal campaign phases cannot require operator_confirmed; "
+                "use observable state or phase_action_succeeded evidence"
+            )
+        criteria = self._normalize_phase_success_criteria(
+            criteria, phase_kind=kind, migrate_legacy=True
+        )
+        self._validate_phase_success_criteria(kind, criteria, goal, phase)
+        abandon_predicates = phase.get("abandon_predicates", [])
+        if not isinstance(abandon_predicates, list):
+            raise ValueError("campaign phase abandon_predicates must be an array")
+        valid_abandon_predicates: list[dict[str, Any]] = []
+        ignored_abandon_predicates: list[Any] = []
+        for predicate in abandon_predicates:
+            try:
+                self.storage._validate_goal(
+                    {
+                        "title": "Internal campaign phase abandonment predicate",
+                        "objective": "Detect a verified reason to reconsider this internal phase.",
+                        "success_criteria": [predicate],
+                        "constraints": {},
+                        "priority": int(goal.get("priority", 50)),
+                        "activation": "queue",
+                    }
+                )
+                valid_abandon_predicates.append(predicate)
+            except (TypeError, ValueError):
+                # Abandonment is optional. Dropping an untyped model suggestion is
+                # safer than discarding an otherwise valid phase or treating prose
+                # as a deterministic reason to quit useful work.
+                ignored_abandon_predicates.append(redact(predicate))
+        raw_budget = phase.get("budget") if isinstance(phase.get("budget"), dict) else {}
+        try:
+            requested_actions = int(raw_budget.get("max_actions", 24))
+            requested_minutes = int(raw_budget.get("max_minutes", 45))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("campaign phase budget values must be integers") from exc
+        phase_context = (
+            dict(phase.get("context"))
+            if isinstance(phase.get("context"), dict)
+            else {}
+        )
+        if raw_targets is not None:
+            phase_context["phase_targets"] = redact(raw_targets)
+        if ignored_abandon_predicates:
+            phase_context["ignored_invalid_abandon_predicates"] = (
+                ignored_abandon_predicates
+            )
+        if raw_targets is None and criteria != phase.get("success_criteria"):
+            phase_context["normalized_success_criteria"] = [
+                "legacy success criteria converted to controller-owned canonical verifiers"
+            ]
+        if observation is not None and valid_abandon_predicates:
+            valid_abandon_predicates, initially_true = (
+                self._filter_initially_true_abandonment(
+                    goal, valid_abandon_predicates, observation
+                )
+            )
+            if initially_true:
+                phase_context["ignored_initially_true_abandon_predicates"] = (
+                    initially_true
+                )
+        prepared = {
+            **phase,
+            "success_criteria": criteria,
+            "abandon_predicates": valid_abandon_predicates,
+            "context": phase_context,
+            # A model cannot abandon an otherwise viable phase after one
+            # or two ordinary actions. Breakers still react immediately to
+            # repeated equivalent failure, which is a materially good reason.
+            "budget": {
+                "max_actions": max(8, min(requested_actions, 200)),
+                "max_minutes": max(30, min(requested_minutes, 480)),
+            },
+        }
+        prepared.pop("targets", None)
+        return prepared
+
     def apply_manager_decision(
         self,
         run: dict[str, Any],
@@ -552,105 +686,7 @@ class CampaignCoordinator:
             phase = decision.get("phase")
             if not isinstance(phase, dict):
                 raise ValueError(f"{action} requires a phase object")
-            kind = str(phase.get("kind") or "").strip()
-            if kind not in PHASE_KINDS:
-                raise ValueError(
-                    f"unsupported campaign phase kind {kind!r}; supported: {', '.join(sorted(PHASE_KINDS))}"
-                )
-            raw_targets = phase.get("targets")
-            if raw_targets is not None:
-                if phase.get("success_criteria") is not None:
-                    raise ValueError(
-                        "campaign phase must use targets or legacy success_criteria, not both"
-                    )
-                criteria = self.compile_phase_targets(kind, raw_targets)
-            else:
-                criteria = phase.get("success_criteria")
-                if not isinstance(criteria, list) or not criteria:
-                    raise ValueError(
-                        "campaign phase requires at least one typed target"
-                    )
-            if any(
-                isinstance(criterion, dict)
-                and criterion.get("kind") == "operator_confirmed"
-                for criterion in criteria
-            ):
-                raise ValueError(
-                    "internal campaign phases cannot require operator_confirmed; "
-                    "use observable state or phase_action_succeeded evidence"
-                )
-            criteria = self._normalize_phase_success_criteria(
-                criteria, phase_kind=kind, migrate_legacy=True
-            )
-            self._validate_phase_success_criteria(kind, criteria, goal, phase)
-            abandon_predicates = phase.get("abandon_predicates", [])
-            if not isinstance(abandon_predicates, list):
-                raise ValueError("campaign phase abandon_predicates must be an array")
-            valid_abandon_predicates: list[dict[str, Any]] = []
-            ignored_abandon_predicates: list[Any] = []
-            for predicate in abandon_predicates:
-                try:
-                    self.storage._validate_goal(
-                        {
-                            "title": "Internal campaign phase abandonment predicate",
-                            "objective": "Detect a verified reason to reconsider this internal phase.",
-                            "success_criteria": [predicate],
-                            "constraints": {},
-                            "priority": int(goal.get("priority", 50)),
-                            "activation": "queue",
-                        }
-                    )
-                    valid_abandon_predicates.append(predicate)
-                except (TypeError, ValueError):
-                    # Abandonment is optional. Dropping an untyped model suggestion is
-                    # safer than discarding an otherwise valid phase or treating prose
-                    # as a deterministic reason to quit useful work.
-                    ignored_abandon_predicates.append(redact(predicate))
-            raw_budget = phase.get("budget") if isinstance(phase.get("budget"), dict) else {}
-            try:
-                requested_actions = int(raw_budget.get("max_actions", 24))
-                requested_minutes = int(raw_budget.get("max_minutes", 45))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("campaign phase budget values must be integers") from exc
-            phase_context = (
-                dict(phase.get("context"))
-                if isinstance(phase.get("context"), dict)
-                else {}
-            )
-            if raw_targets is not None:
-                phase_context["phase_targets"] = redact(raw_targets)
-            if ignored_abandon_predicates:
-                phase_context["ignored_invalid_abandon_predicates"] = (
-                    ignored_abandon_predicates
-                )
-            if raw_targets is None and criteria != phase.get("success_criteria"):
-                phase_context["normalized_success_criteria"] = [
-                    "legacy success criteria converted to controller-owned canonical verifiers"
-                ]
-            if observation is not None and valid_abandon_predicates:
-                valid_abandon_predicates, initially_true = (
-                    self._filter_initially_true_abandonment(
-                        goal, valid_abandon_predicates, observation
-                    )
-                )
-                if initially_true:
-                    phase_context["ignored_initially_true_abandon_predicates"] = (
-                        initially_true
-                    )
-            phase = {
-                **phase,
-                "success_criteria": criteria,
-                "abandon_predicates": valid_abandon_predicates,
-                "context": phase_context,
-                # A model cannot abandon an otherwise viable phase after one
-                # or two ordinary actions. Breakers still react immediately to
-                # repeated equivalent failure, which is a materially good reason.
-                "budget": {
-                    "max_actions": max(8, min(requested_actions, 200)),
-                    "max_minutes": max(30, min(requested_minutes, 480)),
-                },
-            }
-            phase.pop("targets", None)
+            phase = self._validated_manager_phase(goal, phase, observation)
             mode = "push" if action == "push_support_phase" else "replace"
             if self.storage.active_campaign_phase(run["id"]) is None:
                 mode = "start"
@@ -1599,6 +1635,10 @@ class CampaignCoordinator:
         return {
             "run": self._compact_run(run),
             "active_phase": self._compact_phase(phase),
+            "phase_capabilities": {
+                kind: sorted(tool_names)
+                for kind, tool_names in sorted(PHASE_TOOL_NAMES.items())
+            },
             "recent_phase_summaries": [
                 projected
                 for value in history[-8:]

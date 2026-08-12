@@ -351,11 +351,16 @@ Supported targets (only the listed fields are accepted):
 - {{"id":string,"type":"location_reached","room_id":positive integer and/or "name":string}}
 - {{"id":string,"type":"wielding_equals","items":null or array of canonical weapon names}}
 - {{"id":string,"type":"ability_at_least","ability_kind":"skill|spell","name":canonical name,"value":number}}
-- {{"id":string,"type":"phase_action_succeeded","tools":[available tool names]}}
+- {{"id":string,"type":"phase_action_succeeded","tools":[exact names from campaign.phase_capabilities[phase.kind]]}}
 
 Use phase_action_succeeded only when successful controller evidence collection is itself the bounded outcome,
 especially research_progression. Never use it as the sole farm outcome: a farm needs an observable result such as
-the next max-health milestone. Internal phases never ask for operator confirmation.
+the next max-health milestone. campaign.phase_capabilities is the closed callable-tool vocabulary for these
+targets. Choose each tool only from the array for the selected phase kind. All other JSON property names in
+campaign, grounded_knowledge, progression_context, learned_failures, financial_context, and verified_observation
+are fact namespaces, not callable tools. In particular, never copy context labels such as room_options_by_candidate,
+room_spawn_tables, safe_spot_evidence, combat_readiness, tactic_ledger, external_blocker, or room_info into tools.
+Internal phases never ask for operator confirmation.
 Phase budgets are normalized to at least 8 actions and 30 minutes; repeated equivalent semantic failure can end
 a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot.
 Each abandon_predicates entry is an OR trigger: if any one becomes deterministically true, the controller ends only
@@ -529,6 +534,7 @@ class VllmClient:
                 for key in (
                     "run",
                     "active_phase",
+                    "phase_capabilities",
                     "tactic_ledger",
                     "research_retry",
                     "manager_feedback",
@@ -614,6 +620,7 @@ class VllmClient:
                         for key in (
                             "run",
                             "active_phase",
+                            "phase_capabilities",
                             "tactic_ledger",
                             "research_retry",
                             "manager_feedback",

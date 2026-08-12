@@ -329,12 +329,23 @@ class PolicyAndJournalTests(unittest.TestCase):
                 client.manage_campaign(
                     goal={},
                     observation={},
-                    campaign_context={},
+                    campaign_context={
+                        "phase_capabilities": {
+                            "research_progression": ["hunting_grounds"]
+                        }
+                    },
                     grounded_knowledge=None,
                     learned_failures=None,
                     financial_context=None,
                 )
             self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+            messages = complete.call_args.args[0]
+            sent = json.loads(messages[1]["content"])
+            self.assertEqual(
+                ["hunting_grounds"],
+                sent["campaign"]["phase_capabilities"]["research_progression"],
+            )
+            self.assertIn("fact namespaces, not callable tools", messages[0]["content"])
 
     def test_campaign_manager_enforces_prompt_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

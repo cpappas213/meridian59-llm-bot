@@ -2692,8 +2692,6 @@ class BotController:
         phase_ids = (
             list(prior.get("phase_ids", []))
             if prior.get("fingerprint") == fingerprint
-            and prior.get("retry_state_fingerprint")
-            == retry_state_fingerprint
             and isinstance(prior.get("phase_ids"), list)
             else []
         )
@@ -8729,20 +8727,40 @@ class BotController:
                 progression_context=progression,
                 persona=self.storage.persona(),
             )
-            proposed = decision.get("phase")
-            if (
-                retry_gate.get("allowed") is False
-                and isinstance(proposed, dict)
-                and proposed.get("kind") == "research_progression"
-            ):
+            validation_error = self._campaign_manager_decision_error(
+                run,
+                goal,
+                decision,
+                observation,
+                retry_gate,
+                research_avoid_rooms,
+            )
+            if validation_error is not None:
+                rejected_decision = redact(decision)
                 manager_campaign_context = {
                     **manager_campaign_context,
-                    "manager_feedback": (
-                        "The proposed research_progression phase is deterministically ineligible: "
-                        + str(retry_gate.get("reason") or "the candidate set is unchanged")
-                        + ". Select a materially different support phase now."
-                    ),
+                    "manager_feedback": {
+                        "status": "rejected",
+                        "validation_error": validation_error,
+                        "rejected_decision": rejected_decision,
+                        "instruction": (
+                            "Return one corrected decision. For phase_action_succeeded, copy only "
+                            "exact tool names from phase_capabilities for the selected phase kind; "
+                            "context property names are facts, not tools."
+                        ),
+                    },
                 }
+                self.storage.emit_event(
+                    "campaign.manager.revision_requested",
+                    "Returned an invalid campaign phase to the manager for one grounded correction",
+                    severity="notice",
+                    interesting=False,
+                    goal_id=goal["id"],
+                    data={
+                        "validation_error": validation_error[:1000],
+                        "rejected_decision": rejected_decision,
+                    },
+                )
                 decision = self.model.manage_campaign(
                     goal=goal,
                     observation=manager_observation,
@@ -8801,30 +8819,16 @@ class BotController:
             }
 
         try:
-            proposed_phase = decision.get("phase")
-            if (
-                retry_gate.get("allowed") is False
-                and isinstance(proposed_phase, dict)
-                and proposed_phase.get("kind") == "research_progression"
-            ):
-                raise ValueError(
-                    "unchanged progression research is ineligible until its material retry "
-                    "predicate changes"
-                )
-            proposed_blocker = self._campaign_phase_grounding_blocker(
-                proposed_phase if isinstance(proposed_phase, dict) else None,
+            validation_error = self._campaign_manager_decision_error(
+                run,
+                goal,
+                decision,
                 observation,
-                avoid_rooms=research_avoid_rooms,
-                goal_id=goal["id"],
+                retry_gate,
+                research_avoid_rooms,
             )
-            if proposed_blocker is not None:
-                raise ValueError(
-                    "proposed farm phase conflicts with retained controller evidence: "
-                    + str(
-                        proposed_blocker.get("guidance")
-                        or proposed_blocker.get("kind")
-                    )
-                )
+            if validation_error is not None:
+                raise ValueError(validation_error)
             phase = self.campaign.apply_manager_decision(
                 run, goal, decision, observation=observation
             )
@@ -8859,6 +8863,52 @@ class BotController:
                 run["id"], external_blocker=external_blocker_candidate
             )
         return run, phase, {"decision": decision, "grounding": grounding}
+
+    def _campaign_manager_decision_error(
+        self,
+        run: dict[str, Any],
+        goal: dict[str, Any],
+        decision: Any,
+        observation: dict[str, Any],
+        retry_gate: dict[str, Any],
+        research_avoid_rooms: set[str],
+    ) -> str | None:
+        """Return deterministic feedback for invalid manager output without mutation."""
+
+        try:
+            if not isinstance(decision, dict):
+                raise TypeError("campaign manager response must be a JSON object")
+            self.campaign.validate_manager_decision(
+                run, goal, decision, observation=observation
+            )
+            proposed_phase = decision.get("phase")
+            if (
+                retry_gate.get("allowed") is False
+                and isinstance(proposed_phase, dict)
+                and proposed_phase.get("kind") == "research_progression"
+            ):
+                raise ValueError(
+                    "unchanged progression research is ineligible until its material retry "
+                    "predicate changes: "
+                    + str(retry_gate.get("reason") or "candidate set unchanged")
+                )
+            proposed_blocker = self._campaign_phase_grounding_blocker(
+                proposed_phase if isinstance(proposed_phase, dict) else None,
+                observation,
+                avoid_rooms=research_avoid_rooms,
+                goal_id=goal["id"],
+            )
+            if proposed_blocker is not None:
+                raise ValueError(
+                    "proposed farm phase conflicts with retained controller evidence: "
+                    + str(
+                        proposed_blocker.get("guidance")
+                        or proposed_blocker.get("kind")
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            return str(exc)
+        return None
 
     def _recent_research_avoid_rooms(self, run: dict[str, Any]) -> set[str]:
         """Return soft room-diversity hints from the newest research phase."""
@@ -8921,6 +8971,73 @@ class BotController:
         """Fingerprint only facts that can materially reopen progression research."""
 
         goal_id = str(goal.get("id") or "")
+        raw_equipment = deep_get(
+            observation,
+            "equipment",
+            deep_get(observation, "status.equipment", {}),
+        )
+        raw_equipment = raw_equipment if isinstance(raw_equipment, dict) else {}
+        equipped = raw_equipment.get("equipped", [])
+        equipped = equipped if isinstance(equipped, list) else []
+        equipment = {
+            "known": raw_equipment.get("known"),
+            "equipped": sorted(
+                [
+                    {
+                        "id": item.get("id"),
+                        "name": normalize(str(item.get("name") or "")),
+                    }
+                    for item in equipped
+                    if isinstance(item, dict) and item.get("name")
+                ],
+                key=canonical_json,
+            ),
+            "wielding": sorted(
+                normalize(str(item))
+                for item in raw_equipment.get("wielding", [])
+                if str(item).strip()
+            )
+            if isinstance(raw_equipment.get("wielding"), list)
+            else [],
+        }
+        raw_abilities = deep_get(
+            observation,
+            "abilities",
+            {
+                "skills": deep_get(
+                    observation,
+                    "skills",
+                    deep_get(observation, "status.skills", []),
+                ),
+                "spells": deep_get(
+                    observation,
+                    "spells",
+                    deep_get(observation, "status.spells", []),
+                ),
+            },
+        )
+        raw_abilities = raw_abilities if isinstance(raw_abilities, dict) else {}
+
+        def ability_values(kind: str) -> list[dict[str, Any]]:
+            values = raw_abilities.get(kind, [])
+            values = values if isinstance(values, list) else []
+            return sorted(
+                [
+                    {
+                        "id": item.get("id"),
+                        "name": normalize(str(item.get("name") or "")),
+                        "ability": item.get("ability"),
+                    }
+                    for item in values
+                    if isinstance(item, dict) and item.get("name")
+                ],
+                key=canonical_json,
+            )
+
+        abilities = {
+            "skills": ability_values("skills"),
+            "spells": ability_values("spells"),
+        }
         inventory = deep_get(observation, "inventory.items", [])
         inventory = inventory if isinstance(inventory, list) else []
         capability_item_words = (
@@ -8952,31 +9069,36 @@ class BotController:
             ],
             key=lambda item: (str(item.get("name")), str(item.get("amount"))),
         )
-        lessons = [
-            {
-                "id": item.get("id"),
-                "status": item.get("status"),
-                "classification": item.get("classification"),
-                "tactic_key": item.get("tactic_key"),
-                "updated_at": item.get("updated_at"),
-            }
-            for item in self.storage.goal_lessons(
-                statuses=["deferred", "unlocked"], limit=200
-            )
-            if str(item.get("goal_id") or "") == goal_id
-            and item.get("scope") == "tactic"
-        ]
+        lessons = sorted(
+            [
+                {
+                    "id": item.get("id"),
+                    "status": item.get("status"),
+                    "classification": item.get("classification"),
+                    "tactic_key": item.get("tactic_key"),
+                }
+                for item in self.storage.goal_lessons(
+                    statuses=["deferred", "unlocked"], limit=200
+                )
+                if str(item.get("goal_id") or "") == goal_id
+                and item.get("scope") == "tactic"
+            ],
+            key=canonical_json,
+        )
         blocked_actions = self.storage.get_runtime("blocked_actions", [])
         blocked_actions = blocked_actions if isinstance(blocked_actions, list) else []
-        route_evidence = [
-            {
-                "tool": item.get("tool"),
-                "room": item.get("room"),
-                "reason": item.get("reason"),
-            }
-            for item in blocked_actions
-            if isinstance(item, dict) and item.get("goal_id") == goal_id
-        ]
+        route_evidence = sorted(
+            [
+                {
+                    "tool": item.get("tool"),
+                    "room": item.get("room"),
+                    "reason": item.get("reason"),
+                }
+                for item in blocked_actions
+                if isinstance(item, dict) and item.get("goal_id") == goal_id
+            ],
+            key=canonical_json,
+        )
         return json_hash(
             {
                 "max_health": deep_get(
@@ -8984,28 +9106,10 @@ class BotController:
                     "status.vitals.health.max",
                     deep_get(observation, "look.vitals.health.max"),
                 ),
-                "equipment": deep_get(
-                    observation,
-                    "equipment",
-                    deep_get(observation, "status.equipment"),
-                ),
-                "abilities": deep_get(
-                    observation,
-                    "abilities",
-                    {
-                        "abilities": deep_get(observation, "status.abilities"),
-                        "skills": deep_get(
-                            observation,
-                            "skills",
-                            deep_get(observation, "status.skills"),
-                        ),
-                        "spells": deep_get(
-                            observation,
-                            "spells",
-                            deep_get(observation, "status.spells"),
-                        ),
-                    },
-                ),
+                # Broker cache ages and response notes change every observation;
+                # only actual equipped items and named ability values reopen work.
+                "equipment": equipment,
+                "abilities": abilities,
                 "inventory": items,
                 "tactic_lessons": lessons,
                 "route_evidence": route_evidence,
@@ -9057,7 +9161,18 @@ class BotController:
                 )
             recorded = current
         if recorded != current:
-            self._clear_research_recipe_exhaustion(goal_id)
+            # Authorize exactly one lookup against the materially changed state,
+            # while retaining the prior candidate-set history. If that lookup
+            # returns the same candidates, it strengthens (rather than erases)
+            # the exhaustion evidence and closes the gate again immediately.
+            record = {
+                **record,
+                "retry_state_fingerprint": current,
+                "retry_reopened_from": recorded,
+                "retry_reopened_at": timestamp(),
+            }
+            values[goal_id] = record
+            self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, values)
             run = self.storage.campaign_run(goal_id)
             blocker = run.get("external_blocker") if isinstance(run, dict) else None
             if (
