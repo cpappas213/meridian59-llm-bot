@@ -5314,6 +5314,25 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("not interested", rejected or "")
         self.assertIsNone(quoted)
 
+    def test_live_no_need_sale_refusal_invalidates_only_the_execution_plan(self) -> None:
+        reason = 'Caramo tells you, "I simply have no need for that."'
+
+        context = BotController._failure_context("sell", reason, {})
+        guidance = BotController._no_progress_guidance("sell", reason)
+
+        self.assertEqual("merchant_rejected_sale", (context or {}).get("kind"))
+        self.assertIn("only this item/merchant tactic", (context or {}).get("purpose", ""))
+        self.assertIn("Do not retry the same item with this merchant", guidance)
+        self.assertTrue(BotController._failure_invalidates_plan("sell", reason))
+        self.assertFalse(BotController._failure_invalidates_plan("travel", reason))
+
+        archaic_reason = 'Pritchett tells you, "Whyfore dost you offer me that?"'
+        archaic_context = BotController._failure_context("sell", archaic_reason, {})
+        archaic_guidance = BotController._no_progress_guidance("sell", archaic_reason)
+        self.assertEqual("merchant_rejected_sale", (archaic_context or {}).get("kind"))
+        self.assertIn("Do not retry the same item with this merchant", archaic_guidance)
+        self.assertTrue(BotController._failure_invalidates_plan("sell", archaic_reason))
+
     def test_sell_all_with_only_refusals_is_factual_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
             {

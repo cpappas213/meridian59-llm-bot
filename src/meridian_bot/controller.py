@@ -13630,9 +13630,8 @@ class BotController:
                     "sell quote for a materially different ordinary item."
                 ),
             }
-        if tool in {"sell", "sell_all"} and any(
-            marker in text
-            for marker in ("not interested", "did not buy", "no counteroffer")
+        if tool == "sell" or (
+            tool == "sell_all" and cls._is_merchant_sale_refusal(text)
         ):
             return {
                 "kind": "merchant_rejected_sale",
@@ -13675,10 +13674,30 @@ class BotController:
                     )
                 )
             )
-        ) or (
-            tool == "sell_all" and "merchant bought zero" in text
+        ) or tool == "sell" or (
+            tool == "sell_all"
+            and (
+                "merchant bought zero" in text
+                or BotController._is_merchant_sale_refusal(text)
+            )
         ) or (
             tool == "travel" and "travel route cycled" in text
+        )
+
+    @staticmethod
+    def _is_merchant_sale_refusal(reason: Any) -> bool:
+        """Recognize factual broker/NPC refusals that disprove a sale tactic."""
+
+        text = str(reason or "").casefold()
+        return any(
+            marker in text
+            for marker in (
+                "not interested",
+                "did not buy",
+                "no counteroffer",
+                "no need for that",
+                "no need of that",
+            )
         )
 
     @classmethod
@@ -13777,7 +13796,9 @@ class BotController:
                 prefix
                 + "No property transferred and the call did not reduce the carried inventory load."
             )
-        if tool in {"sell", "sell_all"} and any(marker in text for marker in ("not interested", "did not buy", "no counteroffer")):
+        if tool == "sell" or (
+            tool == "sell_all" and cls._is_merchant_sale_refusal(text)
+        ):
             return (
                 prefix
                 + "Do not retry the same item with this merchant. Quote a materially different ordinary item or use "
