@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .contracts import parse_ability_metric
 from .criteria import CriteriaEvaluator
 from .storage import Storage
 from .utils import canonical_json, deep_get, json_hash, redact, timestamp
@@ -47,6 +48,13 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "knowledge_search",
     },
     "research_progression": {
+        # Progression research may need to move out of a sanctuary and inspect
+        # the locally connected route before the read-only creature/room
+        # adapters can produce useful evidence. Mutation still requires a
+        # verified execution-plan step and the ordinary controller safeguards.
+        "look",
+        "map",
+        "travel",
         "prey",
         "hunting_grounds",
         "safe_spots",
@@ -107,6 +115,9 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "merchants",
         "map",
         "travel",
+        # The controller-owned purchase plan may use one exact live-map go
+        # exit after ordinary travel reports an unusable duplicate edge.
+        "go_through",
         "shop",
         "sell",
         "sell_all",
@@ -123,6 +134,8 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "merchants",
         "map",
         "travel",
+        # Paid training shares the guarded purchase-route recovery path.
+        "go_through",
         "shop",
         "bank",
         "cast",
@@ -163,9 +176,76 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "bank",
         "knowledge_search",
     },
-    "return_home": {"look", "map", "travel", "walk_to", "go_through", "knowledge_search"},
+    "return_home": {
+        "look",
+        "map",
+        "travel",
+        "walk_to",
+        "go_through",
+        "leave_raza",
+        "knowledge_search",
+    },
     "pvp_opportunity": {"look", "inventory", "equipment", "bank", "map", "travel", "pvp_engage"},
 }
+
+PHASE_ACTION_SUCCEEDED = "phase_action_succeeded"
+PHASE_ACTION_CRITERION_FIELDS = frozenset({"id", "kind", "tools"})
+
+# Campaign-manager output uses this small semantic vocabulary. The controller
+# compiles targets into verifier criteria, so an LLM can select an outcome but
+# cannot invent an observation path or verifier implementation.
+PHASE_TARGET_FIELDS: dict[str, frozenset[str]] = {
+    "max_health_at_least": frozenset({"id", "type", "value"}),
+    "current_health_at_least": frozenset({"id", "type", "value"}),
+    "vigor_at_least": frozenset({"id", "type", "value"}),
+    "carried_currency_at_least": frozenset({"id", "type", "amount"}),
+    "inventory_items_at_most": frozenset({"id", "type", "count"}),
+    "inventory_room_for_at_least": frozenset(
+        {"id", "type", "dimension", "value"}
+    ),
+    "item_count_at_least": frozenset({"id", "type", "item", "count"}),
+    "inventory_not_full": frozenset({"id", "type"}),
+    "location_reached": frozenset({"id", "type", "room_id", "name"}),
+    "equipment_known": frozenset({"id", "type"}),
+    "wielding_equals": frozenset({"id", "type", "items"}),
+    "ability_at_least": frozenset(
+        {"id", "type", "ability_kind", "name", "value"}
+    ),
+    PHASE_ACTION_SUCCEEDED: frozenset({"id", "type", "tools"}),
+}
+
+PHASE_NUMERIC_METRICS = frozenset(
+    {
+        "max_health",
+        "current_health",
+        "vigor",
+        "carried_currency",
+        "status.vitals.health.max",
+        "status.vitals.health.value",
+        "status.vitals.health.current",
+        "look.vitals.health.max",
+        "look.vitals.health.value",
+        "look.vitals.health.current",
+        "status.vitals.vigor.value",
+        "status.vitals.vigor.current",
+        "look.vitals.vigor.value",
+        "look.vitals.vigor.current",
+        "inventory.carry.items",
+        "inventory.carry.room_for.weight",
+        "inventory.carry.room_for.bulk",
+    }
+)
+
+PHASE_STATE_PATHS = frozenset(
+    {
+        "inventory.full",
+        "inventory.items",
+        "equipment.known",
+        "equipment.wielding",
+        "status.position.col",
+        "status.position.row",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -244,7 +324,8 @@ class CampaignCoordinator:
                     "success_criteria": [
                         {
                             "id": f"local-farm-recipe-{milestone}",
-                            "kind": "operator_confirmed",
+                            "kind": PHASE_ACTION_SUCCEEDED,
+                            "tools": ["hunting_grounds"],
                         }
                     ],
                     "abandon_predicates": [],
@@ -267,6 +348,198 @@ class CampaignCoordinator:
                 }
         return CampaignCoordinator.compatible_phase(goal)
 
+    @staticmethod
+    def _target_number(target: dict[str, Any], field: str) -> int | float:
+        value = target.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(
+                f"phase target {target.get('type')!r}.{field} must be numeric"
+            )
+        return value
+
+    @classmethod
+    def compile_phase_targets(
+        cls, phase_kind: str, targets: Any
+    ) -> list[dict[str, Any]]:
+        """Compile model-selected semantic outcomes into trusted verifiers."""
+
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 20:
+            raise ValueError("campaign phase targets must contain 1-20 objects")
+        compiled: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        for index, target in enumerate(targets):
+            if not isinstance(target, dict):
+                raise ValueError(f"campaign phase target {index + 1} must be an object")
+            target_type = str(target.get("type") or "").strip()
+            allowed_fields = PHASE_TARGET_FIELDS.get(target_type)
+            if allowed_fields is None:
+                raise ValueError(
+                    f"unsupported campaign phase target type {target_type!r}; supported: "
+                    + ", ".join(sorted(PHASE_TARGET_FIELDS))
+                )
+            unknown = set(target) - allowed_fields
+            if unknown:
+                raise ValueError(
+                    f"phase target {target_type!r} contains unknown field(s): "
+                    + ", ".join(sorted(unknown))
+                )
+            target_id = str(target.get("id") or f"target_{index + 1}").strip()
+            if not target_id or target_id in ids:
+                raise ValueError(f"duplicate or empty phase target id: {target_id!r}")
+            ids.add(target_id)
+
+            if target_type == "max_health_at_least":
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": "max_health",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "value"),
+                }
+            elif target_type == "current_health_at_least":
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": "current_health",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "value"),
+                }
+            elif target_type == "vigor_at_least":
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": "vigor",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "value"),
+                }
+            elif target_type == "carried_currency_at_least":
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": "carried_currency",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "amount"),
+                }
+            elif target_type == "inventory_items_at_most":
+                count = cls._target_number(target, "count")
+                if count < 0:
+                    raise ValueError("inventory_items_at_most.count must be non-negative")
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": "inventory.carry.items",
+                    "operator": "<=",
+                    "value": count,
+                }
+            elif target_type == "inventory_room_for_at_least":
+                dimension = str(target.get("dimension") or "").strip()
+                if dimension not in {"weight", "bulk"}:
+                    raise ValueError(
+                        "inventory_room_for_at_least.dimension must be weight or bulk"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": f"inventory.carry.room_for.{dimension}",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "value"),
+                }
+            elif target_type == "item_count_at_least":
+                item = " ".join(str(target.get("item") or "").split())
+                count = target.get("count", 1)
+                if (
+                    not item
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                ):
+                    raise ValueError(
+                        "item_count_at_least requires a non-empty item and positive integer count"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": "inventory_contains",
+                    "item": item,
+                    "count": count,
+                }
+            elif target_type == "inventory_not_full":
+                criterion = {
+                    "id": target_id,
+                    "kind": "state_equals",
+                    "path": "inventory.full",
+                    "value": False,
+                }
+            elif target_type == "location_reached":
+                room_id = target.get("room_id")
+                name = " ".join(str(target.get("name") or "").split())
+                if room_id is None and not name:
+                    raise ValueError("location_reached requires room_id or name")
+                if room_id is not None and (
+                    not isinstance(room_id, int)
+                    or isinstance(room_id, bool)
+                    or room_id < 1
+                ):
+                    raise ValueError("location_reached.room_id must be a positive integer")
+                criterion = {
+                    "id": target_id,
+                    "kind": "location_reached",
+                    **({"room_id": room_id} if room_id is not None else {}),
+                    **({"location": name} if name else {}),
+                }
+            elif target_type == "equipment_known":
+                criterion = {
+                    "id": target_id,
+                    "kind": "state_equals",
+                    "path": "equipment.known",
+                    "value": True,
+                }
+            elif target_type == "wielding_equals":
+                items = target.get("items")
+                if items is not None and (
+                    not isinstance(items, list)
+                    or any(not isinstance(item, str) or not item.strip() for item in items)
+                ):
+                    raise ValueError(
+                        "wielding_equals.items must be null or an array of canonical names"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": "state_equals",
+                    "path": "equipment.wielding",
+                    "value": items,
+                }
+            elif target_type == "ability_at_least":
+                ability_kind = str(target.get("ability_kind") or "").casefold()
+                name = " ".join(str(target.get("name") or "").split())
+                if ability_kind not in {"skill", "spell"} or not name:
+                    raise ValueError(
+                        "ability_at_least requires ability_kind=skill|spell and a name"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": "numeric_threshold",
+                    "metric": f"ability.{ability_kind}.{name}",
+                    "operator": ">=",
+                    "value": cls._target_number(target, "value"),
+                }
+            else:
+                tools = target.get("tools")
+                if (
+                    not isinstance(tools, list)
+                    or not tools
+                    or any(not isinstance(tool, str) or not tool.strip() for tool in tools)
+                ):
+                    raise ValueError(
+                        "phase_action_succeeded.tools must be a non-empty array of tool names"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": PHASE_ACTION_SUCCEEDED,
+                    "tools": tools,
+                }
+            compiled.append(criterion)
+        return compiled
+
     def apply_manager_decision(
         self,
         run: dict[str, Any],
@@ -284,21 +557,32 @@ class CampaignCoordinator:
                 raise ValueError(
                     f"unsupported campaign phase kind {kind!r}; supported: {', '.join(sorted(PHASE_KINDS))}"
                 )
-            criteria = phase.get("success_criteria")
-            if not isinstance(criteria, list) or not criteria:
-                raise ValueError("campaign phase requires at least one deterministic success criterion")
-            criteria = self._normalize_phase_success_criteria(criteria)
-            # Reuse the public criterion validator without creating a public goal.
-            self.storage._validate_goal(
-                {
-                    "title": str(phase.get("objective") or "Internal campaign phase")[:120],
-                    "objective": str(phase.get("objective") or "Internal campaign phase"),
-                    "success_criteria": criteria,
-                    "constraints": {},
-                    "priority": int(goal.get("priority", 50)),
-                    "activation": "queue",
-                }
+            raw_targets = phase.get("targets")
+            if raw_targets is not None:
+                if phase.get("success_criteria") is not None:
+                    raise ValueError(
+                        "campaign phase must use targets or legacy success_criteria, not both"
+                    )
+                criteria = self.compile_phase_targets(kind, raw_targets)
+            else:
+                criteria = phase.get("success_criteria")
+                if not isinstance(criteria, list) or not criteria:
+                    raise ValueError(
+                        "campaign phase requires at least one typed target"
+                    )
+            if any(
+                isinstance(criterion, dict)
+                and criterion.get("kind") == "operator_confirmed"
+                for criterion in criteria
+            ):
+                raise ValueError(
+                    "internal campaign phases cannot require operator_confirmed; "
+                    "use observable state or phase_action_succeeded evidence"
+                )
+            criteria = self._normalize_phase_success_criteria(
+                criteria, phase_kind=kind, migrate_legacy=True
             )
+            self._validate_phase_success_criteria(kind, criteria, goal, phase)
             abandon_predicates = phase.get("abandon_predicates", [])
             if not isinstance(abandon_predicates, list):
                 raise ValueError("campaign phase abandon_predicates must be an array")
@@ -333,13 +617,15 @@ class CampaignCoordinator:
                 if isinstance(phase.get("context"), dict)
                 else {}
             )
+            if raw_targets is not None:
+                phase_context["phase_targets"] = redact(raw_targets)
             if ignored_abandon_predicates:
                 phase_context["ignored_invalid_abandon_predicates"] = (
                     ignored_abandon_predicates
                 )
-            if criteria != phase.get("success_criteria"):
+            if raw_targets is None and criteria != phase.get("success_criteria"):
                 phase_context["normalized_success_criteria"] = [
-                    "equipment.wielding scalar expected value converted to the broker's canonical name array"
+                    "legacy success criteria converted to controller-owned canonical verifiers"
                 ]
             if observation is not None and valid_abandon_predicates:
                 valid_abandon_predicates, initially_true = (
@@ -364,6 +650,7 @@ class CampaignCoordinator:
                     "max_minutes": max(30, min(requested_minutes, 480)),
                 },
             }
+            phase.pop("targets", None)
             mode = "push" if action == "push_support_phase" else "replace"
             if self.storage.active_campaign_phase(run["id"]) is None:
                 mode = "start"
@@ -386,6 +673,9 @@ class CampaignCoordinator:
     @staticmethod
     def _normalize_phase_success_criteria(
         criteria: list[dict[str, Any]],
+        *,
+        phase_kind: str | None = None,
+        migrate_legacy: bool = False,
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for criterion in criteria:
@@ -397,8 +687,218 @@ class CampaignCoordinator:
                 and isinstance(value.get("value"), str)
             ):
                 value["value"] = [value["value"]]
+            if (
+                migrate_legacy
+                and isinstance(value, dict)
+            ):
+                if (
+                    phase_kind == "research_progression"
+                    and value.get("kind") == "operator_confirmed"
+                ):
+                    value = {
+                        "id": value.get("id"),
+                        "kind": PHASE_ACTION_SUCCEEDED,
+                        "tools": ["hunting_grounds"],
+                    }
+                elif (
+                    value.get("kind") in {"numeric_threshold", "numeric_delta"}
+                    and str(value.get("metric") or "").casefold()
+                    in {
+                        "inventory.items.shilling.amount",
+                        "inventory.items.shillings.amount",
+                        "inventory.items.shilling.quantity",
+                        "inventory.items.shillings.quantity",
+                    }
+                ):
+                    value["metric"] = "carried_currency"
             normalized.append(value)
         return normalized
+
+    def _validate_phase_success_criteria(
+        self,
+        phase_kind: str,
+        criteria: list[dict[str, Any]],
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+    ) -> None:
+        public_criteria: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        has_internal = False
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                raise ValueError("campaign phase success criteria must be objects")
+            criterion_id = str(criterion.get("id") or f"criterion_{index + 1}")
+            if criterion_id in ids:
+                raise ValueError(f"duplicate criterion id: {criterion_id}")
+            ids.add(criterion_id)
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
+                self._validate_public_phase_criterion(criterion)
+                public_criteria.append(criterion)
+                continue
+            has_internal = True
+            unknown = set(criterion) - PHASE_ACTION_CRITERION_FIELDS
+            if unknown:
+                raise ValueError(
+                    "unknown phase_action_succeeded criterion field(s): "
+                    + ", ".join(sorted(unknown))
+                )
+            tools = criterion.get("tools")
+            if (
+                not isinstance(tools, list)
+                or not tools
+                or any(not isinstance(tool, str) or not tool.strip() for tool in tools)
+            ):
+                raise ValueError(
+                    "phase_action_succeeded.tools must be a non-empty array of tool names"
+                )
+            unavailable = sorted(set(tools) - PHASE_TOOL_NAMES.get(phase_kind, set()))
+            if unavailable:
+                raise ValueError(
+                    "phase_action_succeeded names tools unavailable to this phase: "
+                    + ", ".join(unavailable)
+                )
+        if has_internal and any(
+            criterion.get("kind") in {"composite_all", "composite_any"}
+            for criterion in public_criteria
+        ):
+            raise ValueError(
+                "phase_action_succeeded cannot be referenced by composite criteria"
+            )
+        if phase_kind == "farm" and has_internal and not public_criteria:
+            raise ValueError(
+                "farm phase cannot complete merely because an action launched; "
+                "require an observable farming outcome such as a max-health milestone"
+            )
+        if public_criteria:
+            # Reuse the public criterion validator without creating a public goal.
+            self.storage._validate_goal(
+                {
+                    "title": str(phase.get("objective") or "Internal campaign phase")[:120],
+                    "objective": str(phase.get("objective") or "Internal campaign phase"),
+                    "success_criteria": public_criteria,
+                    "constraints": {},
+                    "priority": int(goal.get("priority", 50)),
+                    "activation": "queue",
+                }
+            )
+
+    @staticmethod
+    def _validate_public_phase_criterion(criterion: dict[str, Any]) -> None:
+        """Reject semantically invalid observation paths before persistence."""
+
+        kind = str(criterion.get("kind") or "")
+        if kind in {"numeric_threshold", "numeric_delta"}:
+            metric = str(criterion.get("metric") or "")
+            if metric not in PHASE_NUMERIC_METRICS and parse_ability_metric(metric) is None:
+                raise ValueError(
+                    f"unsupported internal phase numeric metric {metric!r}; "
+                    "use a typed target instead of inventing an observation path"
+                )
+            return
+        if kind == "state_equals":
+            path = str(criterion.get("path") or "")
+            if path not in PHASE_STATE_PATHS:
+                raise ValueError(
+                    f"unsupported internal phase state path {path!r}; "
+                    "use a typed target instead of inventing an observation path"
+                )
+            return
+        if kind in {
+            "inventory_contains",
+            "location_reached",
+            "event_occurred",
+            "composite_all",
+            "composite_any",
+        }:
+            return
+        raise ValueError(
+            f"unsupported internal phase criterion kind {kind!r}; use a typed target"
+        )
+
+    def _evaluate_phase_success_criteria(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        criteria: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        annotated = [
+            {
+                **criterion,
+                "id": str(criterion.get("id") or f"criterion_{index + 1}"),
+            }
+            for index, criterion in enumerate(criteria)
+            if isinstance(criterion, dict)
+        ]
+        public = [
+            criterion
+            for criterion in annotated
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED
+        ]
+        public_results: dict[str, dict[str, Any]] = {}
+        if public:
+            evaluated = self.criteria.evaluate(
+                {"id": goal["id"], "success_criteria": public}, observation
+            )
+            public_results = {
+                str(result.get("id") or ""): result
+                for result in evaluated.get("criteria", [])
+                if isinstance(result, dict)
+            }
+
+        attempts = self.storage.phase_attempts(phase["id"], limit=200)
+        successful = [attempt for attempt in attempts if attempt.get("status") == "succeeded"]
+        results: list[dict[str, Any]] = []
+        evidence_event_ids: list[str] = []
+        for criterion in annotated:
+            criterion_id = str(criterion["id"])
+            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
+                result = public_results.get(criterion_id)
+                if result is not None:
+                    results.append(result)
+                continue
+            allowed_tools = {str(tool) for tool in criterion.get("tools", [])}
+            matches = [
+                attempt
+                for attempt in successful
+                if str(attempt.get("semantic_action") or "") in allowed_tools
+            ]
+            met = bool(matches)
+            if matches:
+                evidence_event_ids.extend(
+                    str(attempt.get("id"))
+                    for attempt in matches
+                    if attempt.get("id") is not None
+                )
+            results.append(
+                {
+                    "id": criterion_id,
+                    "kind": PHASE_ACTION_SUCCEEDED,
+                    "met": met,
+                    "detail": (
+                        "verified successful phase action(s): "
+                        + ", ".join(
+                            sorted(
+                                {
+                                    str(attempt.get("semantic_action") or "")
+                                    for attempt in matches
+                                }
+                            )
+                        )
+                        if met
+                        else "awaiting a successful phase action from: "
+                        + ", ".join(sorted(allowed_tools))
+                    ),
+                }
+            )
+        met_count = sum(result.get("met") is True for result in results)
+        return {
+            "percent_estimate": round(100 * met_count / len(results)) if results else 0,
+            "summary": f"{met_count} of {len(results)} criteria verified",
+            "evidence_event_ids": evidence_event_ids,
+            "criteria": results,
+            "all_met": bool(results) and met_count == len(results),
+        }
 
     def _filter_initially_true_abandonment(
         self,
@@ -424,11 +924,17 @@ class CampaignCoordinator:
         run: dict[str, Any],
         phase: dict[str, Any] | None,
         observation: dict[str, Any],
+        *,
+        allow_completion: bool = True,
     ) -> PhaseOutcome:
         if phase is None:
             return PhaseOutcome(False, False, None, {"reason": "no_active_phase"})
         raw_criteria = phase.get("success_criteria", [])
-        criteria = self._normalize_phase_success_criteria(raw_criteria)
+        criteria = self._normalize_phase_success_criteria(
+            raw_criteria,
+            phase_kind=str(phase.get("kind") or ""),
+            migrate_legacy=True,
+        )
         abandon = phase.get("abandon_predicates", [])
         context = (
             dict(phase.get("context"))
@@ -438,9 +944,9 @@ class CampaignCoordinator:
         normalization_reasons: list[str] = []
         if criteria != raw_criteria:
             context["normalized_success_criteria"] = [
-                "equipment.wielding scalar expected value converted to the broker's canonical name array"
+                "converted legacy phase criteria to deterministic controller representations"
             ]
-            normalization_reasons.append("normalized equipment.wielding success value")
+            normalization_reasons.append("normalized internal phase success criteria")
         if (
             isinstance(abandon, list)
             and abandon
@@ -462,7 +968,6 @@ class CampaignCoordinator:
                 success_criteria=criteria,
                 reason="; ".join(normalization_reasons),
             )
-        pseudo_goal = {"id": goal["id"], "success_criteria": criteria}
         if isinstance(abandon, list) and abandon:
             abandonment = self.criteria.evaluate(
                 {"id": goal["id"], "success_criteria": abandon}, observation
@@ -486,25 +991,44 @@ class CampaignCoordinator:
                     finished,
                     {"reason": reason, "abandonment": abandonment},
                 )
-        completion = self.criteria.evaluate(pseudo_goal, observation)
+        completion = self._evaluate_phase_success_criteria(
+            goal, phase, criteria, observation
+        )
         if completion.get("all_met") is True:
-            finished = self.storage.transition_campaign_phase(
-                phase["id"],
-                "succeeded",
-                reason="all deterministic phase criteria verified",
-                resume_parent=bool(phase.get("parent_phase_id")),
-            )
-            self.storage.update_campaign_memory(
-                run["id"],
-                progress_checkpoint={
-                    "phase_id": phase["id"],
-                    "phase_kind": phase["kind"],
-                    "completion": completion,
-                    "recorded_at": timestamp(),
-                },
-            )
-            return PhaseOutcome(True, False, finished, completion)
+            if not allow_completion:
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {**completion, "completion_deferred": True},
+                )
+            return self.complete_phase(run, phase, completion)
         return PhaseOutcome(False, False, phase, completion)
+
+    def complete_phase(
+        self,
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> PhaseOutcome:
+        """Commit a previously verified phase outcome after completion hygiene."""
+
+        finished = self.storage.transition_campaign_phase(
+            phase["id"],
+            "succeeded",
+            reason="all deterministic phase criteria verified",
+            resume_parent=bool(phase.get("parent_phase_id")),
+        )
+        self.storage.update_campaign_memory(
+            run["id"],
+            progress_checkpoint={
+                "phase_id": phase["id"],
+                "phase_kind": phase["kind"],
+                "completion": completion,
+                "recorded_at": timestamp(),
+            },
+        )
+        return PhaseOutcome(True, False, finished, completion)
 
     @staticmethod
     def budget_exhausted(phase: dict[str, Any]) -> dict[str, Any] | None:

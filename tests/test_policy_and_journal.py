@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
-from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, VllmClient
+from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, PLANNER_SYSTEM, VllmClient
 from meridian_bot.obsidian import ObsidianJournal
 from meridian_bot.policy import PolicyEngine
 from meridian_bot.controller import BotController
@@ -177,9 +177,62 @@ class PolicyAndJournalTests(unittest.TestCase):
                 )
 
             self.assertEqual("caster", result["stats"])
-            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 1200)
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
 
-    def test_vllm_reports_reasoning_only_response_clearly(self) -> None:
+    def test_vllm_retries_reasoning_only_length_with_larger_budget(self) -> None:
+        class Response:
+            def __init__(self, content: str | None, reasoning: str | None = None):
+                self.content = content
+                self.reasoning = reasoning
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "length" if self.content is None else "stop",
+                                "message": {
+                                    "content": self.content,
+                                    "reasoning": self.reasoning,
+                                },
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch(
+                "meridian_bot.model.urllib.request.urlopen",
+                side_effect=[
+                    Response(None, "Still thinking..."),
+                    Response('{"decision":"wait"}'),
+                ],
+            ) as request:
+                result = client._complete(
+                    [{"role": "system", "content": "Return JSON."}],
+                    5,
+                    max_tokens=300,
+                )
+
+            self.assertEqual({"decision": "wait"}, result)
+            self.assertEqual(2, request.call_count)
+            retry_payload = json.loads(
+                request.call_args_list[1].args[0].data.decode("utf-8")
+            )
+            self.assertGreaterEqual(retry_payload["max_tokens"], 4096)
+            self.assertIn(
+                "exhausted its completion budget",
+                retry_payload["messages"][-1]["content"],
+            )
+
+    def test_vllm_reports_reasoning_only_response_after_bounded_retry(self) -> None:
         class Response:
             def __enter__(self) -> "Response":
                 return self
@@ -205,14 +258,16 @@ class PolicyAndJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             client = VllmClient(config(Path(temporary)))
             with patch(
-                "meridian_bot.model.urllib.request.urlopen", return_value=Response()
-            ):
+                "meridian_bot.model.urllib.request.urlopen",
+                side_effect=[Response(), Response()],
+            ) as request:
                 with self.assertRaisesRegex(
-                    ModelError, "reasoning but no final JSON"
+                    ModelError, "after retrying with 4096 completion tokens"
                 ):
                     client._complete(
                         [{"role": "system", "content": "Return JSON."}], 5
                     )
+            self.assertEqual(2, request.call_count)
 
     def test_goal_drafter_receives_operator_revision_and_current_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -256,6 +311,86 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual(current, context["current_goal"])
             self.assertEqual("EXAMPLE", context["validation_feedback"][0]["code"])
             self.assertIn("operator_confirmed", messages[0]["content"])
+            self.assertIn("event_kind raza.left", messages[0]["content"])
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+
+    def test_campaign_manager_and_planner_reserve_reasoning_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch.object(
+                client, "_complete", return_value={"decision": "start_phase"}
+            ) as complete:
+                client.manage_campaign(
+                    goal={},
+                    observation={},
+                    campaign_context={},
+                    grounded_knowledge=None,
+                    learned_failures=None,
+                    financial_context=None,
+                )
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+
+    def test_campaign_manager_and_planner_receive_full_planning_persona(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            persona = {
+                "version": 4,
+                "name": "Sable",
+                "character_voice": "A guarded pilgrim who prefers quiet sanctuaries.",
+                "traits": ["wary", "curious"],
+                "speech_style": ["concise"],
+                "values": ["self-reliance"],
+                "taboos": ["boasting"],
+                "relationship_defaults": "Polite but slow to trust.",
+                "max_reply_characters": 360,
+            }
+
+            with patch.object(
+                client, "_complete", return_value={"decision": "start_phase"}
+            ) as complete:
+                client.manage_campaign(
+                    goal={},
+                    observation={},
+                    campaign_context={},
+                    grounded_knowledge=None,
+                    learned_failures=None,
+                    financial_context=None,
+                    persona=persona,
+                )
+            manager_context = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual(persona, manager_context["planning_persona"])
+
+            with patch.object(
+                client, "_complete", return_value={"decision": "wait"}
+            ) as complete:
+                client.plan(
+                    goal={},
+                    observation={},
+                    tools=[],
+                    persona=persona,
+                    recent_events=[],
+                    pending_proposals=[],
+                    planner_feedback=None,
+                    policy_summary={},
+                )
+            planner_context = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual(persona, planner_context["planning_persona"])
+            self.assertIn("safe_ending.rationale", PLANNER_SYSTEM)
+
+            with patch.object(
+                client, "_complete", return_value={"decision": "wait"}
+            ) as complete:
+                client.plan(
+                    goal={},
+                    observation={},
+                    tools=[],
+                    persona={},
+                    recent_events=[],
+                    pending_proposals=[],
+                    planner_feedback=None,
+                    policy_summary={},
+                )
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
 
     def test_planner_receives_explicit_financial_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -34,6 +34,7 @@ different prompt and output schema.
 | Role | Tools | Purpose | May change controller state? |
 |---|---|---|---|
 | Goal normalizer | None | Help form controller-created proposals or an operator-visible draft before submission. | No; the supervisor submits the reviewed structured goal. |
+| Campaign manager | None | Select a bounded internal phase beneath the active goal, tailored to verified state and the complete persona. | Only through deterministic phase validation. |
 | Planner | Bounded abstract capability descriptions | Choose one next action or request more observation. | Only through validator + authority + executor. |
 | Progress evaluator | None | Suggest whether evidence advances criteria and identify missing evidence. | No; deterministic criterion evaluators decide where available. |
 | Memory summarizer | None | Compact old observations into typed candidate facts/summaries. | Only validated typed facts are committed. |
@@ -58,16 +59,18 @@ reduce injection risk:
    schemas selected for the current planning stage.
 4. **Active goal**: objective, criteria, constraints, progress, and recent
    consequence assessments relevant to the next action.
-5. **Current verified state**: character, vitals, room, visible entities,
+5. **Planning persona**: the complete operator-authored identity, used to choose
+   among equally safe, goal-compatible phases, tactics, and ending locations.
+6. **Current verified state**: character, vitals, room, visible entities,
    inventory/equipment, broker/autopilot, active hazards, and observation age.
-6. **Relevant durable knowledge**: selected map/compendium facts and typed memories
+7. **Relevant durable knowledge**: selected map/compendium facts and typed memories
    with source, confidence, and last verification time.
-7. **Recent trajectory**: last successful action, recent failures, current plan,
+8. **Recent trajectory**: last successful action, recent failures, current plan,
    and bounded observation/action history.
-8. **Learned failures**: goal-family lessons, exact deferred tactics, failed
+9. **Learned failures**: goal-family lessons, exact deferred tactics, failed
    state, retry evaluations, and supporting-goal suggestions. These are
    controller-owned facts; the model cannot declare their predicates met.
-9. **Untrusted material**: any player claims or conversation excerpts, enclosed in
+10. **Untrusted material**: any player claims or conversation excerpts, enclosed in
    a typed data field and explicitly labeled untrusted.
 
 Mutable content never appears before the fixed system/policy/capability prefix.
@@ -344,17 +347,25 @@ Each success criterion has a verifier implemented in code or a specifically
 allowed operator confirmation. The planner may nominate completion but cannot set
 `succeeded`.
 
-Completion transaction:
+Goal and campaign-phase completion transaction:
 
 1. freeze new ordinary actions for the goal;
 2. obtain fresh evidence for all volatile criteria;
-3. evaluate every criterion;
-4. if all pass, persist terminal transition and completion event atomically;
-5. place character in a safe stable state when practical; and
-6. notify, journal, then allow scheduler promotion of the next goal.
+3. evaluate every active phase or public goal criterion;
+4. if all pass, durably latch the verified outcome even if a volatile location
+   criterion becomes false during withdrawal;
+5. require the configured model's accepted execution plan to name an exact
+   source-grounded safe ending and final travel step;
+6. allow only that ending step, then freshly verify both room id and
+   `ROOM_SANCTUARY`/`ROOM_NO_COMBAT` source flags;
+7. persist the phase advance or goal terminal transition and completion event;
+   and
+8. notify, journal, then allow the next campaign phase or scheduler promotion.
 
-If evidence is incomplete, the controller resumes planning or becomes blocked;
-it does not lower the criterion.
+If criterion evidence is incomplete, the controller resumes planning or becomes
+blocked; it does not lower the criterion. If a phase or goal outcome is latched
+but safe arrival is incomplete, it remains non-terminal and ordinary work may
+not restart.
 
 ## 13. Non-progress and self-correction
 

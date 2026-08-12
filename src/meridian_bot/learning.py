@@ -42,7 +42,7 @@ RECOVERABLE_PREPARATION_TOOLS = {
     "hunting_grounds",
     "knowledge_search",
 }
-HOME_EVENT_KINDS = {"goal.returned_to_tos_inn", "goal.home_reached"}
+HOME_EVENT_KINDS = {"goal.home_reached"}
 COMBAT_MEMORY_KEY = "combat_outcomes_v1"
 WEAPON_WORDS = ("mace", "hammer", "sword", "axe", "dagger", "bow", "staff", "club")
 ARMOR_WORDS = ("armor", "armour", "shield", "gauntlet", "glove", "pants", "breeches", "vest", "mail", "helm")
@@ -94,29 +94,24 @@ class GoalLearning:
         return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).split())
 
     @classmethod
-    def _is_tos_home_location(cls, criterion: dict[str, Any]) -> bool:
+    def _is_finish_location(cls, criterion: dict[str, Any]) -> bool:
         kind = criterion.get("kind")
         if kind == "location_reached":
-            named = cls._normal_text(criterion.get("location") or criterion.get("room") or "")
-            room_id = str(criterion.get("room_id", "")).strip()
-            return "tos inn" in named or room_id == "52"
+            return True
         if kind == "event_occurred":
             event_kind = str(criterion.get("event_kind", "")).casefold()
-            return event_kind in HOME_EVENT_KINDS or ("tos" in event_kind and "inn" in event_kind)
+            return event_kind in HOME_EVENT_KINDS or event_kind.startswith("goal.returned_to_")
         if kind == "state_equals":
             path = str(criterion.get("path", "")).casefold()
-            value = cls._normal_text(criterion.get("value", ""))
-            return "room" in path and "tos inn" in value
+            return "room" in path
         return False
 
     @staticmethod
-    def _is_tos_bar_coordinate(criterion: dict[str, Any]) -> bool:
+    def _is_finish_coordinate(criterion: dict[str, Any]) -> bool:
         if criterion.get("kind") != "state_equals":
             return False
         path = str(criterion.get("path", "")).casefold()
-        return criterion.get("value") == 8 and path.endswith(
-            ("position.col", "position.row")
-        )
+        return path.endswith(("position.col", "position.row"))
 
     @classmethod
     def _criterion_identity(cls, criterion: dict[str, Any]) -> dict[str, Any]:
@@ -138,12 +133,12 @@ class GoalLearning:
             for item in goal.get("success_criteria", [])
             if isinstance(item, dict)
         ]
-        has_tos_home = any(cls._is_tos_home_location(item) for item in source_criteria)
+        has_finish_location = any(cls._is_finish_location(item) for item in source_criteria)
         criteria = [
             cls._criterion_identity(item)
             for item in source_criteria
-            if not cls._is_tos_home_location(item)
-            and not (has_tos_home and cls._is_tos_bar_coordinate(item))
+            if not cls._is_finish_location(item)
+            and not (has_finish_location and cls._is_finish_coordinate(item))
         ]
         criteria.sort(key=canonical_json)
         if criteria:
@@ -293,14 +288,14 @@ class GoalLearning:
                 key=canonical_json,
             )
         profile["inventory_load_hash"] = json_hash(inventory_load_state)
-        # Keep the long-lived equipment_hash compatible with lessons created
-        # before equipment visibility was modeled. Otherwise deploying the new
-        # "unknown" state would falsely look like a real equipment change and
-        # unlock old combat goals. The observation hash is available for newer
-        # generic capability comparisons without weakening the old predicate.
-        profile["equipment_hash"] = json_hash(profile["equipment"])
+        # Server object ids identify one session's item instances, not combat
+        # capability.  Reconnects may assign a different id to the same sword;
+        # including that id in a durable retry fingerprint falsely unlocked
+        # lessons even though the character was no better prepared.
+        semantic_equipment = cls._semantic_equipment(profile["equipment"])
+        profile["equipment_hash"] = json_hash(semantic_equipment)
         profile["equipment_observation_hash"] = json_hash(
-            {"state": profile["equipment_state"], "items": profile["equipment"]}
+            {"state": profile["equipment_state"], "items": semantic_equipment}
         )
         profile["attributes_hash"] = json_hash(profile["attributes"])
         profile["skills_hash"] = json_hash(profile["skills"])
@@ -313,7 +308,6 @@ class GoalLearning:
                     "max_health",
                     "max_mana",
                     "equipment_hash",
-                    "equipment_observation_hash",
                     "attributes_hash",
                     "skills_hash",
                     "abilities_hash",
@@ -322,6 +316,25 @@ class GoalLearning:
             }
         )
         return profile
+
+    @staticmethod
+    def _semantic_equipment(equipment: Any) -> list[dict[str, str | None]]:
+        """Return stable equipment identity without ephemeral server object ids."""
+
+        if not isinstance(equipment, list):
+            return []
+        values = [
+            {
+                "name": " ".join(str(item.get("name") or "").casefold().split()),
+                "slot": (
+                    " ".join(str(item.get("slot") or "").casefold().split())
+                    or None
+                ),
+            }
+            for item in equipment
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        return sorted(values, key=canonical_json)
 
     def profile(self, observation: dict[str, Any]) -> dict[str, Any]:
         return self.state_profile(observation, self._corpus_version())
@@ -384,6 +397,7 @@ class GoalLearning:
             "health_before": before_health,
             "health_after": after_health,
             "equipment_state": self.profile(before).get("equipment_state"),
+            "equipment": self.profile(before).get("equipment", []),
             "equipment_hash": self.profile(before).get("equipment_hash"),
             "equipment_observation_hash": self.profile(before).get("equipment_observation_hash"),
             "error": str(error or "")[:500] or None,
@@ -635,6 +649,19 @@ class GoalLearning:
     @staticmethod
     def classify(tool: str, reason: str, *, event_kind: str = "") -> tuple[str, str, float]:
         text = f"{reason} {event_kind}".casefold()
+        if any(
+            marker in text
+            for marker in (
+                "server answered nothing at all",
+                "not a door problem but a lost packet",
+                "reply that did not arrive inside",
+            )
+        ):
+            # The broker explicitly distinguishes this from an exit refusal:
+            # no authoritative response arrived. Route tools must not make the
+            # more generic ROUTE_TOOLS branch turn transport silence into a
+            # permanent location/corpus gate.
+            return "dependency_failure", "tactic", 0.9
         if tool in {"map", "knowledge_search"} and any(marker in text for marker in ("no match", "not found", "unknown", "invalid")):
             # Operator-authored goal references are validated before planning
             # and explicitly deferred with scope="goal" by the controller.
@@ -679,10 +706,10 @@ class GoalLearning:
                 "conditions": [
                     {"kind": "numeric_increase", "field": "max_health", "from": profile.get("max_health")},
                     {"kind": "numeric_increase", "field": "max_mana", "from": profile.get("max_mana")},
-                    {"kind": "component_changed", "field": "equipment_hash", "from": profile["equipment_hash"]},
-                    {"kind": "component_changed", "field": "attributes_hash", "from": profile["attributes_hash"]},
-                    {"kind": "component_changed", "field": "skills_hash", "from": profile["skills_hash"]},
-                    {"kind": "component_changed", "field": "abilities_hash", "from": profile["abilities_hash"]},
+                    {"kind": "component_improved", "field": "equipment", "from": profile["equipment"]},
+                    {"kind": "component_improved", "field": "attributes", "from": profile["attributes"]},
+                    {"kind": "component_improved", "field": "skills", "from": profile["skills"]},
+                    {"kind": "component_improved", "field": "abilities", "from": profile["abilities"]},
                     {"kind": "numeric_increase", "field": "healing_supply_count", "from": profile["healing_supply_count"]},
                 ],
             }
@@ -704,6 +731,33 @@ class GoalLearning:
         }
 
     @staticmethod
+    def _is_farm_survivability_failure(
+        failed_tactic: Any, summary: Any = "", event_kind: Any = ""
+    ) -> bool:
+        if not isinstance(failed_tactic, dict):
+            return False
+        arguments = failed_tactic.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        if str(failed_tactic.get("tool") or "") != "autopilot" or not (
+            str(arguments.get("mode") or "").casefold() == "farm"
+            or arguments.get("assigned_room") is not None
+        ):
+            return False
+        text = f"{summary} {event_kind}".casefold()
+        return any(
+            marker in text
+            for marker in (
+                "survivability",
+                "retreat episodes",
+                "safe-spot failure",
+                "safe spot failure",
+                "healing margin",
+                "flee threshold",
+                "observed a death",
+            )
+        )
+
+    @staticmethod
     def _parse_time(value: str) -> float:
         try:
             return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
@@ -711,7 +765,139 @@ class GoalLearning:
             return 0.0
 
     @classmethod
-    def _condition_met(cls, condition: dict[str, Any], profile: dict[str, Any], now: float) -> tuple[bool, str]:
+    def _structured_component_improved(cls, before: Any, current: Any) -> bool:
+        """Return true only for a monotonic gain in a structured capability.
+
+        Hash inequality is directionless: losing a weapon after death changes the
+        equipment hash just as surely as acquiring armor.  Retry gates must only
+        unlock on evidence that is at least as capable as the failed state and
+        strictly better in one respect.
+        """
+
+        if isinstance(before, bool) or isinstance(current, bool):
+            return False
+        if isinstance(before, (int, float)) and isinstance(current, (int, float)):
+            return current > before
+        if isinstance(before, dict) and isinstance(current, dict):
+            improved = False
+            for key, before_value in before.items():
+                if key not in current:
+                    return False
+                current_value = current[key]
+                if isinstance(before_value, (dict, list)):
+                    if cls._structured_component_regressed(before_value, current_value):
+                        return False
+                    improved = improved or cls._structured_component_improved(
+                        before_value, current_value
+                    )
+                elif (
+                    not isinstance(before_value, bool)
+                    and not isinstance(current_value, bool)
+                    and isinstance(before_value, (int, float))
+                    and isinstance(current_value, (int, float))
+                ):
+                    if current_value < before_value:
+                        return False
+                    improved = improved or current_value > before_value
+                elif current_value != before_value:
+                    return False
+            return improved or any(key not in before for key in current)
+        if isinstance(before, list) and isinstance(current, list):
+            before_values = {canonical_json(value) for value in before}
+            current_values = {canonical_json(value) for value in current}
+            return before_values < current_values
+        return False
+
+    @classmethod
+    def _structured_component_regressed(cls, before: Any, current: Any) -> bool:
+        """Return true when a structured capability has lost known state."""
+
+        if isinstance(before, bool) or isinstance(current, bool):
+            return before != current
+        if isinstance(before, (int, float)) and isinstance(current, (int, float)):
+            return current < before
+        if isinstance(before, dict) and isinstance(current, dict):
+            for key, before_value in before.items():
+                if key not in current:
+                    return True
+                current_value = current[key]
+                if isinstance(before_value, (dict, list)):
+                    if cls._structured_component_regressed(before_value, current_value):
+                        return True
+                elif (
+                    not isinstance(before_value, bool)
+                    and not isinstance(current_value, bool)
+                    and isinstance(before_value, (int, float))
+                    and isinstance(current_value, (int, float))
+                    and current_value < before_value
+                ):
+                    return True
+                elif not isinstance(before_value, (int, float)) and current_value != before_value:
+                    return True
+            return False
+        if isinstance(before, list) and isinstance(current, list):
+            before_values = {canonical_json(value) for value in before}
+            current_values = {canonical_json(value) for value in current}
+            return not before_values <= current_values
+        return before != current
+
+    @classmethod
+    def _component_improved(
+        cls, field: str, failed_state: dict[str, Any], profile: dict[str, Any]
+    ) -> bool:
+        if field in {"equipment", "equipment_hash"}:
+            before_values = {
+                canonical_json(value)
+                for value in cls._semantic_equipment(failed_state.get("equipment"))
+            }
+            current_values = {
+                canonical_json(value)
+                for value in cls._semantic_equipment(profile.get("equipment"))
+            }
+            return before_values < current_values
+        source_field = field.removesuffix("_hash")
+        if source_field in {"attributes", "skills", "abilities"}:
+            return cls._structured_component_improved(
+                failed_state.get(source_field), profile.get(source_field)
+            )
+        return False
+
+    @classmethod
+    def _capability_improved(
+        cls, failed_state: dict[str, Any], profile: dict[str, Any]
+    ) -> bool:
+        """Compare durable capability facts instead of versioned aggregate hashes."""
+
+        for field in ("max_health", "max_mana", "healing_supply_count"):
+            before, current = failed_state.get(field), profile.get(field)
+            if (
+                isinstance(before, (int, float))
+                and isinstance(current, (int, float))
+                and current > before
+            ):
+                return True
+        for field in ("equipment", "attributes", "skills", "abilities"):
+            if field in failed_state and cls._component_improved(
+                field, failed_state, profile
+            ):
+                return True
+        return False
+
+    def capability_improved(
+        self, failed_state: dict[str, Any], observation: dict[str, Any]
+    ) -> bool:
+        """Compare a prior capability snapshot with a live observation."""
+
+        return self._capability_improved(failed_state, self.profile(observation))
+
+    @classmethod
+    def _condition_met(
+        cls,
+        condition: dict[str, Any],
+        profile: dict[str, Any],
+        now: float,
+        failed_state: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
         kind = condition.get("kind")
         if kind == "numeric_increase":
             before, current = condition.get("from"), profile.get(str(condition.get("field")))
@@ -722,9 +908,30 @@ class GoalLearning:
             met = isinstance(current, (int, float)) and isinstance(required, (int, float)) and current >= required
             return met, f"{condition.get('field')} must be at least {required!r} (now {current!r})"
         if kind == "component_changed":
-            current = profile.get(str(condition.get("field")))
+            field = str(condition.get("field"))
+            if (
+                field in {
+                    "equipment_hash",
+                    "attributes_hash",
+                    "skills_hash",
+                    "abilities_hash",
+                }
+                and isinstance(failed_state, dict)
+            ):
+                met = cls._component_improved(field, failed_state, profile)
+                return met, f"{field.removesuffix('_hash')} must improve without a known loss"
+            current = profile.get(field)
             return current != condition.get("from"), f"{condition.get('field')} must change"
+        if kind == "component_improved":
+            field = str(condition.get("field"))
+            met = bool(
+                isinstance(failed_state, dict)
+                and cls._component_improved(field, failed_state, profile)
+            )
+            return met, f"{field} must improve without a known loss"
         if kind == "capability_changed":
+            if isinstance(failed_state, dict):
+                return cls._capability_improved(failed_state, profile), "combat capability or equipment must improve"
             return profile.get("capability_hash") != condition.get("from"), "combat capability or equipment must change"
         if kind == "location_changed":
             return profile.get("room") != condition.get("from"), f"location must change from {condition.get('from')}"
@@ -740,6 +947,40 @@ class GoalLearning:
         predicate = lesson.get("retry_when", {})
         conditions = predicate.get("conditions", []) if isinstance(predicate, dict) else []
         conditions = list(conditions) if isinstance(conditions, list) else []
+        failed_state = lesson.get("failed_state", {})
+        failed_tactic = failed_state.get("failed_tactic", {}) if isinstance(failed_state, dict) else {}
+        if self._is_farm_survivability_failure(
+            failed_tactic, lesson.get("summary")
+        ) and any(
+            isinstance(item, dict) and item.get("kind") == "cooldown_elapsed"
+            for item in conditions
+        ):
+            # Migrate legacy exact-farm safety lessons. A timeout can make a
+            # transient tactic worth another try; it cannot make unchanged
+            # combat readiness survive a room that repeatedly forced retreat.
+            conditions = [
+                item
+                for item in conditions
+                if isinstance(item, dict) and item.get("kind") != "cooldown_elapsed"
+            ] or [
+                {
+                    "kind": "capability_changed",
+                    "from": failed_state.get("capability_hash"),
+                }
+            ]
+        # Time alone may justify retrying a transient or merely ineffective
+        # tactic. It can never erase a verified death in the exact farm room.
+        # Once that stronger evidence exists, require a real capability gain.
+        if any(
+            isinstance(item, dict) and item.get("kind") == "cooldown_elapsed"
+            for item in conditions
+        ) and self._farm_tactic_has_later_death(lesson, failed_state, failed_tactic):
+            conditions = [
+                {
+                    "kind": "capability_changed",
+                    "from": failed_state.get("capability_hash"),
+                }
+            ]
         # Lessons created before healing supplies were modeled cannot contain a
         # supply predicate. Treat their missing baseline as zero so a newly
         # observed carried flask is a concrete readiness change, not a prose
@@ -753,13 +994,10 @@ class GoalLearning:
             lesson.get("classification") in {"insufficient_combat_power", "missing_capability"}
             and "healing_supply_count" not in condition_fields
         ):
-            failed_state = lesson.get("failed_state", {})
             baseline = failed_state.get("healing_supply_count", 0) if isinstance(failed_state, dict) else 0
             conditions.append(
                 {"kind": "numeric_increase", "field": "healing_supply_count", "from": baseline}
             )
-        failed_state = lesson.get("failed_state", {})
-        failed_tactic = failed_state.get("failed_tactic", {}) if isinstance(failed_state, dict) else {}
         economic_reason = str(lesson.get("summary") or "")
         economic_baseline = failed_state.get("carried_currency", 0) if isinstance(failed_state, dict) else 0
         if isinstance(failed_tactic, dict) and failed_tactic.get("tool") == "shop":
@@ -808,7 +1046,12 @@ class GoalLearning:
         results = []
         for condition in conditions:
             if isinstance(condition, dict):
-                met, detail = self._condition_met(condition, profile, time.time())
+                met, detail = self._condition_met(
+                    condition,
+                    profile,
+                    time.time(),
+                    failed_state if isinstance(failed_state, dict) else None,
+                )
                 results.append({"met": met, "detail": detail, "condition": condition})
         failed_room = failed_state.get("room") if isinstance(failed_state, dict) else None
         failed_tool = str(failed_tactic.get("tool") or "") if isinstance(failed_tactic, dict) else ""
@@ -827,10 +1070,19 @@ class GoalLearning:
                 for marker in ("broken", "can't use", "cannot use", "unusable")
             )
         )
+        farm_failure_is_destination_bound = (
+            failed_tool == "autopilot"
+            and isinstance(failed_arguments, dict)
+            and (
+                str(failed_arguments.get("mode") or "").casefold() == "farm"
+                or failed_arguments.get("assigned_room") is not None
+            )
+        )
         if (
             lesson.get("scope") == "tactic"
             and failed_room
             and not equipment_failure_is_location_independent
+            and not farm_failure_is_destination_bound
         ):
             location_changed = profile.get("room") != failed_room
             results.append(
@@ -844,6 +1096,289 @@ class GoalLearning:
         met = bool(results) and (all(item["met"] for item in results) if mode == "all" else any(item["met"] for item in results))
         return {"met": met, "mode": mode, "conditions": results}
 
+    def _farm_tactic_has_later_death(
+        self,
+        lesson: dict[str, Any],
+        failed_state: Any,
+        failed_tactic: Any,
+    ) -> bool:
+        """Return whether stronger death evidence supersedes a farm cooldown."""
+
+        if not isinstance(failed_state, dict) or not isinstance(failed_tactic, dict):
+            return False
+        arguments = failed_tactic.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        if str(failed_tactic.get("tool") or "") != "autopilot" or not (
+            str(arguments.get("mode") or "").casefold() == "farm"
+            or arguments.get("assigned_room") is not None
+        ):
+            return False
+        room = arguments.get("assigned_room")
+        target = self._normal_text(arguments.get("hunt") or arguments.get("target") or "")
+        created_at = self._parse_time(str(lesson.get("created_at") or ""))
+        history = self.storage.get_runtime(COMBAT_MEMORY_KEY, [])
+        for outcome in history if isinstance(history, list) else []:
+            if not isinstance(outcome, dict) or outcome.get("died") is not True:
+                continue
+            occurred_at = self._parse_time(str(outcome.get("occurred_at") or ""))
+            if created_at and occurred_at and occurred_at < created_at:
+                continue
+            outcome_room = outcome.get("room")
+            if isinstance(outcome_room, dict):
+                outcome_room = outcome_room.get("id", outcome_room.get("num"))
+            if room is not None and str(outcome_room) != str(room):
+                continue
+            outcome_target = self._normal_text(outcome.get("target") or "")
+            if target and outcome_target and target != outcome_target:
+                continue
+            return True
+        return False
+
+    def repair_regressive_capability_unlocks(
+        self, observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Re-defer legacy lessons unlocked by a loss masquerading as progress."""
+
+        repaired: list[dict[str, Any]] = []
+        quarantines_raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantines = (
+            dict(quarantines_raw) if isinstance(quarantines_raw, dict) else {}
+        )
+        quarantines_changed = False
+        for lesson in self.storage.goal_lessons(statuses=["unlocked"], limit=200):
+            predicate = lesson.get("retry_when")
+            conditions = (
+                predicate.get("conditions", []) if isinstance(predicate, dict) else []
+            )
+            if not any(
+                isinstance(condition, dict)
+                and condition.get("kind")
+                in {"capability_changed", "component_changed", "component_improved"}
+                for condition in conditions
+            ):
+                continue
+            if lesson.get("resolution_goal_id") and lesson.get("scope") == "goal":
+                continue
+            evaluation = self.evaluate_retry(lesson, observation)
+            if evaluation.get("met"):
+                continue
+            updated = self.storage.update_goal_lesson(
+                lesson["id"],
+                "deferred",
+                evidence={
+                    "repair": (
+                        "a directionless capability fingerprint changed because "
+                        "known readiness was lost, not improved"
+                    ),
+                    "retry_evaluation": evaluation,
+                    "at": timestamp(),
+                },
+            )
+            repaired.append(updated)
+
+            identity = self._farm_lesson_identity(updated)
+            if identity is None:
+                continue
+            room, target, safe_spots = identity
+            existing = quarantines.get(room)
+            if isinstance(existing, dict):
+                continue
+            failed_state = updated.get("failed_state")
+            failed_state = failed_state if isinstance(failed_state, dict) else {}
+            failed_tactic = failed_state.get("failed_tactic")
+            failed_tactic = failed_tactic if isinstance(failed_tactic, dict) else {}
+            failed_room = failed_state.get("room")
+            failed_room_id = (
+                failed_room.get("id", failed_room.get("num"))
+                if isinstance(failed_room, dict)
+                else None
+            )
+            at_assigned_room = (
+                failed_room_id is None or str(failed_room_id) == str(room)
+            )
+            quarantines[room] = {
+                "room": int(room) if room.isdigit() else room,
+                "assigned_room": int(room) if room.isdigit() else room,
+                "at_assigned_room": at_assigned_room,
+                "target": target,
+                "use_safe_spots": safe_spots,
+                "quarantined_at": timestamp(),
+                "goal_id": updated.get("goal_id"),
+                "reasons": [str(updated.get("summary") or "unsafe farm tactic")],
+                "quarantined": at_assigned_room,
+                "lesson_id": updated.get("id"),
+                "guidance": (
+                    "Do not reuse this room/prey farm unchanged; choose another "
+                    "grounded room until combat readiness verifiably improves."
+                ),
+            }
+            quarantines_changed = True
+        if quarantines_changed:
+            self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+        if repaired:
+            self.storage.emit_event(
+                "goal_learning.false_unlock_repaired",
+                "Repaired capability lessons unlocked by readiness loss",
+                severity="notice",
+                interesting=True,
+                data={
+                    "lesson_ids": [item.get("id") for item in repaired],
+                    "farm_rooms_requarantined": [
+                        self._farm_lesson_identity(item)[0]
+                        for item in repaired
+                        if self._farm_lesson_identity(item) is not None
+                    ],
+                },
+            )
+        return repaired
+
+    @staticmethod
+    def _farm_lesson_identity(
+        lesson: dict[str, Any],
+    ) -> tuple[str, str, bool | None] | None:
+        """Return the quarantine identity owned by an exact farm lesson."""
+
+        if lesson.get("scope") != "tactic":
+            return None
+        failed_state = lesson.get("failed_state")
+        failed_state = failed_state if isinstance(failed_state, dict) else {}
+        failed_tactic = failed_state.get("failed_tactic")
+        failed_tactic = failed_tactic if isinstance(failed_tactic, dict) else {}
+        if str(failed_tactic.get("tool") or "") != "autopilot":
+            return None
+        arguments = failed_tactic.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        room = arguments.get("assigned_room")
+        if room is None:
+            return None
+        target = " ".join(
+            str(arguments.get("hunt") or arguments.get("target") or "")
+            .casefold()
+            .split()
+        )
+        safe_spots = arguments.get("use_safe_spots")
+        return str(room), target, safe_spots if isinstance(safe_spots, bool) else None
+
+    def _release_matching_farm_quarantine(
+        self,
+        lesson: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Keep an unlocked exact tactic lesson and its runtime gate consistent."""
+
+        identity = self._farm_lesson_identity(lesson)
+        if identity is None:
+            return None
+        room, target, safe_spots = identity
+        raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantines = dict(raw) if isinstance(raw, dict) else {}
+        record = quarantines.get(room)
+        if not isinstance(record, dict):
+            return None
+        recorded_target = " ".join(str(record.get("target") or "").casefold().split())
+        if target and recorded_target and target != recorded_target:
+            return None
+        recorded_safe_spots = record.get("use_safe_spots")
+        if (
+            isinstance(safe_spots, bool)
+            and isinstance(recorded_safe_spots, bool)
+            and safe_spots != recorded_safe_spots
+        ):
+            return None
+        record_goal_id = str(record.get("goal_id") or "")
+        lesson_goal_id = str(lesson.get("goal_id") or "")
+        if record_goal_id and lesson_goal_id and record_goal_id != lesson_goal_id:
+            return None
+        quarantined_at = self._parse_time(str(record.get("quarantined_at") or ""))
+        lesson_release_at = self._parse_time(
+            str(
+                lesson.get("unlocked_at")
+                or lesson.get("resolved_at")
+                or lesson.get("updated_at")
+                or ""
+            )
+        )
+        if quarantined_at and lesson_release_at < quarantined_at:
+            # An older unlocked lesson cannot erase newer contradictory safety
+            # evidence for the same tactic.
+            return None
+
+        released = {
+            **record,
+            "released_at": timestamp(),
+            "release_reason": reason,
+            "lesson_id": lesson.get("id"),
+        }
+        quarantines.pop(room, None)
+        self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+        raw_retreats = self.storage.get_runtime(
+            "farm_tactic_retreat_incidents_v1", {}
+        )
+        retreats = dict(raw_retreats) if isinstance(raw_retreats, dict) else {}
+        filtered_retreats = {
+            key: value
+            for key, value in retreats.items()
+            if not (
+                isinstance(value, dict)
+                and str(value.get("assigned_room")) == room
+                and (
+                    not target
+                    or not str(value.get("target") or "").strip()
+                    or str(value.get("target") or "").strip().casefold() == target
+                )
+                and (
+                    not isinstance(safe_spots, bool)
+                    or not isinstance(value.get("use_safe_spots"), bool)
+                    or value.get("use_safe_spots") == safe_spots
+                )
+                and (
+                    not lesson_goal_id
+                    or not str(value.get("goal_id") or "")
+                    or str(value.get("goal_id")) == lesson_goal_id
+                )
+            )
+        }
+        if len(filtered_retreats) != len(retreats):
+            self.storage.set_runtime(
+                "farm_tactic_retreat_incidents_v1", filtered_retreats
+            )
+        suppression = self.storage.get_runtime("safety_suppression_v1")
+        if isinstance(suppression, dict) and "quarantined_farm_tactic" in suppression.get(
+            "blocker_kinds", []
+        ):
+            self.storage.set_runtime("safety_suppression_v1", None)
+        self.storage.emit_event(
+            "background_farm.quarantine_released",
+            "Released a farm quarantine whose exact tactic lesson unlocked",
+            severity="notice",
+            interesting=False,
+            goal_id=lesson_goal_id or None,
+            data={
+                "room": record.get("room", room),
+                "target": record.get("target"),
+                "use_safe_spots": record.get("use_safe_spots"),
+                "lesson_id": lesson.get("id"),
+                "reason": reason,
+            },
+        )
+        return released
+
+    def release_unlocked_farm_quarantines(self) -> list[dict[str, Any]]:
+        """Repair runtime gates left behind by lessons unlocked before this build."""
+
+        released: list[dict[str, Any]] = []
+        for lesson in self.storage.goal_lessons(
+            statuses=["unlocked", "resolved"], limit=200
+        ):
+            record = self._release_matching_farm_quarantine(
+                lesson,
+                reason=f"matching farm lesson is {lesson.get('status')}",
+            )
+            if record is not None:
+                released.append(record)
+        return released
+
     def refresh_unlocks(self, observation: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.config.enabled:
             return []
@@ -851,7 +1386,14 @@ class GoalLearning:
         for lesson in self.storage.goal_lessons(statuses=["deferred"], limit=200):
             evaluation = self.evaluate_retry(lesson, observation)
             if evaluation["met"]:
-                unlocked.append(self.storage.update_goal_lesson(lesson["id"], "unlocked", evidence=evaluation))
+                updated = self.storage.update_goal_lesson(
+                    lesson["id"], "unlocked", evidence=evaluation
+                )
+                self._release_matching_farm_quarantine(
+                    updated,
+                    reason="matching farm lesson retry predicate was satisfied",
+                )
+                unlocked.append(updated)
         return unlocked
 
     def _equivalent_goal_lessons(
@@ -882,6 +1424,26 @@ class GoalLearning:
             limit=50,
         )
         for lesson in lessons:
+            original = self.storage.goal(str(lesson.get("goal_id") or ""))
+            if (
+                lesson.get("scope") == "goal"
+                and original
+                and original.get("status") in {"queued", "active", "paused"}
+            ):
+                return {
+                    "allowed": False,
+                    "code": "GOAL_ALREADY_OPEN",
+                    "goal_family": family,
+                    "lesson": self.public_lesson(
+                        lesson,
+                        evaluation=self.evaluate_retry(lesson, observation),
+                    ),
+                    "suggested_goals": [],
+                    "message": (
+                        f"The original strategic goal is already {original['status']}; "
+                        "supervise or reprioritize it instead of creating a retry."
+                    ),
+                }
             if lesson["status"] == "deferred" and lesson["scope"] == "goal":
                 evaluation = self.evaluate_retry(lesson, observation)
                 if evaluation["met"]:
@@ -937,7 +1499,13 @@ class GoalLearning:
                 continue
             evaluation = self.evaluate_retry(lesson, observation)
             if evaluation["met"]:
-                self.storage.update_goal_lesson(lesson["id"], "unlocked", evidence=evaluation)
+                updated = self.storage.update_goal_lesson(
+                    lesson["id"], "unlocked", evidence=evaluation
+                )
+                self._release_matching_farm_quarantine(
+                    updated,
+                    reason="matching farm lesson retry predicate was satisfied",
+                )
                 return None
             return {"lesson": self.public_lesson(lesson, evaluation=evaluation), "tactic_key": key}
         return None
@@ -946,13 +1514,13 @@ class GoalLearning:
     def _suggested_goals(classification: str, profile: dict[str, Any]) -> list[str]:
         if classification in {"insufficient_combat_power", "missing_capability"}:
             return [
-                f"Raise max HP above {profile.get('max_health')} through safer progression, then return to the Tos Inn bar.",
-                "Acquire or improve combat equipment, a relevant trained skill, or verified healing supplies, then return to the Tos Inn bar.",
+                f"Raise max HP above {profile.get('max_health')} through safer progression, then satisfy any explicit finish criteria.",
+                "Acquire or improve combat equipment, a relevant trained skill, or verified healing supplies, then satisfy any explicit finish criteria.",
             ]
         if classification == "invalid_reference":
             return ["Choose a verified destination or target from knowledge_search; do not invent aliases."]
         if classification == "route_unavailable":
-            return ["Reach a connected staging room using verified numeric exits, then return to the Tos Inn bar."]
+            return ["Reach a connected source-verified safe staging room using verified numeric exits, then satisfy any explicit finish criteria."]
         if classification == "world_unavailable":
             return ["Pursue safe progression while waiting for the required player, NPC, or world condition."]
         return ["Choose a materially different tactic or supporting progression goal before retrying."]
@@ -977,10 +1545,16 @@ class GoalLearning:
             classified, inferred_scope, confidence = "route_unavailable", "tactic", 0.9
         classification = classification or classified
         scope = scope or inferred_scope
-        if block is None:
-            # A tactic lesson suppresses only that exact tactic. Blocking the whole
-            # goal here caused recoverable pathing failures to strand the campaign.
-            block = scope == "goal"
+        # Lessons constrain future decisions; they never own the strategic-goal
+        # lifecycle.  Earlier builds treated a goal-scoped lesson as authority to
+        # transition the active goal to ``blocked``.  That made one combat, route,
+        # merchant, or world-state conclusion strand the outcome instead of
+        # letting campaign management choose another tactic or supporting phase.
+        # Keep ``block`` in the signature for stored callers and older extensions,
+        # but deliberately ignore it. Lifecycle handling, such as a recoverable
+        # pause for an invalid contract or ambiguous mutation, belongs to the
+        # controller rather than to a learned failure classification.
+        block = False
         if classification not in FAILURE_CLASSES:
             raise ValueError(f"unknown goal failure classification {classification}")
         profile = self.profile(observation)
@@ -989,6 +1563,13 @@ class GoalLearning:
             "arguments": arguments or {},
             "room": profile.get("room"),
         }
+        if retry_when is None and self._is_farm_survivability_failure(
+            profile["failed_tactic"], reason, event_kind
+        ):
+            # This remains tactic-scoped, so other rooms and prey stay usable.
+            # The exact unsafe farm has no time-only unlock: require a measured
+            # readiness gain before repeating it unchanged.
+            retry_when = self._retry_when("insufficient_combat_power", profile)
         if (
             retry_when is None
             and tool == "shop"
@@ -1027,14 +1608,12 @@ class GoalLearning:
                 "suggested_goals": self._suggested_goals(classification, profile),
             }
         )
-        blocked = None
-        if block and goal.get("status") == "active":
-            blocked_reason = {
-                "invalid_reference": "invalid_game_reference",
-                "world_unavailable": "world_unavailable",
-            }.get(classification, "prerequisite_not_met" if scope == "goal" else "repeated_non_progress")
-            blocked = self.storage.block_goal(goal["id"], reason=reason, blocked_reason=blocked_reason)
-        return {"lesson": lesson, "goal": blocked, "goal_blocked": blocked is not None}
+        return {
+            "lesson": lesson,
+            "goal": None,
+            "goal_blocked": False,
+            "strategic_goal_preserved": goal.get("status") == "active",
+        }
 
     def maybe_defer(
         self,
@@ -1046,7 +1625,31 @@ class GoalLearning:
         reason: str,
         event: dict[str, Any],
     ) -> dict[str, Any] | None:
-        relevant = self.storage.goal_events(goal["id"], kinds=["action.no_progress", "action.failed"], limit=100)
+        history = self.storage.goal_events(
+            goal["id"],
+            kinds=["action.no_progress", "action.failed", "action.succeeded"],
+            limit=200,
+        )
+        cutoff = time.time() - float(self.config.failure_evidence_window_seconds)
+        recent = [
+            item
+            for item in history
+            if self._parse_time(str(item.get("occurred_at") or "")) >= cutoff
+        ]
+        last_progress_at = max(
+            [
+                self._parse_time(str(item.get("occurred_at") or ""))
+                for item in recent
+                if item.get("kind") == "action.succeeded"
+            ]
+            or [cutoff]
+        )
+        relevant = [
+            item
+            for item in recent
+            if item.get("kind") in {"action.no_progress", "action.failed"}
+            and self._parse_time(str(item.get("occurred_at") or "")) > last_progress_at
+        ]
         key = self.tactic_key(tool, arguments, observation)
         matching = [
             item
@@ -1279,7 +1882,14 @@ class GoalLearning:
             "eligible_retries": [
                 self.public_lesson(item)
                 for item in unlocked
-                if item.get("scope") == "goal" and not item.get("resolution_goal_id")
+                if item.get("scope") == "goal"
+                and not item.get("resolution_goal_id")
+                and (
+                    (original := self.storage.goal(str(item.get("goal_id") or "")))
+                    is None
+                    or original.get("status")
+                    not in {"queued", "active", "paused"}
+                )
             ][:10],
             "retries_in_progress": [
                 self.public_lesson(item)

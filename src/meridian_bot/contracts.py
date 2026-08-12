@@ -21,6 +21,7 @@ CRITERION_KINDS = (
 # legacy engagement kind remains accepted only so pre-phase PvP goals can be
 # loaded and upgraded; new guidance uses the correlated phase event instead.
 GOAL_EVENT_KINDS = (
+    "raza.left",
     "pvp.phase.completed",
     "property.transaction",
     "conversation.responded",

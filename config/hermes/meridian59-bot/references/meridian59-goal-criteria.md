@@ -20,7 +20,7 @@ Do not copy paths from the public MCP status response. In particular, `game.*`, 
 Schema validity also does not override durable campaign memory. `GOAL_DEFERRED`
 means the controller has grouped the criteria with a prior failed outcome and
 its observed retry predicate is still false. Changing ids, title, prose,
-`after_cursor`, or the standard Tos Inn completion criteria is not a new goal.
+`after_cursor`, or ancillary finish-location/coordinate criteria is not a new goal.
 Issue a supporting progression goal and retry only after `goal.retry_unlocked`.
 
 ## Verified observation paths

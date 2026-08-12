@@ -16,7 +16,7 @@ autojoin = true
 
 [harness]
 root = "../vendor/m59-harness"
-expected_revision = "4a2428739505ed8e05a98ddcbac4c41e6f941895"
+expected_revision = "f19549e86be52cd861ec6151be5f7b19d882d7d5"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -31,11 +31,11 @@ name = "YOUR_MODEL_ID"
 auth_mode = "none"
 planner_timeout_seconds = 90
 responder_timeout_seconds = 45
-max_output_tokens = 1200
+max_output_tokens = 4096
 temperature = 0.2
 # Disable when the endpoint does not implement OpenAI JSON response format.
 json_mode = true
-# Enable only for servers/models that implement Qwen-style enable_thinking.
+# Recommended for Qwen. Enable only for models implementing Qwen-style enable_thinking.
 disable_thinking = false
 
 [controller]

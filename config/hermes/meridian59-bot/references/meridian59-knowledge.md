@@ -99,8 +99,8 @@ compare them with `campaign_memory.combat_readiness` and `combat_history`. Choos
 the smallest viable gap; after a death or uncertain equipment, prefer a `+1` HP
 phase or a capability-supporting goal instead of a multiple-of-five milestone.
 Keep the goal bounded, use live financial context before danger, preserve the character's life, and append the
-Tos Inn bar completion criteria unless the user explicitly requires another
-finish. See `meridian59-new-player-doctrine.md` for the decision ladder.
+location or coordinate completion criteria only when the user explicitly
+requires that finish. See `meridian59-new-player-doctrine.md` for the decision ladder.
 
 The compact result's `live_development` is current build evidence: known
 skills/spells, 0-100 values, freshness, recent changes/atrophy, and spell

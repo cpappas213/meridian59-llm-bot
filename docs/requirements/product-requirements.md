@@ -106,7 +106,11 @@ revising tactics in service of the active goal.
   constraints, priority, provenance, timestamps, and a durable status.
 - **FR-GOAL-005**: The controller shall promote the highest-priority eligible
   queued goal when no active goal exists. Equal priorities shall retain queue
-  order.
+  order. After a bounded campaign phase succeeds at its verified safe ending
+  and all keeper control is released, a strictly higher-priority queued goal
+  shall cooperatively preempt the active goal. The interrupted goal shall be
+  atomically requeued with its campaign state preserved so it resumes through
+  ordinary scheduler promotion after the higher-priority work terminates.
 - **FR-GOAL-006**: Pausing or cancelling an active goal shall first place the
   character in the safest practical stable state, unless an immediate survival
   action is already necessary.
@@ -115,9 +119,12 @@ revising tactics in service of the active goal.
   active.
 - **FR-GOAL-008**: Goal completion shall require evidence satisfying each success
   criterion. An LLM assertion alone is not evidence.
-- **FR-GOAL-009**: A goal blocked by a no-cheating policy conflict, missing
-  capability, repeated failure, or external outage shall become `blocked` with a machine-readable
-  reason and a recommended operator action.
+- **FR-GOAL-009**: Controller-observed policy conflict, missing capability,
+  repeated failure, death, or external outage shall not transition a strategic
+  goal to `blocked`. The controller shall retain machine-readable evidence,
+  stabilize immediate danger, suppress only disproved tactics, and preserve the
+  goal for another tactic or supporting phase. An invalid contract or ambiguous
+  mutation may be recoverably paused rather than guessed through.
 - **FR-GOAL-010**: The controller may generate proposed goals from observed
   opportunities or risks. Proposals shall not become active until the supervisor or the
   user accepts them as queue-management decisions.
@@ -132,23 +139,41 @@ revising tactics in service of the active goal.
 - **FR-GOAL-013**: A bounded goal failure shall create a durable typed lesson
   containing evidence, failed character/world state, goal-or-tactic scope, and
   a deterministic retry predicate.
-- **FR-GOAL-014**: The controller shall reject a materially equivalent
-  goal-scoped retry until ordinary-client observation satisfies its predicate.
-  Title, criterion-id, event-cursor, and default-home changes shall not bypass
-  equivalence.
+- **FR-GOAL-014**: While an equivalent strategic goal remains active, queued,
+  or paused, the controller shall reject a duplicate retry and direct supervision
+  to the preserved goal. If the original is no longer open, a goal-scoped retry
+  remains ineligible until ordinary-client observation satisfies its predicate.
+  Title, criterion-id, event-cursor, and ancillary finish-state changes shall not
+  bypass equivalence.
 - **FR-GOAL-015**: A tactic-scoped lesson shall suppress only the same failed
   action shape and shall not prevent a different tactic or supporting campaign
   goal.
-- **FR-GOAL-016**: An eligible retry shall link to the failed goal, and verified
-  success shall resolve matching open lessons.
+- **FR-GOAL-016**: When the original goal is no longer open, an eligible retry
+  shall link to it; an open original shall replan in place. Verified success
+  shall resolve matching open lessons.
 - **FR-GOAL-017**: The controller shall reject cancellation of a fresh active
   goal unless the operator explicitly requested it or evidence verifies a
   safety emergency, invalid goal, durable stall, or committed supersession.
   Replacing ordinary active work shall preserve it as paused by default.
 - **FR-GOAL-018**: On startup and after each fresh broker observation, the
-  controller shall deterministically evaluate paused and blocked goals and mark
-  any goal whose complete typed criterion set is verified as `succeeded`
-  without invoking the planning model.
+  controller shall requeue legacy controller-blocked goals, deterministically
+  evaluate inactive goals, latch a verified complete typed criterion set without
+  invoking the planning model, and mark it `succeeded` only when its previously
+  model-selected safe ending is also verified. Otherwise it remains resumable
+  for the required safe return.
+- **FR-GOAL-019**: Controller-owned purchase and training flows shall perform
+  post-acquisition travel or positioning only when the approved goal contains
+  the corresponding location or coordinate success criteria. No city, inn, or
+  square shall be an implicit goal criterion; the separate model-selected safe
+  ending required by FR-GOAL-020 is completion hygiene, not goal scope.
+- **FR-GOAL-020**: Every accepted execution plan shall declare an exact safe
+  ending chosen by the configured planning model from source-grounded options.
+  The controller shall reject a missing ending, an ending without
+  `ROOM_SANCTUARY` or `ROOM_NO_COMBAT`, a non-final/non-travel ending step, or a
+  mismatched runtime travel target. Once active campaign-phase criteria or public
+  goal criteria are verified, the controller shall latch that outcome, permit
+  only the ending step, freshly verify arrival and safety flags, and only then
+  advance the campaign phase or set the goal `succeeded`.
 
 ### 4.3 Autonomous play
 
@@ -173,6 +198,10 @@ revising tactics in service of the active goal.
 - **FR-PLAY-008**: A bounded harness autopilot may perform repetitive mechanical
   work selected by the planner, but the controller remains responsible for
   monitoring progress, detecting stalls, and changing tactics.
+- **FR-PLAY-018**: A farm keeper shall launch only from a room whose pinned
+  source facts include `ROOM_SANCTUARY` or `ROOM_NO_COMBAT`. The controller may
+  reuse source-revalidated live staging history or select a connected/same-region
+  safe candidate, but shall not infer a fixed home city from the farm region.
 - **FR-PLAY-012**: A PvP search shall visit multiple grounded public rooms and
   acquire an attack target only from a fresh local observation. A global online
   list shall not establish local attackability. The controller shall immediately
@@ -213,8 +242,11 @@ revising tactics in service of the active goal.
 
 - **FR-CONV-001**: In-game conversation shall be generated by an isolated responder
   model call with no controller, broker, filesystem, network, or shell tools.
-- **FR-CONV-002**: The supervisor shall be able to set and update the active conversation
-  persona through the Hermes integration. Persona revisions shall be versioned.
+- **FR-CONV-002**: The supervisor shall be able to set and update the active
+  character persona through the Hermes integration. Persona revisions shall be
+  versioned. Both campaign and tactical planning calls shall receive the full
+  active persona and may use it to choose among equally safe, goal-compatible
+  strategies and ending locations; it shall not override goal or policy.
 - **FR-CONV-003**: The responder may receive persona, recent sanitized conversation,
   public game context, relationship notes, and response-length/style limits.
 - **FR-CONV-004**: The responder shall not receive account credentials, internal

@@ -35,6 +35,19 @@ ANSI_STYLES = {
 class ControllerApiError(RuntimeError):
     """The local controller API rejected or could not service a TUI request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+        self.retryable = retryable
+
 
 class ControllerApi:
     def __init__(self, config: BotConfig, *, timeout: float = 4.0):
@@ -80,7 +93,13 @@ class ControllerApi:
                 error = {}
             code = error.get("code", f"HTTP_{exc.code}") if isinstance(error, dict) else f"HTTP_{exc.code}"
             message = error.get("message", exc.reason) if isinstance(error, dict) else exc.reason
-            raise ControllerApiError(f"{code}: {message}") from exc
+            details = error.get("details", {}) if isinstance(error, dict) else {}
+            raise ControllerApiError(
+                f"{code}: {message}",
+                code=str(code),
+                details=details if isinstance(details, dict) else {},
+                retryable=bool(error.get("retryable")) if isinstance(error, dict) else False,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ControllerApiError(f"controller unavailable at {self.base_url}: {reason}") from exc
@@ -381,6 +400,19 @@ def render_dashboard(
                             color,
                         )
                     )
+            if any(
+                isinstance(criterion, dict)
+                and criterion.get("kind") == "operator_confirmed"
+                and criterion.get("met") is not True
+                for criterion in criteria
+            ):
+                lines.append(
+                    _paint(
+                        "  Manual confirmation pending: press M, select this goal, then F after the other criteria pass.",
+                        "yellow",
+                        color,
+                    )
+                )
     else:
         lines.append("No active, paused, or blocked goal. The bot is strategically idle.")
 
@@ -783,7 +815,62 @@ def prompt_new_goal(
 
     while True:
         print("\nAsking the configured model to construct and validate the goal...")
-        response = api.draft_goal(prompt, current_goal=current_goal)
+        try:
+            response = api.draft_goal(prompt, current_goal=current_goal)
+        except ControllerApiError as exc:
+            print(f"\nThe draft did not pass validation: {exc}")
+            errors = exc.details.get("errors", [])
+            if isinstance(errors, list):
+                for error in errors:
+                    if not isinstance(error, dict):
+                        continue
+                    print(f"- {error.get('message', error.get('code', 'invalid draft'))}")
+                    candidates = error.get("purchase_plan_candidates", [])
+                    if isinstance(candidates, list):
+                        for candidate in candidates[:5]:
+                            if not isinstance(candidate, dict):
+                                continue
+                            print(
+                                "  valid training option: "
+                                f"{candidate.get('merchant_class')} in room {candidate.get('room_id')} "
+                                f"for at most {candidate.get('maximum_price')}"
+                            )
+            failed_draft = exc.details.get("canonical_goal")
+            if isinstance(failed_draft, dict):
+                allowed = {
+                    "title",
+                    "objective",
+                    "success_criteria",
+                    "constraints",
+                    "priority",
+                    "activation",
+                }
+                current_goal = {
+                    key: value for key, value in failed_draft.items() if key in allowed
+                }
+                print("The invalid structured draft has been retained for repair.")
+            while True:
+                recovery = _prompt_required(
+                    "[R]etry, [M]odify the request, [C]ancel, or [Esc] back: ",
+                    input_fn,
+                )
+                if recovery is None or recovery.casefold() in {"c", "cancel"}:
+                    print("Goal creation cancelled; nothing was submitted.")
+                    return None
+                if recovery.casefold() in {"r", "retry"}:
+                    break
+                if recovery.casefold() in {"m", "modify"}:
+                    revised_prompt = _prompt_required(
+                        "Describe what the model should change ([Esc] back): ",
+                        input_fn,
+                    )
+                    if revised_prompt is None:
+                        print("Goal creation cancelled; nothing was submitted.")
+                        return None
+                    prompt = revised_prompt
+                    break
+                print("Choose R to retry, M to modify, or C to cancel.")
+            continue
         draft = response.get("goal")
         if not isinstance(draft, dict):
             raise ControllerApiError("controller returned no structured goal draft")
@@ -869,6 +956,9 @@ def prompt_goal_command(
         for item in success_criteria
     ):
         choices.append("confirm_complete")
+        print(
+            "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes."
+        )
     action_keys = {
         "pause": "p",
         "resume": "r",
@@ -881,7 +971,7 @@ def prompt_goal_command(
         "resume": "[R]esume",
         "reprioritize": "[E]dit priority",
         "cancel": "[C]ancel",
-        "confirm_complete": "Con[F]irm operator criterion",
+        "confirm_complete": "Con[F]irm manual criterion",
     }
     print(
         "Actions: "
@@ -932,7 +1022,7 @@ def prompt_goal_command(
         payload["cause"] = "operator_requested"
     if action == "confirm_complete":
         confirmation = _form_input(
-            "Type CONFIRM to verify the operator criterion ([Esc] back): ",
+            "Type CONFIRM to attest the manual criterion and complete the goal ([Esc] back): ",
             input_fn,
         )
         if confirmation is None:
@@ -1028,7 +1118,8 @@ def run_tui(
             if key == "h":
                 message = (
                     "N turns a plain-language request into a model-authored goal for your approval; "
-                    "M manages goals; S shows complete skills, spells, inventory, and equipment; "
+                    "M manages goals (use F there to confirm a pending manual criterion); "
+                    "S shows complete skills, spells, inventory, and equipment; "
                     "Esc cancels any subpage and returns here."
                 )
                 continue

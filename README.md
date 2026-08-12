@@ -113,8 +113,11 @@ timezone names. Unix-like systems continue to use their system timezone data.
 
 The default request contract uses OpenAI JSON response mode. If an otherwise
 compatible endpoint does not implement `response_format`, set
-`model.json_mode=false`. `model.disable_thinking` is off by default and should be
-enabled only for servers/models that support Qwen-style `enable_thinking`.
+`model.json_mode=false`. Setup asks whether to disable model thinking and
+recommends doing so for Qwen models because reasoning tokens count against the
+completion budget and can delay controller actions. `model.disable_thinking`
+should be enabled only for servers/models that support Qwen-style
+`enable_thinking`; generic endpoints default to keeping their normal behavior.
 `model.auth_mode` accepts `none`, `bearer`, or `anthropic`; legacy configurations
 without it use `auto`, which sends Bearer auth only when a model key exists.
 
@@ -144,12 +147,27 @@ broker remain loopback-only.
 4. Press `N` in the terminal dashboard and describe the first high-level goal in
    plain language. The configured model constructs a validated structured draft
    for approval. Press `M` to pause, resume, cancel, reprioritize, or confirm an
-   operator criterion.
+   operator criterion. To provide that confirmation, press `M`, select the goal,
+   press `F`, and type `CONFIRM`. The controller accepts it only after every
+   observable criterion in that goal is already verified. Confirmation latches
+   the outcome; the goal becomes terminal only after the character reaches the
+   model-selected, source-verified safe ending in its execution plan.
 
 To run or revise persona setup independently, use `setup-persona`. With no
 arguments it prompts for the name, voice, traits, speech style, values, taboos,
 relationship defaults, and reply limit. An existing persona is preserved unless
 `--update-existing` is explicit.
+
+The complete active persona is supplied to both long-horizon campaign planning
+and tactical planning. It can shape choices among equally safe, goal-compatible
+strategies—including which source-verified safe location ends a plan—but cannot
+override the operator's goal or controller policy.
+
+Every accepted tactical plan must end with exact travel to a source-verified
+safe location selected by the model. When an internal campaign phase or the
+public goal becomes complete, the controller latches that result, permits only
+the declared safe-ending step, and advances only after fresh room and safety
+verification.
 
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional

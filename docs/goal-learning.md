@@ -32,12 +32,13 @@ Statuses are:
 - `deferred`: the predicate is false; an equivalent goal or exact tactic is
   suppressed according to scope.
 - `unlocked`: a fresh ordinary-client observation satisfied the predicate and a
-  materially revised retry may be submitted.
+  materially revised tactic may be used. A new goal is needed only when the
+  original strategic goal is no longer open.
 - `resolved`: verified success of the goal family resolved the lesson.
 
 Goal-family identity is based on normalized deterministic outcome criteria. It
-ignores titles, criterion IDs, `event_occurred.after_cursor`, and the standard
-Tos Inn bar completion phase. Those fields cannot be changed to evade a lesson.
+ignores titles, criterion IDs, `event_occurred.after_cursor`, and ancillary
+finish-location/coordinate criteria. Those fields cannot be changed to evade a lesson.
 At most one equivalent active, queued, or paused goal is retained. A direct
 duplicate submission returns the existing canonical goal rather than creating
 another retry.
@@ -46,8 +47,8 @@ another retry.
 
 | Classification | Typical scope | Retry evidence |
 |---|---|---|
-| `insufficient_combat_power` | goal | max HP/mana increase, or attributes, equipment, skills, or abilities change |
-| `missing_capability` | goal | the same capability-profile changes |
+| `insufficient_combat_power` | goal | max HP/mana increase, healing supplies increase, or a monotonic attributes/equipment/skills/abilities gain |
+| `missing_capability` | goal | the same monotonic capability-profile gains |
 | `route_unavailable` | tactic | character changes room or the knowledge corpus changes |
 | `world_unavailable` | goal | capability changes or the configured world cooldown elapses |
 | `invalid_reference` | goal | knowledge corpus version changes |
@@ -72,31 +73,68 @@ Combat readiness deliberately has no time-only unlock. If PvP or a hunt proved
 too dangerous at 25 max HP, waiting an hour cannot make the same fight viable;
 the character must measurably improve.
 
-Farm quarantine is the corresponding fast runtime gate. For legacy
-health-threshold quarantines that predate an explicit predicate, startup compares
-the current character with the closest pre-quarantine combat evidence for the
-same room and prey. A verified max-HP increase or equipment change releases that
-survivability tactic for a bounded retry. Death evidence and structural failures
-such as no usable safe spot, unreachable fight geometry, or a live over-level
-hazard do not unlock merely because the character improved.
+Capability comparison uses semantic equipment identity (normalized item name
+and slot), never a session-local object id. A reconnect that assigns a new id to
+the same equipped weapon is therefore not retry evidence. Equipment loss after
+death is also not an improvement: known equipment and structured capability
+components must increase without a known loss. Aggregate capability hash
+migrations are checked against those stored failed-state components so a
+controller upgrade cannot manufacture an improvement.
 
-The operator-owned farm flee policy is also part of tactic identity. Lowering
-that boundary from an older value releases only quarantines whose sole evidence
-was reaching the former threshold without a withdrawal or death. It does not
-erase a wall failure, structural hazard, withdrawal, or death record.
+Farm quarantine is the corresponding fast runtime gate. Crossing the configured
+flee boundary once is an ordinary recovery event: the keeper retains control,
+the phase remains active, and no lesson or quarantine is created. Two distinct
+retreat/withdrawal episodes for the exact room, prey, and safe-spot strategy
+inside 30 minutes quarantine that tactic. A death, lethal safe-spot failure,
+depleted healing margin, or verified live over-level hazard still quarantines
+immediately. An over-level hazard uses a specific retry predicate: max HP must
+reach the level required by the configured danger margin, or the pinned source
+corpus must change. It cannot unlock from a generic cooldown or unrelated
+equipment-id churn. The same no-timeout rule applies once repeated retreats,
+safe-spot failures, or depleted healing margin establish an exact farm
+survivability failure. Other room/prey tactics remain available while that one
+stays quarantined until readiness measurably improves.
+
+Startup removes legacy quarantines whose sole evidence was an ordinary
+flee-threshold crossing. Other survivability quarantines may be released after a
+verified max-HP or equipment improvement. When the deterministic retry predicate
+of an exact farm lesson unlocks, its matching runtime quarantine and retreat
+counter are released in the same reconciliation step so the two gates cannot
+contradict one another.
+
+Progression research keeps `avoid_rooms` only as a diversity preference. It
+prefers an exact room/prey tactic that recently completed a milestone, then an
+eligible new room, and finally a recently considered room. Recent use by itself
+never quarantines or rejects a tactic; only retained safety, stagnation, or
+durable route evidence can do that. This lets finite hunting-ground tables reuse
+proven farms across adjacent max-HP milestones without falsely exhausting every
+candidate.
+
+Every proposed farm room is also checked against its complete source spawn
+table. A safe requested prey does not make a room valid when another
+source-listed monster exceeds the character's danger limit. An exhausted
+candidate set is retained as campaign evidence, not promoted into a
+strategic-goal block. The controller re-evaluates recorded candidates after
+lesson, quarantine, route, or survivability changes while preserving the
+original outcome. A newly executable candidate can therefore become the next
+phase without creating a replacement goal.
 
 ## Runtime behavior
 
-At startup the controller backfills eligible prior blocked/failed goals, then
-evaluates all deferred predicates against the fresh live observation. Each turn
-it repeats that evaluation before planning.
+At startup the controller backfills lessons from prior blocked/failed goals,
+requeues every legacy controller-blocked strategic goal, and then evaluates all
+deferred predicates against the fresh live observation. Each turn repeats that
+repair and evaluation before planning.
 
-Lessons are created when any bounded budget is exhausted:
+Lessons are created when any bounded budget is exhausted. Ordinary action
+failures count only when they are consecutive after the last verified action
+success and occurred inside the configured evidence window; old or recovered
+failures cannot accumulate forever:
 
 - repeated semantic no-progress or broker action failure;
 - repeating an exact known-failed action;
 - ten consecutive planner waits by default;
-- three critical-health/survival interrupts by default; or
+- repeated retreat or death evidence for one exact combat/farm tactic; or
 - an active legacy goal contains an invalid static reference.
 
 Banking, routing, shopping, equipment, and evidence lookup are preparation
@@ -104,11 +142,13 @@ tactics. Exhausting their aggregate budget cannot by itself establish that the
 campaign outcome is impossible; their lessons remain tactic-scoped. Startup
 repairs legacy whole-goal lessons that were inferred from those failures.
 
-A goal-scoped lesson causes direct submissions and proposal acceptance to return
-structured `GOAL_DEFERRED` (HTTP 409, `retryable: false`). The error includes the
-public lesson, unmet condition details, and suggested supporting goals. A
-tactic-scoped lesson suppresses only the matching tool, arguments, and room; the
-planner can and should choose a different route or method.
+A goal-scoped lesson never changes the original goal to `blocked`. While that
+goal remains active, queued, or paused, an equivalent submission returns
+structured `GOAL_ALREADY_OPEN` and points supervision back to the preserved
+goal. If the original is no longer open and its retry predicate is still false,
+the response is `GOAL_DEFERRED` (HTTP 409, `retryable: false`). A tactic-scoped
+lesson suppresses only the matching tool, arguments, and room; the planner can
+and should choose a different route or method.
 
 Idempotent replay is checked before the learning gate, so replaying an identical
 already-committed request returns its original result. A newly eligible retry is
@@ -125,13 +165,15 @@ The existing six-tool Hermes contract is unchanged. `status` adds:
 
 - `campaign_memory.deferred_goals`
 - `campaign_memory.deferred_tactics`
-- `campaign_memory.eligible_retries`
+- `campaign_memory.eligible_retries` (only when the original goal is no longer open)
 - attention counts for deferred goals and eligible retries
 
 Diagnostic status additionally includes raw public lesson records. Useful event
 kinds are `goal.lesson.created`, `goal.reissue_suppressed`,
-`goal.retry_unlocked`, `goal.retry.started`, `goal.lesson.resolved`, and
-`action.lesson_suppressed`.
+`goal.retry_unlocked`, `tactic.retry_unlocked`, `goal.retry.started`,
+`goal.lesson.resolved`, and `action.lesson_suppressed`. Goal and tactic unlocks
+use distinct event kinds. Repeated survival incidents emit planning evidence
+but never block the strategic goal.
 
 New lessons also expose `failed_tactic` (tool, arguments, and room) so Hermes and
 the planner can distinguish an unchanged retry from a materially different
@@ -152,11 +194,14 @@ Optional `[learning]` settings default to:
 enabled = true
 no_progress_budget = 6
 repeated_tactic_budget = 3
+failure_evidence_window_seconds = 900
 wait_budget = 10
 survival_interrupt_budget = 3
 world_retry_cooldown_seconds = 1800
 generic_retry_cooldown_seconds = 3600
 ```
 
-Changing budgets affects future classification. Existing lessons keep their
+Changing budgets affects future classification. `survival_interrupt_budget`
+controls only when the controller emits repeated-handoff planning telemetry; it
+never authorizes a goal lifecycle transition. Existing lessons keep their
 stored predicates and evidence.

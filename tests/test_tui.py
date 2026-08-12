@@ -5,6 +5,7 @@ import io
 import unittest
 
 from meridian_bot.tui import (
+    ControllerApiError,
     prompt_goal_command,
     prompt_new_goal,
     render_character_status,
@@ -225,6 +226,22 @@ class TuiTests(unittest.TestCase):
         self.assertIn("\x1b[32mrunning\x1b[0m", rendered)
         self.assertIn("\x1b[1;36m", rendered)
 
+    def test_dashboard_explains_pending_manual_confirmation(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["goal"]["criteria"].append(
+            {
+                "id": "human",
+                "kind": "operator_confirmed",
+                "met": False,
+                "detail": "awaiting explicit operator confirmation",
+            }
+        )
+
+        rendered = render_dashboard(status, api.goals(), api.events(), width=110)
+
+        self.assertIn("press M, select this goal, then F", rendered)
+
     def test_detailed_character_status_lists_every_requested_category(self) -> None:
         api = FakeApi()
 
@@ -313,6 +330,73 @@ class TuiTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(1, len(api.draft_requests))
 
+    def test_goal_validation_failure_stays_in_editor_and_retains_draft(self) -> None:
+        class FailingOnceApi(FakeApi):
+            def draft_goal(
+                self,
+                prompt: str,
+                *,
+                current_goal: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                self.draft_requests.append(
+                    {"prompt": prompt, "current_goal": current_goal}
+                )
+                if len(self.draft_requests) == 1:
+                    invalid = {
+                        "title": "Acquire slash",
+                        "objective": "Acquire the slash skill.",
+                        "success_criteria": [
+                            {
+                                "id": "slash",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.slash",
+                                "value": 1,
+                            }
+                        ],
+                        "constraints": {},
+                        "priority": 50,
+                        "activation": "queue",
+                    }
+                    raise ControllerApiError(
+                        "KNOWLEDGE_VALIDATION_FAILED: purchase plan required",
+                        code="KNOWLEDGE_VALIDATION_FAILED",
+                        details={
+                            "canonical_goal": invalid,
+                            "errors": [
+                                {
+                                    "code": "PURCHASE_PLAN_REQUIRED",
+                                    "message": "A verified training plan is required.",
+                                    "purchase_plan_candidates": [
+                                        {
+                                            "merchant_class": "CorNothSergeant",
+                                            "room_id": 50,
+                                            "maximum_price": 500,
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    )
+                return {
+                    "goal": self.drafts[0],
+                    "validation": {"warnings": []},
+                }
+
+        api = FailingOnceApi()
+        answers = iter(["Acquire slash.", "retry", "approve"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            payload = prompt_new_goal(api, input_fn=lambda _: next(answers))
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(2, len(api.draft_requests))
+        self.assertEqual(
+            "Acquire slash",
+            api.draft_requests[1]["current_goal"]["title"],
+        )
+        self.assertIn("retained for repair", output.getvalue())
+        self.assertIn("CorNothSergeant in room 50", output.getvalue())
+
     def test_goal_management_uses_selected_version_and_explicit_cancel(self) -> None:
         goals = FakeApi().goals()
         pause_answers = iter(["1", "p"])
@@ -351,6 +435,29 @@ class TuiTests(unittest.TestCase):
             "New priority (0 lowest, 100 highest) [50; Esc to go back]: ",
             reprioritize_prompts,
         )
+
+        confirm_goals = [
+            {
+                "id": "goal-confirm",
+                "title": "Human verification",
+                "status": "active",
+                "version": 4,
+                "priority": 50,
+                "success_criteria": [
+                    {"id": "human", "kind": "operator_confirmed"}
+                ],
+            }
+        ]
+        confirm_answers = iter(["1", "f", "CONFIRM"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            goal_id, confirm = prompt_goal_command(
+                confirm_goals, input_fn=lambda _: next(confirm_answers)
+            ) or (None, None)
+        self.assertEqual("goal-confirm", goal_id)
+        self.assertEqual("confirm_complete", confirm["action"])
+        self.assertEqual(4, confirm["expected_version"])
+        self.assertIn("only after every observable criterion passes", output.getvalue())
 
     def test_escape_cancels_goal_creation_from_each_prompt_stage(self) -> None:
         initial = FakeApi()
