@@ -5333,6 +5333,56 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Do not retry the same item with this merchant", archaic_guidance)
         self.assertTrue(BotController._failure_invalidates_plan("sell", archaic_reason))
 
+    def test_tactical_context_retains_goal_blocked_actions_after_feedback_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="blocked-tactic-context")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.set_runtime(
+                    "blocked_actions",
+                    [
+                        {
+                            "goal_id": "other-goal",
+                            "tool": "sell",
+                            "arguments": {"to": 1, "items": [2]},
+                            "room": 10,
+                            "reason": "irrelevant",
+                        },
+                        {
+                            "goal_id": goal["id"],
+                            "tool": "sell",
+                            "arguments": {"to": 736, "items": [7525, 7526]},
+                            "room": 106,
+                            "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                            "suppressed_count": 1,
+                        },
+                    ],
+                )
+
+                context = controller._campaign_context(run, None, audience="tactical")
+
+                self.assertEqual(
+                    [
+                        {
+                            "tool": "sell",
+                            "arguments": {"to": 736, "items": [7525, 7526]},
+                            "room": 106,
+                            "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                            "suppressed_count": 1,
+                        }
+                    ],
+                    context["verified_no_progress_tactics"],
+                )
+                self.assertIn(
+                    "do not restore an exact failed tool/argument/room tactic",
+                    context["instructions"],
+                )
+            finally:
+                controller.storage.close()
+
     def test_sell_all_with_only_refusals_is_factual_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
             {

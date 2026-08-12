@@ -12,6 +12,28 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_compact_campaign_attempt_preserves_verified_failure_reason(self) -> None:
+        compact = CampaignCoordinator._compact_attempt(
+            {
+                "id": "attempt-1",
+                "semantic_action": "sell",
+                "status": "failed",
+                "result": {"messages": ["merchant dialogue omitted from compact context"]},
+                "verification": {
+                    "no_progress": True,
+                    "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                },
+            }
+        )
+
+        self.assertEqual(
+            {
+                "no_progress": True,
+                "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+            },
+            (compact or {}).get("verification"),
+        )
+
     def test_inventory_not_full_uses_known_broker_capacity_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:

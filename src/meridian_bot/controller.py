@@ -10607,6 +10607,36 @@ class BotController:
             value = self.campaign.tactical_context(run, phase)
         else:
             raise ValueError("campaign context audience must be manager or tactical")
+        blocked_actions = self.storage.get_runtime("blocked_actions", [])
+        if isinstance(blocked_actions, list):
+            verified_no_progress = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "tool",
+                        "arguments",
+                        "room",
+                        "reason",
+                        "suppressed_count",
+                        "updated_at",
+                    )
+                    if item.get(key) is not None
+                }
+                for item in blocked_actions
+                if isinstance(item, dict)
+                and item.get("goal_id") == run.get("goal_id")
+            ][-12:]
+            if verified_no_progress:
+                value["verified_no_progress_tactics"] = redact(
+                    verified_no_progress
+                )
+                value["instructions"] = (
+                    str(value.get("instructions") or "")
+                    + " Treat verified_no_progress_tactics as durable negative evidence: "
+                    "do not restore an exact failed tool/argument/room tactic after travel, "
+                    "a successful unrelated action, or a plan rewrite. Change the buyer, "
+                    "offered item set, tool, or causal prerequisite."
+                ).strip()
         value["operator_contract"] = {
             "primary": "Complete the active operator-supplied strategic goal through ordinary gameplay.",
             "pvp": (

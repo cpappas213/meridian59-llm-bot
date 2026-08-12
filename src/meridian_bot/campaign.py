@@ -1636,6 +1636,21 @@ class CampaignCoordinator:
                 ]
             if compact_result:
                 compact["result"] = compact_result
+        verification = value.get("verification")
+        if isinstance(verification, dict):
+            compact_verification = {
+                key: verification.get(key)
+                for key in (
+                    "no_progress",
+                    "known_no_progress",
+                    "durably_deferred",
+                    "transient_movement_failure",
+                    "reason",
+                )
+                if verification.get(key) is not None
+            }
+            if compact_verification:
+                compact["verification"] = compact_verification
         return compact
 
     @classmethod
