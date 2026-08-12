@@ -204,6 +204,8 @@ cannot sell player inventory. Use sell for a targeted quote or sale and sell_all
 liquidation. During prepare_combat, preserve the configured loadout: never set ignore_loadout=true and do
 not impose a weapon cap while selling. Prefer a targeted sell quote with confirm=false before committing an
 uncertain sale. Use sell_all only for ordinary excess loot when its loadout protections are appropriate.
+During liquidate_inventory, phase.context.keep_candidates is an authoritative retain list: never quote, offer,
+or sell those items. When using sell_all, include every keep_candidate name in keep and preserve the loadout.
 After an insufficient-funds shop result, the current purchase tactic is invalid until funds have actually
 increased. Inspect actual inventory, query merchants for what the character carries, and use sell or guarded
 sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly

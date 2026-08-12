@@ -1877,6 +1877,69 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_liquidation_sale_guard_preserves_phase_keep_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="liquidation-sale-guards")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "liquidate_inventory",
+                        "objective": "Sell ordinary excess loot.",
+                        "success_criteria": [],
+                        "context": {"keep_candidates": ["mace", "sapphire"]},
+                    },
+                    mode="start",
+                )
+                observation = {
+                    "look": {"room": {"num": 106, "name": "Brownestone Inn"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "mace"},
+                            {"id": 88, "name": "mushroom"},
+                        ]
+                    },
+                }
+
+                with self.assertRaisesRegex(ModelError, "retained keep_candidate.*mace"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 736, "items": [77], "confirm": False},
+                        observation,
+                    )
+
+                bulk = {"merchant": 736, "keep": ["reagent"]}
+                controller._guard_prepare_combat_sale(
+                    goal, phase, "sell_all", bulk, observation
+                )
+                self.assertFalse(bulk["ignore_loadout"])
+                self.assertEqual(["mace", "reagent", "sapphire"], bulk["keep"])
+
+                plan_error = controller._protected_phase_sale_step_error(
+                    phase,
+                    {
+                        "tool": "sell",
+                        "outcome": "Get a read-only quote for the mace.",
+                    },
+                )
+                retained_error = controller._protected_phase_sale_step_error(
+                    phase,
+                    {
+                        "tool": "sell",
+                        "outcome": "Sell mushrooms while keeping the mace and sapphire.",
+                    },
+                )
+                self.assertIn("keep_candidate 'mace'", plan_error or "")
+                self.assertIsNone(retained_error)
+            finally:
+                controller.storage.close()
+
     def test_direct_prepare_combat_capability_highlights_create_weapon(self) -> None:
         context = BotController._direct_phase_capabilities(
             {"kind": "prepare_combat"},

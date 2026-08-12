@@ -1834,6 +1834,55 @@ class BotController:
         return None
 
     @staticmethod
+    def _phase_keep_candidates(phase: dict[str, Any] | None) -> list[str]:
+        context = (
+            phase.get("context")
+            if isinstance(phase, dict) and isinstance(phase.get("context"), dict)
+            else {}
+        )
+        candidates = context.get("keep_candidates")
+        if not isinstance(candidates, list):
+            return []
+        return sorted(
+            {
+                str(candidate).strip().casefold()
+                for candidate in candidates
+                if str(candidate).strip()
+            }
+        )
+
+    @classmethod
+    def _protected_phase_sale_step_error(
+        cls,
+        phase: dict[str, Any] | None,
+        step: dict[str, Any],
+    ) -> str | None:
+        """Reject plans that explicitly target phase-retained property for sale."""
+
+        if str((phase or {}).get("kind") or "") != "liquidate_inventory":
+            return None
+        if str(step.get("tool") or "") != "sell":
+            return None
+        outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+        sale_cues = tuple(re.finditer(r"\b(?:sell|quote|offer|liquidate|dispose)\b", outcome))
+        if not sale_cues:
+            return None
+        for candidate in cls._phase_keep_candidates(phase):
+            for match in re.finditer(re.escape(candidate), outcome):
+                prior_cues = [cue for cue in sale_cues if cue.start() < match.start()]
+                if not prior_cues:
+                    continue
+                phrase = outcome[prior_cues[-1].start() : match.end()]
+                if re.search(r"\b(?:keep|keeping|retain|retaining|preserve|except|excluding)\b", phrase):
+                    continue
+                return (
+                    f"targets retained keep_candidate {candidate!r} for sale. Purpose: "
+                    "liquidation may dispose of ordinary excess loot but must preserve the "
+                    "phase's explicitly retained equipment and valuables"
+                )
+        return None
+
+    @staticmethod
     def _is_plan_purchase_step(step: dict[str, Any]) -> bool:
         if step.get("tool") != "shop":
             return False
@@ -2041,6 +2090,25 @@ class BotController:
         )
         if invalid_commerce_step is not None:
             step, error = invalid_commerce_step
+            self._invalidate_execution_plan(
+                goal,
+                f"stored step {step.get('id')!r} {error}",
+            )
+            return None
+        invalid_protected_sale_step = next(
+            (
+                (step, error)
+                for step in value.get("steps", [])
+                if isinstance(step, dict)
+                if (
+                    error := self._protected_phase_sale_step_error(phase, step)
+                )
+                is not None
+            ),
+            None,
+        )
+        if invalid_protected_sale_step is not None:
+            step, error = invalid_protected_sale_step
             self._invalidate_execution_plan(
                 goal,
                 f"stored step {step.get('id')!r} {error}",
@@ -3296,6 +3364,14 @@ class BotController:
             if commerce_error is not None:
                 raise ModelError(
                     f"execution_plan step {step_id} {commerce_error}"
+                )
+            protected_sale_error = self._protected_phase_sale_step_error(
+                phase,
+                {"tool": tool, "outcome": outcome, "verification": verification},
+            )
+            if protected_sale_error is not None:
+                raise ModelError(
+                    f"execution_plan step {step_id} {protected_sale_error}"
                 )
             ids.add(step_id)
             normalized_steps.append(
@@ -12031,24 +12107,73 @@ class BotController:
         arguments: dict[str, Any],
         observation: dict[str, Any],
     ) -> None:
-        if str((phase or {}).get("kind") or "") != "prepare_combat":
+        phase_kind = str((phase or {}).get("kind") or "")
+        if phase_kind not in {"prepare_combat", "liquidate_inventory"}:
             return
+        keep_candidates = self._phase_keep_candidates(phase)
         if tool == "sell_all":
             if arguments.get("ignore_loadout") is True:
                 raise ModelError(
-                    "prepare_combat rejected sell_all with ignore_loadout=true. Purpose: "
+                    f"{phase_kind} rejected sell_all with ignore_loadout=true. Purpose: "
                     "preserve goal-relevant equipment and the character loadout while raising "
                     "funds; omit ignore_loadout or set it false"
                 )
             if arguments.get("max_weapons") is not None:
                 raise ModelError(
-                    "prepare_combat rejected sell_all with a weapon cap. Purpose: preserve all "
+                    f"{phase_kind} rejected sell_all with a weapon cap. Purpose: preserve all "
                     "candidate weapons until combat setup has selected a working one; omit "
                     "max_weapons"
                 )
             arguments["ignore_loadout"] = False
+            if keep_candidates:
+                requested_keep = arguments.get("keep")
+                requested = (
+                    [str(value) for value in requested_keep]
+                    if isinstance(requested_keep, list)
+                    else []
+                )
+                arguments["keep"] = sorted(
+                    {value for value in [*requested, *keep_candidates] if value},
+                    key=str.casefold,
+                )
             return
-        if tool != "sell" or arguments.get("confirm") is False:
+        if tool != "sell":
+            return
+        if keep_candidates:
+            raw_selected = arguments.get("items")
+            selected = raw_selected if isinstance(raw_selected, list) else [raw_selected]
+            selected_keys = {
+                str(value).strip().casefold()
+                for value in selected
+                if value is not None and str(value).strip()
+            }
+            inventory = deep_get(observation, "inventory.items", [])
+            protected: set[str] = set()
+            for item in inventory if isinstance(inventory, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip().casefold()
+                identifiers = {
+                    str(item.get(key)).strip().casefold()
+                    for key in ("id", "object_id")
+                    if item.get(key) is not None
+                }
+                if not (selected_keys & identifiers or name in selected_keys):
+                    continue
+                if any(candidate in name for candidate in keep_candidates):
+                    protected.add(name or next(iter(identifiers), "retained item"))
+            protected.update(
+                selected
+                for selected in selected_keys
+                if any(candidate in selected for candidate in keep_candidates)
+            )
+            if protected:
+                raise ModelError(
+                    f"{phase_kind} rejected targeted sale of retained keep_candidate(s): "
+                    f"{', '.join(sorted(protected))}. Purpose: preserve the phase's explicitly "
+                    "retained equipment and valuables; choose only ordinary excess loot"
+                )
+        if arguments.get("confirm") is False:
             return
         signature = self._sell_quote_signature(
             goal,
@@ -12066,7 +12191,7 @@ class BotController:
         )
         if not verified:
             raise ModelError(
-                "prepare_combat rejected an unquoted targeted sale. Purpose: confirm that this "
+                f"{phase_kind} rejected an unquoted targeted sale. Purpose: confirm that this "
                 "exact merchant accepts these exact inventory items before transferring them; "
                 "call sell once with the same to/items and confirm=false, then confirm the sale "
                 "only if the returned offered_price is acceptable"
@@ -12081,7 +12206,8 @@ class BotController:
         result: Any,
     ) -> None:
         if (
-            str((phase or {}).get("kind") or "") != "prepare_combat"
+            str((phase or {}).get("kind") or "")
+            not in {"prepare_combat", "liquidate_inventory"}
             or arguments.get("confirm") is not False
             or not isinstance(result, dict)
             or not isinstance(result.get("offered_price"), (int, float))
