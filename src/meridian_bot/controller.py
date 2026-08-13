@@ -537,6 +537,117 @@ class BotController:
             )
         return removed
 
+    def _repair_gentle_overlevel_farm_quarantines(
+        self, observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Release level-only quarantines disproved by grounded attack ratings.
+
+        Legacy records retained only the classifier's conclusion, so the text
+        alone is not enough to delete one.  Re-read the current source spawn
+        table and release the room only when it contains at least one overlevel
+        spawn, every such spawn has a known gentle rating, and no dangerous or
+        unknown overlevel spawn remains.
+        """
+
+        raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        if not isinstance(raw, dict):
+            return []
+        quarantines = dict(raw)
+        released: list[dict[str, Any]] = []
+        for key, record in list(quarantines.items()):
+            if not isinstance(record, dict):
+                continue
+            reasons = [
+                str(reason).strip().casefold()
+                for reason in record.get("reasons", [])
+                if str(reason).strip()
+            ]
+            level_only = bool(reasons) and all(
+                "source-resolved hostile above the verified danger band" in reason
+                for reason in reasons
+            )
+            if not level_only:
+                continue
+            room = record.get("room", record.get("assigned_room"))
+            assessment = self._source_room_overlevel_assessment(room, observation)
+            if (
+                assessment is None
+                or assessment["threats"]
+                or not assessment["forgiven"]
+            ):
+                continue
+            released.append(
+                {
+                    **record,
+                    "released_at": timestamp(),
+                    "release_reason": (
+                        "fresh source difficulty proves every overlevel spawn is "
+                        "inside the keeper's gentle attack-rating band"
+                    ),
+                    "forgiven_overlevel_spawns": assessment["forgiven"],
+                }
+            )
+            quarantines.pop(key, None)
+        if not released:
+            return []
+
+        self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+        self._clear_released_farm_retreat_incidents(released)
+        repaired_lessons: list[dict[str, Any]] = []
+        for item in released:
+            lesson_id = item.get("lesson_id")
+            lesson = self.storage.goal_lesson(str(lesson_id)) if lesson_id else None
+            if isinstance(lesson, dict) and lesson.get("status") in {
+                "deferred",
+                "unlocked",
+            }:
+                repaired_lessons.append(
+                    self.storage.update_goal_lesson(
+                        str(lesson_id),
+                        "resolved",
+                        evidence={
+                            "repair": item["release_reason"],
+                            "forgiven_overlevel_spawns": item[
+                                "forgiven_overlevel_spawns"
+                            ],
+                            "at": timestamp(),
+                        },
+                    )
+                )
+        affected_goal_ids = {
+            str(item.get("goal_id") or "")
+            for item in released
+            if item.get("goal_id")
+        }
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+        suppression = self.storage.get_runtime("safety_suppression_v1")
+        if isinstance(suppression, dict) and "quarantined_farm_tactic" in suppression.get(
+            "blocker_kinds", []
+        ):
+            self.storage.set_runtime("safety_suppression_v1", None)
+            self._clear_planner_feedback()
+        self.storage.emit_event(
+            "background_farm.quarantine_released",
+            "Released farm quarantines created by the obsolete level-only classifier",
+            severity="notice",
+            interesting=False,
+            data={
+                "rooms": [item.get("room") for item in released],
+                "targets": [item.get("target") for item in released],
+                "lesson_ids": [item.get("id") for item in repaired_lessons],
+                "reason": "fresh source attack ratings align the controller with the keeper",
+            },
+        )
+        return released
+
     def _repair_capability_unlocked_farm_quarantines(
         self, observation: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -1934,6 +2045,9 @@ class BotController:
             self.learning.backfill(self.last_observation)
             self._repair_controller_goal_blocks()
             self.learning.repair_regressive_capability_unlocks(
+                self.last_observation
+            )
+            self._repair_gentle_overlevel_farm_quarantines(
                 self.last_observation
             )
             self._repair_capability_unlocked_farm_quarantines(self.last_observation)
@@ -12272,14 +12386,14 @@ class BotController:
             )
         return results
 
-    def _source_room_overlevel_hostiles(
+    def _source_room_overlevel_assessment(
         self,
         room_id: Any,
         observation: dict[str, Any],
         *,
         danger_margin: int = FARM_DANGER_MARGIN,
-    ) -> list[dict[str, Any]]:
-        """Return source-listed hostile spawns above the farm safety limit."""
+    ) -> dict[str, Any] | None:
+        """Classify source-listed overlevel spawns without hiding unknown data."""
 
         maximum = deep_get(
             observation,
@@ -12289,24 +12403,25 @@ class BotController:
         try:
             character_level = int(maximum)
         except (TypeError, ValueError):
-            return []
+            return None
         getter = getattr(self.knowledge, "get", None)
         if not callable(getter) or room_id is None:
-            return []
+            return None
         entity_id = str(room_id)
         if not entity_id.startswith("location:"):
             entity_id = f"location:{entity_id}"
         try:
             result = getter(entity_id)
         except (OSError, sqlite3.Error, TypeError, ValueError):
-            return []
+            return None
         entity = result.get("entity") if isinstance(result, dict) else None
         spawn_table = entity.get("spawn_table") if isinstance(entity, dict) else None
         spawns = spawn_table.get("spawns") if isinstance(spawn_table, dict) else None
         if not isinstance(spawns, list):
-            return []
+            return None
         danger_limit = character_level + max(0, int(danger_margin))
         threats: list[dict[str, Any]] = []
+        forgiven: list[dict[str, Any]] = []
         for spawn in spawns:
             if not isinstance(spawn, dict) or not self._spawn_is_hostile(spawn):
                 continue
@@ -12319,24 +12434,43 @@ class BotController:
                 danger_limit,
                 difficulty=spawn.get("difficulty"),
             )
-            if not is_threat:
+            if creature_level <= danger_limit:
                 continue
-            threats.append(
-                {
-                    "entity_id": spawn.get("creature_id"),
-                    "name": spawn.get("creature"),
-                    "level": creature_level,
-                    "difficulty": spawn.get("difficulty"),
-                    "attack_rating": attack_rating,
-                    "character_level": character_level,
-                    "danger_limit": danger_limit,
-                    "chance": spawn.get("chance"),
-                    "cap": spawn.get("cap"),
-                    "how": spawn.get("how"),
-                    "source_ref": spawn.get("citation"),
-                }
-            )
-        return sorted(threats, key=lambda item: -int(item["level"]))
+            detail = {
+                "entity_id": spawn.get("creature_id"),
+                "name": spawn.get("creature"),
+                "level": creature_level,
+                "difficulty": spawn.get("difficulty"),
+                "attack_rating": attack_rating,
+                "character_level": character_level,
+                "danger_limit": danger_limit,
+                "chance": spawn.get("chance"),
+                "cap": spawn.get("cap"),
+                "how": spawn.get("how"),
+                "source_ref": spawn.get("citation"),
+            }
+            (threats if is_threat else forgiven).append(detail)
+        return {
+            "danger_limit": danger_limit,
+            "threats": sorted(threats, key=lambda item: -int(item["level"])),
+            "forgiven": sorted(forgiven, key=lambda item: -int(item["level"])),
+        }
+
+    def _source_room_overlevel_hostiles(
+        self,
+        room_id: Any,
+        observation: dict[str, Any],
+        *,
+        danger_margin: int = FARM_DANGER_MARGIN,
+    ) -> list[dict[str, Any]]:
+        """Return source-listed hostile spawns above the farm safety limit."""
+
+        assessment = self._source_room_overlevel_assessment(
+            room_id,
+            observation,
+            danger_margin=danger_margin,
+        )
+        return list(assessment["threats"]) if assessment is not None else []
 
     def _campaign_phase_grounding_blocker(
         self,

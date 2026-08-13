@@ -10069,6 +10069,105 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_level_only_quarantine_is_repaired_only_with_gentle_source_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="gentle-level-quarantine-repair")
+                )["goal"]
+                lesson = controller.storage.create_goal_lesson(
+                    {
+                        "goal_id": goal["id"],
+                        "goal_family": "goal-family:gentle-level-repair",
+                        "tactic_key": "tactic:room-544-larva",
+                        "classification": "ineffective_tactic",
+                        "scope": "tactic",
+                        "confidence": 0.9,
+                        "summary": (
+                            "Background farming exceeded verified survivability "
+                            "in the assigned room: live room contains a "
+                            "source-resolved hostile above the verified danger band"
+                        ),
+                        "failed_state": {},
+                        "evidence_event_ids": [],
+                        "retry_when": {"mode": "any", "conditions": []},
+                        "suggested_goals": [],
+                    }
+                )
+
+                def get_room(entity_id: str) -> dict[str, object]:
+                    if entity_id == "location:544":
+                        spawn = {
+                            "creature_id": "creature:fungusbeast",
+                            "creature": "fungus beast",
+                            "level": 50,
+                            "difficulty": 1,
+                            "role": "monster",
+                        }
+                    else:
+                        spawn = {
+                            "creature_id": "creature:ogre",
+                            "creature": "ogre",
+                            "level": 60,
+                            "difficulty": 4,
+                            "role": "monster",
+                        }
+                    return {
+                        "status": "found",
+                        "entity": {"spawn_table": {"spawns": [spawn]}},
+                    }
+
+                controller.knowledge = SimpleNamespace(get=get_room)
+                old_reason = (
+                    "Background farming exceeded verified survivability in the "
+                    "assigned room: live room contains a source-resolved hostile "
+                    "above the verified danger band"
+                )
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1",
+                    {
+                        "544": {
+                            "room": 544,
+                            "target": "groundworm larva",
+                            "goal_id": goal["id"],
+                            "lesson_id": lesson["id"],
+                            "reasons": [old_reason],
+                        },
+                        "563": {
+                            "room": 563,
+                            "target": "ant",
+                            "reasons": [old_reason],
+                        },
+                    },
+                )
+
+                released = controller._repair_gentle_overlevel_farm_quarantines(
+                    observation
+                )
+
+                self.assertEqual([544], [item["room"] for item in released])
+                self.assertEqual(
+                    210,
+                    released[0]["forgiven_overlevel_spawns"][0]["attack_rating"],
+                )
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_quarantine_v1", {}
+                )
+                self.assertNotIn("544", remaining)
+                self.assertIn("563", remaining)
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(lesson["id"])["status"],
+                )
+            finally:
+                controller.storage.close()
+
     def test_survivability_quarantine_releases_after_verified_health_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
