@@ -502,6 +502,38 @@ class StalePostTravelBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class StalePostCreateFoodBroker(SimulatedBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inventory_items = [{"id": 7, "name": "apple", "amount": 1}]
+        self.tools["cast"] = Tool(
+            "cast",
+            "Cast a spell and optionally observe created inventory.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "spell": {"type": "string"},
+                    "observe_created": {"type": "boolean"},
+                },
+                "required": ["agent", "spell"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "cast":
+            self.calls.append((name, dict(arguments)))
+            # Return the broker's authoritative delta while deliberately
+            # retaining a stale inventory cache for the next observation.
+            return {
+                "cast": True,
+                "spell": "create food",
+                "mana_spent": 10,
+                "created": [{"name": "apple", "amount": 1}],
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
 class UnwieldableWeaponBroker(SimulatedBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -5207,6 +5239,53 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(2, len(reconciled))
                 self.assertEqual(100, reconciled[0]["data"]["stale_observed_room"])
                 self.assertEqual(54, reconciled[0]["data"]["receipt_room"])
+            finally:
+                controller.storage.close()
+
+    def test_create_food_delta_reconciles_next_stale_inventory_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = StalePostCreateFoodBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="stale-post-create-food")
+                )["goal"]
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertEqual("cast", result["action"])
+                cast_arguments = next(
+                    arguments for name, arguments in broker.calls if name == "cast"
+                )
+                self.assertTrue(cast_arguments["observe_created"])
+                stale = broker.observe()
+                self.assertEqual(
+                    1,
+                    CriteriaEvaluator.inventory_count(
+                        stale["inventory"]["items"], "food"
+                    ),
+                )
+                reconciled = controller._reconcile_recent_inventory_creation(stale)
+                self.assertEqual(
+                    2,
+                    CriteriaEvaluator.inventory_count(
+                        reconciled["inventory"]["items"], "food"
+                    ),
+                )
+                events = controller.storage.events(
+                    kinds=["action.inventory_observation_reconciled"]
+                )["events"]
+                self.assertEqual(1, len(events))
             finally:
                 controller.storage.close()
 

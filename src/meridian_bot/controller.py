@@ -141,6 +141,7 @@ PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
+RECENT_INVENTORY_CREATION_RUNTIME_KEY = "recent_inventory_creation_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
@@ -1015,6 +1016,138 @@ class BotController:
         )
         return reconciled
 
+    def _remember_successful_inventory_creation(
+        self,
+        tool: str,
+        result: Any,
+        before: dict[str, Any],
+        *,
+        goal_id: str | None,
+    ) -> None:
+        """Retain broker-observed creation deltas across one stale inventory read."""
+
+        created = result.get("created") if isinstance(result, dict) else None
+        if tool != "cast" or not isinstance(created, list) or not created:
+            return
+        before_items = deep_get(before, "inventory.items", [])
+        expected: list[dict[str, Any]] = []
+        for item in created:
+            if not isinstance(item, dict):
+                continue
+            name = " ".join(str(item.get("name") or "").split())
+            amount = item.get("amount", 1)
+            if not name or not isinstance(amount, (int, float)) or amount <= 0:
+                continue
+            expected.append(
+                {
+                    "name": name,
+                    "minimum_count": CriteriaEvaluator.inventory_count(
+                        before_items, name
+                    )
+                    + int(amount),
+                }
+            )
+        if not expected:
+            return
+        self.storage.set_runtime(
+            RECENT_INVENTORY_CREATION_RUNTIME_KEY,
+            {
+                "tool": tool,
+                "goal_id": goal_id,
+                "expected": expected,
+                "recorded_at": timestamp(),
+                "expires_unix": time.time() + 180,
+                "stale_observations_reconciled": 0,
+            },
+        )
+
+    def _reconcile_recent_inventory_creation(
+        self, observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply a recent positive creation delta when inventory briefly regresses."""
+
+        receipt = self.storage.get_runtime(RECENT_INVENTORY_CREATION_RUNTIME_KEY)
+        if not isinstance(receipt, dict):
+            return observation
+        expires_unix = receipt.get("expires_unix")
+        expected = receipt.get("expected")
+        if (
+            not isinstance(expires_unix, (int, float))
+            or expires_unix < time.time()
+            or not isinstance(expected, list)
+        ):
+            self.storage.set_runtime(RECENT_INVENTORY_CREATION_RUNTIME_KEY, None)
+            return observation
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = [dict(item) for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        missing = [
+            item
+            for item in expected
+            if isinstance(item, dict)
+            and CriteriaEvaluator.inventory_count(items, item.get("name"))
+            < int(item.get("minimum_count", 0) or 0)
+        ]
+        if not missing:
+            self.storage.set_runtime(RECENT_INVENTORY_CREATION_RUNTIME_KEY, None)
+            return observation
+        stale_count = int(receipt.get("stale_observations_reconciled", 0) or 0)
+        if stale_count >= 3:
+            self.storage.set_runtime(RECENT_INVENTORY_CREATION_RUNTIME_KEY, None)
+            return observation
+        for expected_item in missing:
+            name = " ".join(str(expected_item.get("name") or "").split())
+            minimum = int(expected_item.get("minimum_count", 0) or 0)
+            current = CriteriaEvaluator.inventory_count(items, name)
+            deficit = max(0, minimum - current)
+            target = next(
+                (
+                    item
+                    for item in items
+                    if " ".join(str(item.get("name") or "").split()).casefold()
+                    == name.casefold()
+                ),
+                None,
+            )
+            if target is None:
+                items.append(
+                    {
+                        "name": name,
+                        "amount": deficit,
+                        "source": "successful_creation_receipt",
+                    }
+                )
+            else:
+                current_amount = target.get("amount", 1)
+                current_amount = (
+                    int(current_amount)
+                    if isinstance(current_amount, (int, float))
+                    else 1
+                )
+                target["amount"] = current_amount + deficit
+        receipt = {
+            **receipt,
+            "stale_observations_reconciled": stale_count + 1,
+        }
+        self.storage.set_runtime(RECENT_INVENTORY_CREATION_RUNTIME_KEY, receipt)
+        reconciled = dict(observation)
+        inventory = observation.get("inventory")
+        inventory = dict(inventory) if isinstance(inventory, dict) else {}
+        inventory["items"] = items
+        reconciled["inventory"] = inventory
+        self.storage.emit_event(
+            "action.inventory_observation_reconciled",
+            "Reconciled stale inventory from a successful creation delta",
+            severity="info",
+            interesting=False,
+            goal_id=receipt.get("goal_id"),
+            data={
+                "tool": receipt.get("tool"),
+                "expected": redact(expected),
+                "stale_observations_reconciled": stale_count + 1,
+            },
+        )
+        return reconciled
+
     def _repair_position_unknown_lessons(self) -> list[dict[str, Any]]:
         """Resolve route lessons that only captured transient client/protocol loss."""
 
@@ -1470,8 +1603,8 @@ class BotController:
             self._set_fallback()
             if self.config.controller.conversation_enabled:
                 self._start_conversation_listener()
-            self.last_observation = self._reconcile_recent_room_transition(
-                self.broker.observe()
+            self.last_observation = self._reconcile_recent_inventory_creation(
+                self._reconcile_recent_room_transition(self.broker.observe())
             )
             self._record_character_progress(self.last_observation)
             self._repair_bank_receipt()
@@ -6841,8 +6974,8 @@ class BotController:
             self._begin_foreground_action("reconcile_after_action_error")
             if "not in game" in error.casefold() and self.config.game.autojoin:
                 self.broker.ensure_joined()
-            observation = self._reconcile_recent_room_transition(
-                self.broker.observe()
+            observation = self._reconcile_recent_inventory_creation(
+                self._reconcile_recent_room_transition(self.broker.observe())
             )
             self.last_observation = observation
             self._remember_safe_staging(observation)
@@ -12839,8 +12972,8 @@ class BotController:
         if not self._turn_lock.acquire(blocking=False):
             return {"skipped": "turn already running"}
         try:
-            observation = self._reconcile_recent_room_transition(
-                self.broker.observe()
+            observation = self._reconcile_recent_inventory_creation(
+                self._reconcile_recent_room_transition(self.broker.observe())
             )
             self.last_observation = observation
             self._remember_safe_staging(observation)
@@ -14529,6 +14662,16 @@ class BotController:
             raise ModelError(f"planner selected unknown broker tool {tool}")
         if tool_spec.accepts("agent"):
             arguments["agent"] = self.config.game.agent
+        if (
+            tool == "cast"
+            and str(arguments.get("spell") or "").strip().casefold()
+            == "create food"
+            and tool_spec.accepts("observe_created")
+        ):
+            # Create Food succeeds silently. Ask the broker to establish a
+            # before/after inventory delta so plan-step completion never rests
+            # on the first potentially stale inventory read after the cast.
+            arguments["observe_created"] = True
         try:
             tool_spec.validate(arguments)
             if tool == PVP_TOOL_NAME:
@@ -15498,6 +15641,12 @@ class BotController:
             self._remember_successful_room_transition(
                 tool,
                 result,
+                goal_id=goal["id"],
+            )
+            self._remember_successful_inventory_creation(
+                tool,
+                result,
+                observation,
                 goal_id=goal["id"],
             )
             reconciled_room = self._observation_room(self.last_observation)
