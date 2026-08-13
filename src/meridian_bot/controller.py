@@ -1265,6 +1265,96 @@ class BotController:
             )
         return repaired
 
+    def _repair_transient_cast_evidence(self) -> list[dict[str, Any]]:
+        """Remove legacy tactic blocks written for retryable cast outcomes."""
+
+        transient_signatures: set[tuple[str, str]] = set()
+        source_event_ids: list[str] = []
+        for event in self.storage.latest_events(
+            limit=200,
+            kinds=["action.no_progress", "action.transient_failure"],
+        ):
+            data = event.get("data")
+            data = data if isinstance(data, dict) else {}
+            result = data.get("result")
+            if self._transient_cast_failure_reason(
+                str(data.get("tool") or ""), result
+            ) is None:
+                continue
+            arguments = data.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            transient_signatures.add(
+                (
+                    str(event.get("goal_id") or ""),
+                    canonical_json({"tool": "cast", "arguments": arguments}),
+                )
+            )
+            if event.get("id"):
+                source_event_ids.append(str(event["id"]))
+        if not transient_signatures:
+            return []
+
+        removed_blocks: list[dict[str, Any]] = []
+        blocked_actions = self.storage.get_runtime("blocked_actions", [])
+        if isinstance(blocked_actions, list):
+            retained: list[Any] = []
+            for item in blocked_actions:
+                key = (
+                    str(item.get("goal_id") or ""),
+                    str(item.get("signature") or ""),
+                ) if isinstance(item, dict) else None
+                if key in transient_signatures:
+                    removed_blocks.append(item)
+                else:
+                    retained.append(item)
+            if removed_blocks:
+                self.storage.set_runtime("blocked_actions", retained)
+
+        repaired_lessons: list[dict[str, Any]] = []
+        for lesson in self.storage.goal_lessons(
+            statuses=["deferred", "unlocked"], limit=200
+        ):
+            failed_tactic = deep_get(lesson, "failed_state.failed_tactic", {})
+            failed_tactic = (
+                failed_tactic if isinstance(failed_tactic, dict) else {}
+            )
+            tool = str(failed_tactic.get("tool") or "")
+            arguments = failed_tactic.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            key = (
+                str(lesson.get("goal_id") or ""),
+                canonical_json({"tool": tool, "arguments": arguments}),
+            )
+            if lesson.get("scope") != "tactic" or key not in transient_signatures:
+                continue
+            repaired_lessons.append(
+                self.storage.update_goal_lesson(
+                    lesson["id"],
+                    "resolved",
+                    evidence={
+                        "repair": (
+                            "zero-cost and half-cost cast outcomes are transient; "
+                            "they preserve the current plan step and never block the tactic"
+                        ),
+                        "source_event_ids": source_event_ids,
+                        "at": timestamp(),
+                    },
+                )
+            )
+        if removed_blocks or repaired_lessons:
+            self.storage.emit_event(
+                "cast.transient_evidence_repaired",
+                "Removed durable tactic evidence created from transient cast outcomes",
+                severity="notice",
+                interesting=False,
+                data={
+                    "blocked_action_count": len(removed_blocks),
+                    "lesson_ids": [item.get("id") for item in repaired_lessons],
+                    "source_event_ids": source_event_ids,
+                },
+            )
+        return repaired_lessons
+
     def _repair_unscoped_evidence_lookup_lessons(self) -> list[dict[str, Any]]:
         """Resolve lookup blocks created before evidence caches were phase-scoped."""
 
@@ -1671,6 +1761,7 @@ class BotController:
             self._repair_recovered_farm_route_evidence(self.last_observation)
             self._repair_transient_farm_stagnations()
             self._repair_position_unknown_lessons()
+            self._repair_transient_cast_evidence()
             self._repair_unscoped_evidence_lookup_lessons()
             self._repair_invalid_farm_contract_lessons()
             self.learning.refresh_unlocks(self.last_observation)

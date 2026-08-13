@@ -5421,6 +5421,64 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_transient_cast_repair_removes_legacy_block_from_result_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = UnverifiedCreateFoodBroker(mana_spent=5)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-failed-roll-create-food")
+                )["goal"]
+                arguments = {
+                    "agent": "primary",
+                    "observe_created": True,
+                    "spell": "create food",
+                }
+                controller._record_blocked_action(
+                    goal,
+                    broker.observe(),
+                    "cast",
+                    arguments,
+                    "create food spent 5 mana but produced no verified carried item",
+                )
+                controller.storage.emit_event(
+                    "action.no_progress",
+                    "Action made no progress: cast",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "cast",
+                        "arguments": arguments,
+                        "result": {
+                            "cast": True,
+                            "spell": "create food",
+                            "mana_spent": 5,
+                            "created": [],
+                            "what_the_mana_says": (
+                                "half cost (5 of 10) — the spell was cast and "
+                                "FAILED its roll"
+                            ),
+                        },
+                        "reason": (
+                            "create food spent 5 mana but produced no verified "
+                            "carried item"
+                        ),
+                    },
+                )
+
+                repaired = controller._repair_transient_cast_evidence()
+
+                self.assertEqual([], repaired)
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+                events = controller.storage.events(
+                    kinds=["cast.transient_evidence_repaired"]
+                )["events"]
+                self.assertEqual(1, len(events))
+                self.assertEqual(1, events[0]["data"]["blocked_action_count"])
+            finally:
+                controller.storage.close()
+
     def test_full_cost_creation_without_delta_requires_replanning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
