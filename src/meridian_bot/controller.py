@@ -2406,6 +2406,17 @@ class BotController:
                 tokens.append(number_words[value])
             return bool(re.search(rf"\b(?:{'|'.join(tokens)})\b", text))
 
+        def amount_before(text: str, item_pattern: str) -> list[int]:
+            word_values = {word: value for value, word in number_words.items()}
+            matches = re.findall(
+                rf"\b(\d+|{'|'.join(word_values)})\s+(?:x\s+)?(?:{item_pattern})\b",
+                text,
+            )
+            return [
+                int(match) if match.isdigit() else word_values[match]
+                for match in matches
+            ]
+
         for criterion in (phase or {}).get("success_criteria", []):
             if not isinstance(criterion, dict) or criterion.get("kind") != "inventory_contains":
                 continue
@@ -2415,6 +2426,186 @@ class BotController:
                 inventory.get("items"), item_name
             )
             if current >= required:
+                continue
+            semantic_food = item_name in {"food", "edible food"}
+            if semantic_food:
+                food_entries = [
+                    entry
+                    for entry in inventory["items"]
+                    if isinstance(entry, dict)
+                    and any(
+                        marker
+                        in " ".join(
+                            str(entry.get("name") or "").split()
+                        ).casefold()
+                        for marker in EDIBLE_FOOD_NAME_MARKERS
+                    )
+                ]
+                removed_keys: set[str] = set()
+                planned_removals = 0
+                for step in steps:
+                    tool = str(step.get("tool") or "")
+                    outcome = str(step.get("outcome") or "").casefold()
+                    if tool == "sell_all" and not re.search(
+                        r"\b(?:keep|preserve|retain)\b.{0,80}\b(?:food|edible|snacks?)\b",
+                        outcome,
+                    ):
+                        candidates = food_entries
+                    elif tool == "sell" or (
+                        tool == "act"
+                        and re.match(r"\s*(?:eat|drop|use)\b", outcome)
+                    ):
+                        candidates = [
+                            entry
+                            for entry in food_entries
+                            if (
+                                entry.get("id", entry.get("object_id")) is not None
+                                and re.search(
+                                    rf"\b{re.escape(str(entry.get('id', entry.get('object_id'))))}\b",
+                                    outcome,
+                                )
+                            )
+                            or re.search(
+                                rf"\b{re.escape(str(entry.get('name') or '').casefold())}s?\b",
+                                outcome,
+                            )
+                        ]
+                    else:
+                        candidates = []
+                    for entry in candidates:
+                        key = str(
+                            entry.get(
+                                "id",
+                                entry.get("object_id", entry.get("name")),
+                            )
+                        )
+                        if key in removed_keys:
+                            continue
+                        removed_keys.add(key)
+                        try:
+                            planned_removals += max(
+                                1, int(entry.get("amount", 1) or 1)
+                            )
+                        except (TypeError, ValueError):
+                            planned_removals += 1
+
+                preserved = max(0, current - planned_removals)
+                needed_units = required - preserved
+                cast_steps = [
+                    step
+                    for step in steps
+                    if step.get("tool") == "cast"
+                    and "create food"
+                    in str(step.get("outcome") or "").casefold()
+                ]
+                repeat_to_target = any(
+                    re.search(
+                        r"\b(?:until|as needed|repeat)\b",
+                        str(step.get("outcome") or "").casefold(),
+                    )
+                    and names_item(
+                        str(step.get("verification") or "").casefold(),
+                        item_name,
+                    )
+                    and names_count(
+                        str(step.get("verification") or "").casefold(),
+                        required,
+                    )
+                    for step in cast_steps
+                )
+                planned_casts = max(
+                    len(cast_steps), needed_units if repeat_to_target else 0
+                )
+                planned_food_purchases = 0
+                for step in steps:
+                    if step.get("tool") != "shop":
+                        continue
+                    outcome = str(step.get("outcome") or "").casefold()
+                    if not re.search(r"\b(?:buy|purchase|acquire)\b", outcome):
+                        continue
+                    if "reagent" in outcome:
+                        continue
+                    food_pattern = (
+                        r"food(?:\s+items?)?|edible(?:\s+food)?|snacks?|"
+                        + "|".join(
+                            re.escape(marker) + "s?"
+                            for marker in EDIBLE_FOOD_NAME_MARKERS
+                        )
+                    )
+                    amounts = amount_before(outcome, food_pattern)
+                    planned_food_purchases += max(amounts) if amounts else 0
+                projected = preserved + planned_casts + planned_food_purchases
+                if projected < required:
+                    return (
+                        f"execution_plan does not cover active phase criterion {criterion.get('id')!r}: "
+                        f"it starts with {current} edible food item(s), plans to remove "
+                        f"{planned_removals}, and adds only {planned_casts + planned_food_purchases}; "
+                        f"projected total {projected} is below required {required}. Purpose: "
+                        "plan verification cannot assume an item remains after selling, eating, "
+                        "or dropping it; preserve the existing food or add enough concrete "
+                        "acquisition/cast actions"
+                    )
+
+                create_food = next(
+                    (
+                        spell
+                        for spell in deep_get(observation, "spells.spells", [])
+                        if isinstance(spell, dict)
+                        and str(spell.get("name") or "").strip().casefold()
+                        == "create food"
+                    ),
+                    None,
+                )
+                for reagent in (
+                    create_food.get("reagents", [])
+                    if isinstance(create_food, dict)
+                    else []
+                ):
+                    match = re.fullmatch(
+                        r"\s*(\d+)\s*x\s*(.+?)\s*", str(reagent), re.I
+                    )
+                    if not match or planned_casts <= 0:
+                        continue
+                    per_cast = int(match.group(1))
+                    reagent_name = " ".join(match.group(2).split()).casefold()
+                    reagent_pattern = (
+                        r"elder\s*berr(?:y|ies)"
+                        if reagent_name == "elderberry"
+                        else r"herbs?"
+                        if reagent_name in {"herb", "herbs"}
+                        else re.escape(reagent_name) + "s?"
+                    )
+                    available = CriteriaEvaluator.inventory_count(
+                        inventory["items"], reagent_name
+                    )
+                    projected_reagents = available
+                    for step in steps:
+                        if step.get("tool") != "shop":
+                            continue
+                        outcome = str(step.get("outcome") or "").casefold()
+                        verification = str(
+                            step.get("verification") or ""
+                        ).casefold()
+                        if re.search(r"\b(?:buy|purchase|acquire)\b", outcome):
+                            additions = amount_before(outcome, reagent_pattern)
+                            projected_reagents += max(additions) if additions else 0
+                        verified_totals = amount_before(
+                            verification, reagent_pattern
+                        )
+                        if verified_totals:
+                            projected_reagents = max(
+                                projected_reagents, max(verified_totals)
+                            )
+                    reagent_required = per_cast * planned_casts
+                    if projected_reagents < reagent_required:
+                        return (
+                            f"execution_plan cannot support its {planned_casts} planned "
+                            f"Create Food cast(s): {reagent_name} is {per_cast} per cast, "
+                            f"so {reagent_required} is required, but authoritative inventory "
+                            f"plus quantified purchase steps provides only {projected_reagents}. "
+                            "Purpose: acquire the exact live reagent total before relying on "
+                            "the casts; verification text cannot manufacture missing reagents"
+                        )
                 continue
             remaining = required - current
             relevant_mutations = 0

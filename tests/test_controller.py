@@ -2724,6 +2724,86 @@ class ControllerTests(unittest.TestCase):
             )
         )
 
+    def test_food_plan_accounts_for_removals_and_per_cast_reagents(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+        }
+        observation = {
+            "inventory": {
+                "items": [
+                    {"id": 10, "name": "apple"},
+                    {"id": 20, "name": "elderberry", "amount": 2},
+                    {"id": 30, "name": "herb", "amount": 2},
+                ]
+            },
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Food",
+                        "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                    }
+                ]
+            },
+        }
+        three_casts = [
+            {
+                "id": f"cast-{index}",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": f"Inventory contains {index + 2} edible food items total.",
+            }
+            for index in range(3)
+        ]
+        sell_existing = [
+            {
+                "id": "sell-apple",
+                "tool": "sell",
+                "outcome": "Sell apple id 10.",
+                "verification": "Apple id 10 is gone and shillings increase.",
+            },
+            *three_casts,
+        ]
+
+        self.assertIn(
+            "plans to remove 1",
+            BotController._phase_inventory_plan_error(
+                phase, sell_existing, observation
+            )
+            or "",
+        )
+        self.assertIn(
+            "elderberry is 2 per cast",
+            BotController._phase_inventory_plan_error(
+                phase, three_casts, observation
+            )
+            or "",
+        )
+
+        grounded = [
+            {
+                "id": "buy-reagents",
+                "tool": "shop",
+                "outcome": "Buy 4 ElderBerry and 4 Herbs.",
+                "verification": (
+                    "Inventory contains 6 ElderBerry total and 6 Herbs total."
+                ),
+            },
+            *three_casts,
+        ]
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, grounded, observation
+            )
+        )
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

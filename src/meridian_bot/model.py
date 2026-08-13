@@ -157,6 +157,9 @@ The execution plan must collectively reach every exact active_phase.success_crit
 inventory quantities. A tool-level success is not phase completion. For inventory_contains item="food",
 food is a semantic edible category rather than a literal item name; use direct_phase_capabilities.production
 for the possible concrete product, units per cast, and vigor semantics. Never rename the product "Snack".
+Account for inventory flow: selling, eating, or dropping an existing required item removes it from the starting
+count. For Create Food, multiply the live per-cast reagent list by every planned cast, subtract reagents already
+carried, and explicitly acquire the remainder. Verification prose cannot substitute for those resource inputs.
 If one repeatable plan step will be used multiple times, make its verification name the required total (or
 remaining additional quantity) and keep selecting that same step until the quantity is actually observed.
 Every active phase has a controller-persisted execution_plan. When execution_plan is absent, return
