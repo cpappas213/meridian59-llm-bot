@@ -166,7 +166,8 @@ maximum. This is a per-phase limit, never a complete multi-hour campaign plan. D
 criteria and keeper state without them. Consolidate preparation into bounded outcome steps when needed.
 Never combine a read-only discovery and its downstream movement into one step: merchants, map, prey,
 hunting_grounds, inventory, abilities, and knowledge_search do not travel. Add a separate travel step
-when the discovered numeric room must be reached.
+when the discovered numeric room must be reached. Likewise, a travel step cannot also buy, sell, cast,
+or equip, and a shop step cannot also equip or travel. Give each follow-on mutation its own tool-bound step.
 Use read-only tools for observation steps. Never assign act to an outcome that merely looks, observes,
 checks, confirms, verifies, or refreshes state; act is only for the mutating verbs use, unuse, get,
 drop, activate, eat, and go.

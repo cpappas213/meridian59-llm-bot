@@ -2489,6 +2489,39 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_execution_plan_step_cannot_claim_a_second_tool_action(self) -> None:
+        self.assertIn(
+            "separate equip_best/wear_best step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "shop",
+                    "outcome": "Buy a war mace, then equip it.",
+                    "verification": "The war mace is wielded.",
+                }
+            )
+            or "",
+        )
+        self.assertIn(
+            "separate shop step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "travel",
+                    "outcome": "Travel to the merchant, then buy armor.",
+                    "verification": "Armor is carried.",
+                }
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._commerce_step_error(
+                {
+                    "tool": "shop",
+                    "outcome": "Read the catalogue, then buy the quoted armor.",
+                    "verification": "Armor is carried.",
+                }
+            )
+        )
+
     def test_farm_execution_plan_rejects_later_out_of_phase_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

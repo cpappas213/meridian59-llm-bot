@@ -1851,6 +1851,33 @@ class BotController:
                 "lookup as one step and add a following travel step bound to its numeric "
                 "room result"
             )
+        follow_on = re.search(
+            r"\bthen\s+(?:the\s+)?(?P<verb>buy|purchase|sell|liquidate|equip|wield|wear|cast|travel|go|walk|move)\b",
+            outcome,
+        )
+        if follow_on is not None:
+            verb = follow_on.group("verb")
+            compatible_tools = {
+                "buy": {"shop"},
+                "purchase": {"shop"},
+                "sell": {"sell", "sell_all"},
+                "liquidate": {"sell", "sell_all"},
+                "equip": {"equip_best", "wear_best"},
+                "wield": {"equip_best"},
+                "wear": {"equip_best", "wear_best"},
+                "cast": {"cast"},
+                "travel": MOVEMENT_TOOLS,
+                "go": MOVEMENT_TOOLS,
+                "walk": MOVEMENT_TOOLS,
+                "move": MOVEMENT_TOOLS,
+            }[verb]
+            if tool not in compatible_tools:
+                expected = "/".join(sorted(compatible_tools))
+                return (
+                    f"combines a follow-on {verb} action with {tool}. Purpose: one "
+                    "execution-plan step can invoke only its declared broker tool; "
+                    f"add a separate {expected} step for the {verb} outcome"
+                )
         return None
 
     @staticmethod
