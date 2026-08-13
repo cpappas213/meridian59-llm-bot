@@ -12269,6 +12269,127 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_assignment_deferral_retires_only_active_farm_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.farm_activity = "travelling"
+                broker.room = {"num": 557, "name": "The Lowlands"}
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                    "standing_where_assigned": False,
+                    "failed": 0,
+                    "relocations": 2,
+                    "returned_to_assignment": 1,
+                    "why_not": [],
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="deferred-farm-assignment",
+                        objective="Raise max HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae in room 566.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Use a bounded safe-wall farm.",
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+                observation = broker.observe()
+
+                result = controller._manage_background_farm(
+                    goal,
+                    observation,
+                    controller.criteria.evaluate(goal, observation),
+                )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(result["background_farm_assignment_deferred"])
+                self.assertFalse(result["goal_blocked"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertEqual(
+                    "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
+                )
+                stagnation = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )[f"{goal['id']}|566|groundworm larva"]
+                self.assertEqual("farm_assignment_deferred", stagnation["kind"])
+                # A successful arrival does not negate an exhausted in-room
+                # wall search; the exact tactic receives a bounded cooldown.
+                self.assertTrue(controller._farm_stagnation_blocks(stagnation))
+                self.assertEqual("ineffective_tactic", result["lesson"]["classification"])
+                self.assertEqual("tactic", result["lesson"]["scope"])
+                feedback = controller._planner_feedback(goal)
+                self.assertEqual(
+                    "farm_assignment_deferred", feedback["failure_context"]["kind"]
+                )
+                self.assertIn("different grounded", feedback["message"])
+                events = controller.storage.goal_events(
+                    goal["id"],
+                    kinds=["background_farm.assignment_deferred"],
+                    limit=10,
+                )
+                self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
     def test_failed_retreat_to_inn_is_not_an_assignment_route_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

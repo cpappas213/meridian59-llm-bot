@@ -9695,9 +9695,11 @@ class BotController:
         # persist that cross-record match as a route stagnation.  Never let such
         # evidence block the already-proven destination, even before startup
         # repair has removed the legacy record.
-        if int(placement.get("returned_to_assignment", 0) or 0) > 0 and int(
-            placement.get("failed", 0) or 0
-        ) <= 0:
+        if (
+            stagnation.get("kind") != "farm_assignment_deferred"
+            and int(placement.get("returned_to_assignment", 0) or 0) > 0
+            and int(placement.get("failed", 0) or 0) <= 0
+        ):
             return False
 
         last_error = str(stagnation.get("last_error") or "").strip()
@@ -10406,6 +10408,157 @@ class BotController:
             **deferred,
         }
 
+    def _handle_deferred_farm_assignment(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        status: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Retire only the active tactic when the keeper exhausts its room.
+
+        ``assignment_deferred`` is an authoritative, bounded keeper outcome:
+        the requested prey/room combination has no remaining usable placement
+        candidate in this session. It is not a generic stall and must not leave
+        the campaign phase claiming ownership while the keeper relocates.
+        """
+
+        placement = status.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
+        if placement.get("assignment_deferred") is not True:
+            return None
+
+        phase = self._active_keeper_combat_phase(goal)
+        if phase is None:
+            return None
+        intent = self._campaign_phase_farm_intent(phase)
+        assigned_room = placement.get("assigned_room") or intent.get(
+            "assigned_room"
+        )
+        target = str(intent.get("hunt") or self._farm_target(status)).strip()
+        if assigned_room is None or not target:
+            return None
+
+        detail = str(
+            placement.get("assignment_deferred_reason")
+            or "the keeper exhausted its bounded placement search"
+        ).strip()
+        reason = (
+            f"Keeper deferred assigned_room={assigned_room} for hunt={target}: "
+            f"{detail}"
+        )
+        stopped = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                "hard": True,
+                "why": "the assigned farm room tactic was authoritatively exhausted",
+            },
+            timeout=20,
+            mutation=True,
+        )
+        self.storage.set_runtime("background_farm_owner_v1", {})
+
+        current_room = self._observation_room(observation)
+        stagnations = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
+        stagnations = dict(stagnations) if isinstance(stagnations, dict) else {}
+        stagnation_key = f"{goal['id']}|{assigned_room}|{target}"
+        prior = stagnations.get(stagnation_key)
+        count = int(prior.get("count", 0) or 0) + 1 if isinstance(prior, dict) else 1
+        stagnation = {
+            "kind": "farm_assignment_deferred",
+            "goal_id": goal["id"],
+            "room": current_room,
+            "assigned_room": assigned_room,
+            "requested_assigned_room": assigned_room,
+            "stalled_in_transit": False,
+            "target": target,
+            "count": count,
+            "recorded_at": timestamp(),
+            "placement": redact(placement),
+            # Keep the typed bounded outcome on the normal tactic cooldown.
+            # ``last_error`` is reserved for durable keeper faults.
+            "last_error": "",
+            "reason": detail,
+            "guidance": (
+                "This exact room/prey placement search is exhausted. Choose a different "
+                "grounded hunting room; do not restart the same assignment unchanged."
+            ),
+        }
+        stagnations[stagnation_key] = stagnation
+        self.storage.set_runtime("farm_tactic_stagnation_v1", stagnations)
+
+        deferred = self.learning.defer_goal(
+            goal,
+            observation,
+            tool="autopilot",
+            arguments={
+                "action": "start",
+                "mode": "farm",
+                "hunt": target,
+                "assigned_room": assigned_room,
+                "use_safe_spots": intent.get("use_safe_spots"),
+            },
+            reason=reason,
+            event_kind="background_farm.assignment_deferred",
+            classification="ineffective_tactic",
+            scope="tactic",
+            block=False,
+        )
+        failed_phase = self._fail_active_campaign_phase(goal, reason)
+        self.storage.set_runtime(
+            f"background_farm_route_failure_handled_v1:{goal['id']}", True
+        )
+        feedback_message = (
+            f"The keeper exhausted its bounded placement search for {target} in "
+            f"room {assigned_room}. The strategic goal remains active. Research and "
+            "submit a replacement farm phase using a different grounded room; do not "
+            "retry this room/prey assignment unchanged."
+        )
+        self._set_planner_feedback(
+            goal,
+            feedback_message,
+            failure_context={
+                "kind": "farm_assignment_deferred",
+                "purpose": "replace_only_the_exhausted_farm_tactic",
+                "assigned_room": assigned_room,
+                "target": target,
+                "reason": detail,
+                "required_response": (
+                    "Choose a different grounded hunting room for this prey, or choose "
+                    "different grounded prey and room evidence."
+                ),
+            },
+        )
+        self.storage.emit_event(
+            "background_farm.assignment_deferred",
+            "Retired an exhausted farm assignment while preserving the strategic goal",
+            severity="warning",
+            interesting=True,
+            goal_id=goal["id"],
+            data={
+                **stagnation,
+                "lesson_id": deep_get(deferred, "lesson.id"),
+                "campaign_phase_failed": (
+                    failed_phase.get("id") if failed_phase else None
+                ),
+                "strategic_goal_preserved": True,
+                "goal_blocked": False,
+                "keeper_stop": redact(stopped),
+            },
+        )
+        return {
+            "background_farm_assignment_deferred": True,
+            "campaign_phase_failed": failed_phase,
+            "strategic_goal_preserved": True,
+            "goal_blocked": False,
+            "failure": stagnation,
+            "keeper_stop": stopped,
+            "completion": completion,
+            **deferred,
+        }
+
     def _farm_flee_threshold(self, status: dict[str, Any]) -> float:
         raw = deep_get(status, "policy.fleeBelow", deep_get(status, "policy.flee_below"))
         try:
@@ -11101,6 +11254,12 @@ class BotController:
                 "mismatch": mismatch,
                 "completion": completion,
             }
+
+        assignment_deferred = self._handle_deferred_farm_assignment(
+            goal, observation, status, completion
+        )
+        if assignment_deferred is not None:
+            return assignment_deferred
 
         evidence = self._farm_status_evidence(goal, observation, status)
         if evidence.get("at_assigned_room") is True:
