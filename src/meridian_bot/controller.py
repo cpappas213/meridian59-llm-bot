@@ -1853,7 +1853,7 @@ class BotController:
                 "room result"
             )
         follow_on = re.search(
-            r"\bthen\s+(?:the\s+)?(?P<verb>buy|purchase|sell|liquidate|equip|wield|wear|cast|travel|go|walk|move)\b",
+            r"\b(?:then|and\s+then|otherwise|if\s+not)\s*[,;:]?\s+(?:the\s+)?(?P<verb>buy|purchase|sell|liquidate|equip|wield|wear|cast|travel|go|walk|move)\b",
             outcome,
         )
         if follow_on is not None:
@@ -3733,15 +3733,134 @@ class BotController:
             ),
             None,
         )
-        if next_sale is None or any(
-            step.get("tool") == "merchants" for step in steps[:next_sale]
-        ):
+        if next_sale is None:
+            return None
+        sale_step = steps[next_sale]
+        sale_text = " ".join(
+            str(sale_step.get(field) or "")
+            for field in ("outcome", "verification")
+        ).casefold()
+        blocked_actions = self.storage.get_runtime("blocked_actions", [])
+        blocked_actions = (
+            blocked_actions if isinstance(blocked_actions, list) else []
+        )
+        for entry in blocked_actions:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("goal_id") != goal.get("id")
+                or entry.get("tool") not in {"sell", "sell_all"}
+            ):
+                continue
+            rejected_target = deep_get(entry, "arguments.to")
+            if rejected_target is not None and re.search(
+                rf"\b{re.escape(str(rejected_target))}\b", sale_text
+            ):
+                return (
+                    f"the proposed sale targets merchant {rejected_target}, which already "
+                    "rejected this sale tactic; choose a different candidate returned by "
+                    "buyer discovery"
+                )
+
+        prior_discovery = self._recent_buyer_discovery_evidence(
+            goal, sale_text=sale_text
+        )
+        lookups = [
+            step
+            for step in steps[:next_sale]
+            if step.get("tool") == "merchants"
+        ]
+        if lookups:
+            if prior_discovery is not None:
+                query = str(prior_discovery.get("query") or "").casefold()
+                repeated = any(
+                    query
+                    and query
+                    in " ".join(
+                        str(step.get(field) or "")
+                        for field in ("outcome", "verification")
+                    ).casefold()
+                    for step in lookups
+                )
+                if repeated:
+                    return (
+                        f"buyer discovery for {query!r} already completed with candidate "
+                        "results; consume that verified result and proceed to a different "
+                        "candidate instead of repeating the same merchants lookup"
+                    )
+            return None
+        if prior_discovery is not None:
             return None
         return (
             "the previous merchant rejected the sale; a replacement plan must "
             "include a merchants buyer-discovery step before its next sell or "
-            "sell_all step, rather than assuming another buyer exists"
+            "sell_all step, or consume a recent completed targeted buyer lookup, "
+            "rather than assuming another buyer exists"
         )
+
+    def _recent_buyer_discovery_evidence(
+        self,
+        goal: dict[str, Any],
+        *,
+        sale_text: str,
+    ) -> dict[str, Any] | None:
+        """Find a completed targeted buyer lookup with usable candidates."""
+
+        blocked_actions = self.storage.get_runtime("blocked_actions", [])
+        sale_failures = [
+            entry
+            for entry in (
+                blocked_actions if isinstance(blocked_actions, list) else []
+            )
+            if isinstance(entry, dict)
+            and entry.get("goal_id") == goal.get("id")
+            and entry.get("tool") in {"sell", "sell_all"}
+        ]
+        latest_failure_at = max(
+            (str(entry.get("updated_at") or "") for entry in sale_failures),
+            default="",
+        )
+        events = self.storage.goal_events(
+            str(goal.get("id") or ""),
+            kinds=["action.succeeded", "action.no_progress"],
+            limit=120,
+        )
+        for event in reversed(events):
+            if (
+                latest_failure_at
+                and str(event.get("occurred_at") or "") < latest_failure_at
+            ):
+                continue
+            data = event.get("data")
+            data = data if isinstance(data, dict) else {}
+            if data.get("tool") != "merchants":
+                continue
+            arguments = data.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            query = " ".join(str(arguments.get("buys") or "").split())
+            if not query or query.casefold() not in sale_text:
+                continue
+            result = data.get("result")
+            result = result if isinstance(result, dict) else {}
+            broad = result.get("buys_anything")
+            mentioned = result.get("rules_mentioning")
+            candidates = [
+                item
+                for item in (
+                    (broad if isinstance(broad, list) else [])
+                    + (mentioned if isinstance(mentioned, list) else [])
+                )
+                if isinstance(item, dict)
+                and item.get("room") is not None
+                and item.get("excludes_it") is not True
+            ]
+            if candidates:
+                return {
+                    "query": query,
+                    "occurred_at": event.get("occurred_at"),
+                    "event_id": event.get("id"),
+                    "candidates": candidates[:20],
+                }
+        return None
 
     def _record_plan_action(
         self,
@@ -13674,7 +13793,12 @@ class BotController:
                 f"Action succeeded: {tool}",
                 interesting=False,
                 goal_id=goal["id"],
-                data={"tool": tool, "result": redact(result), "attempt_id": attempt_id},
+                data={
+                    "tool": tool,
+                    "arguments": redact(arguments),
+                    "result": redact(result),
+                    "attempt_id": attempt_id,
+                },
                 correlation_id=correlation_id,
                 policy_decision_id=policy.id,
             )

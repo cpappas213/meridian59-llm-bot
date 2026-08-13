@@ -219,9 +219,12 @@ increased. Inspect actual inventory, query merchants for what the character carr
 sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly
 inspect the same shop catalogue until a funding action succeeds; do not perform a knowingly invalid bank
 call from the shop.
-After a merchant rejects a sale, the replacement execution_plan must include a merchants buyer-discovery step
-before its next sell or sell_all step. Naming an unspecified "weapon-buying merchant" in prose or assumptions is
-not grounding. Execute the lookup as its own bound plan step, then use its result to choose the buyer and route.
+After a merchant rejects a sale, buyer discovery must precede the next sell or sell_all. Include a merchants
+buyer-discovery step unless a recent completed targeted merchants lookup is already present in last_action,
+revision_authorization, planner_feedback, or verified event context. In that case consume its actual candidates;
+do not repeat the lookup merely to keep it visible in the replacement plan. Naming an unspecified
+"weapon-buying merchant" in prose or assumptions is not grounding. Never choose a merchant whose prior refusal
+is present in verified_no_progress_tactics; choose a different candidate and route.
 Prefer verified direct capabilities over speculative commerce. If a castable self-production spell such as
 Create Weapon directly supplies the missing phase requirement, use cast before constructing a buy-and-sell
 detour. A successful read-only catalogue or status lookup is evidence, not progress; after learning it once,

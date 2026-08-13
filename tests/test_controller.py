@@ -2512,6 +2512,19 @@ class ControllerTests(unittest.TestCase):
             )
             or "",
         )
+        self.assertIn(
+            "separate escape_underworld/go_through/leave_raza/travel/walk_to step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "sell",
+                    "outcome": (
+                        "Quote the local buyer; if not, travel to the alternate buyer."
+                    ),
+                    "verification": "A quote is returned or the room changes.",
+                }
+            )
+            or "",
+        )
         self.assertIsNone(
             BotController._commerce_step_error(
                 {
@@ -6002,9 +6015,67 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual("merchants", stored["steps"][0]["tool"])
                 self.assertIn(
-                    "must include a merchants buyer-discovery step",
+                    "buyer discovery must precede the next sell",
                     PLANNER_SYSTEM,
                 )
+
+                controller.storage.emit_event(
+                    "action.no_progress",
+                    "Repeated buyer discovery returned known evidence",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "merchants",
+                        "arguments": {
+                            "agent": "primary",
+                            "buys": "rusty sword",
+                        },
+                        "reason": (
+                            "repeated identical evidence lookup returned no new evidence"
+                        ),
+                        "result": {
+                            "buys_anything": [
+                                {"merchant": "Assassin", "room": 110}
+                            ],
+                            "rules_mentioning": [],
+                        },
+                    },
+                )
+                controller._clear_planner_feedback()
+                consumed = controller._store_execution_plan(
+                    goal,
+                    ungrounded,
+                    grounding={"valid": True},
+                    revision=True,
+                )
+                self.assertEqual("sell", consumed["steps"][0]["tool"])
+
+                repeated_lookup = copy.deepcopy(grounded)
+                repeated_lookup["steps"][0]["outcome"] = (
+                    "Find merchants that buy rusty sword."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "already completed with candidate results"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        repeated_lookup,
+                        grounding={"valid": True},
+                        revision=True,
+                    )
+
+                refused_buyer = copy.deepcopy(ungrounded)
+                refused_buyer["steps"][0]["outcome"] = (
+                    "Sell the rusty sword to D'Franco merchant 736."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "merchant 736.*already rejected"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        refused_buyer,
+                        grounding={"valid": True},
+                        revision=True,
+                    )
             finally:
                 controller.storage.close()
 
