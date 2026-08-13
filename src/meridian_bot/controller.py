@@ -3036,6 +3036,115 @@ class BotController:
         return None
 
     @staticmethod
+    def _live_spell_readiness(
+        observation: dict[str, Any], spell_name: str
+    ) -> dict[str, Any] | None:
+        """Return the live typed spell row for an exact normalized name."""
+
+        wanted = " ".join(str(spell_name).split()).casefold()
+        rows = deep_get(observation, "spells.spells", [])
+        for row in rows if isinstance(rows, list) else []:
+            if (
+                isinstance(row, dict)
+                and " ".join(str(row.get("name") or "").split()).casefold()
+                == wanted
+            ):
+                return row
+        return None
+
+    def _farm_weapon_plan_error(
+        self,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+        *,
+        launch_index: int,
+    ) -> str | None:
+        """Require a causal weapon path before a known-unarmed farm launch."""
+
+        readiness = self.learning.readiness_summary(observation)
+        if (
+            readiness.get("equipment_state") != "known"
+            or readiness.get("wielded_weapons")
+        ):
+            return None
+
+        prior = steps[:launch_index]
+
+        def step_text(step: dict[str, Any]) -> str:
+            return " ".join(
+                str(step.get(field) or "")
+                for field in ("outcome", "verification")
+            ).casefold()
+
+        acquisition_index = -1
+        if not readiness.get("carried_weapons"):
+            create_weapon = self._live_spell_readiness(
+                observation, "create weapon"
+            )
+            cast_index = next(
+                (
+                    index
+                    for index, step in enumerate(prior)
+                    if step.get("tool") == "cast"
+                    and "create weapon" in step_text(step)
+                ),
+                None,
+            )
+            if create_weapon is not None and create_weapon.get("castable") is True:
+                if cast_index is None:
+                    return (
+                        "the character is known unarmed with no carried weapon, while "
+                        "live Create Weapon is castable; add a Create Weapon cast step "
+                        "before the farm launch. Create Food, travel, or another "
+                        "non-weapon action cannot satisfy this combat prerequisite"
+                    )
+                acquisition_index = cast_index
+            else:
+                acquisition_index = next(
+                    (
+                        index
+                        for index, step in enumerate(prior)
+                        if step.get("tool") in {"cast", "shop", "act"}
+                        and re.search(
+                            r"\b(?:weapon|mace|sword|axe|hammer|scimitar)\b",
+                            step_text(step),
+                        )
+                    ),
+                    -1,
+                )
+                if acquisition_index < 0:
+                    return (
+                        "the character is known unarmed with no carried weapon; the "
+                        "farm plan must acquire or create a weapon before launch"
+                    )
+
+        equip_index = next(
+            (
+                index
+                for index, step in enumerate(prior)
+                if index > acquisition_index
+                and (
+                    step.get("tool") == "equip_best"
+                    or (
+                        step.get("tool") == "act"
+                        and re.search(
+                            r"\b(?:equip|wield|use)\b.{0,80}"
+                            r"\b(?:weapon|mace|sword|axe|hammer|scimitar)\b",
+                            step_text(step),
+                        )
+                    )
+                )
+            ),
+            None,
+        )
+        if equip_index is None:
+            return (
+                "the character is known unarmed; add a verified equip_best or exact "
+                "weapon-use step after weapon acquisition and before the farm launch"
+            )
+        return None
+
+    @staticmethod
     def _direct_phase_capabilities(
         phase: dict[str, Any] | None,
         observation: dict[str, Any],
@@ -5510,6 +5619,13 @@ class BotController:
                     "the farm launch step must name the goal-owned prey and exact assigned room"
                 )
             observation = self.last_observation or {}
+            weapon_error = self._farm_weapon_plan_error(
+                normalized_steps,
+                observation,
+                launch_index=launch_index,
+            )
+            if weapon_error is not None:
+                raise ModelError(weapon_error)
             current_room = deep_get(
                 observation,
                 "look.room.num",
@@ -9197,6 +9313,14 @@ class BotController:
             )
         launch_room = int(launch_origin["room_id"])
         launch_name = str(launch_origin["name"])
+        readiness = self.learning.readiness_summary(observation)
+        needs_created_weapon = bool(
+            readiness.get("equipment_state") == "known"
+            and not readiness.get("wielded_weapons")
+            and not readiness.get("carried_weapons")
+            and self._live_spell_readiness(observation, "create weapon")
+            is not None
+        )
         steps: list[dict[str, Any]] = [
             {
                 "id": "farm-bank-transit",
@@ -9238,7 +9362,25 @@ class BotController:
                 ]
             )
         steps.extend(
-            [
+            (
+                [
+                    {
+                        "id": "create-weapon-before-farm",
+                        "outcome": (
+                            "Cast Create Weapon in safe staging because the character "
+                            "has no wielded or carried weapon."
+                        ),
+                        "tool": "cast",
+                        "verification": (
+                            "Live inventory gains a usable weapon and mana decreases; "
+                            "a silent zero-mana cast is not success."
+                        ),
+                    }
+                ]
+                if needs_created_weapon
+                else []
+            )
+            + [
                 {
                     "id": "rest-for-farm",
                     "outcome": "Rest safely to the ordinary 80-vigor ceiling and stand again.",
@@ -9462,6 +9604,23 @@ class BotController:
             or not readiness.get("wielded_weapons")
         ):
             if not readiness.get("carried_weapons"):
+                create_weapon = self._live_spell_readiness(
+                    observation, "create weapon"
+                )
+                if (
+                    isinstance(create_weapon, dict)
+                    and create_weapon.get("castable") is True
+                ):
+                    return action(
+                        "cast",
+                        {"spell": "create weapon", "observe_created": True},
+                        "create-weapon-before-farm",
+                        (
+                            "Create a weapon deterministically while mana and safe "
+                            "staging permit it; an unrelated food cast cannot repair "
+                            "known-unarmed combat readiness."
+                        ),
+                    )
                 return None
             if self.learning.check_action("equip_best", {}, observation) is not None:
                 # The tactical campaign owns recovery once the ordinary

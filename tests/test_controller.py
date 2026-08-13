@@ -11293,6 +11293,134 @@ class ControllerTests(unittest.TestCase):
                     )
                 )
 
+                conjure_ready = copy.deepcopy(armor_only)
+                conjure_ready["spells"] = {
+                    "spells": [
+                        {
+                            "name": "Create Weapon",
+                            "mana": 15,
+                            "reagents": [],
+                            "castable": True,
+                        }
+                    ]
+                }
+                controller.last_observation = conjure_ready
+                create = controller._structured_farm_preparation_action(
+                    goal, conjure_ready, completion
+                )
+                self.assertEqual("cast", create["tool"])
+                self.assertEqual("create weapon", create["arguments"]["spell"])
+                structured_plan = controller._structured_farm_controller_plan(goal)
+                structured_ids = [step["id"] for step in structured_plan["steps"]]
+                self.assertLess(
+                    structured_ids.index("create-weapon-before-farm"),
+                    structured_ids.index("equip-before-farm"),
+                )
+                self.assertLess(
+                    structured_ids.index("equip-before-farm"),
+                    structured_ids.index("launch-goal-keeper"),
+                )
+
+                invalid_weapon_plan = [
+                    {
+                        "id": "wrong-prerequisite",
+                        "tool": "cast",
+                        "outcome": "Cast Create Food before combat.",
+                        "verification": "Food appears in inventory.",
+                    },
+                    {
+                        "id": "launch-unarmed",
+                        "tool": "autopilot",
+                        "outcome": "Launch farm for groundworm larva in room 557.",
+                        "verification": "Keeper is running.",
+                    },
+                ]
+                self.assertIn(
+                    "live Create Weapon is castable",
+                    controller._farm_weapon_plan_error(
+                        invalid_weapon_plan,
+                        conjure_ready,
+                        launch_index=1,
+                    ),
+                )
+                valid_weapon_plan = [
+                    {
+                        "id": "create",
+                        "tool": "cast",
+                        "outcome": "Cast Create Weapon.",
+                        "verification": "A usable weapon appears in inventory.",
+                    },
+                    {
+                        "id": "equip",
+                        "tool": "equip_best",
+                        "outcome": "Equip the created weapon.",
+                        "verification": "A weapon is wielded.",
+                    },
+                    invalid_weapon_plan[-1],
+                ]
+                self.assertIsNone(
+                    controller._farm_weapon_plan_error(
+                        valid_weapon_plan,
+                        conjure_ready,
+                        launch_index=2,
+                    )
+                )
+
+                broker = BackgroundFarmBroker()
+                broker.tools["cast"] = Tool(
+                    "cast",
+                    "Cast a known spell.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "spell": {"type": "string"},
+                        },
+                    },
+                )
+                broker.tools["equip_best"] = Tool(
+                    "equip_best",
+                    "Equip the best carried weapon.",
+                    {"type": "object", "properties": {"agent": {}}},
+                )
+                controller.broker = broker
+                with self.assertRaisesRegex(
+                    ModelError, "live Create Weapon is castable"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        with_safe_ending(
+                            {
+                                "summary": "Substitute food for a missing weapon.",
+                                "steps": invalid_weapon_plan,
+                                "assumptions": [],
+                            },
+                            52,
+                        ),
+                        grounding={
+                            "valid": True,
+                            "corpus": {"corpus_version": "test"},
+                        },
+                        revision=False,
+                    )
+                stored = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create, equip, and then launch.",
+                            "steps": valid_weapon_plan,
+                            "assumptions": [],
+                        },
+                        52,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                self.assertEqual("verified", stored["verification"]["status"])
+
                 carrying_mace = copy.deepcopy(armor_only)
                 carrying_mace["inventory"]["items"].append(
                     {"id": 11, "name": "mace", "can": ["use"]}
