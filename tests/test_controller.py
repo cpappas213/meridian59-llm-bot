@@ -2553,8 +2553,8 @@ class ControllerTests(unittest.TestCase):
             {
                 "id": "sell-created",
                 "tool": "sell",
-                "outcome": "Sell the created weapon to raise funds.",
-                "verification": "Shillings increase.",
+                "outcome": "Sell the newly created mace with the exact id from create-weapon.",
+                "verification": "A merchant buys that mace and shillings increase.",
             },
         ]
         weapon_only_phase = {
@@ -2569,6 +2569,18 @@ class ControllerTests(unittest.TestCase):
                 created_weapon_sale,
                 observation,
                 [],
+            )
+            or "",
+        )
+        self.assertIn(
+            "assumes a Create Weapon product is sellable",
+            BotController._direct_capability_plan_error(
+                weapon_only_phase,
+                created_weapon_sale[:1],
+                observation,
+                [
+                    "At least one merchant will accept the newly created mace as sellable funding."
+                ],
             )
             or "",
         )

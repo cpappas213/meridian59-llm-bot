@@ -2174,6 +2174,7 @@ class BotController:
             ).casefold()
         ]
         for cast_index in create_weapon_indexes:
+            cast_step_id = str(steps[cast_index].get("id") or "").casefold()
             for step in steps[cast_index + 1 :]:
                 if step.get("tool") not in {"sell", "sell_all"}:
                     continue
@@ -2181,12 +2182,38 @@ class BotController:
                     str(step.get(field) or "")
                     for field in ("outcome", "verification")
                 ).casefold()
-                if re.search(r"\b(?:created|conjured|summoned)\s+weapon\b", sale_text):
+                created_item_reference = bool(
+                    re.search(
+                        r"\b(?:created|conjured|summoned|newly created)\b.{0,100}"
+                        r"\b(?:weapon|mace|sword|axe|hammer|scimitar)\b",
+                        sale_text,
+                    )
+                    or (
+                        cast_step_id
+                        and re.search(
+                            rf"\b(?:from|produced by|created in)\s+{re.escape(cast_step_id)}\b",
+                            sale_text,
+                        )
+                    )
+                )
+                if created_item_reference:
                     return (
                         "Create Weapon products are marked IA_MADE and cannot be given "
                         "to any NPC; use the created weapon as equipment, never as a "
                         "sale or funding step"
                     )
+        assumption_text = " ".join(assumptions or []).casefold()
+        if create_weapon_indexes and re.search(
+            r"\b(?:created|conjured|summoned|newly created)\b.{0,100}"
+            r"\b(?:weapon|mace|sword|axe|hammer|scimitar)\b.{0,100}"
+            r"\b(?:sell|sale|sellable|buyer|merchant|fund)\w*\b",
+            assumption_text,
+        ):
+            return (
+                "the plan assumes a Create Weapon product is sellable, but every such "
+                "product is marked IA_MADE and cannot be given to any NPC; use it only "
+                "as equipment and choose a non-sale funding route"
+            )
         return None
 
     def _targeted_sale_grounding_error(
