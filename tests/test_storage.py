@@ -125,6 +125,69 @@ class StorageTests(unittest.TestCase):
                 self.assertFalse(full["all_met"])
                 self.assertFalse(unknown["all_met"])
 
+    def test_named_ability_state_path_resolves_live_catalogue_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                evaluator = CriteriaEvaluator(storage)
+                goal = {
+                    "id": "named-ability-membership",
+                    "success_criteria": [
+                        {
+                            "id": "has-punch",
+                            "kind": "state_equals",
+                            "path": "abilities.skills.Punch",
+                            "value": True,
+                        },
+                        {
+                            "id": "punch-level",
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.punch",
+                            "operator": ">=",
+                            "value": 1,
+                        },
+                    ],
+                }
+
+                learned = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": True}},
+                            "skills": [{"name": "PUNCH", "ability": 18}],
+                        }
+                    },
+                )
+                absent = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": True}},
+                            "skills": [{"name": "mace fighting", "ability": 32}],
+                        }
+                    },
+                )
+                unknown = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": False}},
+                            "skills": [{"name": "punch", "ability": 18}],
+                        }
+                    },
+                )
+
+                self.assertTrue(learned["all_met"])
+                self.assertEqual(
+                    "observed True; expected True",
+                    learned["criteria"][0]["detail"],
+                )
+                self.assertFalse(absent["criteria"][0]["met"])
+                self.assertEqual(
+                    "observed None; expected True",
+                    unknown["criteria"][0]["detail"],
+                )
+                self.assertFalse(unknown["all_met"])
+
     def test_higher_priority_preemption_requeues_and_automatically_resumes_goal(
         self,
     ) -> None:

@@ -205,6 +205,34 @@ class CriteriaEvaluator:
     def _state_value(observation: dict[str, Any], path: str) -> Any:
         """Resolve stable state paths, including broker compatibility aliases."""
 
+        parts = path.split(".", 2)
+        if (
+            len(parts) == 3
+            and parts[0].casefold() == "abilities"
+            and parts[1].casefold() in {"skills", "spells"}
+            and parts[2].strip()
+        ):
+            abilities = observation.get("abilities")
+            if not isinstance(abilities, dict):
+                return None
+            ability_kind = parts[1].casefold()
+            freshness = abilities.get("freshness")
+            if isinstance(freshness, dict):
+                known = freshness.get("known")
+                if known is False:
+                    return None
+                if isinstance(known, dict) and known.get(ability_kind) is False:
+                    return None
+            rows = abilities.get(ability_kind)
+            if not isinstance(rows, list):
+                return None
+            wanted = ability_name_key(parts[2])
+            return any(
+                isinstance(row, dict)
+                and ability_name_key(row.get("name")) == wanted
+                for row in rows
+            )
+
         if path != "inventory.full":
             return deep_get(observation, path)
 
