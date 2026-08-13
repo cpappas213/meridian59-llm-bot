@@ -2005,6 +2005,17 @@ class BotController:
         steps: list[dict[str, Any]],
         observation: dict[str, Any],
     ) -> str | None:
+        inventory = observation.get("inventory")
+        if not isinstance(inventory, dict) or not isinstance(
+            inventory.get("items"), list
+        ):
+            # Startup validates persisted structure before the first broker
+            # observation.  Missing inventory is unknown, not proof of zero
+            # funds; enforce this live prerequisite after observation arrives.
+            return None
+        carry = inventory.get("carry")
+        if isinstance(carry, dict) and carry.get("known") is False:
+            return None
         if cls._carried_currency(observation) > 0:
             return None
         funding_seen = False

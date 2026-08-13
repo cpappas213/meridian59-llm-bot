@@ -1853,6 +1853,32 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_plan_funding_check_defers_until_inventory_is_observed(self) -> None:
+        purchase = [
+            {
+                "id": "buy-food",
+                "tool": "shop",
+                "outcome": "Purchase edible food.",
+                "verification": "Inventory contains the purchased food.",
+            }
+        ]
+
+        self.assertIsNone(BotController._plan_funding_error(purchase, {}))
+        self.assertIsNone(
+            BotController._plan_funding_error(
+                purchase,
+                {"inventory": {"items": [], "carry": {"known": False}}},
+            )
+        )
+        self.assertIn(
+            "zero carried shillings",
+            BotController._plan_funding_error(
+                purchase,
+                {"inventory": {"items": [], "carry": {"known": True}}},
+            )
+            or "",
+        )
+
     def test_prepare_combat_sale_guards_preserve_loadout_and_require_quote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
