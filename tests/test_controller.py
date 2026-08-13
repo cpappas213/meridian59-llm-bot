@@ -2629,6 +2629,40 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_bank_plan_requires_separate_preceding_travel(self) -> None:
+        observation = {
+            "look": {"room": {"num": 106, "name": "Brownestone Inn"}}
+        }
+        invalid = [
+            {
+                "id": "balance",
+                "tool": "bank",
+                "outcome": "Check the balance at Tos bank room 54.",
+                "verification": "A positive bank balance is shown.",
+            }
+        ]
+        valid = [
+            {
+                "id": "reach-bank",
+                "tool": "travel",
+                "outcome": "Travel to First Royal Bank of Tos, room 54.",
+                "verification": "Current room id is 54.",
+            },
+            invalid[0],
+        ]
+
+        self.assertIn(
+            "calls bank before reaching a verified bank room",
+            BotController._bank_plan_error(invalid, observation) or "",
+        )
+        self.assertIsNone(BotController._bank_plan_error(valid, observation))
+        self.assertIsNone(
+            BotController._bank_plan_error(
+                invalid,
+                {"look": {"room": {"num": 54, "name": "First Royal Bank of Tos"}}},
+            )
+        )
+
     def test_intrinsic_sale_evidence_survives_id_churn_only_for_unchanged_inventory(self) -> None:
         reason = (
             'Meidei tells you, "I cannot see how you could bear to part with a mace! '
@@ -3069,6 +3103,10 @@ class ControllerTests(unittest.TestCase):
                     {"id": 2, "name": "shilling", "amount": 10, "can": []}
                 )
                 controller.last_observation = broker.observe()
+                controller.last_observation["look"]["room"] = {
+                    "num": 54,
+                    "name": "First Royal Bank of Tos",
+                }
                 payload = goal_payload(request_id="legacy-zero-currency-plan")
                 payload["constraints"] = {
                     **payload.get("constraints", {}),

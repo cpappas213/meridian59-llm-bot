@@ -2022,6 +2022,44 @@ class BotController:
         return None
 
     @staticmethod
+    def _bank_plan_error(
+        steps: list[dict[str, Any]], observation: dict[str, Any]
+    ) -> str | None:
+        """Require an explicit bank-room prerequisite before each bank call."""
+
+        current_room_id = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        current_room_name = str(deep_get(observation, "look.room.name", ""))
+        at_bank = (
+            str(current_room_id) == str(TOS_BANK_ROOM_ID)
+            or "bank" in current_room_name.casefold()
+        )
+        for step in steps:
+            tool = str(step.get("tool") or "")
+            text = " ".join(
+                str(step.get(field) or "")
+                for field in ("outcome", "verification")
+            ).casefold()
+            if tool in MOVEMENT_TOOLS:
+                at_bank = bool(
+                    "bank" in text
+                    or re.search(rf"\broom\s+{TOS_BANK_ROOM_ID}\b", text)
+                    or re.search(rf"\b{TOS_BANK_ROOM_ID}\b", text)
+                )
+                continue
+            if tool == "bank" and not at_bank:
+                return (
+                    f"execution_plan step {step.get('id')} calls bank before reaching a "
+                    "verified bank room. Purpose: bank cannot move the character; add a "
+                    "separate preceding travel step to the selected bank (for Tos, room "
+                    f"{TOS_BANK_ROOM_ID})"
+                )
+        return None
+
+    @staticmethod
     def _direct_phase_capabilities(
         phase: dict[str, Any] | None,
         observation: dict[str, Any],
@@ -2460,6 +2498,24 @@ class BotController:
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
         sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
+        bank_error = self._bank_plan_error(
+            stored_steps, self.last_observation or {}
+        )
+        if bank_error is not None:
+            self._invalidate_execution_plan(goal, bank_error)
+            self._set_planner_feedback(
+                goal,
+                bank_error
+                + ". Build a replacement plan with travel and bank as separate ordered steps.",
+                failure_context={
+                    "kind": "bank_location_prerequisite_missing",
+                    "purpose": "Prevent a bank call from being executed outside a bank room.",
+                    "required_response": (
+                        "Add a preceding travel step to a verified bank room before bank."
+                    ),
+                },
+            )
+            return None
         direct_capability_error = self._direct_capability_plan_error(
             phase,
             stored_steps,
@@ -3806,6 +3862,11 @@ class BotController:
         sale_recovery_error = self._sale_recovery_plan_error(
             goal, normalized_steps
         )
+        bank_error = self._bank_plan_error(
+            normalized_steps, self.last_observation or {}
+        )
+        if bank_error is not None:
+            raise ModelError(bank_error)
         direct_capability_error = self._direct_capability_plan_error(
             phase,
             normalized_steps,
