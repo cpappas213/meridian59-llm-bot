@@ -5852,6 +5852,13 @@ class ControllerTests(unittest.TestCase):
 
                 # A subsequent planner rejection may replace the immediate
                 # feedback, but it must not erase the verified sale refusal.
+                controller._clear_planner_feedback()
+                legacy = controller._store_execution_plan(
+                    goal,
+                    ungrounded,
+                    grounding={"valid": True},
+                    revision=False,
+                )
                 controller._record_blocked_action(
                     goal,
                     broker.observe(),
@@ -5860,6 +5867,16 @@ class ControllerTests(unittest.TestCase):
                     "D'Franco refused to buy the mace.",
                 )
                 controller._clear_planner_feedback()
+                self.assertIsNone(controller._execution_plan(goal))
+                invalidations = controller.storage.events(
+                    kinds=["planner.plan.invalidated"]
+                )["events"]
+                self.assertTrue(invalidations)
+                self.assertIn(
+                    "previous merchant rejected",
+                    invalidations[-1]["data"]["reason"],
+                )
+                self.assertEqual(legacy["goal_id"], goal["id"])
                 with self.assertRaisesRegex(
                     ModelError, "buyer-discovery step before its next sell"
                 ):

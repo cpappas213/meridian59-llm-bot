@@ -2182,6 +2182,27 @@ class BotController:
         stored_steps = [
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
+        sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
+        if sale_recovery_error is not None:
+            self._invalidate_execution_plan(goal, sale_recovery_error)
+            self._set_planner_feedback(
+                goal,
+                sale_recovery_error
+                + ". Return decision=plan with a merchants buyer-discovery step "
+                "before any sell or sell_all step.",
+                failure_context={
+                    "kind": "merchant_rejected_sale",
+                    "purpose": (
+                        "Retire a persisted pre-enforcement commerce plan after "
+                        "durable evidence disproved its assumed buyer."
+                    ),
+                    "required_response": (
+                        "Build a replacement plan that discovers a compatible buyer "
+                        "before attempting another sale."
+                    ),
+                },
+            )
+            return None
         funding_error = self._plan_funding_error(
             stored_steps,
             self.last_observation or {},
@@ -3454,59 +3475,11 @@ class BotController:
                     "verification": verification[:600],
                 }
             )
-        feedback = self._planner_feedback(goal)
-        failure_kind = str(
-            deep_get(feedback or {}, "failure_context.kind", "")
+        sale_recovery_error = self._sale_recovery_plan_error(
+            goal, normalized_steps
         )
-        sale_failure_kinds = {
-            "merchant_rejected_sale",
-            "bulk_sale_transferred_nothing",
-        }
-        sale_recovery_required = failure_kind in sale_failure_kinds
-        if not sale_recovery_required:
-            blocked_actions = self.storage.get_runtime("blocked_actions", [])
-            sale_recovery_required = any(
-                isinstance(entry, dict)
-                and entry.get("goal_id") == goal.get("id")
-                and str(
-                    deep_get(
-                        self._failure_context(
-                            str(entry.get("tool") or ""),
-                            str(entry.get("reason") or ""),
-                            self.last_observation or {},
-                        )
-                        or {},
-                        "kind",
-                        "",
-                    )
-                )
-                in sale_failure_kinds
-                for entry in (
-                    blocked_actions if isinstance(blocked_actions, list) else []
-                )
-            )
-        if sale_recovery_required:
-            next_sale = next(
-                (
-                    index
-                    for index, step in enumerate(normalized_steps)
-                    if step.get("tool") in {"sell", "sell_all"}
-                ),
-                None,
-            )
-            buyer_lookup_before_sale = bool(
-                next_sale is not None
-                and any(
-                    step.get("tool") == "merchants"
-                    for step in normalized_steps[:next_sale]
-                )
-            )
-            if next_sale is not None and not buyer_lookup_before_sale:
-                raise ModelError(
-                    "the previous merchant rejected the sale; a replacement plan must "
-                    "include a merchants buyer-discovery step before its next sell or "
-                    "sell_all step, rather than assuming another buyer exists"
-                )
+        if sale_recovery_error is not None:
+            raise ModelError(sale_recovery_error)
         funding_error = self._plan_funding_error(
             normalized_steps,
             self.last_observation or {},
@@ -3655,6 +3628,70 @@ class BotController:
             data={"plan": redact(value)},
         )
         return value
+
+    def _sale_recovery_plan_error(
+        self,
+        goal: dict[str, Any],
+        steps: list[dict[str, Any]],
+    ) -> str | None:
+        """Require live buyer discovery after a verified sale refusal.
+
+        The durable blocked-action ledger is authoritative because unrelated
+        planner feedback can replace the immediate refusal message. Applying
+        the same check while loading a stored plan also retires plans persisted
+        by an older controller version before they can replay a blind sale.
+        """
+
+        sale_failure_kinds = {
+            "merchant_rejected_sale",
+            "bulk_sale_transferred_nothing",
+        }
+        feedback = self._planner_feedback(goal)
+        failure_kind = str(
+            deep_get(feedback or {}, "failure_context.kind", "")
+        )
+        sale_recovery_required = failure_kind in sale_failure_kinds
+        if not sale_recovery_required:
+            blocked_actions = self.storage.get_runtime("blocked_actions", [])
+            sale_recovery_required = any(
+                isinstance(entry, dict)
+                and entry.get("goal_id") == goal.get("id")
+                and str(
+                    deep_get(
+                        self._failure_context(
+                            str(entry.get("tool") or ""),
+                            str(entry.get("reason") or ""),
+                            self.last_observation or {},
+                        )
+                        or {},
+                        "kind",
+                        "",
+                    )
+                )
+                in sale_failure_kinds
+                for entry in (
+                    blocked_actions if isinstance(blocked_actions, list) else []
+                )
+            )
+        if not sale_recovery_required:
+            return None
+        next_sale = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if step.get("tool") in {"sell", "sell_all"}
+            ),
+            None,
+        )
+        if next_sale is None or any(
+            step.get("tool") == "merchants" for step in steps[:next_sale]
+        ):
+            return None
+        return (
+            "the previous merchant rejected the sale; a replacement plan must "
+            "include a merchants buyer-discovery step before its next sell or "
+            "sell_all step, rather than assuming another buyer exists"
+        )
 
     def _record_plan_action(
         self,
