@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -275,6 +277,108 @@ class StorageTests(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertEqual(active["id"], storage.active_goal()["id"])
 
+    def test_operator_pause_and_resume_keep_campaign_lifecycle_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Raise max HP to the next local milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "value": 101,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-campaign-lifecycle",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                        "reason": "operator requested a reversible pause",
+                    }
+                )
+
+                self.assertEqual("paused", storage.goal(goal["id"])["status"])
+                self.assertIsNone(storage.campaign_run(goal["id"]))
+                paused_run = storage.campaign_run(goal["id"], include_terminal=True)
+                self.assertEqual("paused", paused_run["status"])
+                self.assertEqual(phase["id"], paused_run["active_phase_id"])
+                self.assertEqual(
+                    "paused",
+                    next(
+                        item["status"]
+                        for item in storage.campaign_phases(run["id"])
+                        if item["id"] == phase["id"]
+                    ),
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-campaign-lifecycle",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                        "reason": "operator requested a fresh retry",
+                    }
+                )
+
+                self.assertEqual("active", storage.goal(goal["id"])["status"])
+                resumed_run = storage.campaign_run(goal["id"])
+                self.assertEqual(run["id"], resumed_run["id"])
+                self.assertEqual(phase["id"], resumed_run["active_phase_id"])
+                self.assertEqual(
+                    phase["id"], storage.active_campaign_phase(run["id"])["id"]
+                )
+
+    def test_migration_repairs_paused_goal_with_active_campaign_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "bot.sqlite3"
+            with Storage(database) as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Raise max HP to the next local milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "value": 101,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "UPDATE goals SET status='paused' WHERE id=?", (goal["id"],)
+                )
+                connection.execute("DELETE FROM schema_migrations WHERE version=4")
+                connection.commit()
+
+            with Storage(database) as repaired:
+                migrated_run = repaired.campaign_run(
+                    goal["id"], include_terminal=True
+                )
+                self.assertEqual("paused", migrated_run["status"])
+                self.assertEqual(phase["id"], migrated_run["active_phase_id"])
+                self.assertEqual(
+                    "paused", repaired.campaign_phase(phase["id"])["status"]
+                )
+
     def test_blocking_strategic_goal_closes_active_campaign_and_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:
@@ -502,7 +606,14 @@ class StorageTests(unittest.TestCase):
             phase, "equip_best", {}, first, {"equipment.wielding": "mace"}
         )
         second_signature = coordinator.action_signature(
-            phase, "equip_best", {}, second, {"equipment.wielding": "mace"}
+            phase,
+            "equip_best",
+            {},
+            second,
+            {
+                "status": "equipment ready",
+                "detail": "the best weapon should now be wielded",
+            },
         )
         self.assertEqual(first_signature, second_signature)
 

@@ -8745,6 +8745,17 @@ class BotController:
             )
             if self._planner_feedback(goal) is not None:
                 self._clear_planner_feedback()
+            self._clear_safety_suppression(goal["id"])
+        elif payload.get("action") == "pause":
+            # Durable goal/run/phase state is paused atomically by Storage.
+            # Retire transient tactical state as well so a later resume cannot
+            # replay the exact plan or suppression counter that preceded it.
+            self._invalidate_execution_plan(
+                goal, "goal paused; retire transient tactical execution state"
+            )
+            if self._planner_feedback(goal) is not None:
+                self._clear_planner_feedback()
+            self._clear_safety_suppression(goal["id"])
         if isinstance(resulting_goal, dict) and resulting_goal.get("status") == "cancelled":
             self.storage.complete_campaign_run(resulting_goal["id"], status="cancelled")
         if assessment is not None:
@@ -9649,6 +9660,180 @@ class BotController:
                 "current_count": carried,
                 "required_count": minimum,
                 "farm_recipe_preserved": True,
+            },
+        )
+        return support
+
+    def _ensure_combat_vigor_support_phase(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        *,
+        blockers: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Convert an unsatisfied keeper-vigor gate into bounded preparation.
+
+        Resting deliberately stops at 80 vigor.  When the selected keeper phase
+        needs more and no carried/cookable food can bridge the gap, repeated
+        launch attempts cannot change the state.  Pause the exact farm as a
+        parent and let a typed child phase fund, acquire, create, and eat food.
+        """
+
+        run = self.storage.campaign_run(str(goal.get("id") or ""))
+        phase = self.storage.active_campaign_phase(run["id"]) if run else None
+        if not isinstance(phase, dict) or phase.get("kind") not in {
+            "farm",
+            "train_ability",
+        }:
+            return None
+
+        vigor_blocker = next(
+            (
+                item
+                for item in (blockers or [])
+                if isinstance(item, dict)
+                and item.get("kind") == "recover_combat_vigor"
+            ),
+            None,
+        )
+        required_raw = (
+            vigor_blocker.get("minimum")
+            if isinstance(vigor_blocker, dict)
+            # Farm launch normalizes every historical/model-proposed value to
+            # this controller-owned policy boundary.
+            else FARM_FIGHT_VIGOR
+        )
+        vigor_raw = deep_get(
+            observation,
+            "status.vitals.vigor.value",
+            deep_get(observation, "look.vitals.vigor.value", 0),
+        )
+        try:
+            required = max(FARM_FIGHT_VIGOR, int(required_raw or FARM_FIGHT_VIGOR))
+            current = int(vigor_raw or 0)
+        except (TypeError, ValueError):
+            return None
+        supply = self._combat_vigor_supply(observation)
+        if (
+            current >= required
+            or bool(supply.get("available"))
+            or (
+                blockers is not None
+                and not isinstance(vigor_blocker, dict)
+            )
+        ):
+            return None
+
+        intent = self._campaign_phase_farm_intent(phase)
+        finances = self._financial_context(observation)
+        support = self.campaign.apply_manager_decision(
+            run,
+            goal,
+            {
+                "decision": "push_support_phase",
+                "phase": {
+                    "kind": "prepare_combat",
+                    "objective": (
+                        f"Raise verified vigor from {current} to at least {required} "
+                        "by obtaining and consuming edible food before resuming combat."
+                    ),
+                    "success_criteria": [
+                        {
+                            "id": f"combat-vigor-{required}",
+                            "kind": "numeric_threshold",
+                            "metric": "status.vitals.vigor.value",
+                            "operator": ">=",
+                            "value": required,
+                        }
+                    ],
+                    "abandon_predicates": [],
+                    "budget": {"max_actions": 40, "max_minutes": 90},
+                    "context": {
+                        "reason": "recover_combat_vigor",
+                        "required_vigor": required,
+                        "current_vigor": current,
+                        "vigor_shortfall": required - current,
+                        "verified_supply": redact(supply),
+                        "funding": {
+                            "carried_shillings": finances.get("carried_shillings"),
+                            "bank_accounts": redact(finances.get("bank_accounts", [])),
+                            "buyer_candidates": redact(finances.get("buyer_candidates", [])),
+                            "purchase_quote_required": True,
+                            "instruction": (
+                                "Obtain a fresh merchant quote, compute the exact total and "
+                                "deficit, then fund it with a verified bank withdrawal or a "
+                                "guarded sale before purchasing."
+                            ),
+                        },
+                        "allowed_recovery": [
+                            "sell guarded excess inventory after a fresh quote",
+                            "withdraw verified bank funds",
+                            "buy edible food or exact Create Food reagents",
+                            "cast Create Food only when its live reagent check is satisfied",
+                            "consume verified edible food until the vigor target is observed",
+                        ],
+                        "resume_combat_phase_id": phase.get("id"),
+                        "resume_combat_recipe": redact(intent),
+                    },
+                    "rationale": (
+                        "The deterministic combat preflight cannot be satisfied by "
+                        "resting alone; perform the missing resource work in the smallest "
+                        "bounded child phase while preserving the strategic goal."
+                    ),
+                },
+                "rationale": "Satisfy the deterministic keeper-vigor prerequisite.",
+            },
+            observation=observation,
+        )
+        if support is None:
+            return None
+        self._invalidate_execution_plan(
+            goal, "combat vigor requires a bounded preparation support phase"
+        )
+        self._clear_safety_suppression(str(goal.get("id") or ""))
+        self._clear_planner_feedback()
+        resolved_lesson_ids: list[str] = []
+        for lesson in self.storage.goal_lessons(
+            statuses=["deferred", "unlocked"],
+            goal_id=str(goal.get("id") or ""),
+            limit=50,
+        ):
+            summary = str(lesson.get("summary") or "").casefold()
+            if (
+                lesson.get("scope") == "tactic"
+                and lesson.get("classification") == "ineffective_tactic"
+                and "deterministic safety suppression" in summary
+                and "vigor" in summary
+            ):
+                resolved = self.storage.update_goal_lesson(
+                    lesson["id"],
+                    "resolved",
+                    resolution_goal_id=str(goal.get("id") or ""),
+                    evidence={
+                        "repair": "bounded combat-vigor support phase started",
+                        "support_phase_id": support.get("id"),
+                        "required_vigor": required,
+                        "at": timestamp(),
+                    },
+                )
+                resolved_lesson_ids.append(str(resolved["id"]))
+        self.storage.emit_event(
+            "campaign.combat_vigor_support_started",
+            (
+                f"Paused combat phase to raise vigor from {current} to {required} "
+                "through verified provisioning"
+            ),
+            severity="notice",
+            interesting=False,
+            goal_id=goal.get("id"),
+            data={
+                "combat_phase_id": phase.get("id"),
+                "support_phase_id": support.get("id"),
+                "current_vigor": current,
+                "required_vigor": required,
+                "vigor_shortfall": required - current,
+                "resolved_safety_lesson_ids": resolved_lesson_ids,
+                "strategic_goal_preserved": True,
             },
         )
         return support
@@ -14972,6 +15157,18 @@ class BotController:
                     "reason": "replenish_healing_supplies_after_death",
                     "strategic_goal_preserved": True,
                 }
+            vigor_support = (
+                None
+                if phase_safe_return_checkpoint is not None
+                else self._ensure_combat_vigor_support_phase(goal, observation)
+            )
+            if vigor_support is not None:
+                return {
+                    "campaign_support_phase_started": True,
+                    "phase": vigor_support,
+                    "reason": "recover_combat_vigor",
+                    "strategic_goal_preserved": True,
+                }
             structured_purchase = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -16486,6 +16683,7 @@ class BotController:
             self._invalidate_execution_plan(
                 goal, "campaign circuit breaker rejected an equivalent failed action"
             )
+            self._clear_safety_suppression(goal["id"])
             return {
                 "action": tool,
                 "action_suppressed": True,
@@ -16526,6 +16724,18 @@ class BotController:
                     str(item.get("guidance") or item.get("kind")) for item in preflight
                 ),
             )
+            vigor_support = self._ensure_combat_vigor_support_phase(
+                goal, observation, blockers=preflight
+            )
+            if vigor_support is not None:
+                return {
+                    "action": tool,
+                    "safety_suppressed": True,
+                    "blockers": preflight,
+                    "campaign_support_phase_started": True,
+                    "phase": vigor_support,
+                    "strategic_goal_preserved": True,
+                }
             suppression = self._record_safety_suppression(
                 goal, observation, tool, arguments, preflight
             )
@@ -16567,6 +16777,7 @@ class BotController:
                 self._invalidate_execution_plan(
                     goal, "campaign breaker ended a repeatedly safety-blocked phase"
                 )
+                self._clear_safety_suppression(goal["id"])
                 return {
                     "action": tool,
                     "safety_suppressed": True,
@@ -16575,42 +16786,41 @@ class BotController:
                     "strategic_goal_preserved": True,
                 }
             if count >= self.config.learning.wait_budget:
+                stall_reason = (
+                    "Repeated deterministic safety suppression exhausted the controller wait budget: "
+                    + "; ".join(
+                        str(item.get("guidance") or item.get("kind"))
+                        for item in preflight
+                    )
+                )
                 deferred = self.learning.defer_goal(
                     goal,
                     observation,
                     tool=tool,
                     arguments=arguments,
-                    reason=(
-                        "Repeated deterministic safety suppression exhausted the controller wait budget: "
-                        + "; ".join(
-                            str(item.get("guidance") or item.get("kind"))
-                            for item in preflight
-                        )
-                    ),
+                    reason=stall_reason,
                     event_kind="action.safety_suppressed",
                     classification="ineffective_tactic",
                     scope="tactic",
                     block=False,
                 )
-                paused = self.storage.manage_goal(
-                    {
-                        "request_id": f"controller-safety-stall-{uuid7()}",
-                        "goal_id": goal["id"],
-                        "action": "pause",
-                        "reason": (
-                            "controller paused the goal after the same safety blocker "
-                            f"repeated {count} times"
-                        ),
-                    }
-                )["goal"]
+                failed_phase = self._fail_active_campaign_phase(goal, stall_reason)
+                if failed_phase is None:
+                    self._invalidate_execution_plan(
+                        goal, "retired a repeatedly safety-blocked tactic"
+                    )
+                self._clear_safety_suppression(goal["id"])
                 return {
+                    **deferred,
                     "action": tool,
                     "safety_suppressed": True,
-                    "goal_paused": True,
-                    "goal": paused,
+                    "tactic_deferred": True,
+                    "phase_retired": failed_phase is not None,
+                    "phase": failed_phase,
+                    "goal": self.storage.goal(goal["id"]),
                     "blockers": preflight,
                     "suppression": suppression,
-                    **deferred,
+                    "strategic_goal_preserved": True,
                 }
             return {
                 "action": tool,
@@ -20482,10 +20692,18 @@ class BotController:
         if not goal:
             return None
         run = self.storage.campaign_run(str(goal.get("id") or ""))
+        if run is None and goal.get("status") == "paused":
+            run = self.storage.campaign_run(
+                str(goal.get("id") or ""), include_terminal=True
+            )
         if run is None:
             return None
         phase = self.storage.active_campaign_phase(run["id"])
         phases = self.storage.campaign_phases(run["id"])
+        if phase is None and run.get("status") == "paused" and run.get(
+            "active_phase_id"
+        ):
+            phase = self.storage.campaign_phase(str(run["active_phase_id"]))
         attempt_phase = phase or (phases[-1] if phases else None)
         attempts = (
             self.storage.phase_attempts(attempt_phase["id"], limit=8)

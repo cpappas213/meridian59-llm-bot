@@ -6204,7 +6204,6 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="start",
                 )
-
                 _, active, _ = controller._campaign_turn_state(
                     goal,
                     broker.observe(),
@@ -9240,7 +9239,7 @@ class ControllerTests(unittest.TestCase):
             BotController._spawn_is_hostile({"creature": "Unknown NPC", "level": 50})
         )
 
-    def test_repeated_safety_suppression_escalates_and_pauses_at_budget(self) -> None:
+    def test_repeated_safety_suppression_retires_tactic_without_pausing_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -9280,8 +9279,12 @@ class ControllerTests(unittest.TestCase):
                         },
                     )
 
-                self.assertTrue(result["goal_paused"])
-                self.assertEqual("paused", controller.storage.goal(goal["id"])["status"])
+                self.assertTrue(result["tactic_deferred"])
+                self.assertNotIn("goal_paused", result)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller.storage.get_runtime("safety_suppression_v1")
+                )
                 stalled = controller.storage.events(kinds=["planner.stalled"])["events"]
                 self.assertEqual(1, len(stalled))
                 self.assertEqual(3, stalled[0]["data"]["same_blocker_count"])
@@ -9713,6 +9716,47 @@ class ControllerTests(unittest.TestCase):
                 broker.vitals["vigor"] = {"value": 93, "scale_max": 200, "rested": True}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(goal_payload(request_id="farm-vigor-gate"))["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 575.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "context": {
+                            "room": 575,
+                            "target": "giant rat",
+                            "fight_above_vigor": 140,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                stale_lesson = controller.learning.defer_goal(
+                    goal,
+                    broker.observe(),
+                    tool="autopilot",
+                    arguments={
+                        "action": "start",
+                        "mode": "farm",
+                        "hunt": "giant rat",
+                        "assigned_room": 575,
+                    },
+                    reason=(
+                        "Repeated deterministic safety suppression exhausted the "
+                        "controller wait budget: recover combat vigor before launch"
+                    ),
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                )["lesson"]
 
                 result = controller._execute(
                     goal,
@@ -9731,9 +9775,31 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertTrue(result["safety_suppressed"])
+                self.assertTrue(result["campaign_support_phase_started"])
                 self.assertIn("recover_combat_vigor", {item["kind"] for item in result["blockers"]})
                 blocker = next(item for item in result["blockers"] if item["kind"] == "recover_combat_vigor")
                 self.assertIn("resting stops at 80 vigor", blocker["guidance"])
+                support = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual("prepare_combat", support["kind"])
+                self.assertEqual(farm["id"], support["parent_phase_id"])
+                self.assertEqual(
+                    {
+                        "id": "combat-vigor-100",
+                        "kind": "numeric_threshold",
+                        "metric": "status.vitals.vigor.value",
+                        "operator": ">=",
+                        "value": 100,
+                    },
+                    support["success_criteria"][0],
+                )
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller.storage.get_runtime("safety_suppression_v1")
+                )
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(stale_lesson["id"])["status"],
+                )
                 self.assertFalse(any(name == "autopilot" for name, _ in broker.calls))
             finally:
                 controller.storage.close()

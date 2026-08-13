@@ -1261,12 +1261,15 @@ class CampaignCoordinator:
         observation: dict[str, Any],
         expected_effect: Any,
     ) -> str:
+        # ``expected_effect`` is retained on the attempt as audit and verifier
+        # input, but it is model-authored prose/shape and therefore cannot own
+        # semantic action identity.  Equivalent actions used to evade the
+        # breaker whenever the model rephrased this field between turns.
         return json_hash(
             {
                 "phase_kind": phase.get("kind"),
                 "tool": tool,
                 "arguments": arguments,
-                "expected_effect": expected_effect or {},
                 "state": self.state_fingerprint(observation),
             }
         )

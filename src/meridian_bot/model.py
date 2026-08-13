@@ -228,6 +228,11 @@ not impose a weapon cap while selling. Prefer a targeted sell quote with confirm
 uncertain sale. Use sell_all only for ordinary excess loot when its loadout protections are appropriate.
 During liquidate_inventory, phase.context.keep_candidates is an authoritative retain list: never quote, offer,
 or sell those items. When using sell_all, include every keep_candidate name in keep and preserve the loadout.
+When a prepare_combat phase has phase.context.reason=recover_combat_vigor, the parent combat phase is deliberately
+suspended until the typed vigor target is observed. Use the disclosed verified_supply and funding facts to build a
+real recovery sequence: obtain a fresh quote, calculate its exact total and deficit, fund that deficit through a
+verified bank withdrawal or guarded sale, acquire food or exact Create Food reagents, then consume the resulting
+edible items. Do not retry autopilot, lower the required vigor, or finish merely because a purchase/cast returned.
 For a targeted sell, never offer an inventory id present in equipment.equipped or marked in_use/equipped.
 When duplicate items share a name, select the exact unequipped instance id so the active loadout is preserved.
 When feedback says item_not_npc_transferable or CanBeGivenToNPC=false, the server rejected that exact item

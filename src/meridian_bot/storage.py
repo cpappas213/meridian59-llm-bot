@@ -318,6 +318,33 @@ class Storage:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?)",
                 (timestamp(),),
             )
+            if connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version=4"
+            ).fetchone() is None:
+                # Earlier versions could leave a paused public goal attached to
+                # an active campaign run and phase.  Repair that durable mismatch
+                # once on startup before any scheduler can inspect or resume it.
+                now = timestamp()
+                connection.execute(
+                    """UPDATE campaign_phases SET status='paused',updated_at=?
+                       WHERE status='active' AND run_id IN (
+                         SELECT campaign_runs.id FROM campaign_runs
+                         JOIN goals ON goals.id=campaign_runs.goal_id
+                         WHERE campaign_runs.status='active' AND goals.status='paused'
+                       )""",
+                    (now,),
+                )
+                connection.execute(
+                    """UPDATE campaign_runs SET status='paused',updated_at=?
+                       WHERE status='active' AND goal_id IN (
+                         SELECT id FROM goals WHERE status='paused'
+                       )""",
+                    (now,),
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)",
+                    (now,),
+                )
 
     @staticmethod
     def _loads(value: str | None, default: Any = None) -> Any:
@@ -971,7 +998,19 @@ class Storage:
                     if preserve_replaced_active or normalized["activation"].endswith("pause")
                     else "cancelled"
                 )
-                self._transition_in_tx(connection, active, target, "replaced by new goal", "operator_agent")
+                self._transition_in_tx(
+                    connection,
+                    active,
+                    target,
+                    "replaced by new goal",
+                    "operator_agent",
+                )
+                if target == "paused":
+                    self._pause_campaign_run_in_tx(connection, str(active["id"]))
+                else:
+                    self._complete_campaign_run_in_tx(
+                        connection, str(active["id"]), status="cancelled"
+                    )
             goal_id = uuid7()
             source = dict(normalized["source"])
             source["request_id"] = request_id
@@ -1115,7 +1154,11 @@ class Storage:
         ).fetchone()
         if row is None:
             return None
-        return self._transition_in_tx(connection, row, "active", "scheduler promotion", "controller")
+        promoted = self._transition_in_tx(
+            connection, row, "active", "scheduler promotion", "controller"
+        )
+        self._resume_campaign_run_in_tx(connection, str(row["id"]))
+        return promoted
 
     def promote(self) -> dict[str, Any] | None:
         with self.transaction() as connection:
@@ -1282,7 +1325,15 @@ class Storage:
                         self._complete_campaign_run_in_tx(
                             connection, goal_id, status="blocked"
                         )
-                    goal = self._transition_in_tx(connection, row, targets[action], reason, "operator_agent")
+                    goal = self._transition_in_tx(
+                        connection, row, targets[action], reason, "operator_agent"
+                    )
+                    if action == "pause":
+                        self._pause_campaign_run_in_tx(connection, goal_id)
+                    elif action == "cancel":
+                        self._complete_campaign_run_in_tx(
+                            connection, goal_id, status="cancelled"
+                        )
                 else:
                     raise ValueError("action must be pause, resume, cancel, reprioritize, or confirm_complete")
             self._promote_in_tx(connection)
@@ -1604,7 +1655,7 @@ class Storage:
         if status not in {"succeeded", "blocked", "cancelled"}:
             raise ValueError("invalid campaign run terminal status")
         run = connection.execute(
-            "SELECT id FROM campaign_runs WHERE goal_id=? AND status='active' "
+            "SELECT id FROM campaign_runs WHERE goal_id=? AND status IN ('active','paused') "
             "ORDER BY created_at DESC LIMIT 1",
             (goal_id,),
         ).fetchone()
@@ -1621,6 +1672,52 @@ class Storage:
             """UPDATE campaign_runs SET status=?,active_phase_id=NULL,
                updated_at=?,terminal_at=? WHERE id=?""",
             (status, now, now, run["id"]),
+        )
+        return str(run["id"])
+
+    def _pause_campaign_run_in_tx(
+        self, connection: sqlite3.Connection, goal_id: str
+    ) -> str | None:
+        run = connection.execute(
+            "SELECT id,active_phase_id FROM campaign_runs "
+            "WHERE goal_id=? AND status='active' ORDER BY created_at DESC LIMIT 1",
+            (goal_id,),
+        ).fetchone()
+        if run is None:
+            return None
+        now = timestamp()
+        if run["active_phase_id"]:
+            connection.execute(
+                "UPDATE campaign_phases SET status='paused',updated_at=? "
+                "WHERE id=? AND status='active'",
+                (now, run["active_phase_id"]),
+            )
+        connection.execute(
+            "UPDATE campaign_runs SET status='paused',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        return str(run["id"])
+
+    def _resume_campaign_run_in_tx(
+        self, connection: sqlite3.Connection, goal_id: str
+    ) -> str | None:
+        run = connection.execute(
+            "SELECT id,active_phase_id FROM campaign_runs "
+            "WHERE goal_id=? AND status='paused' ORDER BY created_at DESC LIMIT 1",
+            (goal_id,),
+        ).fetchone()
+        if run is None:
+            return None
+        now = timestamp()
+        if run["active_phase_id"]:
+            connection.execute(
+                "UPDATE campaign_phases SET status='active',updated_at=? "
+                "WHERE id=? AND status='paused'",
+                (now, run["active_phase_id"]),
+            )
+        connection.execute(
+            "UPDATE campaign_runs SET status='active',updated_at=? WHERE id=?",
+            (now, run["id"]),
         )
         return str(run["id"])
 
@@ -2056,6 +2153,12 @@ class Storage:
         row = self._connect().execute(
             "SELECT * FROM campaign_phases WHERE run_id=? AND status='active' ORDER BY ordinal DESC LIMIT 1",
             (run_id,),
+        ).fetchone()
+        return self._campaign_phase_from_row(row)
+
+    def campaign_phase(self, phase_id: str) -> dict[str, Any] | None:
+        row = self._connect().execute(
+            "SELECT * FROM campaign_phases WHERE id=?", (phase_id,)
         ).fetchone()
         return self._campaign_phase_from_row(row)
 
