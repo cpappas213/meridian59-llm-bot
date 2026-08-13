@@ -2508,6 +2508,18 @@ class BotController:
         )
 
     @staticmethod
+    def _autopilot_launch_step(step: dict[str, Any]) -> bool:
+        """Distinguish a keeper launch from a later stop/cleanup step."""
+
+        if step.get("tool") != "autopilot":
+            return False
+        outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+        return bool(
+            re.search(r"\b(?:start|launch|begin|run|activate)\b", outcome)
+            or re.match(r"^farm\b", outcome)
+        )
+
+    @staticmethod
     def _commerce_step_error(step: dict[str, Any]) -> str | None:
         """Return a corrective error when a plan assigns commerce to the wrong tool."""
 
@@ -5460,6 +5472,78 @@ class BotController:
                         }
                     )
                     steps = necessary_steps
+            ending = raw_plan.get("safe_ending")
+            final_step = steps[-1] if steps and isinstance(steps[-1], dict) else None
+            ending_step_id = (
+                str(ending.get("step_id") or "").strip()
+                if isinstance(ending, dict)
+                else ""
+            )
+            final_step_id = (
+                str(final_step.get("id") or "").strip()
+                if isinstance(final_step, dict)
+                else ""
+            )
+            final_outcome = (
+                str(final_step.get("outcome") or "")
+                if isinstance(final_step, dict)
+                else ""
+            )
+            final_arguments = (
+                final_step.get("arguments")
+                if isinstance(final_step, dict)
+                and isinstance(final_step.get("arguments"), dict)
+                else {}
+            )
+            keeper_stop = (
+                isinstance(final_step, dict)
+                and final_step.get("tool") == "autopilot"
+                and (
+                    str(final_arguments.get("action") or "").casefold() == "stop"
+                    or re.search(r"\bstop\b", final_outcome, re.IGNORECASE) is not None
+                )
+            )
+            room_id = ending.get("room_id") if isinstance(ending, dict) else None
+            if (
+                keeper_stop
+                and ending_step_id
+                and ending_step_id == final_step_id
+                and isinstance(room_id, int)
+                and not isinstance(room_id, bool)
+                and room_id > 0
+                and len(steps) < EXECUTION_PLAN_MAX_STEPS
+            ):
+                existing_ids = {
+                    str(step.get("id") or "")
+                    for step in steps
+                    if isinstance(step, dict)
+                }
+                safe_step_id = f"{ending_step_id}-safe-travel"
+                suffix = 2
+                while safe_step_id in existing_ids:
+                    safe_step_id = f"{ending_step_id}-safe-travel-{suffix}"
+                    suffix += 1
+                steps = [
+                    *steps,
+                    {
+                        "id": safe_step_id,
+                        "outcome": f"Travel to source-verified safe room {room_id}.",
+                        "tool": "travel",
+                        "verification": f"Current room id is {room_id}.",
+                    },
+                ]
+                raw_plan = {
+                    **raw_plan,
+                    "safe_ending": {**ending, "step_id": safe_step_id},
+                }
+                plan_normalizations.append(
+                    {
+                        "kind": "separated_keeper_stop_from_safe_ending",
+                        "keeper_step_id": ending_step_id,
+                        "safe_step_id": safe_step_id,
+                        "room_id": room_id,
+                    }
+                )
         if (
             not summary
             or not isinstance(steps, list)
@@ -5631,8 +5715,7 @@ class BotController:
         launch_indexes = [
             index
             for index, step in enumerate(normalized_steps)
-            if step.get("tool") == "autopilot"
-            and re.search(r"\b(?:start|launch|farm)\b", step.get("outcome", ""), re.IGNORECASE)
+            if self._autopilot_launch_step(step)
         ]
         if (
             isinstance(phase, dict)

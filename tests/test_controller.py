@@ -1834,6 +1834,45 @@ class ControllerTests(unittest.TestCase):
                         revision=False,
                     )
 
+                keeper_stop = {
+                    "summary": "Stop the completed farm, then return safely.",
+                    "steps": [
+                        {
+                            "id": "stop-farm",
+                            "outcome": "After the farm criterion is verified, stop autopilot and ensure we are in safe room 100.",
+                            "tool": "autopilot",
+                            "arguments": {"action": "stop"},
+                            "verification": "Autopilot is stopped and current room id is 100.",
+                        }
+                    ],
+                    "safe_ending": {
+                        "room_id": 100,
+                        "step_id": "stop-farm",
+                        "rationale": "Return to the source-verified safe staging room.",
+                    },
+                }
+                normalized_keeper_stop = controller._store_execution_plan(
+                    goal,
+                    keeper_stop,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(
+                    ["stop-farm", "stop-farm-safe-travel"],
+                    [step["id"] for step in normalized_keeper_stop["steps"]],
+                )
+                self.assertEqual(
+                    "travel", normalized_keeper_stop["steps"][-1]["tool"]
+                )
+                self.assertEqual(
+                    "stop-farm-safe-travel",
+                    normalized_keeper_stop["safe_ending"]["step_id"],
+                )
+                self.assertEqual(
+                    "separated_keeper_stop_from_safe_ending",
+                    normalized_keeper_stop["normalizations"][0]["kind"],
+                )
+
                 accepted = controller._store_execution_plan(
                     goal,
                     with_safe_ending(base, 100),
@@ -1898,6 +1937,32 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(controller._execution_plan(goal))
             finally:
                 controller.storage.close()
+
+    def test_autopilot_stop_is_not_classified_as_farm_launch(self) -> None:
+        self.assertFalse(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "After max HP reaches 36, stop the completed farm.",
+                }
+            )
+        )
+        self.assertTrue(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Launch autopilot farm for ants in room 563.",
+                }
+            )
+        )
+        self.assertTrue(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Start farming ants and stop when max HP reaches 36.",
+                }
+            )
+        )
 
     def test_safe_ending_travel_may_also_satisfy_the_public_location_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
