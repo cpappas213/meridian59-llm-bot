@@ -9223,7 +9223,17 @@ class ControllerTests(unittest.TestCase):
                     goal,
                     step_id="read-inventory",
                     tool="inventory",
+                    arguments={"scope": "all"},
                     result={"items": []},
+                )
+
+                recorded = controller._execution_plan(goal)
+                authorization = controller._plan_revision_authorization(
+                    goal, recorded, None
+                )
+                self.assertEqual(
+                    {"scope": "all"},
+                    authorization["source"]["arguments"],
                 )
 
                 result = controller.turn()
@@ -9234,6 +9244,9 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertIsNone(result["execution_plan"]["last_action"])
                 self.assertIsNone(controller._planner_feedback(goal))
+                self.assertIn(
+                    "exact prior tool arguments", PLANNER_SYSTEM
+                )
             finally:
                 controller.storage.close()
 

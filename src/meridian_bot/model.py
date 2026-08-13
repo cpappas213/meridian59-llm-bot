@@ -160,6 +160,10 @@ assumptions separately. The controller checks tool names and static goal feasibi
 the plan; your confidence is not verification. On later turns, act only on one listed step and return
 its id as plan_step_id. Return decision=plan again only when revision_authorization is present. Copy its
 exact id into execution_plan.revision_authorization_id and state the evidence-based revision_reason.
+execution_plan.last_action and revision_authorization.source include the exact prior tool arguments;
+treat them as authoritative. After a successful read-only lookup, consume its result in the next step or
+revision. Never claim it was unfiltered or repeat the same tool and arguments when those recorded arguments
+show the filter was already used.
 Without that controller-issued id, keep the verified plan and return decision=act. Planning is a real non-mutating turn: never
 combine decision=plan with a tool call. Count the steps before returning JSON: ten is an absolute
 maximum. This is a per-phase limit, never a complete multi-hour campaign plan. Do not create tool=null waiting or monitoring steps; the controller continuously verifies

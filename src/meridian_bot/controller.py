@@ -1186,6 +1186,7 @@ class BotController:
             goal,
             step_id=str(plan.get("plan_step_id") or "controller-owned-step"),
             tool="bank",
+            arguments=arguments,
             result=result,
         )
         self.storage.emit_event(
@@ -3748,6 +3749,7 @@ class BotController:
         *,
         step_id: str,
         tool: str,
+        arguments: dict[str, Any],
         result: Any,
     ) -> None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
@@ -3757,6 +3759,7 @@ class BotController:
         value["last_action"] = {
             "step_id": step_id,
             "tool": tool,
+            "arguments": redact(arguments),
             "observed_at": timestamp(),
             "result_summary": str(redact(result))[:1000],
         }
@@ -12235,6 +12238,7 @@ class BotController:
                 "kind": "completed_plan_action",
                 "step_id": last_action.get("step_id"),
                 "tool": last_action.get("tool"),
+                "arguments": last_action.get("arguments"),
                 "observed_at": last_action.get("observed_at"),
                 "result_summary": last_action.get("result_summary"),
             }
@@ -13365,6 +13369,7 @@ class BotController:
                 goal,
                 step_id=str(plan.get("plan_step_id") or "controller-owned-step"),
                 tool=tool,
+                arguments=arguments,
                 result=result,
             )
             if post_action is not None and (
