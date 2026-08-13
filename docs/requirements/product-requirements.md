@@ -202,6 +202,13 @@ revising tactics in service of the active goal.
   source facts include `ROOM_SANCTUARY` or `ROOM_NO_COMBAT`. The controller may
   reuse source-revalidated live staging history or select a connected/same-region
   safe candidate, but shall not infer a fixed home city from the farm region.
+- **FR-PLAY-019**: Exhausting an internal phase action or time budget shall not
+  strand the character in an unverified room. The controller shall durably latch
+  the exhaustion boundary, prevent further goal work, retain or start survival
+  control while exposed or recovering, and return to a source-verified
+  `ROOM_SANCTUARY`/`ROOM_NO_COMBAT` room before marking the phase failed. Safety
+  return actions shall remain audited but shall not consume the exhausted phase
+  budget or create a goal-wide block.
 - **FR-PLAY-012**: A PvP search shall visit multiple grounded public rooms and
   acquire an attack target only from a fresh local observation. A global online
   list shall not establish local attackability. The controller shall immediately

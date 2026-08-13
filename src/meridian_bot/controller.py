@@ -187,6 +187,7 @@ INVALID_PLANNER_ACTION_LIMIT = 2
 INVALID_PLAN_REVISION_LIMIT = 2
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
+PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY = "phase_exhaustion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
@@ -4536,6 +4537,269 @@ class BotController:
         values.pop(phase_id, None)
         self.storage.set_runtime(PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY, values)
 
+    def _phase_exhaustion_checkpoint(
+        self, phase: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Return a durable budget-exhaustion boundary for an active phase."""
+
+        if not isinstance(phase, dict):
+            return None
+        values = self.storage.get_runtime(
+            PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict):
+            return None
+        value = values.get(str(phase.get("id") or ""))
+        if (
+            not isinstance(value, dict)
+            or value.get("phase_contract") != self._phase_contract(phase)
+            or not isinstance(value.get("budget"), dict)
+        ):
+            return None
+        return value
+
+    def _phase_exhaustion_destination(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Choose a source-verified evacuation room without another model call."""
+
+        plan = self._execution_plan(goal)
+        ending = plan.get("safe_ending") if isinstance(plan, dict) else None
+        if isinstance(ending, dict):
+            verified = self._verified_safe_staging(ending.get("room_id"))
+            if verified is not None:
+                return {
+                    **verified,
+                    "basis": "retained_model_selected_safe_ending",
+                }
+
+        context = self._safe_ending_context(observation)
+        candidates = context.get("candidates")
+        if not isinstance(candidates, list):
+            return None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            verified = self._verified_safe_staging(candidate.get("room_id"))
+            if verified is None:
+                continue
+            return {
+                **verified,
+                "distance": candidate.get("distance"),
+                "basis": "controller_selected_emergency_safe_ending",
+            }
+        return None
+
+    def _latch_phase_exhaustion(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        exhausted: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing = self._phase_exhaustion_checkpoint(phase)
+        if existing is not None:
+            return existing
+        values = self.storage.get_runtime(
+            PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        destination = self._phase_exhaustion_destination(goal, observation)
+        value = {
+            "goal_id": goal["id"],
+            "run_id": run["id"],
+            "phase_id": phase["id"],
+            "phase_contract": self._phase_contract(phase),
+            "budget": exhausted,
+            "safe_ending": destination,
+            "exhausted_at": timestamp(),
+        }
+        values[phase["id"]] = value
+        self.storage.set_runtime(PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, values)
+        self.storage.emit_event(
+            "campaign.phase.budget_exhausted",
+            "Campaign phase budget exhausted; preserving survival control until safe",
+            severity="warning",
+            interesting=False,
+            goal_id=goal["id"],
+            data={
+                "run_id": run["id"],
+                "phase_id": phase["id"],
+                "phase_kind": phase.get("kind"),
+                "budget": exhausted,
+                "safe_ending": redact(destination),
+                "terminal_deferred": True,
+                "strategic_goal_preserved": True,
+            },
+        )
+        return value
+
+    def _clear_phase_exhaustion_checkpoint(self, phase_id: str) -> None:
+        values = self.storage.get_runtime(
+            PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or phase_id not in values:
+            return
+        values = dict(values)
+        values.pop(phase_id, None)
+        self.storage.set_runtime(PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, values)
+
+    def _phase_exhaustion_safety(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Accept any current verified sanctuary as a safe exhaustion boundary."""
+
+        current = self._observation_room(observation)
+        verified = self._verified_safe_staging(current)
+        if verified is not None:
+            return {
+                "met": True,
+                "current_room_id": current,
+                "safe_ending": redact(verified),
+                "verified_room": redact(verified),
+            }
+        checkpoint = self._phase_exhaustion_checkpoint(phase)
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint, dict)
+            and isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        return {
+            "met": False,
+            "reason": (
+                "phase budget is exhausted and the current room is not a "
+                "source-verified sanctuary"
+            ),
+            "current_room_id": current,
+            "safe_ending": redact(destination),
+        }
+
+    def _ensure_phase_exhaustion_plan(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+        *,
+        grounding: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Install a one-step, source-verified evacuation plan when needed."""
+
+        checkpoint = self._phase_exhaustion_checkpoint(phase)
+        if checkpoint is None:
+            return None
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        if destination is None:
+            destination = self._phase_exhaustion_destination(goal, observation)
+            if destination is not None:
+                values = self.storage.get_runtime(
+                    PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, {}
+                )
+                if isinstance(values, dict):
+                    values = dict(values)
+                    values[phase["id"]] = {
+                        **checkpoint,
+                        "safe_ending": destination,
+                    }
+                    self.storage.set_runtime(
+                        PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, values
+                    )
+                    checkpoint = values[phase["id"]]
+        if not isinstance(destination, dict):
+            return None
+        verified = self._verified_safe_staging(destination.get("room_id"))
+        if verified is None:
+            return None
+        room_id = int(verified["room_id"])
+
+        existing = self._execution_plan(goal)
+        ending = existing.get("safe_ending") if isinstance(existing, dict) else None
+        if (
+            isinstance(ending, dict)
+            and str(ending.get("room_id")) == str(room_id)
+            and str(ending.get("step_id") or "")
+        ):
+            return existing
+
+        step_id = "phase-exhaustion-safe-return"
+        return self._store_execution_plan(
+            goal,
+            {
+                "summary": (
+                    "Return to source-verified safety before closing the exhausted "
+                    "campaign phase."
+                ),
+                "steps": [
+                    {
+                        "id": step_id,
+                        "outcome": (
+                            f"Reach source-verified safe room {room_id} before the "
+                            "exhausted phase is finalized."
+                        ),
+                        "tool": "travel",
+                        "verification": f"Current room id is {room_id}.",
+                    }
+                ],
+                "safe_ending": {
+                    "room_id": room_id,
+                    "step_id": step_id,
+                    "rationale": (
+                        "Budget exhaustion is a controller safety boundary; use the "
+                        "nearest retained source-verified sanctuary before replanning."
+                    ),
+                },
+                "assumptions": [],
+                "revision_reason": "Campaign phase budget exhausted outside safety.",
+            },
+            grounding=grounding,
+            revision=existing is not None,
+        )
+
+    def _structured_phase_exhaustion_return_action(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+        execution_plan: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return directly to safety without waiting on another model round trip."""
+
+        checkpoint = self._phase_exhaustion_checkpoint(phase)
+        if checkpoint is None or not isinstance(phase, dict):
+            return None
+        if self._phase_exhaustion_safety(goal, phase, observation).get("met") is True:
+            return None
+        if not isinstance(execution_plan, dict):
+            return None
+        ending = execution_plan.get("safe_ending")
+        if not isinstance(ending, dict):
+            return None
+        destination = self._verified_safe_staging(ending.get("room_id"))
+        step_id = str(ending.get("step_id") or "")
+        if destination is None or not step_id:
+            return None
+        return {
+            "tool": "travel",
+            "arguments": {"to": int(destination["room_id"])},
+            "rationale": (
+                "The phase budget is exhausted; return directly to the retained "
+                "source-verified sanctuary before finalizing the phase."
+            ),
+            "expected_observation": {"room_id": int(destination["room_id"])},
+            "plan_step_id": step_id,
+            "safety_recovery": True,
+        }
+
     def _evaluate_campaign_phase(
         self,
         goal: dict[str, Any],
@@ -5708,9 +5972,13 @@ class BotController:
             raise ModelError("execution plan cannot be verified because purchase feasibility is invalid")
         farm_intent = self._effective_farm_intent(goal)
         current_completion = self.criteria.evaluate(goal, self.last_observation or {})
-        self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
-        farm_work_remains = self._keeper_combat_work_remains(
-            goal, current_completion
+        phase_exhaustion_pending = self._phase_exhaustion_checkpoint(phase) is not None
+        if not phase_exhaustion_pending:
+            self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
+        farm_work_remains = (
+            False
+            if phase_exhaustion_pending
+            else self._keeper_combat_work_remains(goal, current_completion)
         )
         launch_indexes = [
             index
@@ -5789,6 +6057,15 @@ class BotController:
                         "before its autopilot launch step"
                     )
         safe_ending = self._validated_safe_ending(raw_plan, normalized_steps)
+        if phase_exhaustion_pending and (
+            len(normalized_steps) != 1
+            or str(normalized_steps[0].get("id") or "")
+            != str(safe_ending.get("step_id") or "")
+        ):
+            raise ModelError(
+                "an exhausted campaign phase accepts only its one final "
+                "source-verified safe-ending travel step"
+            )
         if self._goal_requires_raza_exit(goal) and (
             "raza" in str(safe_ending.get("name") or "").casefold()
             or "mausoleum" in str(safe_ending.get("name") or "").casefold()
@@ -9127,6 +9404,7 @@ class BotController:
         return bool(
             phase is not None
             and self._phase_completion_checkpoint(phase) is None
+            and self._phase_exhaustion_checkpoint(phase) is None
         )
 
     def _effective_farm_intent(self, goal: dict[str, Any]) -> dict[str, Any]:
@@ -11675,6 +11953,7 @@ class BotController:
         phase_work_remains = bool(
             active_keeper_phase is not None
             and self._phase_completion_checkpoint(active_keeper_phase) is None
+            and self._phase_exhaustion_checkpoint(active_keeper_phase) is None
         )
         unhealthy = self._keeper_stall_is_persistent(status)
         if (unmet_health or phase_work_remains) and not unhealthy:
@@ -14176,16 +14455,45 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
+        exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
-        exhausted = (
-            None
-            if (
+        if (
+            exhaustion_checkpoint is not None
+            and (
                 outcome.completed
                 or outcome.failed
                 or outcome.detail.get("completion_deferred") is True
             )
-            else self.campaign.budget_exhausted(phase)
+        ):
+            # A deterministically verified success or abandonment supersedes a
+            # previously latched budget boundary. Completion still performs
+            # its own safe-ending hygiene before becoming terminal.
+            self._clear_phase_exhaustion_checkpoint(str(phase["id"]))
+            exhaustion_checkpoint = None
+        exhausted = (
+            exhaustion_checkpoint.get("budget")
+            if isinstance(exhaustion_checkpoint, dict)
+            else (
+                None
+                if (
+                    outcome.completed
+                    or outcome.failed
+                    or outcome.detail.get("completion_deferred") is True
+                )
+                else self.campaign.budget_exhausted(phase)
+            )
         )
+        if not outcome.completed and not outcome.failed and exhausted is not None:
+            if exhaustion_checkpoint is None:
+                exhaustion_checkpoint = self._latch_phase_exhaustion(
+                    goal, run, phase, exhausted, observation
+                )
+            safety = self._phase_exhaustion_safety(goal, phase, observation)
+            if safety.get("met") is not True:
+                # Keep the phase active so the ordinary keeper handoff and
+                # safe-return path retain ownership. No further goal work is
+                # authorized while this durable checkpoint exists.
+                return None
         if not outcome.completed and not outcome.failed and exhausted is None:
             return None
         if outcome.completed:
@@ -14203,12 +14511,14 @@ class BotController:
             next_phase = None
         else:
             reason = (
-                "internal campaign phase exhausted its bounded review budget: "
+                "internal campaign phase reached a verified safe boundary after "
+                "exhausting its bounded review budget: "
                 + canonical_json(exhausted)
             )
             result_phase = self.storage.transition_campaign_phase(
                 phase["id"], "failed", reason=reason, resume_parent=False
             )
+            self._clear_phase_exhaustion_checkpoint(str(phase["id"]))
             next_phase = None
         external_blocker = None
         if outcome.detail.get("external_blocker_verified") is True:
@@ -14306,6 +14616,7 @@ class BotController:
         failed = self.storage.transition_campaign_phase(
             phase["id"], "failed", reason=reason, resume_parent=False
         )
+        self._clear_phase_exhaustion_checkpoint(str(phase["id"]))
         self._invalidate_execution_plan(goal, reason)
         return failed
 
@@ -14450,6 +14761,8 @@ class BotController:
                 completion = completion_checkpoint["completion"]
             goal = self.storage.set_goal_completion(goal["id"], completion)
             phase_completion_checkpoint = None
+            phase_exhaustion_checkpoint = None
+            phase_safe_return_checkpoint = None
             if completion_checkpoint is None:
                 phase_completion = self._reconcile_existing_campaign_phase(
                     goal, observation
@@ -14487,6 +14800,14 @@ class BotController:
                 phase_completion_checkpoint = self._phase_completion_checkpoint(
                     existing_phase
                 )
+                phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
+                    existing_phase
+                )
+                phase_safe_return_checkpoint = (
+                    phase_completion_checkpoint
+                    if phase_completion_checkpoint is not None
+                    else phase_exhaustion_checkpoint
+                )
             expired_opportunity = self._expire_direct_pvp_opportunity(
                 goal, observation, completion
             )
@@ -14519,7 +14840,7 @@ class BotController:
             purchase_result_met = self._purchase_result_met(goal, completion)
             purchase_preflight = (
                 None
-                if purchase_result_met or phase_completion_checkpoint is not None
+                if purchase_result_met or phase_safe_return_checkpoint is not None
                 else self._purchase_preflight(goal, observation)
             )
             if isinstance(purchase_preflight, dict):
@@ -14626,9 +14947,14 @@ class BotController:
                 observation,
                 completion,
                 force_stop_reason=(
-                    "the active campaign phase outcome is verified; release movement "
-                    "control for the plan's safe-ending travel"
-                    if phase_completion_checkpoint is not None
+                    (
+                        "the active campaign phase budget is exhausted; preserve "
+                        "survival control before the safe-ending travel"
+                        if phase_exhaustion_checkpoint is not None
+                        else "the active campaign phase outcome is verified; release "
+                        "movement control for the plan's safe-ending travel"
+                    )
+                    if phase_safe_return_checkpoint is not None
                     else None
                 ),
             )
@@ -14636,7 +14962,7 @@ class BotController:
                 return farm_control
             healing_support = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._ensure_farm_healing_support_phase(goal, observation)
             )
             if healing_support is not None:
@@ -14648,7 +14974,7 @@ class BotController:
                 }
             structured_purchase = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_purchase_preparation_action(
                     goal, observation, completion, purchase_preflight
                 )
@@ -14677,7 +15003,7 @@ class BotController:
                     return self._execute(goal, observation, structured_purchase)
             structured_preparation = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_farm_preparation_action(
                     goal, observation, completion
                 )
@@ -14705,7 +15031,7 @@ class BotController:
                     return self._execute(goal, observation, structured_preparation)
             structured_launch = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_farm_launch_plan(
                     goal, observation, completion
                 )
@@ -14744,6 +15070,14 @@ class BotController:
             phase_completion_checkpoint = self._phase_completion_checkpoint(
                 campaign_phase
             )
+            phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
+                campaign_phase
+            )
+            phase_safe_return_checkpoint = (
+                phase_completion_checkpoint
+                if phase_completion_checkpoint is not None
+                else phase_exhaustion_checkpoint
+            )
             page = self.storage.events(after_cursor=max(0, self.storage.get_runtime("planner_event_cursor", 0) - 12), limit=20)
             pending_proposals = self.storage.proposals()[:10]
             planner_feedback = self._planner_feedback(goal)
@@ -14772,6 +15106,23 @@ class BotController:
                         "execute only the verified plan's final safe-ending travel."
                     ),
                 }
+            if phase_exhaustion_checkpoint is not None:
+                grounded_context["phase_budget_exhaustion_checkpoint"] = {
+                    "exhausted": True,
+                    "exhausted_at": phase_exhaustion_checkpoint.get("exhausted_at"),
+                    "phase_id": campaign_phase.get("id"),
+                    "phase_kind": campaign_phase.get("kind"),
+                    "budget": redact(phase_exhaustion_checkpoint.get("budget")),
+                    "safe_ending": redact(
+                        phase_exhaustion_checkpoint.get("safe_ending")
+                    ),
+                    "instruction": (
+                        "The active phase budget is exhausted. Do not continue goal "
+                        "work. Preserve survival control and execute only the exact "
+                        "source-verified safe-ending travel before the controller "
+                        "closes this phase."
+                    ),
+                }
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
@@ -14789,12 +15140,39 @@ class BotController:
             if purchase_preflight is not None:
                 grounded_context["purchase_preflight"] = redact(purchase_preflight)
             execution_plan = self._execution_plan(goal)
+            if (
+                phase_exhaustion_checkpoint is not None
+                and isinstance(campaign_phase, dict)
+            ):
+                try:
+                    execution_plan = self._ensure_phase_exhaustion_plan(
+                        goal,
+                        campaign_phase,
+                        observation,
+                        grounding=grounding,
+                    )
+                except ModelError as exc:
+                    self._set_planner_feedback(
+                        goal,
+                        "The phase budget is exhausted and safety return is the only "
+                        f"permitted work. Build one travel-only plan to a source-verified "
+                        f"safe-ending room: {exc}",
+                    )
+                    planner_feedback = self._planner_feedback(goal)
             revision_authorization = self._plan_revision_authorization(
                 goal, execution_plan, planner_feedback
             )
+            structured_exhaustion_return = self._structured_phase_exhaustion_return_action(
+                goal,
+                campaign_phase,
+                observation,
+                execution_plan,
+            )
+            if structured_exhaustion_return is not None:
+                return self._execute(goal, observation, structured_exhaustion_return)
             structured_raza_exit = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_raza_exit_action(
                     goal,
                     campaign_phase,
@@ -14806,7 +15184,7 @@ class BotController:
                 return self._execute(goal, observation, structured_raza_exit)
             structured_farm_route = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_farm_route_action(
                     campaign_phase,
                     observation,
@@ -14817,7 +15195,7 @@ class BotController:
                 return self._execute(goal, observation, structured_farm_route)
             structured_research = (
                 None
-                if phase_completion_checkpoint is not None
+                if phase_safe_return_checkpoint is not None
                 else self._structured_research_progression_action(
                     campaign_phase,
                     observation,
@@ -14958,7 +15336,7 @@ class BotController:
             safe_return_checkpoint = (
                 completion_checkpoint
                 if completion_checkpoint is not None
-                else phase_completion_checkpoint
+                else phase_safe_return_checkpoint
             )
             if (
                 safe_return_checkpoint is not None
@@ -14966,8 +15344,9 @@ class BotController:
             ):
                 self._set_planner_feedback(
                     goal,
-                    "The active goal or campaign phase outcome is already verified. "
-                    "Select only the stored plan's final safe-ending travel step.",
+                    "The active goal or campaign phase is at a terminal safety "
+                    "boundary. Select only the stored plan's final safe-ending "
+                    "travel step.",
                 )
                 return {
                     "safe_ending_required": True,
@@ -15065,9 +15444,9 @@ class BotController:
                 if safe_return_checkpoint is not None and step_id != safe_step_id:
                     return self._reject_planner_action(
                         goal,
-                        "The active goal or campaign phase outcome is already verified. "
+                        "The active goal or campaign phase is at a terminal safety boundary. "
                         f"Select only the final safe-ending step {safe_step_id!r}; "
-                        "do not repeat completed work.",
+                        "do not repeat completed or exhausted work.",
                         decision=decision,
                         execution_plan=execution_plan,
                         result={
@@ -15886,6 +16265,7 @@ class BotController:
 
     def _execute(self, goal: dict[str, Any], observation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         tool = str(plan.get("tool") or "")
+        safety_recovery = plan.get("safety_recovery") is True
         arguments = plan.get("arguments")
         if not isinstance(arguments, dict):
             raise ModelError("planner arguments must be an object")
@@ -15901,6 +16281,33 @@ class BotController:
             if campaign_run
             else None
         )
+        if safety_recovery:
+            checkpoint = self._phase_exhaustion_checkpoint(campaign_phase)
+            destination = (
+                checkpoint.get("safe_ending")
+                if isinstance(checkpoint, dict)
+                and isinstance(checkpoint.get("safe_ending"), dict)
+                else None
+            )
+            requested_room = next(
+                (
+                    arguments.get(key)
+                    for key in ("to", "destination", "room", "room_id")
+                    if arguments.get(key) is not None
+                ),
+                None,
+            )
+            if (
+                checkpoint is None
+                or not isinstance(destination, dict)
+                or tool != "travel"
+                or str(requested_room) != str(destination.get("room_id"))
+                or self._verified_safe_staging(requested_room) is None
+            ):
+                raise ModelError(
+                    "safety_recovery is reserved for an exhausted phase's exact "
+                    "source-verified sanctuary travel"
+                )
         self._guard_map_semantics(campaign_phase, tool, arguments)
         if (
             tool == "fight"
@@ -16057,8 +16464,11 @@ class BotController:
                         "action_suppressed": True,
                         **expired,
                     }
+        # The exhausted budget must remain a hard ceiling. Sanctuary travel is
+        # still recorded by the ordinary action-attempt audit, but it is safety
+        # hygiene rather than another attempt to advance the exhausted phase.
         phase_attempt_id, repeated_signature = self.campaign.prepare_attempt(
-            campaign_phase,
+            None if safety_recovery else campaign_phase,
             tool=tool,
             arguments=arguments,
             observation=observation,
@@ -20082,6 +20492,7 @@ class BotController:
             if attempt_phase
             else []
         )
+        exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         return {
             "run_id": run["id"],
             "status": run["status"],
@@ -20089,6 +20500,20 @@ class BotController:
             "active_phase": phase,
             "phase_outcome_latched": (
                 self._phase_completion_checkpoint(phase) is not None
+            ),
+            "phase_exhaustion_latched": exhaustion_checkpoint is not None,
+            "safe_return_pending": (
+                self._phase_completion_checkpoint(phase) is not None
+                or exhaustion_checkpoint is not None
+            ),
+            "phase_exhaustion": (
+                None
+                if exhaustion_checkpoint is None
+                else {
+                    "exhausted_at": exhaustion_checkpoint.get("exhausted_at"),
+                    "budget": redact(exhaustion_checkpoint.get("budget")),
+                    "safe_ending": redact(exhaustion_checkpoint.get("safe_ending")),
+                }
             ),
             "recent_phases": phases[-8:],
             "recent_attempts": attempts,

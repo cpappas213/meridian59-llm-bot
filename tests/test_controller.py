@@ -2641,6 +2641,148 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_exhausted_farm_returns_to_verified_safety_before_phase_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller_config = config(Path(temporary))
+            controller = BotController(controller_config)
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                controller.model = FixedModel()
+                source_verify_safe_rooms(controller, 100)
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="safe-budget-exhaustion",
+                        title="Increase maximum health",
+                        objective="Increase maximum health to 101.",
+                        success_criteria=[
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants until maximum health reaches 101.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 180},
+                        "context": {
+                            "room": 6,
+                            "target": "ant",
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Exercise the safe exhaustion boundary.",
+                    },
+                    mode="start",
+                )
+                controller.last_observation = broker.observe()
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Farm from safe staging and return safely.",
+                            "steps": [
+                                {
+                                    "id": "launch-goal-keeper",
+                                    "outcome": "Launch the ant farm in assigned room 6.",
+                                    "tool": "autopilot",
+                                    "verification": "Keeper reports the ant farm for room 6.",
+                                }
+                            ],
+                            "assumptions": [],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                for index in range(8):
+                    attempt_id = controller.storage.create_phase_attempt(
+                        phase["id"],
+                        semantic_action="autopilot",
+                        signature=f"budget-attempt-{index}",
+                        expected_effect={"max_health": 101},
+                    )
+                    controller.storage.update_phase_attempt(
+                        attempt_id,
+                        "succeeded",
+                        verification={"no_progress": False},
+                    )
+
+                broker.room = {"num": 6, "name": "Ant field"}
+                broker.farm_room = 6
+                broker.farm_hunt = "ant"
+                broker.farm_use_safe_spots = False
+
+                handed_off = controller.turn()
+
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertIsNotNone(active)
+                self.assertEqual("active", active["status"])
+                self.assertEqual(8, active["attempt_count"])
+                self.assertIsNotNone(
+                    controller._phase_exhaustion_checkpoint(active)
+                )
+                self.assertTrue(handed_off["background_safe_ending_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertTrue(broker.farm_running)
+                execution = controller.status(detail="supervision")["campaign"][
+                    "execution"
+                ]
+                self.assertTrue(execution["phase_exhaustion_latched"])
+                self.assertTrue(execution["safe_return_pending"])
+
+                controller.storage.close()
+                controller = BotController(controller_config)
+                controller.broker = broker
+                controller.model = FixedModel()
+                source_verify_safe_rooms(controller, 100)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertIsNotNone(
+                    controller._phase_exhaustion_checkpoint(active),
+                    "restart must retain the pending safe-return boundary",
+                )
+
+                keeper_stopped = controller.turn()
+                self.assertTrue(keeper_stopped["background_keeper_stopping"])
+                self.assertFalse(broker.farm_running)
+
+                safe_return = controller.turn()
+                self.assertEqual("travel", safe_return["action"])
+                self.assertEqual(100, broker.room["num"])
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(
+                    8,
+                    active["attempt_count"],
+                    "safe-return travel must not consume the exhausted phase budget",
+                )
+
+                finalized = controller.turn()
+                self.assertTrue(finalized["campaign_phase_budget_exhausted"])
+                self.assertEqual("failed", finalized["phase"]["status"])
+                self.assertFalse(finalized["goal_blocked"])
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller._phase_exhaustion_checkpoint(finalized["phase"])
+                )
+                self.assertEqual(100, broker.room["num"])
+            finally:
+                controller.storage.close()
+
     def test_map_route_lookup_without_a_route_is_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
             {
