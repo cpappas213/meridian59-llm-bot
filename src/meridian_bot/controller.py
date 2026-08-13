@@ -83,6 +83,17 @@ FARM_FIGHT_VIGOR = 100
 # and a wandering monster or a break-off can still resolve it.  Give the live
 # keeper a short recovery window before the controller tears down the tactic.
 FARM_STALL_GRACE_SECONDS = 30
+# Typed keeper waits include their own expected completion window. A generic
+# idle/stall flag must not tear down legitimate recovery such as regenerating
+# enough mana to create a weapon before that window has elapsed.
+FARM_TYPED_WAIT_GRACE_SECONDS = 5
+# Movement itself is not progress when the keeper repeatedly alternates among
+# the same few rooms without reaching its assignment. Allow ordinary long
+# routes plenty of time, then recognize only a high-count, low-cardinality
+# cycle rather than treating one refused exit as terminal evidence.
+FARM_TRANSIT_CYCLE_GRACE_SECONDS = 5 * 60
+FARM_TRANSIT_CYCLE_MIN_DRIFTS = 12
+FARM_TRANSIT_CYCLE_MAX_ROOMS = 3
 # A productive, death-free tactic must not be quarantined forever because one
 # old keeper run ended in a transient stall.  After a bounded cooldown it may
 # be retried; a fresh persistent stall records a new cooldown immediately.
@@ -9679,6 +9690,20 @@ class BotController:
         age = stalled.get("since_seconds")
         if not isinstance(age, (int, float)) or isinstance(age, bool):
             return True
+        waiting = status.get("waiting_on")
+        waiting = waiting if isinstance(waiting, dict) else {}
+        expected_ms = waiting.get("expected_ms")
+        since_ms = waiting.get("since")
+        if (
+            isinstance(expected_ms, (int, float))
+            and not isinstance(expected_ms, bool)
+            and float(expected_ms) > 0
+            and isinstance(since_ms, (int, float))
+            and not isinstance(since_ms, bool)
+        ):
+            elapsed_ms = max(0.0, time.time() * 1000 - float(since_ms))
+            if elapsed_ms <= float(expected_ms) + FARM_TYPED_WAIT_GRACE_SECONDS * 1000:
+                return False
         return float(age) >= FARM_STALL_GRACE_SECONDS
 
     def _farm_stagnation_blocks(self, stagnation: dict[str, Any]) -> bool:
@@ -9696,7 +9721,8 @@ class BotController:
         # evidence block the already-proven destination, even before startup
         # repair has removed the legacy record.
         if (
-            stagnation.get("kind") != "farm_assignment_deferred"
+            stagnation.get("kind")
+            not in {"farm_assignment_deferred", "farm_transit_cycle"}
             and int(placement.get("returned_to_assignment", 0) or 0) > 0
             and int(placement.get("failed", 0) or 0) <= 0
         ):
@@ -9962,6 +9988,14 @@ class BotController:
         for key, item in list(stagnations.items()):
             if not isinstance(item, dict):
                 continue
+            if item.get("kind") in {
+                "farm_assignment_deferred",
+                "farm_transit_cycle",
+            }:
+                # These typed outcomes are about exhausted placement or a
+                # launch-scoped movement cycle. Cumulative successful-return
+                # counters from an earlier assignment do not disprove them.
+                continue
             placement = (
                 item.get("placement")
                 if isinstance(item.get("placement"), dict)
@@ -10151,6 +10185,17 @@ class BotController:
             f"background_farm_snapshot_v2:{goal['id']}", {}
         )
         snapshot = snapshot if isinstance(snapshot, dict) else {}
+        transit_cycle = self._farm_transit_cycle_failure(
+            goal,
+            observation,
+            status,
+            assigned_room=assigned_room,
+            target=target,
+            owner=owner if owner_matches else {},
+            snapshot=snapshot,
+        )
+        if transit_cycle is not None:
+            return transit_cycle
         pass_floor = snapshot.get("pass_floor")
         pass_floor = int(pass_floor) if isinstance(pass_floor, (int, float)) else None
         assignment_route_records = self._farm_assignment_route_failure_records(
@@ -10171,6 +10216,7 @@ class BotController:
             return None
 
         return {
+            "kind": "farm_route_failure",
             "assigned_room": assigned_room,
             "target": target,
             "origin_room": (
@@ -10196,6 +10242,129 @@ class BotController:
                     ),
                     "keeper route placement failed",
                 ),
+            ),
+        }
+
+    @staticmethod
+    def _farm_placement_signature(value: Any) -> dict[str, Any]:
+        """Normalize cumulative keeper placement counters for launch deltas."""
+
+        placement = value if isinstance(value, dict) else {}
+        raw_rooms = placement.get("drifted_to")
+        room_counts: dict[str, int] = {}
+        if isinstance(raw_rooms, dict):
+            for room, count in raw_rooms.items():
+                try:
+                    room_counts[str(room)] = max(0, int(count or 0))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(raw_rooms, list):
+            for item in raw_rooms:
+                if isinstance(item, dict):
+                    room = item.get("room", item.get("id"))
+                    count = item.get("count", 1)
+                else:
+                    match = re.match(r"^\s*(.+?)\s+x(\d+)\s*$", str(item))
+                    room = match.group(1) if match else item
+                    count = match.group(2) if match else 1
+                if room is None:
+                    continue
+                try:
+                    room_counts[str(room)] = room_counts.get(str(room), 0) + max(
+                        0, int(count or 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+        return {
+            name: int(placement.get(name, 0) or 0)
+            for name in (
+                "relocations",
+                "drifted",
+                "failed",
+                "returned_to_assignment",
+            )
+        } | {"drifted_to": room_counts}
+
+    def _farm_transit_cycle_failure(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        status: dict[str, Any],
+        *,
+        assigned_room: Any,
+        target: str,
+        owner: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Recognize a bounded low-cardinality room cycle during assignment travel."""
+
+        if owner.get("goal_id") != goal.get("id"):
+            return None
+        placement = status.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
+        current_room = self._observation_room(observation)
+        if (
+            status.get("running") is not True
+            or placement.get("standing_where_assigned") is True
+            or str(current_room) == str(assigned_room)
+            or placement.get("assignment_deferred") is True
+        ):
+            return None
+        launch_age = self._age_seconds(
+            owner.get("started_at") or snapshot.get("launch_started_at")
+        )
+        if (
+            launch_age is None
+            or launch_age < FARM_TRANSIT_CYCLE_GRACE_SECONDS
+        ):
+            return None
+        baseline = snapshot.get("launch_placement")
+        if not isinstance(baseline, dict):
+            return None
+        current = self._farm_placement_signature(placement)
+        drift_delta = max(
+            0, int(current.get("drifted", 0)) - int(baseline.get("drifted", 0) or 0)
+        )
+        relocation_delta = max(
+            0,
+            int(current.get("relocations", 0))
+            - int(baseline.get("relocations", 0) or 0),
+        )
+        current_rooms = current.get("drifted_to", {})
+        current_rooms = current_rooms if isinstance(current_rooms, dict) else {}
+        baseline_rooms = baseline.get("drifted_to", {})
+        baseline_rooms = baseline_rooms if isinstance(baseline_rooms, dict) else {}
+        cycle_rooms = {
+            room: max(0, int(count or 0) - int(baseline_rooms.get(room, 0) or 0))
+            for room, count in current_rooms.items()
+        }
+        cycle_rooms = {room: count for room, count in cycle_rooms.items() if count > 0}
+        repeated_visits = sum(count for count in cycle_rooms.values() if count >= 2)
+        if (
+            drift_delta < FARM_TRANSIT_CYCLE_MIN_DRIFTS
+            or relocation_delta < FARM_TRANSIT_CYCLE_MIN_DRIFTS
+            or not cycle_rooms
+            or len(cycle_rooms) > FARM_TRANSIT_CYCLE_MAX_ROOMS
+            or repeated_visits < FARM_TRANSIT_CYCLE_MIN_DRIFTS
+        ):
+            return None
+        room_summary = ", ".join(
+            f"{room} x{count}" for room, count in sorted(cycle_rooms.items())
+        )
+        return {
+            "kind": "farm_transit_cycle",
+            "assigned_room": assigned_room,
+            "target": target,
+            "origin_room": owner.get("origin_room"),
+            "current_room": current_room,
+            "placement": redact(placement),
+            "launch_age_seconds": launch_age,
+            "drift_delta": drift_delta,
+            "relocation_delta": relocation_delta,
+            "cycle_rooms": cycle_rooms,
+            "reason": (
+                f"keeper repeatedly cycled among {room_summary} for {int(launch_age)}s "
+                f"without reaching assigned_room={assigned_room}"
             ),
         }
 
@@ -10312,7 +10481,9 @@ class BotController:
         stagnation_key = f"{goal['id']}|{assigned_room}|{target}"
         prior = stagnations.get(stagnation_key)
         count = int(prior.get("count", 0) or 0) + 1 if isinstance(prior, dict) else 1
+        failure_kind = str(failure.get("kind") or "farm_route_failure")
         stagnation = {
+            "kind": failure_kind,
             "goal_id": goal["id"],
             "room": failure.get("current_room"),
             "assigned_room": assigned_room,
@@ -10323,7 +10494,16 @@ class BotController:
             "count": count,
             "recorded_at": timestamp(),
             "placement": failure.get("placement"),
-            "last_error": failure.get("reason"),
+            # An observed low-cardinality cycle is strong enough to retire this
+            # launch, but unlike a graph's explicit no-route result it receives
+            # a bounded cooldown rather than becoming permanent evidence.
+            "last_error": (
+                ""
+                if failure_kind == "farm_transit_cycle"
+                else failure.get("reason")
+            ),
+            "reason": failure.get("reason"),
+            "cycle_rooms": failure.get("cycle_rooms"),
             "guidance": (
                 "Do not restart this assigned-room/prey route unchanged. Choose a different "
                 "grounded hunting room or wait for verified route/placement evidence to change."
@@ -10960,6 +11140,12 @@ class BotController:
             "use_safe_spots": use_safe_spots,
             "counters": counters,
             "launch_counters": launch_counters,
+            "launch_placement": (
+                previous.get("launch_placement")
+                if isinstance(previous.get("launch_placement"), dict)
+                else self._farm_placement_signature(status.get("placement"))
+            ),
+            "launch_started_at": previous.get("launch_started_at"),
             "origin_room": previous.get("origin_room"),
             "healing_supply_count": current_supplies,
             "safe_spot": redact(status.get("safe_spot")),
@@ -16858,6 +17044,10 @@ class BotController:
                                 "deaths_in_proven_safe_spot",
                             )
                         },
+                        "launch_placement": self._farm_placement_signature(
+                            result.get("placement") if isinstance(result, dict) else None
+                        ),
+                        "launch_started_at": timestamp(),
                         "origin_room": self._observation_room(observation),
                         "healing_supply_count": self.learning.profile(observation).get(
                             "healing_supply_count", 0

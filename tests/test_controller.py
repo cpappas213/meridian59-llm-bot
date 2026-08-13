@@ -12269,6 +12269,135 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_repeated_transit_cycle_retires_only_active_farm_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 563
+                broker.farm_hunt = "ant"
+                # The keeper alternates this label with ``travelling`` while
+                # bouncing. Detection must rely on launch-scoped movement
+                # counters rather than the controller's sampling instant.
+                broker.farm_activity = "hunting: ant"
+                broker.room = {"num": 586, "name": "The Sweet Grass Prairies"}
+                broker.farm_placement = {
+                    "assigned_room": 563,
+                    "assignment_deferred": False,
+                    "standing_where_assigned": False,
+                    "relocations": 31,
+                    "drifted": 27,
+                    "drifted_to": ["583 x13", "586 x14"],
+                    "returned_to_assignment": 2,
+                    "failed": 1,
+                    "why_not": [
+                        {
+                            "room": 586,
+                            "why": "every square for that exit refused (2 tried)",
+                        }
+                    ],
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="cycling-farm-route",
+                        objective="Raise max HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        constraints={
+                            "operator_notes": (
+                                "hunt=ant; assigned_room=563; use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ant in room 563.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 563,
+                            "target": "ant",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Use a bounded safe-wall farm.",
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 563,
+                        "hunt": "ant",
+                        "origin_room": 567,
+                        "started_at": time.time() - 600,
+                    },
+                )
+                controller.storage.set_runtime(
+                    f"background_farm_snapshot_v2:{goal['id']}",
+                    {
+                        "launch_placement": {
+                            "relocations": 4,
+                            "drifted": 0,
+                            "failed": 1,
+                            "returned_to_assignment": 2,
+                            "drifted_to": {},
+                        },
+                        "launch_started_at": time.time() - 600,
+                        "pass_floor": 300,
+                    },
+                )
+                observation = broker.observe()
+
+                result = controller._manage_background_farm(
+                    goal,
+                    observation,
+                    controller.criteria.evaluate(goal, observation),
+                )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(result["background_farm_route_failed"])
+                self.assertFalse(result["goal_paused"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertEqual("farm_transit_cycle", result["failure"]["kind"])
+                self.assertEqual(
+                    {"583": 13, "586": 14}, result["failure"]["cycle_rooms"]
+                )
+                self.assertEqual("", result["failure"]["last_error"])
+                self.assertTrue(controller._farm_stagnation_blocks(result["failure"]))
+                result["failure"]["recorded_at"] = "2000-01-01T00:00:00.000Z"
+                self.assertFalse(controller._farm_stagnation_blocks(result["failure"]))
+                self.assertEqual("route_unavailable", result["lesson"]["classification"])
+                self.assertEqual("tactic", result["lesson"]["scope"])
+            finally:
+                controller.storage.close()
+
     def test_assignment_deferral_retires_only_active_farm_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -12374,6 +12503,13 @@ class ControllerTests(unittest.TestCase):
                 # A successful arrival does not negate an exhausted in-room
                 # wall search; the exact tactic receives a bounded cooldown.
                 self.assertTrue(controller._farm_stagnation_blocks(stagnation))
+                self.assertEqual(
+                    [], controller._repair_disproved_farm_route_stagnations()
+                )
+                self.assertIn(
+                    f"{goal['id']}|566|groundworm larva",
+                    controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
+                )
                 self.assertEqual("ineffective_tactic", result["lesson"]["classification"])
                 self.assertEqual("tactic", result["lesson"]["scope"])
                 feedback = controller._planner_feedback(goal)
@@ -13040,6 +13176,26 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
             finally:
                 controller.storage.close()
+
+    def test_typed_keeper_wait_uses_its_expected_window(self) -> None:
+        now_ms = time.time() * 1000
+        status = {
+            "stalled": {
+                "idle_passes": 36,
+                "since_seconds": 35,
+                "why": "unarmed - 13 mana, needs 15 to make one",
+            },
+            "waiting_on": {
+                "code": "MANA_FOR_CREATE_WEAPON",
+                "expected_ms": 40_000,
+                "since": now_ms - 35_000,
+            },
+        }
+
+        self.assertFalse(BotController._keeper_stall_is_persistent(status))
+
+        status["waiting_on"]["since"] = now_ms - 50_000
+        self.assertTrue(BotController._keeper_stall_is_persistent(status))
 
     def test_transient_productive_stagnation_is_repaired_on_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
