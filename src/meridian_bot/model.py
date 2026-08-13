@@ -217,12 +217,18 @@ not impose a weapon cap while selling. Prefer a targeted sell quote with confirm
 uncertain sale. Use sell_all only for ordinary excess loot when its loadout protections are appropriate.
 During liquidate_inventory, phase.context.keep_candidates is an authoritative retain list: never quote, offer,
 or sell those items. When using sell_all, include every keep_candidate name in keep and preserve the loadout.
+For a targeted sell, never offer an inventory id present in equipment.equipped or marked in_use/equipped.
+When duplicate items share a name, select the exact unequipped instance id so the active loadout is preserved.
+When feedback says item_not_npc_transferable or CanBeGivenToNPC=false, the server rejected that exact item
+instance before evaluating merchant preference. Never call merchants or try another merchant for that item id;
+choose another exact inventory item id or a non-sale funding route.
 After an insufficient-funds shop result, the current purchase tactic is invalid until funds have actually
 increased. Inspect actual inventory, query merchants for what the character carries, and use sell or guarded
 sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly
 inspect the same shop catalogue until a funding action succeeds; do not perform a knowingly invalid bank
 call from the shop.
-After a merchant rejects a sale, buyer discovery must precede the next sell or sell_all. Include a merchants
+After an ordinary merchant-preference sale rejection, buyer discovery must precede the next sell or sell_all.
+This rule does not apply to item_not_npc_transferable failures. Include a merchants
 buyer-discovery step unless a recent completed targeted merchants lookup is already present in last_action,
 revision_authorization, planner_feedback, or verified event context. In that case consume its actual candidates;
 do not repeat the lookup merely to keep it visible in the replacement plan. Naming an unspecified

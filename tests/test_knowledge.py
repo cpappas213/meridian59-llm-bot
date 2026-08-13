@@ -14,7 +14,7 @@ from meridian_bot.knowledge_mcp import TOOLS as KNOWLEDGE_TOOLS
 from meridian_bot.simulator import SimulatedBroker
 from meridian_bot.storage import Storage
 
-from .helpers import config
+from .helpers import config, goal_payload
 
 
 def make_compendium(root: Path) -> Path:
@@ -402,6 +402,64 @@ class KnowledgeTests(unittest.TestCase):
                 )
                 self.assertIn("confirm=false", leather_buyers["next_evidence"])
                 self.assertTrue(finances["banking_policy"]["never_blocks_travel_or_combat"])
+            finally:
+                controller.storage.close()
+
+    def test_financial_context_excludes_intrinsically_unsellable_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = config(root)
+            harness = make_compendium(root)
+            value = replace(
+                value,
+                harness=replace(
+                    value.harness,
+                    root=harness,
+                    expected_revision="fixture-revision",
+                ),
+            )
+            controller = BotController(value)
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="restricted-financial-context")
+                )["goal"]
+                controller.storage.promote()
+                controller._record_blocked_action(
+                    goal,
+                    {"look": {"room": {"num": 103}}, "inventory": {"items": []}},
+                    "sell",
+                    {"to": 674, "items": [77], "confirm": False},
+                    (
+                        'Meidei tells you, "I cannot see how you could bear to part with '
+                        'leather armor! I certainly couldn\'t be the one to take it off '
+                        'your hands."'
+                    ),
+                )
+
+                finances = controller._financial_context(
+                    {
+                        "inventory": {
+                            "items": [
+                                {"name": "shillings", "amount": 20},
+                                {"id": 77, "name": "leather armor", "amount": 1},
+                                {"id": 78, "name": "leather armor", "amount": 1},
+                            ]
+                        }
+                    }
+                )
+
+                self.assertEqual(200, finances["known_inventory_item_value"])
+                self.assertEqual(100, finances["known_liquidatable_inventory_value"])
+                self.assertEqual(
+                    [77],
+                    [item["id"] for item in finances["npc_transfer_restricted_items"]],
+                )
+                transferability = {
+                    item["id"]: item["npc_transferable"]
+                    for item in finances["valued_items"]
+                }
+                self.assertEqual({77: False, 78: True}, transferability)
+                self.assertEqual(1, len(finances["buyer_candidates"]))
             finally:
                 controller.storage.close()
 

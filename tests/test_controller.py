@@ -1871,7 +1871,18 @@ class ControllerTests(unittest.TestCase):
                     mode="start",
                 )
                 observation = {
-                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}}
+                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "mace", "in_use": True},
+                            {"id": 78, "name": "mace"},
+                            {"id": 88, "name": "mushroom"},
+                        ]
+                    },
+                    "equipment": {
+                        "equipped": [{"id": 77, "name": "mace"}],
+                        "wielding": ["mace"],
+                    },
                 }
 
                 with self.assertRaisesRegex(ModelError, "preserve goal-relevant equipment"):
@@ -1891,7 +1902,27 @@ class ControllerTests(unittest.TestCase):
                         observation,
                     )
 
-                sale = {"to": 10, "items": [77], "confirm": True}
+                with self.assertRaisesRegex(
+                    ModelError,
+                    r"equipped item id\(s\) 77.*unequipped duplicate item id\(s\) 78",
+                ):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 10, "items": [77], "confirm": False},
+                        observation,
+                    )
+                with self.assertRaisesRegex(ModelError, "equipped item"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 10, "items": ["mace"], "confirm": False},
+                        observation,
+                    )
+
+                sale = {"to": 10, "items": [88], "confirm": True}
                 with self.assertRaisesRegex(ModelError, "unquoted targeted sale"):
                     controller._guard_prepare_combat_sale(
                         goal,
@@ -5986,6 +6017,100 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("merchant_rejected_sale", (archaic_context or {}).get("kind"))
         self.assertIn("Do not retry the same item with this merchant", archaic_guidance)
         self.assertTrue(BotController._failure_invalidates_plan("sell", archaic_reason))
+
+    def test_intrinsic_item_refusal_blocks_only_exact_item_across_merchants(self) -> None:
+        reason = (
+            'Meidei tells you, "I cannot see how you could bear to part with a mace! '
+            'I certainly couldn\'t be the one to take it off your hands."'
+        )
+        context = BotController._failure_context("sell", reason, {})
+        guidance = BotController._no_progress_guidance("sell", reason)
+
+        self.assertEqual("item_not_npc_transferable", (context or {}).get("kind"))
+        self.assertEqual(
+            "server_can_be_given_to_npc_check", (context or {}).get("source")
+        )
+        self.assertIn("before evaluating buyer preference", (context or {}).get("purpose", ""))
+        self.assertIn("Do not try this item id with another merchant", guidance)
+        self.assertIn("do not repeat buyer discovery", guidance)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="intrinsic-item-sale-refusal")
+                )["goal"]
+                observation = {
+                    "look": {"room": {"num": 103, "name": "Raza Inn"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 7887, "name": "mace", "in_use": True},
+                            {"id": 11420, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 7887, "name": "mace"}]},
+                }
+                controller._record_blocked_action(
+                    goal,
+                    observation,
+                    "sell",
+                    {"to": 674, "items": [7887], "confirm": False},
+                    reason,
+                )
+                elsewhere = copy.deepcopy(observation)
+                elsewhere["look"]["room"] = {"num": 106, "name": "Other shop"}
+
+                self.assertIsNotNone(
+                    controller._blocked_action(
+                        goal,
+                        elsewhere,
+                        "sell",
+                        {"to": 999, "items": [7887], "confirm": False},
+                    )
+                )
+                self.assertIsNone(
+                    controller._blocked_action(
+                        goal,
+                        elsewhere,
+                        "sell",
+                        {"to": 999, "items": [11420], "confirm": False},
+                    )
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "exact instance cannot be given to any NPC"
+                ):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        {"kind": "prepare_combat", "context": {}},
+                        "sell",
+                        {"to": 999, "items": [7887], "confirm": False},
+                        observation,
+                    )
+
+                reused = [
+                    {
+                        "id": "sell-blocked-mace",
+                        "tool": "sell",
+                        "outcome": "Sell exact mace item id 7887 to merchant 999.",
+                        "verification": "Carried shillings increase after selling id 7887.",
+                    }
+                ]
+                replacement = copy.deepcopy(reused)
+                replacement[0]["outcome"] = "Sell exact mace item id 11420."
+                replacement[0]["verification"] = (
+                    "Carried shillings increase after selling id 11420."
+                )
+                self.assertIn(
+                    "cannot be given to any NPC",
+                    controller._sale_recovery_plan_error(goal, reused) or "",
+                )
+                self.assertIsNone(
+                    controller._sale_recovery_plan_error(goal, replacement)
+                )
+                self.assertIn("item_not_npc_transferable", PLANNER_SYSTEM)
+                self.assertIn("Never call merchants", PLANNER_SYSTEM)
+            finally:
+                controller.storage.close()
 
     def test_sale_refusal_replan_requires_buyer_discovery_before_sale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

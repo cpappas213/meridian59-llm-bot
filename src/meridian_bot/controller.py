@@ -2227,17 +2227,24 @@ class BotController:
         sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
         if sale_recovery_error is not None:
             self._invalidate_execution_plan(goal, sale_recovery_error)
+            intrinsic_item_reused = "cannot be given to any NPC" in sale_recovery_error
             discovery_already_completed = (
                 "buyer discovery" in sale_recovery_error
                 and "already completed" in sale_recovery_error
             )
             required_response = (
-                "Build a replacement plan that omits the repeated merchants lookup, "
-                "uses a different candidate from its completed result, and preserves "
-                "a separate travel step before the sale."
-                if discovery_already_completed
-                else "Build a replacement plan that discovers a compatible buyer "
-                "before attempting another sale."
+                "Build a replacement plan that selects a different exact inventory "
+                "item id or uses a non-sale funding route; merchant discovery cannot "
+                "make the rejected item transferable."
+                if intrinsic_item_reused
+                else (
+                    "Build a replacement plan that omits the repeated merchants lookup, "
+                    "uses a different candidate from its completed result, and preserves "
+                    "a separate travel step before the sale."
+                    if discovery_already_completed
+                    else "Build a replacement plan that discovers a compatible buyer "
+                    "before attempting another sale."
+                )
             )
             self._set_planner_feedback(
                 goal,
@@ -2245,9 +2252,16 @@ class BotController:
                 + ". "
                 + required_response,
                 failure_context={
-                    "kind": "merchant_rejected_sale",
+                    "kind": (
+                        "item_not_npc_transferable"
+                        if intrinsic_item_reused
+                        else "merchant_rejected_sale"
+                    ),
                     "purpose": (
-                        "Retire a persisted pre-enforcement commerce plan after "
+                        "Retire a persisted plan that reused an exact inventory item "
+                        "the server proved cannot be given to any NPC."
+                        if intrinsic_item_reused
+                        else "Retire a persisted pre-enforcement commerce plan after "
                         "durable evidence disproved its assumed buyer."
                     ),
                     "required_response": required_response,
@@ -3709,6 +3723,38 @@ class BotController:
         failure_kind = str(
             deep_get(feedback or {}, "failure_context.kind", "")
         )
+        next_sale = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if step.get("tool") in {"sell", "sell_all"}
+            ),
+            None,
+        )
+        if next_sale is None:
+            return None
+        sale_step = steps[next_sale]
+        sale_text = " ".join(
+            str(sale_step.get(field) or "")
+            for field in ("outcome", "verification")
+        ).casefold()
+        restricted_item_ids = self._intrinsically_unsellable_item_ids(goal)
+        reused_restricted_ids = sorted(
+            item_id
+            for item_id in restricted_item_ids
+            if re.search(rf"\b{re.escape(item_id)}\b", sale_text)
+        )
+        if reused_restricted_ids:
+            return (
+                "the proposed sale reuses exact item id(s) "
+                + ", ".join(reused_restricted_ids)
+                + ", which the live server already proved cannot be given to any "
+                "NPC; choose a different exact inventory item or a non-sale funding route"
+            )
+        if failure_kind == "item_not_npc_transferable":
+            # The item failed Monster.ReqOffer's CanBeGivenToNPC check before
+            # ObjectDesired/buyer preference. Buyer discovery cannot repair it.
+            return None
         sale_recovery_required = failure_kind in sale_failure_kinds
         if not sale_recovery_required:
             blocked_actions = self.storage.get_runtime("blocked_actions", [])
@@ -3734,21 +3780,6 @@ class BotController:
             )
         if not sale_recovery_required:
             return None
-        next_sale = next(
-            (
-                index
-                for index, step in enumerate(steps)
-                if step.get("tool") in {"sell", "sell_all"}
-            ),
-            None,
-        )
-        if next_sale is None:
-            return None
-        sale_step = steps[next_sale]
-        sale_text = " ".join(
-            str(sale_step.get(field) or "")
-            for field in ("outcome", "verification")
-        ).casefold()
         blocked_actions = self.storage.get_runtime("blocked_actions", [])
         blocked_actions = (
             blocked_actions if isinstance(blocked_actions, list) else []
@@ -12764,17 +12795,101 @@ class BotController:
             return
         if tool != "sell":
             return
-        if keep_candidates:
-            raw_selected = arguments.get("items")
-            selected = raw_selected if isinstance(raw_selected, list) else [raw_selected]
-            selected_keys = {
-                str(value).strip().casefold()
-                for value in selected
-                if value is not None and str(value).strip()
+        intrinsic_block = self._intrinsic_sale_block(goal, arguments)
+        if intrinsic_block is not None:
+            blocked_ids = sorted(self._sale_item_ids(arguments))
+            raise ModelError(
+                f"{phase_kind} rejected targeted sale of item id(s) "
+                f"{', '.join(blocked_ids)} because the server already verified that "
+                "the exact instance cannot be given to any NPC. Purpose: treat the "
+                "item restriction as intrinsic rather than cycling through merchants; "
+                "choose a different exact inventory item or a non-sale funding route"
+            )
+        raw_selected = arguments.get("items")
+        selected = raw_selected if isinstance(raw_selected, list) else [raw_selected]
+        selected_keys = {
+            str(value).strip().casefold()
+            for value in selected
+            if value is not None and str(value).strip()
+        }
+        inventory = deep_get(observation, "inventory.items", [])
+        inventory = inventory if isinstance(inventory, list) else []
+        equipped = deep_get(observation, "equipment.equipped", [])
+        equipped = equipped if isinstance(equipped, list) else []
+        equipped_ids = {
+            str(item.get(key)).strip().casefold()
+            for item in equipped
+            if isinstance(item, dict)
+            for key in ("id", "object_id")
+            if item.get(key) is not None
+        }
+        equipped_ids.update(
+            str(item.get(key)).strip().casefold()
+            for item in inventory
+            if isinstance(item, dict)
+            and (item.get("in_use") is True or item.get("equipped") is True)
+            for key in ("id", "object_id")
+            if item.get(key) is not None
+        )
+        selected_inventory = []
+        for item in inventory:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().casefold()
+            identifiers = {
+                str(item.get(key)).strip().casefold()
+                for key in ("id", "object_id")
+                if item.get(key) is not None
             }
-            inventory = deep_get(observation, "inventory.items", [])
+            if selected_keys & identifiers or name in selected_keys:
+                selected_inventory.append((item, name, identifiers))
+        selected_equipped = [
+            (item, name, identifiers)
+            for item, name, identifiers in selected_inventory
+            if identifiers & equipped_ids
+            or item.get("in_use") is True
+            or item.get("equipped") is True
+        ]
+        if selected_equipped:
+            protected_names = {name for _, name, _ in selected_equipped if name}
+            protected_ids = sorted(
+                {
+                    identifier
+                    for _, _, identifiers in selected_equipped
+                    for identifier in identifiers
+                }
+            )
+            alternatives = sorted(
+                {
+                    str(item.get(key)).strip()
+                    for item in inventory
+                    if isinstance(item, dict)
+                    and str(item.get("name") or "").strip().casefold()
+                    in protected_names
+                    and item.get("in_use") is not True
+                    and item.get("equipped") is not True
+                    for key in ("id", "object_id")
+                    if item.get(key) is not None
+                    and str(item.get(key)).strip().casefold() not in equipped_ids
+                }
+            )
+            alternative_guidance = (
+                " Use exact unequipped duplicate item id(s) "
+                + ", ".join(alternatives)
+                + " instead."
+                if alternatives
+                else " No verified unequipped duplicate is available; choose different ordinary loot."
+            )
+            raise ModelError(
+                f"{phase_kind} rejected targeted sale of equipped item id(s) "
+                f"{', '.join(protected_ids) or ', '.join(sorted(protected_names))}. "
+                "Purpose: preserve the active combat loadout and avoid attempting to "
+                "transfer gear that the character is currently using."
+                + alternative_guidance
+            )
+        if keep_candidates:
             protected: set[str] = set()
-            for item in inventory if isinstance(inventory, list) else []:
+            for item in inventory:
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("name") or "").strip().casefold()
@@ -14562,6 +14677,22 @@ class BotController:
                     "sell quote for a materially different ordinary item."
                 ),
             }
+        if tool in {"sell", "sell_all"} and cls._is_intrinsic_item_sale_refusal(
+            text
+        ):
+            return {
+                "kind": "item_not_npc_transferable",
+                "reason": str(reason)[:500],
+                "source": "server_can_be_given_to_npc_check",
+                "purpose": (
+                    "Block this exact item instance across every merchant because the "
+                    "server rejected it before evaluating buyer preference."
+                ),
+                "required_response": (
+                    "Choose a different exact inventory item id or use a non-sale "
+                    "funding route; do not search for another buyer for this item."
+                ),
+            }
         if tool == "sell" or (
             tool == "sell_all" and cls._is_merchant_sale_refusal(text)
         ):
@@ -14630,6 +14761,17 @@ class BotController:
                 "no need for that",
                 "no need of that",
             )
+        )
+
+    @staticmethod
+    def _is_intrinsic_item_sale_refusal(reason: Any) -> bool:
+        """Recognize Monster.ReqOffer's CanBeGivenToNPC=false response."""
+
+        text = str(reason or "").casefold()
+        return (
+            "cannot see how you could bear to part with" in text
+            or "couldn't be the one to take it off your hands" in text
+            or "could not be the one to take it off your hands" in text
         )
 
     @classmethod
@@ -14727,6 +14869,16 @@ class BotController:
             return (
                 prefix
                 + "No property transferred and the call did not reduce the carried inventory load."
+            )
+        if tool in {"sell", "sell_all"} and cls._is_intrinsic_item_sale_refusal(
+            text
+        ):
+            return (
+                prefix
+                + "The server rejected this exact item before checking whether the merchant "
+                "wanted it (CanBeGivenToNPC=false). Do not try this item id with another "
+                "merchant and do not repeat buyer discovery for it. Choose a different exact "
+                "inventory item id or a non-sale funding route."
             )
         if tool == "sell" or (
             tool == "sell_all" and cls._is_merchant_sale_refusal(text)
@@ -15643,7 +15795,18 @@ class BotController:
 
         raw_items = deep_get(observation, "inventory.items", [])
         items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
-        signature = canonical_json(items)
+        active_goal = self.storage.active_goal()
+        npc_transfer_restricted_ids = self._intrinsically_unsellable_item_ids(
+            active_goal
+        )
+        signature = canonical_json(
+            {
+                "items": items,
+                "npc_transfer_restricted_ids": sorted(
+                    npc_transfer_restricted_ids
+                ),
+            }
+        )
         if (
             signature == self._financial_context_signature
             and self._financial_context_value is not None
@@ -15652,8 +15815,10 @@ class BotController:
 
         carried_shillings = self._carried_currency(observation)
         known_inventory_value = 0.0
+        known_liquidatable_inventory_value = 0.0
         valued_items: list[dict[str, Any]] = []
         unknown_value_items: list[dict[str, Any]] = []
+        npc_transfer_restricted_items: list[dict[str, Any]] = []
         for item in items:
             name = " ".join(str(item.get("name") or "").split())
             if not name or "shilling" in name.casefold():
@@ -15679,16 +15844,37 @@ class BotController:
             if isinstance(unit_value, (int, float)) and not isinstance(unit_value, bool):
                 subtotal = float(unit_value) * quantity
                 known_inventory_value += subtotal
+                item_id = item.get("id", item.get("object_id"))
+                transfer_restricted = (
+                    item_id is not None
+                    and str(item_id).strip().casefold()
+                    in npc_transfer_restricted_ids
+                )
+                if not transfer_restricted:
+                    known_liquidatable_inventory_value += subtotal
                 valued_items.append(
                     {
+                        "id": item_id,
                         "name": valuation.get("canonical_name") or name,
                         "quantity": quantity,
                         "unit_value": unit_value,
                         "subtotal": int(subtotal) if subtotal.is_integer() else subtotal,
                         "basis": basis,
                         "source_ref": source_ref,
+                        "npc_transferable": not transfer_restricted,
                     }
                 )
+                if transfer_restricted:
+                    npc_transfer_restricted_items.append(
+                        {
+                            "id": item_id,
+                            "name": valuation.get("canonical_name") or name,
+                            "reason": (
+                                "live server refusal proved CanBeGivenToNPC=false "
+                                "for this exact instance"
+                            ),
+                        }
+                    )
             else:
                 unknown_value_items.append(
                     {
@@ -15703,24 +15889,42 @@ class BotController:
             if known_inventory_value.is_integer()
             else known_inventory_value
         )
+        liquidatable_total: int | float = (
+            int(known_liquidatable_inventory_value)
+            if known_liquidatable_inventory_value.is_integer()
+            else known_liquidatable_inventory_value
+        )
         known_total: int | float = carried_shillings + known_inventory_value
         if isinstance(known_total, float) and known_total.is_integer():
             known_total = int(known_total)
         value = {
             "carried_shillings": carried_shillings,
             "known_inventory_item_value": inventory_total,
+            "known_liquidatable_inventory_value": liquidatable_total,
             "known_total_carried_value": known_total,
             "valuation_complete": not unknown_value_items,
             "valued_items": valued_items[:30],
             "unknown_value_items": unknown_value_items[:30],
+            "npc_transfer_restricted_items": npc_transfer_restricted_items[:30],
             "buyer_candidates": (
-                self.knowledge.buyer_candidates(items)
+                self.knowledge.buyer_candidates(
+                    [
+                        item
+                        for item in items
+                        if str(item.get("id", item.get("object_id")))
+                        .strip()
+                        .casefold()
+                        not in npc_transfer_restricted_ids
+                    ]
+                )
                 if hasattr(self.knowledge, "buyer_candidates")
                 else []
             ),
             "valuation_note": (
                 "Best-effort base/live values, not a guaranteed merchant resale quote. "
-                "Unknown items mean the true total may be higher."
+                "known_liquidatable_inventory_value excludes exact instances the live "
+                "server proved cannot be given to an NPC. Unknown items mean the true "
+                "total may be higher."
             ),
             "banking_policy": {
                 "mode": "planner_discretion",
@@ -15732,6 +15936,63 @@ class BotController:
         self._financial_context_value = value
         return value
 
+    @staticmethod
+    def _sale_item_ids(arguments: dict[str, Any]) -> set[str]:
+        raw_items = arguments.get("items")
+        values = raw_items if isinstance(raw_items, list) else [raw_items]
+        result: set[str] = set()
+        for value in values:
+            item_id = value.get("id") if isinstance(value, dict) else value
+            if item_id is not None and str(item_id).strip():
+                result.add(str(item_id).strip().casefold())
+        return result
+
+    def _intrinsically_unsellable_item_ids(
+        self,
+        goal: dict[str, Any] | None,
+    ) -> set[str]:
+        if not isinstance(goal, dict):
+            return set()
+        entries = self.storage.get_runtime("blocked_actions", [])
+        return {
+            item_id
+            for entry in (entries if isinstance(entries, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("goal_id") == goal.get("id")
+            and entry.get("tool") in {"sell", "sell_all"}
+            and self._is_intrinsic_item_sale_refusal(entry.get("reason"))
+            for item_id in self._sale_item_ids(
+                entry.get("arguments")
+                if isinstance(entry.get("arguments"), dict)
+                else {}
+            )
+        }
+
+    def _intrinsic_sale_block(
+        self,
+        goal: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        requested_ids = self._sale_item_ids(arguments)
+        if not requested_ids:
+            return None
+        entries = self.storage.get_runtime("blocked_actions", [])
+        for entry in entries if isinstance(entries, list) else []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("goal_id") == goal.get("id")
+                and entry.get("tool") in {"sell", "sell_all"}
+                and self._is_intrinsic_item_sale_refusal(entry.get("reason"))
+                and requested_ids
+                & self._sale_item_ids(
+                    entry.get("arguments")
+                    if isinstance(entry.get("arguments"), dict)
+                    else {}
+                )
+            ):
+                return entry
+        return None
+
     def _blocked_action(
         self,
         goal: dict[str, Any],
@@ -15739,6 +16000,13 @@ class BotController:
         tool: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any] | None:
+        intrinsic_sale_block = (
+            self._intrinsic_sale_block(goal, arguments)
+            if tool in {"sell", "sell_all"}
+            else None
+        )
+        if intrinsic_sale_block is not None:
+            return intrinsic_sale_block
         signature = canonical_json({"tool": tool, "arguments": arguments})
         room = self._observation_room(observation)
         entries = self.storage.get_runtime("blocked_actions", [])
