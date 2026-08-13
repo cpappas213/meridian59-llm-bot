@@ -6041,6 +6041,17 @@ class ControllerTests(unittest.TestCase):
                     },
                 )
                 controller._clear_planner_feedback()
+                self.assertIsNone(controller._execution_plan(goal))
+                migration_feedback = controller._planner_feedback(goal)
+                self.assertIn(
+                    "omits the repeated merchants lookup",
+                    migration_feedback["message"],
+                )
+                self.assertNotIn(
+                    "with a merchants buyer-discovery step",
+                    migration_feedback["message"],
+                )
+                controller._clear_planner_feedback()
                 consumed = controller._store_execution_plan(
                     goal,
                     ungrounded,

@@ -2227,21 +2227,30 @@ class BotController:
         sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
         if sale_recovery_error is not None:
             self._invalidate_execution_plan(goal, sale_recovery_error)
+            discovery_already_completed = (
+                "buyer discovery" in sale_recovery_error
+                and "already completed" in sale_recovery_error
+            )
+            required_response = (
+                "Build a replacement plan that omits the repeated merchants lookup, "
+                "uses a different candidate from its completed result, and preserves "
+                "a separate travel step before the sale."
+                if discovery_already_completed
+                else "Build a replacement plan that discovers a compatible buyer "
+                "before attempting another sale."
+            )
             self._set_planner_feedback(
                 goal,
                 sale_recovery_error
-                + ". Return decision=plan with a merchants buyer-discovery step "
-                "before any sell or sell_all step.",
+                + ". "
+                + required_response,
                 failure_context={
                     "kind": "merchant_rejected_sale",
                     "purpose": (
                         "Retire a persisted pre-enforcement commerce plan after "
                         "durable evidence disproved its assumed buyer."
                     ),
-                    "required_response": (
-                        "Build a replacement plan that discovers a compatible buyer "
-                        "before attempting another sale."
-                    ),
+                    "required_response": required_response,
                 },
             )
             return None
