@@ -2049,12 +2049,13 @@ class BotController:
         spells = deep_get(observation, "spells.spells", [])
         direct: list[dict[str, Any]] = []
         for spell in spells if isinstance(spells, list) else []:
-            if not isinstance(spell, dict) or spell.get("castable") is not True:
+            if not isinstance(spell, dict):
                 continue
             name = " ".join(str(spell.get("name") or "").split())
             normalized_name = name.casefold()
             is_weapon = bool(
                 needs_weapon
+                and spell.get("castable") is True
                 and re.search(r"\b(?:create|conjure|summon)\s+weapon\b", name, re.I)
             )
             is_food = normalized_name == "create food" and needs_food
@@ -2076,19 +2077,24 @@ class BotController:
                         ),
                     }
                 )
-            elif is_food and spell.get("reagents") == []:
+            elif is_food:
                 capability["server_semantics"] = (
-                    "Create Food has no reagent prerequisite in the verified live spell "
-                    "record; cast it directly without a shopping or funding detour."
+                    "The live spell record is authoritative for Create Food costs. "
+                    + (
+                        "It has no reagent prerequisite; cast it directly."
+                        if spell.get("reagents") == []
+                        else "Acquire exactly its listed reagents before casting; do not "
+                        "invent, omit, or substitute reagent requirements."
+                    )
                 )
             direct.append(capability)
         if not direct:
             return None
         return {
             "purpose": (
-                "These live, castable capabilities directly satisfy requirements named "
-                "by the current preparation phase. Prefer them before speculative "
-                "shopping or liquidation detours and obey their server semantics."
+                "These verified capabilities and their live prerequisites directly apply "
+                "to requirements named by the current preparation phase. Prefer direct "
+                "use when castable and obey the listed server semantics."
             ),
             "preferred_tool": "cast",
             "capabilities": direct,
@@ -2113,11 +2119,10 @@ class BotController:
                 for item in capabilities
                 if isinstance(item, dict)
                 and str(item.get("name") or "").strip().casefold() == "create food"
-                and item.get("reagents") == []
             ),
             None,
         )
-        if create_food is not None:
+        if create_food is not None and create_food.get("reagents") == []:
             cast_index = next(
                 (
                     index
@@ -2211,7 +2216,10 @@ class BotController:
             if name:
                 counts[name] = counts.get(name, 0) + 1
         duplicates = {name for name, count in counts.items() if count > 1}
-        restricted = self._intrinsically_unsellable_item_ids(goal)
+        restricted = self._intrinsically_unsellable_item_ids(goal, observation)
+        restricted_names = self._intrinsically_unsellable_item_names(
+            goal, observation
+        )
         for step in steps:
             if step.get("tool") != "sell":
                 continue
@@ -2229,6 +2237,19 @@ class BotController:
                 for name in duplicates
                 if re.search(rf"\b{re.escape(name)}s?\b", sale_text)
             )
+            blocked_names = sorted(
+                name
+                for name in restricted_names
+                if re.search(rf"\b{re.escape(name)}s?\b", sale_text)
+            )
+            if blocked_names:
+                return (
+                    "the unchanged semantic inventory has verified every carried "
+                    "instance of "
+                    + ", ".join(repr(name) for name in blocked_names)
+                    + " non-transferable across item-id churn; do not plan another sale "
+                    "until inventory materially changes"
+                )
             if ambiguous_names and not mentioned_ids:
                 return (
                     "the targeted sale names duplicate inventory item(s) "
@@ -3961,7 +3982,25 @@ class BotController:
             str(sale_step.get(field) or "")
             for field in ("outcome", "verification")
         ).casefold()
-        restricted_item_ids = self._intrinsically_unsellable_item_ids(goal)
+        restricted_item_ids = self._intrinsically_unsellable_item_ids(
+            goal, self.last_observation or {}
+        )
+        restricted_item_names = self._intrinsically_unsellable_item_names(
+            goal, self.last_observation or {}
+        )
+        reused_restricted_names = sorted(
+            name
+            for name in restricted_item_names
+            if re.search(rf"\b{re.escape(name)}s?\b", sale_text)
+        )
+        if reused_restricted_names:
+            return (
+                "the unchanged semantic inventory has already proved every carried "
+                "instance of "
+                + ", ".join(repr(name) for name in reused_restricted_names)
+                + " non-transferable despite server item-id churn; use a non-sale "
+                "funding route or materially change inventory"
+            )
         reused_restricted_ids = sorted(
             item_id
             for item_id in restricted_item_ids
@@ -13018,7 +13057,9 @@ class BotController:
             return
         if tool != "sell":
             return
-        intrinsic_block = self._intrinsic_sale_block(goal, arguments)
+        intrinsic_block = self._intrinsic_sale_block(
+            goal, arguments, observation
+        )
         if intrinsic_block is not None:
             blocked_ids = sorted(self._sale_item_ids(arguments))
             raise ModelError(
@@ -16020,13 +16061,19 @@ class BotController:
         items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
         active_goal = self.storage.active_goal()
         npc_transfer_restricted_ids = self._intrinsically_unsellable_item_ids(
-            active_goal
+            active_goal, observation
+        )
+        npc_transfer_restricted_names = self._intrinsically_unsellable_item_names(
+            active_goal, observation
         )
         signature = canonical_json(
             {
                 "items": items,
                 "npc_transfer_restricted_ids": sorted(
                     npc_transfer_restricted_ids
+                ),
+                "npc_transfer_restricted_names": sorted(
+                    npc_transfer_restricted_names
                 ),
             }
         )
@@ -16183,11 +16230,12 @@ class BotController:
     def _intrinsically_unsellable_item_ids(
         self,
         goal: dict[str, Any] | None,
+        observation: dict[str, Any] | None = None,
     ) -> set[str]:
         if not isinstance(goal, dict):
             return set()
         entries = self.storage.get_runtime("blocked_actions", [])
-        return {
+        result = {
             item_id
             for entry in (entries if isinstance(entries, list) else [])
             if isinstance(entry, dict)
@@ -16200,14 +16248,133 @@ class BotController:
                 else {}
             )
         }
+        if isinstance(observation, dict):
+            restricted_names = self._intrinsically_unsellable_item_names(
+                goal, observation
+            )
+            raw_items = deep_get(observation, "inventory.items", [])
+            result.update(
+                str(item.get("id", item.get("object_id"))).strip().casefold()
+                for item in (raw_items if isinstance(raw_items, list) else [])
+                if isinstance(item, dict)
+                and " ".join(str(item.get("name") or "").split()).casefold()
+                in restricted_names
+                and item.get("id", item.get("object_id")) is not None
+            )
+        return result
+
+    @staticmethod
+    def _intrinsic_refusal_item_name(reason: Any) -> str | None:
+        text = " ".join(str(reason or "").split()).casefold()
+        match = re.search(
+            r"\bpart with\s+(?:(?:a|an|the|some)\s+)?(.+?)(?:!|\.|\?|\"|$)",
+            text,
+        )
+        if match is None:
+            return None
+        name = match.group(1).strip(" !?.\"'")
+        return name or None
+
+    def _intrinsically_unsellable_item_names(
+        self,
+        goal: dict[str, Any] | None,
+        observation: dict[str, Any],
+    ) -> set[str]:
+        """Carry exact refusal evidence across opaque server item-id churn.
+
+        The inference applies only while the semantic inventory hash remains
+        unchanged. Distinct refused ids must cover every currently carried
+        instance, so one bad duplicate never poisons its siblings.
+        """
+
+        if not isinstance(goal, dict):
+            return set()
+        current_hash = self.learning.profile(observation).get(
+            "inventory_load_hash"
+        )
+        if not current_hash:
+            return set()
+        raw_items = deep_get(observation, "inventory.items", [])
+        counts: dict[str, int] = {}
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        refused_ids: dict[str, set[str]] = {}
+        entries = self.storage.get_runtime("blocked_actions", [])
+        for entry in entries if isinstance(entries, list) else []:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("goal_id") != goal.get("id")
+                or entry.get("tool") not in {"sell", "sell_all"}
+                or entry.get("inventory_load_hash") != current_hash
+                or not self._is_intrinsic_item_sale_refusal(entry.get("reason"))
+            ):
+                continue
+            name = self._intrinsic_refusal_item_name(entry.get("reason"))
+            if not name or name not in counts:
+                continue
+            refused_ids.setdefault(name, set()).update(
+                self._sale_item_ids(
+                    entry.get("arguments")
+                    if isinstance(entry.get("arguments"), dict)
+                    else {}
+                )
+            )
+        return {
+            name
+            for name, item_ids in refused_ids.items()
+            if counts.get(name, 0) > 0 and len(item_ids) >= counts[name]
+        }
+
+    @staticmethod
+    def _sale_selected_item_names(
+        arguments: dict[str, Any], observation: dict[str, Any]
+    ) -> set[str]:
+        raw_values = arguments.get("items")
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        selected = {
+            str(value.get("id") if isinstance(value, dict) else value)
+            .strip()
+            .casefold()
+            for value in values
+            if (value.get("id") if isinstance(value, dict) else value) is not None
+        }
+        raw_items = deep_get(observation, "inventory.items", [])
+        names: set[str] = set()
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            identifiers = {
+                str(item.get(key)).strip().casefold()
+                for key in ("id", "object_id")
+                if item.get(key) is not None
+            }
+            if name in selected or identifiers & selected:
+                names.add(name)
+        return names
 
     def _intrinsic_sale_block(
         self,
         goal: dict[str, Any],
         arguments: dict[str, Any],
+        observation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         requested_ids = self._sale_item_ids(arguments)
-        if not requested_ids:
+        restricted_names = (
+            self._intrinsically_unsellable_item_names(goal, observation)
+            if isinstance(observation, dict)
+            else set()
+        )
+        requested_names = (
+            self._sale_selected_item_names(arguments, observation)
+            if isinstance(observation, dict)
+            else set()
+        )
+        if not requested_ids and not requested_names:
             return None
         entries = self.storage.get_runtime("blocked_actions", [])
         for entry in entries if isinstance(entries, list) else []:
@@ -16216,11 +16383,14 @@ class BotController:
                 and entry.get("goal_id") == goal.get("id")
                 and entry.get("tool") in {"sell", "sell_all"}
                 and self._is_intrinsic_item_sale_refusal(entry.get("reason"))
-                and requested_ids
-                & self._sale_item_ids(
-                    entry.get("arguments")
-                    if isinstance(entry.get("arguments"), dict)
-                    else {}
+                and (
+                    requested_ids
+                    & self._sale_item_ids(
+                        entry.get("arguments")
+                        if isinstance(entry.get("arguments"), dict)
+                        else {}
+                    )
+                    or requested_names & restricted_names
                 )
             ):
                 return entry
@@ -16234,7 +16404,7 @@ class BotController:
         arguments: dict[str, Any],
     ) -> dict[str, Any] | None:
         intrinsic_sale_block = (
-            self._intrinsic_sale_block(goal, arguments)
+            self._intrinsic_sale_block(goal, arguments, observation)
             if tool in {"sell", "sell_all"}
             else None
         )

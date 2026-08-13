@@ -223,9 +223,10 @@ When feedback says item_not_npc_transferable or CanBeGivenToNPC=false, the serve
 instance before evaluating merchant preference. Never call merchants or try another merchant for that item id;
 choose another exact inventory item id or a non-sale funding route.
 Create Weapon products are marked IA_MADE by the server and cannot be given to any NPC. They are equipment,
-never sale inventory or a funding source. If direct_phase_capabilities lists Create Food with reagents=[], cast
-it directly: do not invent ElderBerry, Herb, shopping, or funding prerequisites. When duplicate inventory names
-exist, every targeted sell step must identify the intended exact unequipped item id.
+never sale inventory or a funding source. For Create Food, the live direct_phase_capabilities `reagents` and
+`blocked_by` fields are authoritative: cast directly only when castable=true; otherwise acquire exactly the
+listed reagents without inventing or omitting prerequisites. When duplicate inventory names exist, every
+targeted sell step must identify the intended exact unequipped item id.
 After an insufficient-funds shop result, the current purchase tactic is invalid until funds have actually
 increased. Inspect actual inventory, query merchants for what the character carries, and use sell or guarded
 sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly

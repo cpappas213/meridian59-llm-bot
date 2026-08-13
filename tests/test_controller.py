@@ -2447,6 +2447,56 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(capabilities["Create Weapon"]["funding_eligible"])
         self.assertIn("no reagent prerequisite", capabilities["Create Food"]["server_semantics"])
 
+        blocked_food_observation = copy.deepcopy(observation)
+        blocked_food = blocked_food_observation["spells"]["spells"][1]
+        blocked_food.update(
+            {
+                "castable": False,
+                "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                "blocked_by": [
+                    "needs 2 x ElderBerry, carrying 0",
+                    "needs 2 x Herbs, carrying 0",
+                ],
+            }
+        )
+        blocked_context = BotController._direct_phase_capabilities(
+            phase, blocked_food_observation
+        )
+        blocked_capabilities = {
+            item["name"]: item
+            for item in (blocked_context or {}).get("capabilities", [])
+        }
+        self.assertFalse(blocked_capabilities["Create Food"]["castable"])
+        self.assertEqual(
+            ["2 x ElderBerry", "2 x Herbs"],
+            blocked_capabilities["Create Food"]["reagents"],
+        )
+        self.assertIn(
+            "Acquire exactly its listed reagents",
+            blocked_capabilities["Create Food"]["server_semantics"],
+        )
+        self.assertIsNone(
+            BotController._direct_capability_plan_error(
+                phase,
+                [
+                    {
+                        "id": "buy-live-reagents",
+                        "tool": "shop",
+                        "outcome": "Buy 2 ElderBerry and 2 Herbs.",
+                        "verification": "Inventory contains the live listed reagents.",
+                    },
+                    {
+                        "id": "cast-after-reagents",
+                        "tool": "cast",
+                        "outcome": "Cast Create Food.",
+                        "verification": "Inventory contains food.",
+                    },
+                ],
+                blocked_food_observation,
+                ["Create Food needs 2 ElderBerry and 2 Herbs."],
+            )
+        )
+
         detour = [
             {
                 "id": "sell-mace",
@@ -2563,6 +2613,103 @@ class ControllerTests(unittest.TestCase):
                     controller._targeted_sale_grounding_error(
                         goal, phase, exact, observation
                     )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_intrinsic_sale_evidence_survives_id_churn_only_for_unchanged_inventory(self) -> None:
+        reason = (
+            'Meidei tells you, "I cannot see how you could bear to part with a mace! '
+            'I certainly couldn\'t be the one to take it off your hands."'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="intrinsic-id-churn")
+                )["goal"]
+                first = {
+                    "look": {"room": {"num": 103}},
+                    "inventory": {
+                        "carry": {
+                            "known": True,
+                            "items": 2,
+                            "load": {"weight": 0, "bulk": 0, "exact": True},
+                            "weight_max": 2700,
+                            "bulk_max": 2700,
+                        },
+                        "items": [
+                            {"id": 10, "name": "mace"},
+                            {"id": 20, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 10, "name": "mace"}]},
+                }
+                second = copy.deepcopy(first)
+                second["inventory"]["items"] = [
+                    {"id": 30, "name": "mace"},
+                    {"id": 40, "name": "mace"},
+                ]
+                second["equipment"]["equipped"] = [{"id": 30, "name": "mace"}]
+                current = copy.deepcopy(second)
+                current["inventory"]["items"] = [
+                    {"id": 50, "name": "mace"},
+                    {"id": 60, "name": "mace"},
+                ]
+                current["equipment"]["equipped"] = [{"id": 50, "name": "mace"}]
+
+                self.assertEqual(
+                    controller.learning.profile(first)["inventory_load_hash"],
+                    controller.learning.profile(second)["inventory_load_hash"],
+                )
+                controller._record_blocked_action(
+                    goal, first, "sell", {"to": 1, "items": [10]}, reason
+                )
+                self.assertEqual(
+                    set(),
+                    controller._intrinsically_unsellable_item_names(goal, current),
+                )
+                controller._record_blocked_action(
+                    goal, second, "sell", {"to": 2, "items": [40]}, reason
+                )
+
+                self.assertEqual(
+                    {"mace"},
+                    controller._intrinsically_unsellable_item_names(goal, current),
+                )
+                self.assertEqual(
+                    {"10", "40", "50", "60"},
+                    controller._intrinsically_unsellable_item_ids(goal, current),
+                )
+                self.assertIsNotNone(
+                    controller._intrinsic_sale_block(
+                        goal, {"to": 3, "items": [60]}, current
+                    )
+                )
+                plan_error = controller._targeted_sale_grounding_error(
+                    goal,
+                    {"kind": "prepare_combat", "context": {}},
+                    [
+                        {
+                            "tool": "sell",
+                            "outcome": "Sell exact mace id 60.",
+                            "verification": "Shillings increase.",
+                        }
+                    ],
+                    current,
+                )
+                self.assertIn("across item-id churn", plan_error or "")
+
+                materially_changed = copy.deepcopy(current)
+                materially_changed["inventory"]["items"].append(
+                    {"id": 70, "name": "mace"}
+                )
+                materially_changed["inventory"]["carry"]["items"] = 3
+                self.assertEqual(
+                    set(),
+                    controller._intrinsically_unsellable_item_names(
+                        goal, materially_changed
+                    ),
                 )
             finally:
                 controller.storage.close()
