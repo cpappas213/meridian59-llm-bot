@@ -8627,6 +8627,40 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_source_gentle_overlevel_spawn_uses_grounded_attack_rating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                controller.knowledge = SimpleNamespace(
+                    get=lambda _entity_id: {
+                        "status": "found",
+                        "entity": {
+                            "spawn_table": {
+                                "spawns": [
+                                    {
+                                        "creature_id": "creature:fungusbeast",
+                                        "creature": "fungus beast",
+                                        "level": 50,
+                                        "difficulty": 1,
+                                        "role": "monster",
+                                        "chance": 65,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                )
+
+                threats = controller._source_room_overlevel_hostiles(
+                    544, broker.observe()
+                )
+
+                self.assertEqual([], threats)
+            finally:
+                controller.storage.close()
+
     def test_blocked_farm_goal_reconciles_against_current_candidate_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -9864,6 +9898,41 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual(50, blocker["hostiles"][0]["level"])
                 self.assertEqual(41, blocker["hostiles"][0]["danger_limit"])
+            finally:
+                controller.storage.close()
+
+    def test_gentle_overlevel_live_creature_does_not_block_farm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                controller.knowledge = SimpleNamespace(
+                    resolve=lambda _query, **_: {
+                        "status": "found",
+                        "entity": {
+                            "id": "creature:fungusbeast",
+                            "facts": {"level": 50, "difficulty": 1},
+                            "evidence": {"source_ref": "monster/fungus.kod"},
+                        },
+                    }
+                )
+                observation = broker.observe()
+                observation["look"]["objects"] = [
+                    {
+                        "id": 9123,
+                        "name": "fungus beast",
+                        "distance": 4,
+                        "reachable": True,
+                        "is_player": False,
+                        "relation": "hostile",
+                        "can": ["attack", "look"],
+                    }
+                ]
+
+                threats = controller._live_overlevel_hostiles(observation)
+
+                self.assertEqual([], threats)
             finally:
                 controller.storage.close()
 

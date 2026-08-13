@@ -92,9 +92,14 @@ FARM_STAGNATION_RETRY_SECONDS = 15 * 60
 # retreat inside this window escalates the exact tactic to quarantine.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
 FARM_RETREAT_QUARANTINE_COUNT = 2
-# A source-listed monster is too dangerous for autonomous farming while its
-# level exceeds max HP by more than this bounded survivability margin.
+# A source-listed monster is provisionally too dangerous for autonomous
+# farming while its level exceeds max HP by more than this bounded
+# survivability margin.  Monster difficulty dominates attack accuracy in the
+# server formula (3 * level + 60 * difficulty), so a known difficulty-1 fungus
+# beast is the conservative exception shared with the upstream keeper.  An
+# unknown difficulty is never forgiven.
 FARM_DANGER_MARGIN = 15
+FARM_GENTLE_ATTACK_RATING = 210
 PVP_TOOL_NAMES = frozenset({PVP_TOOL_NAME, PVP_SEEK_TOOL_NAME})
 PVP_ROUTE_FAILURE_RUNTIME_KEY = "pvp_route_failure_v1"
 SAFE_STAGING_FLAGS = frozenset({"ROOM_SANCTUARY", "ROOM_NO_COMBAT"})
@@ -118,6 +123,35 @@ FARM_FLEE_THRESHOLD = 0.60
 # inference. Keep a controller-owned buffer above the normalized disengage
 # floor instead; autonomous farming still launches only at full health.
 MANUAL_COMBAT_START_MARGIN = 0.10
+
+
+def _monster_attack_rating(level: Any, difficulty: Any) -> int | None:
+    """Return the source attack-accuracy rating, or ``None`` when ungrounded."""
+
+    try:
+        monster_level = int(level)
+        monster_difficulty = int(difficulty)
+    except (TypeError, ValueError):
+        return None
+    if monster_level < 0 or monster_difficulty < 1:
+        return None
+    return (3 * monster_level) + (60 * monster_difficulty)
+
+
+def _is_overlevel_farm_threat(
+    level: int,
+    danger_limit: int,
+    *,
+    difficulty: Any,
+) -> tuple[bool, int | None]:
+    """Apply the keeper's conservative level-plus-known-rating safety rule."""
+
+    if level <= danger_limit:
+        return False, _monster_attack_rating(level, difficulty)
+    attack_rating = _monster_attack_rating(level, difficulty)
+    if attack_rating is not None and attack_rating <= FARM_GENTLE_ATTACK_RATING:
+        return False, attack_rating
+    return True, attack_rating
 
 # The ordinary client advertises ATTACK as an affordance for faction troops
 # because the player is allowed to initiate combat with them.  That is not an
@@ -6836,13 +6870,20 @@ class BotController:
                 creature_level = int(facts.get("level"))
             except (TypeError, ValueError):
                 continue
-            if creature_level <= limit:
+            is_threat, attack_rating = _is_overlevel_farm_threat(
+                creature_level,
+                limit,
+                difficulty=facts.get("difficulty"),
+            )
+            if not is_threat:
                 continue
             threats.append(
                 {
                     "object_id": item.get("id"),
                     "name": name,
                     "level": creature_level,
+                    "difficulty": facts.get("difficulty"),
+                    "attack_rating": attack_rating,
                     "character_level": level,
                     "danger_limit": limit,
                     "distance": item.get("distance"),
@@ -12273,13 +12314,20 @@ class BotController:
                 creature_level = int(spawn.get("level"))
             except (TypeError, ValueError):
                 continue
-            if creature_level <= danger_limit:
+            is_threat, attack_rating = _is_overlevel_farm_threat(
+                creature_level,
+                danger_limit,
+                difficulty=spawn.get("difficulty"),
+            )
+            if not is_threat:
                 continue
             threats.append(
                 {
                     "entity_id": spawn.get("creature_id"),
                     "name": spawn.get("creature"),
                     "level": creature_level,
+                    "difficulty": spawn.get("difficulty"),
+                    "attack_rating": attack_rating,
                     "character_level": character_level,
                     "danger_limit": danger_limit,
                     "chance": spawn.get("chance"),
