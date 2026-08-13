@@ -2545,6 +2545,35 @@ class BotController:
                     }
                 )
             elif is_food:
+                blockers = (
+                    list(capability.get("blocked_by", []))
+                    if isinstance(capability.get("blocked_by"), list)
+                    else []
+                )
+                remaining_blockers: list[str] = []
+                inventory_items = deep_get(observation, "inventory.items", [])
+                for blocker in blockers:
+                    match = re.match(
+                        r"\s*needs\s+(\d+)\s+x\s+(.+?),\s*carrying\s+\d+\s*$",
+                        str(blocker),
+                        re.I,
+                    )
+                    if (
+                        match
+                        and CriteriaEvaluator.inventory_count(
+                            inventory_items,
+                            match.group(2),
+                        )
+                        >= int(match.group(1))
+                    ):
+                        continue
+                    remaining_blockers.append(str(blocker))
+                if blockers and not remaining_blockers:
+                    capability["castable"] = True
+                    capability.pop("blocked_by", None)
+                    capability["availability_reconciled_from_inventory"] = True
+                elif remaining_blockers != blockers:
+                    capability["blocked_by"] = remaining_blockers
                 ability = next(
                     (
                         entry.get("ability")

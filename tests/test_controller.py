@@ -2541,6 +2541,25 @@ class ControllerTests(unittest.TestCase):
             "Acquire exactly its listed reagents",
             blocked_capabilities["Create Food"]["server_semantics"],
         )
+
+        stocked_food_observation = copy.deepcopy(blocked_food_observation)
+        stocked_food_observation["inventory"] = {
+            "items": [
+                {"name": "elderberry", "amount": 2},
+                {"name": "herb", "amount": 2},
+            ]
+        }
+        stocked_context = BotController._direct_phase_capabilities(
+            phase, stocked_food_observation
+        )
+        stocked_food = next(
+            item
+            for item in (stocked_context or {}).get("capabilities", [])
+            if item.get("name") == "Create Food"
+        )
+        self.assertTrue(stocked_food["castable"])
+        self.assertNotIn("blocked_by", stocked_food)
+        self.assertTrue(stocked_food["availability_reconciled_from_inventory"])
         self.assertIsNone(
             BotController._direct_capability_plan_error(
                 phase,
@@ -2841,6 +2860,21 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(
             BotController._phase_inventory_plan_error(
                 phase, grounded, observation
+            )
+        )
+
+        stocked = copy.deepcopy(observation)
+        stocked["inventory"]["items"][1]["amount"] = 6
+        stocked["inventory"]["items"][2]["amount"] = 6
+        self.assertEqual(
+            6,
+            CriteriaEvaluator.inventory_count(
+                stocked["inventory"]["items"], "Herbs"
+            ),
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, three_casts, stocked
             )
         )
 

@@ -35,6 +35,14 @@ EDIBLE_FOOD_NAME_MARKERS = (
     "goblet",
 )
 
+# Source spell catalogues use class names while the live inventory exposes
+# display names. These two reagent classes have irregular/plural source names
+# that are not substrings of their singular inventory labels.
+INVENTORY_NAME_ALIASES = {
+    "herbs": "herb",
+    "elderberries": "elderberry",
+}
+
 
 @dataclass(frozen=True)
 class CriterionResult:
@@ -99,12 +107,14 @@ class CriteriaEvaluator:
         if not isinstance(items, list):
             return 0
         needle = " ".join(str(requested_item or "").split()).casefold()
+        needle = INVENTORY_NAME_ALIASES.get(needle, needle)
         semantic_food = needle in {"food", "edible food"}
         count = 0
         for entry in items:
             if not isinstance(entry, dict):
                 continue
             name = " ".join(str(entry.get("name") or "").split()).casefold()
+            name = INVENTORY_NAME_ALIASES.get(name, name)
             matches = (
                 any(marker in name for marker in EDIBLE_FOOD_NAME_MARKERS)
                 if semantic_food
