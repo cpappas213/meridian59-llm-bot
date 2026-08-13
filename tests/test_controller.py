@@ -551,7 +551,11 @@ class UnverifiedCreateFoodBroker(StalePostCreateFoodBroker):
                 "what_the_mana_says": (
                     "NOTHING was spent — the cast did not happen at all."
                     if self.mana_spent == 0
-                    else "full cost — the spell was cast"
+                    else (
+                        "half cost (5 of 10) — the spell was cast and FAILED its roll"
+                        if self.mana_spent == 5
+                        else "full cost — the spell was cast"
+                    )
                 ),
             }
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
@@ -5342,10 +5346,77 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     1,
                     len(
-                        controller.storage.events(kinds=["action.no_progress"])[
+                        controller.storage.events(kinds=["action.transient_failure"])[
                             "events"
                         ]
                     ),
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+            finally:
+                controller.storage.close()
+
+    def test_half_cost_failed_cast_preserves_plan_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = UnverifiedCreateFoodBroker(mana_spent=5)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="failed-roll-create-food")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create one required food item, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "create-food",
+                                    "tool": "cast",
+                                    "outcome": "Cast Create Food to produce 1 food.",
+                                    "verification": "inventory shows at least 2 food items.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["transient_failure"])
+                self.assertTrue(result["plan_step_preserved"])
+                self.assertIn("FAILED its roll", result["reason"])
+                retained = controller._execution_plan(goal)
+                self.assertIsNotNone(retained)
+                self.assertEqual(
+                    "transient_failure", retained["last_action"]["status"]
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
                 )
             finally:
                 controller.storage.close()

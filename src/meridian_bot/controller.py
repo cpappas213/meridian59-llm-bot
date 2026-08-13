@@ -870,6 +870,31 @@ class BotController:
         return transient if tool in FOREGROUND_ROOM_TRANSITION_TOOLS else None
 
     @staticmethod
+    def _transient_cast_failure_reason(tool: str, result: Any) -> str | None:
+        """Return a cast outcome that is safe to retry without changing tactics."""
+
+        if tool != "cast" or not isinstance(result, dict):
+            return None
+        reading = str(result.get("what_the_mana_says") or "").strip()
+        folded = reading.casefold()
+        mana_spent = result.get("mana_spent")
+        no_cast = (
+            isinstance(mana_spent, (int, float))
+            and not isinstance(mana_spent, bool)
+            and mana_spent == 0
+        )
+        failed_roll = "failed its roll" in folded or "half cost" in folded
+        if not no_cast and not failed_roll:
+            return None
+        if reading:
+            return reading[:500]
+        return (
+            "zero mana was spent; the requested cast did not happen"
+            if no_cast
+            else "the spell spent only its failure cost and failed its roll"
+        )
+
+    @staticmethod
     def _look_room_matches_destination(refreshed: Any, destination: Any) -> bool:
         if not isinstance(refreshed, dict) or destination is None:
             return False
@@ -15196,6 +15221,7 @@ class BotController:
                 self.broker.observe()
                 if tool
                 in {
+                    "cast",
                     "fight",
                     *PVP_TOOL_NAMES,
                     "bank",
@@ -15351,6 +15377,98 @@ class BotController:
                             if phase_result.get("breaker_tripped")
                             else {}
                         ),
+                    }
+                transient_cast_failure = self._transient_cast_failure_reason(
+                    tool, result
+                )
+                if transient_cast_failure:
+                    # A zero-cost swallowed packet or a half-cost random spell
+                    # failure does not disprove the spell, its reagents, or the
+                    # verified plan. It also must not enter blocked-action memory:
+                    # that memory is keyed by tool/arguments/room rather than
+                    # the one-second cast timer or a random roll and would turn
+                    # one transient miss into a permanent suppression.
+                    self._record_plan_action(
+                        goal,
+                        step_id=str(
+                            plan.get("plan_step_id") or "controller-owned-step"
+                        ),
+                        tool=tool,
+                        arguments=arguments,
+                        result=result,
+                        status="transient_failure",
+                    )
+                    self.storage.update_action_attempt(
+                        attempt_id,
+                        "failed",
+                        result=redact(result),
+                        error_code="TRANSIENT_CAST_FAILURE",
+                    )
+                    finish_phase_attempt(
+                        "partial",
+                        action_attempt_id=attempt_id,
+                        result=result,
+                        verification={
+                            "transient_cast_failure": True,
+                            "plan_step_complete": False,
+                            "reason": transient_cast_failure,
+                        },
+                        reason=transient_cast_failure,
+                    )
+                    event = self.storage.emit_event(
+                        "action.transient_failure",
+                        "Cast failed transiently; preserved the current plan step",
+                        severity="warning",
+                        interesting=False,
+                        goal_id=goal["id"],
+                        data={
+                            "tool": tool,
+                            "arguments": redact(arguments),
+                            "room": redact(deep_get(observation, "look.room")),
+                            "reason": transient_cast_failure,
+                            "result": redact(result),
+                            "attempt_id": attempt_id,
+                            "plan_step_preserved": True,
+                        },
+                        correlation_id=correlation_id,
+                        policy_decision_id=policy.id,
+                    )
+                    self._set_planner_feedback(
+                        goal,
+                        self._no_progress_guidance(
+                            tool,
+                            transient_cast_failure,
+                            observation=failure_observation,
+                        ),
+                        failure_context={
+                            **self._failure_context(
+                                tool,
+                                transient_cast_failure,
+                                failure_observation,
+                            ),
+                            "transient": True,
+                            "plan_step_preserved": True,
+                        },
+                    )
+                    if assessment_id:
+                        self.storage.complete_consequence(
+                            assessment_id,
+                            outcome={
+                                "no_progress": True,
+                                "transient_cast_failure": True,
+                                "reason": transient_cast_failure,
+                                "result": redact(result),
+                                "action_event_id": event["id"],
+                            },
+                            succeeded=False,
+                        )
+                    return {
+                        "action": tool,
+                        "no_progress": True,
+                        "transient_failure": True,
+                        "plan_step_preserved": True,
+                        "reason": transient_cast_failure,
+                        "result": redact(result),
                     }
                 self.storage.update_action_attempt(attempt_id, "failed", result=redact(result), error_code="NO_PROGRESS")
                 phase_result = finish_phase_attempt(
@@ -16493,6 +16611,15 @@ class BotController:
                 "Keep the existing plan step, refresh posture and mana, wait for the shared "
                 "attack/cast timer if necessary, and retry only after that live state changes."
             )
+        if tool == "cast" and any(
+            marker in text for marker in ("failed its roll", "half cost")
+        ):
+            return (
+                prefix
+                + "The spell resolved as a normal random failure, so the current plan step "
+                "remains valid and incomplete. Recover enough mana and retry that same step; "
+                "this outcome does not disprove the spell, reagents, or plan."
+            )
         if tool == "cast" and "produced no verified carried item" in text:
             return (
                 prefix
@@ -16615,6 +16742,11 @@ class BotController:
                     mana_reading
                     or "zero mana was spent; the requested cast did not happen"
                 )[:500]
+            if any(
+                marker in mana_reading.casefold()
+                for marker in ("failed its roll", "half cost")
+            ):
+                return mana_reading[:500]
             created = result.get("created")
             observes_created = (arguments or {}).get("observe_created") is True
             spell = " ".join(
