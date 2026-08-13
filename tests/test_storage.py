@@ -832,6 +832,23 @@ class StorageTests(unittest.TestCase):
                     {tool["name"] for tool in selected},
                 )
 
+    def test_farm_phase_keeps_merchant_lookup_with_provisioning(self) -> None:
+        selected = CampaignCoordinator.tools_for_phase(
+            {"kind": "farm"},
+            [
+                {"name": "merchants"},
+                {"name": "shop"},
+                {"name": "cast"},
+                {"name": "autopilot"},
+                {"name": "sell_all"},
+            ],
+        )
+
+        self.assertEqual(
+            {"merchants", "shop", "cast", "autopilot"},
+            {tool["name"] for tool in selected},
+        )
+
     def test_campaign_time_budget_excludes_accounted_controller_downtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:

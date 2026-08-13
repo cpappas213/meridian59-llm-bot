@@ -165,6 +165,15 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "inventory",
         "equipment",
         "abilities",
+        # Provisioning is part of sustaining an already-selected farm, not a
+        # phase change.  `shop` without the read-only catalogue forces the
+        # tactical model to guess a seller/room or revise the plan through
+        # weaker map and free-text knowledge searches.  MANIAC did exactly
+        # that for four full model turns after Create Food reported one missing
+        # elderberry.  Keep the lookup and the purchase in the same bounded
+        # farm phase; ordinary live-quote and transaction safeguards still
+        # apply before money moves.
+        "merchants",
         "equip_best",
         "wear_best",
         "rest_up",

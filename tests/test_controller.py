@@ -3897,6 +3897,78 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_farm_execution_plan_accepts_merchant_provisioning_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = CatalogBroker()
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="farm-plan-merchant-provisioning",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm after replenishing one missing reagent.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "context": {
+                            "target": "ant",
+                            "room": 26,
+                            "use_safe_spots": False,
+                        },
+                    },
+                    mode="start",
+                )
+
+                stored = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Find the missing farm reagent, then launch.",
+                            "steps": [
+                                {
+                                    "id": "find-reagent-seller",
+                                    "outcome": "Find a merchant stocking elderberry.",
+                                    "tool": "merchants",
+                                    "verification": "The catalogue returns a placed seller and room id.",
+                                },
+                                {
+                                    "id": "launch-farm",
+                                    "outcome": "Launch the bounded ant farm in assigned room 26.",
+                                    "tool": "autopilot",
+                                    "verification": "Keeper reports the requested farm policy.",
+                                },
+                            ],
+                        },
+                        52,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                self.assertEqual("verified", stored["verification"]["status"])
+                self.assertEqual("merchants", stored["steps"][0]["tool"])
+            finally:
+                controller.storage.close()
+
     def test_execution_plan_drops_zero_currency_deposit_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
