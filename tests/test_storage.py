@@ -599,6 +599,22 @@ class StorageTests(unittest.TestCase):
             {tool["name"] for tool in training},
         )
 
+    def test_farm_phase_exposes_typed_cast_for_safe_preparation(self) -> None:
+        selected = CampaignCoordinator.tools_for_phase(
+            {"kind": "farm"},
+            [
+                {"name": "cast"},
+                {"name": "act"},
+                {"name": "equip_best"},
+                {"name": "autopilot"},
+            ],
+        )
+
+        self.assertEqual(
+            {"cast", "equip_best", "autopilot"},
+            {tool["name"] for tool in selected},
+        )
+
     def test_return_home_phase_can_use_the_one_way_raza_exit(self) -> None:
         selected = CampaignCoordinator.tools_for_phase(
             {"kind": "return_home"},

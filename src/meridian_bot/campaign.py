@@ -168,6 +168,11 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "equip_best",
         "wear_best",
         "rest_up",
+        # Farm preparation may need to create a weapon or food in safe
+        # staging. Expose the typed spell adapter so the planner can use the
+        # capability described in grounded development context without
+        # falling back to the overly broad `act` tool.
+        "cast",
         "shop",
         "bank",
         "map",
