@@ -241,6 +241,10 @@ increased. Inspect actual inventory, query merchants for what the character carr
 sell_all to obtain funds, or withdraw existing funds from the bank. Do not retry the purchase or repeatedly
 inspect the same shop catalogue until a funding action succeeds; do not perform a knowingly invalid bank
 call from the shop.
+financial_context.bank_accounts contains durable last-known balance evidence from successful bank actions.
+When it shows positive funds and selling would consume an item required by the active phase, preserve the item:
+travel to the canonical bank room, live-check/withdraw enough funds, then continue the purchase. A stale balance
+still requires a live bank call before transfer, but it is grounded evidence that this route exists.
 After an ordinary merchant-preference sale rejection, buyer discovery must precede the next sell or sell_all.
 This rule does not apply to item_not_npc_transferable failures. Include a merchants
 buyer-discovery step unless a recent completed targeted merchants lookup is already present in last_action,

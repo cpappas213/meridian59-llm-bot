@@ -2804,6 +2804,69 @@ class ControllerTests(unittest.TestCase):
             )
         )
 
+    def test_financial_context_retains_latest_known_bank_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="durable-bank-balance-context")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "withdraw",
+                            "balance": 1712,
+                            "balance_observed": False,
+                        },
+                    },
+                )
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shilling", "amount": 32},
+                            {"id": 2, "name": "apple"},
+                        ]
+                    }
+                }
+
+                financial = controller._financial_context(observation)
+
+                self.assertEqual(
+                    1712,
+                    financial["bank_accounts"][0]["last_known_balance"],
+                )
+                self.assertIn(
+                    "preserving that required inventory",
+                    financial["banking_policy"]["funding_guidance"],
+                )
+
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "withdraw",
+                            "balance": 1600,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                refreshed = controller._financial_context(observation)
+                self.assertEqual(
+                    1600,
+                    refreshed["bank_accounts"][0]["last_known_balance"],
+                )
+            finally:
+                controller.storage.close()
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

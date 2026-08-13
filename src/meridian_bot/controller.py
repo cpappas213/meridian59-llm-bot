@@ -16589,6 +16589,7 @@ class BotController:
         npc_transfer_restricted_names = self._intrinsically_unsellable_item_names(
             active_goal, observation
         )
+        bank_accounts = self._latest_bank_balance_context()
         signature = canonical_json(
             {
                 "items": items,
@@ -16598,6 +16599,7 @@ class BotController:
                 "npc_transfer_restricted_names": sorted(
                     npc_transfer_restricted_names
                 ),
+                "bank_accounts": bank_accounts,
             }
         )
         if (
@@ -16709,6 +16711,7 @@ class BotController:
                     "source_ref": "CreateWeapon.Cast / Item.CanBeGivenToNPC",
                 }
             ],
+            "bank_accounts": bank_accounts,
             "buyer_candidates": (
                 self.knowledge.buyer_candidates(
                     [
@@ -16733,11 +16736,52 @@ class BotController:
                 "mode": "planner_discretion",
                 "never_blocks_travel_or_combat": True,
                 "canonical_tos_bank_room_id": TOS_BANK_ROOM_ID,
+                "funding_guidance": (
+                    "A last-known positive account balance is a grounded funding option. "
+                    "When a sale would consume inventory required by the active phase, "
+                    "prefer traveling to the bank, live-checking/withdrawing funds, and "
+                    "preserving that required inventory."
+                ),
             },
         }
         self._financial_context_signature = signature
         self._financial_context_value = value
         return value
+
+    def _latest_bank_balance_context(self) -> list[dict[str, Any]]:
+        """Recover the newest durable balance evidence for each known account."""
+
+        accounts: dict[str, dict[str, Any]] = {}
+        for event in reversed(
+            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
+        ):
+            data = event.get("data")
+            if not isinstance(data, dict) or data.get("tool") != "bank":
+                continue
+            result = data.get("result")
+            if not isinstance(result, dict):
+                continue
+            balance = result.get("balance")
+            if not isinstance(balance, (int, float)) or isinstance(balance, bool):
+                continue
+            account = " ".join(
+                str(result.get("account") or "shared mainland account").split()
+            )
+            if account in accounts:
+                continue
+            accounts[account] = {
+                "account": account,
+                "last_known_balance": int(balance),
+                "recorded_at": event.get("occurred_at"),
+                "source": (
+                    "live banker reply"
+                    if result.get("balance_observed") is True
+                    else "broker-maintained balance updated by the completed bank action"
+                ),
+                "last_action": result.get("action"),
+                "requires_live_check_before_exact_transfer": True,
+            }
+        return list(accounts.values())
 
     @staticmethod
     def _sale_item_ids(arguments: dict[str, Any]) -> set[str]:
