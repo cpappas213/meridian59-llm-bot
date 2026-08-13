@@ -11,7 +11,7 @@ from typing import Any
 from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
 from .campaign import CampaignCoordinator, PhaseOutcome
 from .config import BotConfig
-from .criteria import CriteriaEvaluator
+from .criteria import CriteriaEvaluator, EDIBLE_FOOD_NAME_MARKERS
 from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationError, normalize
 from .contracts import parse_ability_metric
 from .learning import (
@@ -2141,6 +2141,60 @@ class BotController:
                     }
                 )
             elif is_food:
+                ability = next(
+                    (
+                        entry.get("ability")
+                        for entry in deep_get(observation, "abilities.spells", [])
+                        if isinstance(entry, dict)
+                        and str(entry.get("name") or "").strip().casefold()
+                        == "create food"
+                    ),
+                    None,
+                )
+                try:
+                    numeric_ability = int(ability)
+                except (TypeError, ValueError):
+                    numeric_ability = None
+                possible_products = ["apple"]
+                if numeric_ability is not None and numeric_ability >= 30:
+                    low = numeric_ability // 2
+                    possible_products = []
+                    for lower, upper, product in (
+                        (0, 29, "apple"),
+                        (30, 39, "loaf of bread"),
+                        (40, 59, "bunch of grapes"),
+                        (60, 69, "turkey leg"),
+                        (70, 79, "meat pie"),
+                        (80, 99, "wheel of cheese or inky cap"),
+                    ):
+                        if low <= upper and numeric_ability >= lower:
+                            possible_products.append(product)
+                phase_food = next(
+                    (
+                        criterion
+                        for criterion in (phase or {}).get("success_criteria", [])
+                        if isinstance(criterion, dict)
+                        and criterion.get("kind") == "inventory_contains"
+                        and str(criterion.get("item") or "").strip().casefold()
+                        in {"food", "edible food"}
+                    ),
+                    None,
+                )
+                inventory_items = deep_get(observation, "inventory.items", [])
+                current_food = CriteriaEvaluator.inventory_count(
+                    inventory_items, "food"
+                )
+                required_food = int((phase_food or {}).get("count", 1) or 1)
+                missing_food = max(0, required_food - current_food)
+                reagent_totals: list[str] = []
+                for reagent in spell.get("reagents", []):
+                    match = re.fullmatch(
+                        r"\s*(\d+)\s*x\s*(.+?)\s*", str(reagent), re.I
+                    )
+                    if match and missing_food:
+                        reagent_totals.append(
+                            f"{int(match.group(1)) * missing_food} x {match.group(2)}"
+                        )
                 capability["server_semantics"] = (
                     "The live spell record is authoritative for Create Food costs. "
                     + (
@@ -2150,6 +2204,27 @@ class BotController:
                         "invent, omit, or substitute reagent requirements."
                     )
                 )
+                capability["production"] = {
+                    "category": "food",
+                    "possible_products_at_current_ability": possible_products,
+                    "quantity_per_cast": 1,
+                    "restores": "vigor, not health",
+                    **(
+                        {"ability": numeric_ability}
+                        if numeric_ability is not None
+                        else {}
+                    ),
+                }
+                if phase_food is not None:
+                    capability["phase_requirement"] = {
+                        "criterion_id": phase_food.get("id"),
+                        "required_total": required_food,
+                        "currently_carried": current_food,
+                        "remaining": missing_food,
+                        "casts_required": missing_food,
+                        "reagents_required_for_remaining_casts": reagent_totals,
+                        "verification_category": "food",
+                    }
             direct.append(capability)
         if not direct:
             return None
@@ -2276,6 +2351,104 @@ class BotController:
                 "the plan assumes a Create Weapon product is sellable, but every such "
                 "product is marked IA_MADE and cannot be given to any NPC; use it only "
                 "as equipment and choose a non-sale funding route"
+            )
+        return None
+
+    @staticmethod
+    def _phase_inventory_plan_error(
+        phase: dict[str, Any] | None,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> str | None:
+        """Require plans to cover the exact remaining inventory phase outcome."""
+
+        inventory = observation.get("inventory")
+        if not isinstance(inventory, dict) or not isinstance(
+            inventory.get("items"), list
+        ):
+            # Stored plans can be loaded before the first live observation.
+            return None
+        number_words = {
+            1: "one",
+            2: "two",
+            3: "three",
+            4: "four",
+            5: "five",
+            6: "six",
+            7: "seven",
+            8: "eight",
+            9: "nine",
+            10: "ten",
+        }
+
+        def names_item(text: str, item_name: str) -> bool:
+            if item_name in {"food", "edible food"}:
+                return bool(
+                    re.search(r"\b(?:food|edible|snacks?)\b", text)
+                    or any(marker in text for marker in EDIBLE_FOOD_NAME_MARKERS)
+                )
+            return item_name in text
+
+        def names_count(text: str, value: int) -> bool:
+            tokens = [re.escape(str(value))]
+            if value in number_words:
+                tokens.append(number_words[value])
+            return bool(re.search(rf"\b(?:{'|'.join(tokens)})\b", text))
+
+        for criterion in (phase or {}).get("success_criteria", []):
+            if not isinstance(criterion, dict) or criterion.get("kind") != "inventory_contains":
+                continue
+            item_name = " ".join(str(criterion.get("item") or "").split()).casefold()
+            required = int(criterion.get("count", 1) or 1)
+            current = CriteriaEvaluator.inventory_count(
+                inventory.get("items"), item_name
+            )
+            if current >= required:
+                continue
+            remaining = required - current
+            relevant_mutations = 0
+            explicitly_covered = False
+            for step in steps:
+                outcome = str(step.get("outcome") or "").casefold()
+                verification = str(step.get("verification") or "").casefold()
+                verification_covers = names_item(verification, item_name) and (
+                    names_count(verification, required)
+                    or (
+                        names_count(verification, remaining)
+                        and re.search(
+                            r"\b(?:more|additional|remaining)\b", verification
+                        )
+                    )
+                )
+                outcome_covers = (
+                    step.get("tool") == "cast"
+                    and "create food" in outcome
+                    and names_item(outcome, item_name)
+                    and (
+                        names_count(outcome, required)
+                        or (
+                            names_count(outcome, remaining)
+                            and re.search(
+                                r"\b(?:more|additional|remaining)\b", outcome
+                            )
+                        )
+                    )
+                )
+                if verification_covers or outcome_covers:
+                    explicitly_covered = True
+                    break
+                if step.get("tool") == "cast" and "create food" in outcome:
+                    relevant_mutations += 1
+            if explicitly_covered or relevant_mutations >= remaining:
+                continue
+            display_item = "edible food" if item_name in {"food", "edible food"} else item_name
+            return (
+                f"execution_plan does not cover active phase criterion {criterion.get('id')!r}: "
+                f"authoritative inventory has {current} {display_item} item(s), but the "
+                f"phase requires {required}. Purpose: a successful tool call is not phase "
+                "completion. Include mutation step(s) whose outcome or verification "
+                f"explicitly reaches {required} total {display_item} item(s), or "
+                f"{remaining} additional; each Create Food cast produces one item"
             )
         return None
 
@@ -2560,6 +2733,27 @@ class BotController:
         )
         if direct_capability_error is not None:
             self._invalidate_execution_plan(goal, direct_capability_error)
+            return None
+        phase_inventory_error = self._phase_inventory_plan_error(
+            phase, stored_steps, self.last_observation or {}
+        )
+        if phase_inventory_error is not None:
+            self._invalidate_execution_plan(goal, phase_inventory_error)
+            self._set_planner_feedback(
+                goal,
+                phase_inventory_error,
+                failure_context={
+                    "kind": "phase_outcome_not_covered",
+                    "purpose": (
+                        "Keep a tool-level success from being mistaken for the active "
+                        "phase's exact verified outcome."
+                    ),
+                    "required_response": (
+                        "Build a replacement plan that explicitly reaches the remaining "
+                        "typed phase criterion before its safe-ending step."
+                    ),
+                },
+            )
             return None
         sale_grounding_error = self._targeted_sale_grounding_error(
             goal,
@@ -3909,6 +4103,11 @@ class BotController:
         )
         if direct_capability_error is not None:
             raise ModelError(direct_capability_error)
+        phase_inventory_error = self._phase_inventory_plan_error(
+            phase, normalized_steps, self.last_observation or {}
+        )
+        if phase_inventory_error is not None:
+            raise ModelError(phase_inventory_error)
         sale_grounding_error = self._targeted_sale_grounding_error(
             goal,
             phase,

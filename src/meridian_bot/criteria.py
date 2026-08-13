@@ -8,6 +8,34 @@ from .storage import Storage
 from .utils import deep_get
 
 
+# ``inventory_contains`` normally matches a concrete item name.  Internal
+# campaign phases may deliberately request the semantic category ``food``;
+# these are the ordinary edible item names backed by the same source-derived
+# nutrition catalogue used by combat provisioning.  Reagents such as herbs
+# and elderberries are intentionally absent: they are not edible supplies
+# until Create Food converts them.
+EDIBLE_FOOD_NAME_MARKERS = (
+    "inky cap",
+    "chocolate mint",
+    "wheel of cheese",
+    "cheese",
+    "turkey leg",
+    "mug of",
+    "meat pie",
+    "stew",
+    "loaf of bread",
+    "waterskin",
+    "slice of pork",
+    "bowl of soup",
+    "spideye",
+    "bunch of grapes",
+    "apple",
+    "edible mushroom",
+    "drumstick",
+    "goblet",
+)
+
+
 @dataclass(frozen=True)
 class CriterionResult:
     id: str
@@ -64,6 +92,32 @@ class CriteriaEvaluator:
             "all_met": all_met,
         }
 
+    @staticmethod
+    def inventory_count(items: Any, requested_item: Any) -> int:
+        """Count a concrete inventory name or a supported semantic category."""
+
+        if not isinstance(items, list):
+            return 0
+        needle = " ".join(str(requested_item or "").split()).casefold()
+        semantic_food = needle in {"food", "edible food"}
+        count = 0
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            name = " ".join(str(entry.get("name") or "").split()).casefold()
+            matches = (
+                any(marker in name for marker in EDIBLE_FOOD_NAME_MARKERS)
+                if semantic_food
+                else bool(needle) and needle in name
+            )
+            if not matches:
+                continue
+            try:
+                count += max(1, int(entry.get("amount", 1) or 1))
+            except (TypeError, ValueError):
+                count += 1
+        return count
+
     def _simple(self, criterion_id: str, item: dict[str, Any], goal: dict[str, Any], observation: dict[str, Any]) -> CriterionResult:
         kind = item["kind"]
         if kind == "operator_confirmed":
@@ -98,9 +152,8 @@ class CriteriaEvaluator:
             return CriterionResult(criterion_id, kind, met, f"observed {measured!r} {op} {target!r}")
         if kind == "inventory_contains":
             items = deep_get(observation, "inventory.items", [])
-            needle = str(item.get("item", "")).lower()
             wanted = int(item.get("count", 1))
-            count = sum(int(entry.get("amount", 1) or 1) for entry in items if needle in str(entry.get("name", "")).lower()) if isinstance(items, list) else 0
+            count = self.inventory_count(items, item.get("item"))
             return CriterionResult(criterion_id, kind, count >= wanted, f"verified count {count}; required {wanted}")
         if kind == "location_reached":
             location = str(item.get("location", item.get("room", ""))).lower()

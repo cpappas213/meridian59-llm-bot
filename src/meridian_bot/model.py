@@ -153,6 +153,12 @@ When campaign.active_phase is present, work only on that internal phase. The str
 phase: do not propose a public goal for equipment, inventory, commerce, route repair, supplies, recovery,
 or farming preparation. The campaign manager pushes or replaces those internal phases. The available_tools
 list is deliberately phase-specific; never ask for an omitted broker capability.
+The execution plan must collectively reach every exact active_phase.success_criteria value, including
+inventory quantities. A tool-level success is not phase completion. For inventory_contains item="food",
+food is a semantic edible category rather than a literal item name; use direct_phase_capabilities.production
+for the possible concrete product, units per cast, and vigor semantics. Never rename the product "Snack".
+If one repeatable plan step will be used multiple times, make its verification name the required total (or
+remaining additional quantity) and keep selecting that same step until the quantity is actually observed.
 Every active phase has a controller-persisted execution_plan. When execution_plan is absent, return
 decision=plan and no tool. Give 1-10 ordered steps with stable ids, one concrete outcome per step,
 the likely broker tool when known, and the observation that will verify the step. List factual

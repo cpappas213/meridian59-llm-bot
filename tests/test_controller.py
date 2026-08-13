@@ -2586,6 +2586,118 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertIn("Create Weapon products are marked IA_MADE", PLANNER_SYSTEM)
 
+    def test_create_food_context_quantifies_remaining_phase_requirement(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "objective": "Create food supplies.",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+            "context": {},
+        }
+        observation = {
+            "inventory": {"items": [{"name": "apple", "amount": 1}]},
+            "abilities": {
+                "spells": [{"name": "Create Food", "ability": 25}]
+            },
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Food",
+                        "mana": 10,
+                        "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                        "castable": False,
+                        "blocked_by": ["needs reagents"],
+                    }
+                ]
+            },
+        }
+
+        context = BotController._direct_phase_capabilities(phase, observation)
+        capability = (context or {})["capabilities"][0]
+
+        self.assertEqual(["apple"], capability["production"]["possible_products_at_current_ability"])
+        self.assertEqual("vigor, not health", capability["production"]["restores"])
+        self.assertEqual(
+            {
+                "criterion_id": "food_stock",
+                "required_total": 4,
+                "currently_carried": 1,
+                "remaining": 3,
+                "casts_required": 3,
+                "reagents_required_for_remaining_casts": [
+                    "6 x ElderBerry",
+                    "6 x Herbs",
+                ],
+                "verification_category": "food",
+            },
+            capability["phase_requirement"],
+        )
+
+    def test_phase_inventory_plan_requires_exact_remaining_quantity(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+        }
+        observation = {
+            "inventory": {"items": [{"name": "apple", "amount": 1}]}
+        }
+        insufficient = [
+            {
+                "id": "one-cast",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": "Inventory contains an apple.",
+            }
+        ]
+        quantified = [
+            {
+                "id": "finish-food",
+                "tool": "cast",
+                "outcome": "Cast Create Food as needed.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
+        separate_casts = [
+            {
+                "id": f"cast-{index}",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": "Another apple appears.",
+            }
+            for index in range(3)
+        ]
+
+        self.assertIn(
+            "does not cover active phase criterion",
+            BotController._phase_inventory_plan_error(
+                phase, insufficient, observation
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, quantified, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, separate_casts, observation
+            )
+        )
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

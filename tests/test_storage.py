@@ -12,6 +12,39 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_inventory_food_category_counts_edible_items_not_reagents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                result = CriteriaEvaluator(storage).evaluate(
+                    {
+                        "id": "food-category",
+                        "success_criteria": [
+                            {
+                                "id": "food",
+                                "kind": "inventory_contains",
+                                "item": "food",
+                                "count": 3,
+                            }
+                        ],
+                    },
+                    {
+                        "inventory": {
+                            "items": [
+                                {"name": "apple", "amount": 2},
+                                {"name": "wheel of cheese"},
+                                {"name": "herb", "amount": 8},
+                                {"name": "elderberry", "amount": 8},
+                            ]
+                        }
+                    },
+                )
+
+                self.assertTrue(result["all_met"])
+                self.assertEqual(
+                    "verified count 3; required 3",
+                    result["criteria"][0]["detail"],
+                )
+
     def test_compact_campaign_attempt_preserves_verified_failure_reason(self) -> None:
         compact = CampaignCoordinator._compact_attempt(
             {
