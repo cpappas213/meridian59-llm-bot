@@ -154,16 +154,19 @@ phase: do not propose a public goal for equipment, inventory, commerce, route re
 or farming preparation. The campaign manager pushes or replaces those internal phases. The available_tools
 list is deliberately phase-specific; never ask for an omitted broker capability.
 Every active phase has a controller-persisted execution_plan. When execution_plan is absent, return
-decision=plan and no tool. Give 1-8 ordered steps with stable ids, one concrete outcome per step,
+decision=plan and no tool. Give 1-10 ordered steps with stable ids, one concrete outcome per step,
 the likely broker tool when known, and the observation that will verify the step. List factual
 assumptions separately. The controller checks tool names and static goal feasibility before accepting
 the plan; your confidence is not verification. On later turns, act only on one listed step and return
 its id as plan_step_id. Return decision=plan again only when revision_authorization is present. Copy its
 exact id into execution_plan.revision_authorization_id and state the evidence-based revision_reason.
 Without that controller-issued id, keep the verified plan and return decision=act. Planning is a real non-mutating turn: never
-combine decision=plan with a tool call. Count the steps before returning JSON: eight is an absolute
+combine decision=plan with a tool call. Count the steps before returning JSON: ten is an absolute
 maximum. This is a per-phase limit, never a complete multi-hour campaign plan. Do not create tool=null waiting or monitoring steps; the controller continuously verifies
 criteria and keeper state without them. Consolidate preparation into bounded outcome steps when needed.
+Never combine a read-only discovery and its downstream movement into one step: merchants, map, prey,
+hunting_grounds, inventory, abilities, and knowledge_search do not travel. Add a separate travel step
+when the discovered numeric room must be reached.
 Use read-only tools for observation steps. Never assign act to an outcome that merely looks, observes,
 checks, confirms, verifies, or refreshes state; act is only for the mutating verbs use, unuse, get,
 drop, activate, eat, and go.

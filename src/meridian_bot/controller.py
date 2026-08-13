@@ -133,6 +133,7 @@ LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
 EXECUTION_PLAN_SCHEMA_VERSION = 4
+EXECUTION_PLAN_MAX_STEPS = 10
 INVALID_PLANNER_ACTION_LIMIT = 2
 INVALID_PLAN_REVISION_LIMIT = 2
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
@@ -1837,6 +1838,19 @@ class BotController:
                 f"assigns a merchant-stock purchase to {tool}. Purpose: sell tools only "
                 "transfer player inventory to a merchant; use shop for a purchase"
             )
+        if tool == "merchants" and (
+            re.search(r"\b(?:then|and)\s+(?:travel|go|walk|move)\b", outcome)
+            or re.search(
+                r"\b(?:status|current)\s*\.?(?:room|location)\b.*\b(?:matches|equals|is)\b",
+                verification,
+            )
+        ):
+            return (
+                "assigns room movement to merchants. Purpose: merchants is a read-only "
+                "buyer/catalogue discovery tool and cannot move the character; keep the "
+                "lookup as one step and add a following travel step bound to its numeric "
+                "room result"
+            )
         return None
 
     @staticmethod
@@ -3349,7 +3363,10 @@ class BotController:
                 for step in steps
                 if isinstance(step, dict) and step.get("tool") is not None
             ]
-            if len(actionable_steps) != len(steps) and 1 <= len(actionable_steps) <= 8:
+            if (
+                len(actionable_steps) != len(steps)
+                and 1 <= len(actionable_steps) <= EXECUTION_PLAN_MAX_STEPS
+            ):
                 plan_normalizations.append(
                     {
                         "kind": "removed_controller_owned_monitoring_steps",
@@ -3380,10 +3397,15 @@ class BotController:
                         }
                     )
                     steps = necessary_steps
-        if not summary or not isinstance(steps, list) or not 1 <= len(steps) <= 8:
+        if (
+            not summary
+            or not isinstance(steps, list)
+            or not 1 <= len(steps) <= EXECUTION_PLAN_MAX_STEPS
+        ):
             count = len(steps) if isinstance(steps, list) else "non-array"
             raise ModelError(
-                f"execution_plan requires a summary and 1-8 ordered steps; received {count} step(s)"
+                "execution_plan requires a summary and "
+                f"1-{EXECUTION_PLAN_MAX_STEPS} ordered steps; received {count} step(s)"
             )
         if not isinstance(assumptions, list) or any(not isinstance(value, str) for value in assumptions):
             raise ModelError("execution_plan.assumptions must be an array of strings")
@@ -4146,7 +4168,7 @@ class BotController:
             "recover-purchase-go-exit",
             "recover-purchase-route-hop",
         }
-        while len(steps) >= 8:
+        while len(steps) >= EXECUTION_PLAN_MAX_STEPS:
             removable = next(
                 (
                     index
@@ -4157,7 +4179,8 @@ class BotController:
             )
             if removable is None:
                 raise ModelError(
-                    "controller-owned plan cannot preserve the required safe ending within eight steps"
+                    "controller-owned plan cannot preserve the required safe ending "
+                    f"within {EXECUTION_PLAN_MAX_STEPS} steps"
                 )
             steps.pop(removable)
         return {
@@ -4257,7 +4280,7 @@ class BotController:
             # A combined acquire-then-farm goal still needs to prove both the
             # safe launch boundary and the hazardous phase's goal ownership.
             # Route-repair steps are optional and omitted to stay within the
-            # eight-step contract.
+            # bounded execution-plan contract.
             plan["steps"] = [
                 step
                 for step in plan["steps"]
@@ -11902,7 +11925,9 @@ class BotController:
             if decision["decision"] == "act" and execution_plan is None:
                 self._set_planner_feedback(
                     goal,
-                    "No verified execution plan exists for this goal. Return decision=plan with 1-8 grounded, verifiable steps before selecting a tool.",
+                    "No verified execution plan exists for this goal. Return decision=plan "
+                    f"with 1-{EXECUTION_PLAN_MAX_STEPS} grounded, verifiable steps before "
+                    "selecting a tool.",
                 )
                 return {"plan_required": True, "action_suppressed": True}
             if decision["decision"] == "act":

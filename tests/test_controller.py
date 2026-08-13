@@ -2442,6 +2442,53 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_execution_plan_allows_ten_bounded_steps_but_rejects_eleven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="ten-step-plan")
+                )["goal"]
+
+                def plan(action_count: int) -> dict[str, Any]:
+                    return with_safe_ending(
+                        {
+                            "summary": "Execute one bounded commerce phase.",
+                            "steps": [
+                                {
+                                    "id": f"action-{index}",
+                                    "outcome": f"Complete bounded action {index}.",
+                                    "tool": "act",
+                                    "verification": "Observe the requested state change.",
+                                }
+                                for index in range(action_count)
+                            ],
+                        },
+                        100,
+                    )
+
+                stored = controller._store_execution_plan(
+                    goal,
+                    plan(9),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(10, len(stored["steps"]))
+
+                with self.assertRaisesRegex(ModelError, "1-10 ordered steps"):
+                    controller._store_execution_plan(
+                        goal,
+                        plan(10),
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=True,
+                    )
+            finally:
+                controller.storage.close()
+
     def test_farm_execution_plan_rejects_later_out_of_phase_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -5898,6 +5945,22 @@ class ControllerTests(unittest.TestCase):
                         "verification": "Merchant results list a concrete buyer candidate.",
                     },
                 )
+                combined_lookup = copy.deepcopy(grounded)
+                combined_lookup["steps"][0]["outcome"] = (
+                    "Find a compatible buyer and then travel to its room."
+                )
+                combined_lookup["steps"][0]["verification"] = (
+                    "Current room matches the discovered merchant room."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "assigns room movement to merchants"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        combined_lookup,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
                 stored = controller._store_execution_plan(
                     goal,
                     grounded,
