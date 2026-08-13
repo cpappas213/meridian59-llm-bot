@@ -16320,6 +16320,9 @@ class BotController:
             )
         ) or (
             tool == "travel" and "travel route cycled" in text
+        ) or (
+            tool == "cast"
+            and "produced no verified carried item" in text
         )
 
     @staticmethod
@@ -16476,6 +16479,28 @@ class BotController:
                 + "The bank balance is already established. Do not ask for it again in the unchanged state; "
                 "if carried shillings are zero, launch the goal-owned bounded keeper from this sanctuary."
             )
+        if tool == "cast" and any(
+            marker in text
+            for marker in (
+                "nothing was spent",
+                "cast did not happen",
+                "zero mana",
+            )
+        ):
+            return (
+                prefix
+                + "The spell packet produced no cast and the plan step remains incomplete. "
+                "Keep the existing plan step, refresh posture and mana, wait for the shared "
+                "attack/cast timer if necessary, and retry only after that live state changes."
+            )
+        if tool == "cast" and "produced no verified carried item" in text:
+            return (
+                prefix
+                + "Mana expenditure proves the spell ran, but it does not prove the planned "
+                "inventory result. Refresh inventory before deciding the remaining quantity. "
+                "If the item is still absent, use the returned refusal or carry-capacity evidence; "
+                "do not count this plan step as complete or repeat it blindly."
+            )
         if tool == "prey":
             return (
                 prefix
@@ -16572,6 +16597,44 @@ class BotController:
     ) -> str | None:
         if not isinstance(result, dict):
             return None
+        if tool == "cast":
+            if result.get("cast") is False:
+                return str(
+                    result.get("reason")
+                    or result.get("what_the_mana_says")
+                    or "broker reported that the requested spell was not cast"
+                )[:500]
+            mana_spent = result.get("mana_spent")
+            mana_reading = str(result.get("what_the_mana_says") or "").strip()
+            if (
+                isinstance(mana_spent, (int, float))
+                and not isinstance(mana_spent, bool)
+                and mana_spent == 0
+            ):
+                return (
+                    mana_reading
+                    or "zero mana was spent; the requested cast did not happen"
+                )[:500]
+            created = result.get("created")
+            observes_created = (arguments or {}).get("observe_created") is True
+            spell = " ".join(
+                str((arguments or {}).get("spell") or result.get("spell") or "").split()
+            )
+            if (
+                observes_created
+                and isinstance(mana_spent, (int, float))
+                and not isinstance(mana_spent, bool)
+                and mana_spent > 0
+                and isinstance(created, list)
+                and not created
+            ):
+                messages = result.get("messages")
+                if isinstance(messages, list) and messages:
+                    return str(messages[0])[:500]
+                return (
+                    f"{spell or 'creation spell'} spent {mana_spent:g} mana but "
+                    "produced no verified carried item"
+                )[:500]
         if tool in PVP_TOOL_NAMES:
             outcome = str(result.get("outcome") or "")
             if outcome in {

@@ -534,6 +534,29 @@ class StalePostCreateFoodBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class UnverifiedCreateFoodBroker(StalePostCreateFoodBroker):
+    def __init__(self, *, mana_spent: int) -> None:
+        super().__init__()
+        self.mana_spent = mana_spent
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "cast":
+            self.calls.append((name, dict(arguments)))
+            return {
+                "cast": True,
+                "spell": "create food",
+                "mana_spent": self.mana_spent,
+                "created": [],
+                "messages": [],
+                "what_the_mana_says": (
+                    "NOTHING was spent — the cast did not happen at all."
+                    if self.mana_spent == 0
+                    else "full cost — the spell was cast"
+                ),
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
 class UnwieldableWeaponBroker(SimulatedBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -5286,6 +5309,98 @@ class ControllerTests(unittest.TestCase):
                     kinds=["action.inventory_observation_reconciled"]
                 )["events"]
                 self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_zero_mana_cast_does_not_complete_plan_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = UnverifiedCreateFoodBroker(mana_spent=0)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="zero-mana-create-food")
+                )["goal"]
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["no_progress"])
+                self.assertIn("did not happen", result["reason"])
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["action.succeeded"])["events"],
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(kinds=["action.no_progress"])[
+                            "events"
+                        ]
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_full_cost_creation_without_delta_requires_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = UnverifiedCreateFoodBroker(mana_spent=10)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="unverified-create-food")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create one required food item, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "create-food",
+                                    "tool": "cast",
+                                    "outcome": "Cast Create Food to produce 1 food.",
+                                    "verification": "inventory shows at least 2 food items.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["no_progress"])
+                self.assertIn("produced no verified carried item", result["reason"])
+                self.assertIsNone(controller._execution_plan(goal))
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["action.succeeded"])["events"],
+                )
             finally:
                 controller.storage.close()
 
