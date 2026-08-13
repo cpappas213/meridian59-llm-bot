@@ -2023,9 +2023,28 @@ class BotController:
 
     @staticmethod
     def _bank_plan_error(
-        steps: list[dict[str, Any]], observation: dict[str, Any]
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+        *,
+        completed_through_step_id: str | None = None,
     ) -> str | None:
         """Require an explicit bank-room prerequisite before each bank call."""
+
+        remaining_steps = steps
+        if completed_through_step_id:
+            completed_index = next(
+                (
+                    index
+                    for index, step in enumerate(steps)
+                    if str(step.get("id") or "") == completed_through_step_id
+                ),
+                None,
+            )
+            if completed_index is not None:
+                # Stored plans are ordered.  Revalidation happens after each
+                # successful action, so prerequisites in the completed prefix
+                # must not be reinterpreted against the character's new room.
+                remaining_steps = steps[completed_index + 1 :]
 
         current_room_id = deep_get(
             observation,
@@ -2037,7 +2056,7 @@ class BotController:
             str(current_room_id) == str(TOS_BANK_ROOM_ID)
             or "bank" in current_room_name.casefold()
         )
-        for step in steps:
+        for step in remaining_steps:
             tool = str(step.get("tool") or "")
             text = " ".join(
                 str(step.get(field) or "")
@@ -2498,8 +2517,17 @@ class BotController:
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
         sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
+        last_action = value.get("last_action")
+        completed_through_step_id = (
+            str(last_action.get("step_id") or "")
+            if isinstance(last_action, dict)
+            and last_action.get("status") == "succeeded"
+            else None
+        )
         bank_error = self._bank_plan_error(
-            stored_steps, self.last_observation or {}
+            stored_steps,
+            self.last_observation or {},
+            completed_through_step_id=completed_through_step_id,
         )
         if bank_error is not None:
             self._invalidate_execution_plan(goal, bank_error)

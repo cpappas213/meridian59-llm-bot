@@ -2663,6 +2663,71 @@ class ControllerTests(unittest.TestCase):
             )
         )
 
+    def test_bank_plan_ignores_completed_prefix_after_leaving_bank(self) -> None:
+        steps = [
+            {
+                "id": "check-balance",
+                "tool": "bank",
+                "outcome": "Check the balance at Tos bank room 54.",
+                "verification": "The account balance is shown.",
+            },
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings at Tos bank room 54.",
+                "verification": "Inventory contains 100 shillings.",
+            },
+            {
+                "id": "reach-shop",
+                "tool": "travel",
+                "outcome": "Travel to Joguer's Herbs and Roots, room 104.",
+                "verification": "Current room id is 104.",
+            },
+            {
+                "id": "buy-reagents",
+                "tool": "shop",
+                "outcome": "Buy Create Food reagents from Joguer.",
+                "verification": "Inventory contains the required reagents.",
+            },
+        ]
+        observation = {
+            "look": {"room": {"num": 104, "name": "Joguer's Herbs and Roots"}}
+        }
+
+        self.assertIsNone(
+            BotController._bank_plan_error(
+                steps,
+                observation,
+                completed_through_step_id="reach-shop",
+            )
+        )
+
+    def test_bank_plan_still_checks_future_bank_step_after_completed_prefix(self) -> None:
+        steps = [
+            {
+                "id": "inspect",
+                "tool": "look",
+                "outcome": "Inspect the current room.",
+                "verification": "The room is observed.",
+            },
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings.",
+                "verification": "Inventory contains 100 shillings.",
+            },
+        ]
+
+        self.assertIn(
+            "calls bank before reaching a verified bank room",
+            BotController._bank_plan_error(
+                steps,
+                {"look": {"room": {"num": 104, "name": "Joguer's Herbs and Roots"}}},
+                completed_through_step_id="inspect",
+            )
+            or "",
+        )
+
     def test_intrinsic_sale_evidence_survives_id_churn_only_for_unchanged_inventory(self) -> None:
         reason = (
             'Meidei tells you, "I cannot see how you could bear to part with a mace! '
