@@ -3046,6 +3046,206 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_quantified_shop_step_requires_exact_live_basket_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="quantified-shop-action")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                step = {
+                    "id": "buy-reagents",
+                    "tool": "shop",
+                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                    "verification": "Inventory contains the required reagents.",
+                }
+
+                underfilled = controller._quantified_shop_action_error(
+                    step,
+                    {
+                        "seller": 711,
+                        "buy_ids": [714, 714, 714, 712, 712, 712],
+                    },
+                )
+
+                self.assertIn("requires exactly 6 elderberry", underfilled or "")
+                self.assertIn("3 herb (id 712)", underfilled or "")
+                self.assertIn("send the exact repeated live item ids", underfilled or "")
+                self.assertIsNone(
+                    controller._quantified_shop_action_error(
+                        step,
+                        {
+                            "seller": 711,
+                            "buy_ids": [714] * 6 + [712] * 6,
+                        },
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_underfilled_quantified_shop_action_is_returned_to_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = ShopBroker()
+                broker.inventory_items.append(
+                    {"id": 2, "name": "shilling", "amount": 284, "can": []}
+                )
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="reject-underfilled-shop-action")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Buy the exact reagent basket.",
+                            "steps": [
+                                {
+                                    "id": "buy-reagents",
+                                    "tool": "shop",
+                                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                                    "verification": "Inventory contains the reagent basket.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                controller.model = DecisionSequenceModel(
+                    [
+                        {
+                            "decision": "act",
+                            "tool": "shop",
+                            "arguments": {
+                                "seller": 711,
+                                "buy_ids": [714, 714, 714, 712, 712, 712],
+                            },
+                            "rationale": "Buy only half of the declared basket.",
+                            "expected_observation": {},
+                            "proposal": None,
+                            "plan_step_id": "buy-reagents",
+                        }
+                    ]
+                )  # type: ignore[assignment]
+
+                rejected = controller.turn()
+
+                self.assertTrue(rejected["planner_action_rejected"])
+                self.assertTrue(rejected["quantified_shop_basket_mismatch"])
+                self.assertFalse(any(name == "shop" for name, _ in broker.calls))
+                feedback = controller._planner_feedback(goal)
+                self.assertIn("requires exactly 6 elderberry", feedback["message"])
+                self.assertIn("Correct the rejected arguments", feedback["failure_context"]["required_response"])
+            finally:
+                controller.storage.close()
+
+    def test_completed_purchase_prefix_is_not_revalidated_as_future_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = ShopBroker()
+                controller.broker = broker
+                broker.inventory_items.append(
+                    {"id": 2, "name": "shilling", "amount": 284, "can": []}
+                )
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="completed-purchase-prefix")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Buy the reagent basket and finish safely.",
+                            "steps": [
+                                {
+                                    "id": "buy-reagents",
+                                    "tool": "shop",
+                                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                                    "verification": "Inventory contains the reagent basket.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                controller._record_plan_action(
+                    goal,
+                    step_id="buy-reagents",
+                    tool="shop",
+                    arguments={"seller": 711, "buy_ids": [714] * 6 + [712] * 6},
+                    result={"bought": [714] * 6 + [712] * 6},
+                    status="succeeded",
+                )
+                broker.inventory_items[-1]["amount"] = 158
+                controller.last_observation = broker.observe()
+
+                stored = controller._execution_plan(goal)
+
+                self.assertIsNotNone(stored)
+                self.assertEqual("buy-reagents", stored["last_action"]["step_id"])
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
+                )
+            finally:
+                controller.storage.close()
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

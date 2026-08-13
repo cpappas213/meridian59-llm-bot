@@ -2045,6 +2045,25 @@ class BotController:
             )
         )
 
+    @staticmethod
+    def _remaining_plan_steps(
+        steps: list[dict[str, Any]],
+        completed_through_step_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Return only work after the latest verified ordered plan step."""
+
+        if not completed_through_step_id:
+            return steps
+        completed_index = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if str(step.get("id") or "") == completed_through_step_id
+            ),
+            None,
+        )
+        return steps[completed_index + 1 :] if completed_index is not None else steps
+
     @classmethod
     def _plan_funding_error(
         cls,
@@ -2207,6 +2226,112 @@ class BotController:
                 )
             available -= basket_cost
         return None
+
+    def _quantified_shop_action_error(
+        self,
+        step: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> str | None:
+        """Bind a quantified purchase step to the exact live catalogue basket."""
+
+        if not self._is_plan_purchase_step(step):
+            return None
+        catalog_by_name: dict[str, dict[str, Any]] = {}
+        for event in reversed(
+            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
+        ):
+            data = event.get("data")
+            result = data.get("result") if isinstance(data, dict) else None
+            raw_catalog = result.get("items") if isinstance(result, dict) else None
+            if data.get("tool") != "shop" or not isinstance(raw_catalog, list):
+                continue
+            for item in raw_catalog:
+                if not isinstance(item, dict) or item.get("id") is None:
+                    continue
+                name = " ".join(str(item.get("name") or "").split()).casefold()
+                if name:
+                    catalog_by_name[name] = {
+                        "id": str(item["id"]),
+                        "seller": result.get("seller"),
+                    }
+            if catalog_by_name:
+                break
+        if not catalog_by_name:
+            return None
+
+        number_words = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+
+        def item_pattern(name: str) -> str:
+            if name.endswith("y"):
+                return re.escape(name[:-1]) + r"(?:y|ies)"
+            return re.escape(name) + r"(?:s|es)?"
+
+        outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+        expected: dict[str, int] = {}
+        labels: dict[str, str] = {}
+        expected_seller: Any = None
+        for name, item in catalog_by_name.items():
+            match = re.search(
+                rf"\b(\d+|{'|'.join(number_words)})\s+(?:x\s+)?{item_pattern(name)}\b",
+                outcome,
+            )
+            if not match:
+                continue
+            raw_quantity = match.group(1)
+            quantity = (
+                int(raw_quantity)
+                if raw_quantity.isdigit()
+                else number_words[raw_quantity]
+            )
+            item_id = item["id"]
+            expected[item_id] = expected.get(item_id, 0) + quantity
+            labels[item_id] = name
+            expected_seller = expected_seller or item.get("seller")
+        if not expected:
+            return None
+
+        raw_buy_ids = arguments.get("buy_ids")
+        actual: dict[str, int] = {}
+        for item_id in raw_buy_ids if isinstance(raw_buy_ids, list) else []:
+            key = str(item_id)
+            actual[key] = actual.get(key, 0) + 1
+        seller_mismatch = (
+            expected_seller is not None
+            and str(arguments.get("seller")) != str(expected_seller)
+        )
+        if actual == expected and not seller_mismatch:
+            return None
+
+        def describe(basket: dict[str, int]) -> str:
+            return ", ".join(
+                f"{quantity} {labels.get(item_id, 'item')} (id {item_id})"
+                for item_id, quantity in basket.items()
+            ) or "no items"
+
+        seller_detail = (
+            f" and seller {expected_seller}"
+            if expected_seller is not None
+            else ""
+        )
+        return (
+            f"execution_plan step {step.get('id')!r} requires exactly "
+            f"{describe(expected)}{seller_detail}, but the selected shop arguments "
+            f"request {describe(actual)} from seller {arguments.get('seller')!r}. "
+            "Purpose: a quantified plan outcome is not satisfied by a smaller or "
+            "different basket; send the exact repeated live item ids, or revise the "
+            "plan if the required quantity is no longer available"
+        )
 
     @staticmethod
     def _bank_plan_error(
@@ -3181,7 +3306,6 @@ class BotController:
         stored_steps = [
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
-        sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
         last_action = value.get("last_action")
         completed_through_step_id = (
             str(last_action.get("step_id") or "")
@@ -3189,10 +3313,16 @@ class BotController:
             and last_action.get("status") == "succeeded"
             else None
         )
-        bank_error = self._bank_plan_error(
+        remaining_steps = self._remaining_plan_steps(
             stored_steps,
+            completed_through_step_id,
+        )
+        sale_recovery_error = self._sale_recovery_plan_error(
+            goal, remaining_steps
+        )
+        bank_error = self._bank_plan_error(
+            remaining_steps,
             self.last_observation or {},
-            completed_through_step_id=completed_through_step_id,
         )
         if bank_error is not None:
             self._invalidate_execution_plan(goal, bank_error)
@@ -3211,7 +3341,7 @@ class BotController:
             return None
         direct_capability_error = self._direct_capability_plan_error(
             phase,
-            stored_steps,
+            remaining_steps,
             self.last_observation or {},
             value.get("assumptions")
             if isinstance(value.get("assumptions"), list)
@@ -3221,7 +3351,7 @@ class BotController:
             self._invalidate_execution_plan(goal, direct_capability_error)
             return None
         phase_required_sale_error = self._phase_required_sale_plan_error(
-            phase, stored_steps, self.last_observation or {}
+            phase, remaining_steps, self.last_observation or {}
         )
         if phase_required_sale_error is not None:
             self._invalidate_execution_plan(goal, phase_required_sale_error)
@@ -3242,7 +3372,7 @@ class BotController:
             )
             return None
         phase_inventory_error = self._phase_inventory_plan_error(
-            phase, stored_steps, self.last_observation or {}
+            phase, remaining_steps, self.last_observation or {}
         )
         if phase_inventory_error is not None:
             self._invalidate_execution_plan(goal, phase_inventory_error)
@@ -3265,7 +3395,7 @@ class BotController:
         sale_grounding_error = self._targeted_sale_grounding_error(
             goal,
             phase,
-            stored_steps,
+            remaining_steps,
             self.last_observation or {},
         )
         if sale_grounding_error is not None:
@@ -3315,14 +3445,14 @@ class BotController:
             )
             return None
         funding_error = self._plan_funding_error(
-            stored_steps,
+            remaining_steps,
             self.last_observation or {},
         )
         if funding_error is not None:
             self._invalidate_execution_plan(goal, funding_error)
             return None
         affordability_error = self._shop_plan_affordability_error(
-            stored_steps, self.last_observation or {}
+            remaining_steps, self.last_observation or {}
         )
         if affordability_error is not None:
             self._invalidate_execution_plan(goal, affordability_error)
@@ -3345,7 +3475,7 @@ class BotController:
         try:
             self._validate_direct_pvp_plan(
                 goal,
-                value.get("steps", []) if isinstance(value.get("steps"), list) else [],
+                remaining_steps,
                 self.criteria.evaluate(goal, self.last_observation or {}),
             )
         except ModelError:
@@ -13414,6 +13544,27 @@ class BotController:
                             "selected_tool": decision.get("tool"),
                         },
                     )
+                if selected_tool == "shop":
+                    selected_arguments = (
+                        decision.get("arguments")
+                        if isinstance(decision.get("arguments"), dict)
+                        else {}
+                    )
+                    quantified_shop_error = self._quantified_shop_action_error(
+                        selected_step,
+                        selected_arguments,
+                    )
+                    if quantified_shop_error is not None:
+                        return self._reject_planner_action(
+                            goal,
+                            quantified_shop_error,
+                            decision=decision,
+                            execution_plan=execution_plan,
+                            result={
+                                "quantified_shop_basket_mismatch": True,
+                                "plan_step_id": step_id,
+                            },
+                        )
             if decision["decision"] == "wait":
                 learned_wait = self.learning.check_action("planner_wait", {}, observation)
                 if learned_wait:
