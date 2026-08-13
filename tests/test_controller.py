@@ -2416,7 +2416,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_completed_combat_training_keeps_survival_owner_until_safe(self) -> None:
+    def test_completed_combat_training_releases_survival_owner_after_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -2521,25 +2521,36 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
                 )
 
+                broker.vitals["health"] = {"current": 80, "max": 100}
+                recovering = broker.observe()
+                recovering["abilities"] = hazardous["abilities"]
                 still_unsafe = controller._manage_background_farm(
                     goal,
-                    hazardous,
+                    recovering,
                     public_completion,
                     force_stop_reason="phase outcome verified",
                 )
                 self.assertTrue(still_unsafe["background_survival_monitoring"])
                 self.assertTrue(still_unsafe["safe_ending_pending"])
 
-                broker.room = {"num": 100, "name": "Training Hall"}
-                safe = broker.observe()
-                safe["abilities"] = hazardous["abilities"]
+                # Survive mode does not choose the model-selected sanctuary.
+                # At full health it must release movement even while still in
+                # the monster room, allowing foreground safe-ending travel.
+                broker.vitals["health"] = {"current": 100, "max": 100}
+                recovered = broker.observe()
+                recovered["abilities"] = hazardous["abilities"]
                 stopped = controller._manage_background_farm(
                     goal,
-                    safe,
+                    recovered,
                     public_completion,
                     force_stop_reason="phase outcome verified",
                 )
                 self.assertTrue(stopped["background_keeper_stopping"])
+                self.assertFalse(broker.farm_running)
+
+                broker.room = {"num": 100, "name": "Training Hall"}
+                safe = broker.observe()
+                safe["abilities"] = hazardous["abilities"]
                 completed = controller._reconcile_existing_campaign_phase(goal, safe)
                 self.assertTrue(completed["campaign_phase_completed"])
                 self.assertTrue(completed["keeper_released"])

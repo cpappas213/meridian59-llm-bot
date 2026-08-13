@@ -10823,19 +10823,22 @@ class BotController:
                 "watching",
                 "standing by",
             }
+            # A survival keeper is a recovery bridge, not a safe-ending
+            # navigator.  In a proven monster-room wall it deliberately stays
+            # put: leaving the wall would create danger, and survive mode has
+            # no destination telling it which sanctuary the verified plan
+            # selected.  Waiting merely because that safe ending is pending
+            # therefore deadlocks ownership forever once health is full.  Let
+            # it retain the character while recovery is genuinely unfinished;
+            # at full health stop it even outside town so the foreground
+            # controller can execute the already-verified travel step.
             if (
                 keeper_mode == "survive"
+                and health_fraction is not None
+                and health_fraction < 1.0
                 and (
-                    safe_ending_pending
-                    or (
-                        health_fraction is not None
-                        and health_fraction < 1.0
-                        and (
-                            health_fraction
-                            < self.config.policy.rest_health_fraction
-                            or not quiescent
-                        )
-                    )
+                    health_fraction < self.config.policy.rest_health_fraction
+                    or not quiescent
                 )
             ):
                 return {
