@@ -13235,6 +13235,100 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_critical_farm_recovery_preserves_active_phase_and_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 535
+                broker.room = {
+                    "num": 535,
+                    "name": "West Merchant Way through Ilerian Woods",
+                }
+                broker.vitals["health"] = {"current": 10, "max": 26}
+                broker.farm_did.update({"kills": 4, "withdrawals": 0})
+                broker.farm_journal = [
+                    {
+                        "at": 1000 + index,
+                        "pass": 10 + index,
+                        "what": "killed",
+                        "target": "giant rat",
+                    }
+                    for index in range(4)
+                ]
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="critical-farm-recovery",
+                        objective="Reach 27 max HP.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-27",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 535 until max HP reaches 27.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-max-hp-27",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "target": "giant rat",
+                            "room": 535,
+                            "use_safe_spots": True,
+                            "flee_below": 0.75,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller.turn()
+
+                self.assertTrue(result["survival_interrupt"])
+                self.assertTrue(result["background_farm"]["farm_recovery_preserved"])
+                self.assertFalse(result["background_farm"]["switched_to_survival"])
+                self.assertEqual("farm", broker.farm_mode)
+                self.assertTrue(broker.farm_running)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active["id"])
+                self.assertEqual("active", active["status"])
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.goal_lessons(
+                        statuses=["deferred"], goal_id=goal["id"]
+                    ),
+                )
+                events = controller.storage.goal_events(
+                    goal["id"],
+                    kinds=["background_farm.critical_recovery_monitored"],
+                    limit=10,
+                )
+                self.assertEqual(1, len(events))
+                self.assertTrue(events[0]["data"]["campaign_phase_preserved"])
+            finally:
+                controller.storage.close()
+
     def test_repeated_farm_retreats_quarantine_exact_tactic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

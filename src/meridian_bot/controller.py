@@ -11349,7 +11349,54 @@ class BotController:
             return None
 
         evidence = evidence or self._farm_status_evidence(goal, observation, status)
+        active_keeper_phase = self._active_keeper_combat_phase(goal)
+        matching_active_phase = bool(
+            active_keeper_phase is not None
+            and self._background_farm_mismatch(goal, status) is None
+        )
+        if not evidence.get("quarantine_reasons") and matching_active_phase:
+            # The farm keeper already owns flee, withdrawal, and recovery. A
+            # global critical-health advisory can observe the same health dip
+            # one turn earlier than the farm supervisor, but that timing does
+            # not turn a first recoverable incident into proof that the room
+            # or phase failed. Keep the bounded phase and keeper recipe intact;
+            # repeated retreats, a death, or another precise quarantine reason
+            # will still take the terminal handoff below.
+            self.storage.emit_event(
+                "background_farm.critical_recovery_monitored",
+                "Critical health remained under the active farm keeper's recovery control",
+                severity="notice",
+                interesting=False,
+                goal_id=goal["id"],
+                data={
+                    "activity": status.get("activity"),
+                    "room": evidence.get("room"),
+                    "assigned_room": evidence.get("assigned_room"),
+                    "target": evidence.get("target"),
+                    "health_fraction": evidence.get("health_fraction"),
+                    "flee_threshold": evidence.get("flee_threshold"),
+                    "recovery_reasons": evidence.get("recovery_reasons", []),
+                    "retreat_incident_count": evidence.get(
+                        "retreat_incident_count", 0
+                    ),
+                    "campaign_phase_preserved": True,
+                },
+            )
+            return {
+                "farm_recovery_preserved": True,
+                "switched_to_survival": False,
+                "campaign_phase_failed": None,
+                "strategic_goal_preserved": True,
+                "activity": status.get("activity"),
+                "reasons": evidence.get("recovery_reasons", []),
+                "retreat_incident_count": evidence.get(
+                    "retreat_incident_count", 0
+                ),
+            }
         if not evidence.get("quarantine_reasons"):
+            # An unowned/legacy farm loop has no durable phase recipe to
+            # preserve. In that case retain the conservative global recovery
+            # behavior and prevent the orphan keeper from continuing combat.
             critical_reason = "controller critical-health interrupt"
             evidence["risk_reasons"] = list(
                 dict.fromkeys([*evidence.get("risk_reasons", []), critical_reason])
@@ -14028,9 +14075,17 @@ class BotController:
                 same_incident = isinstance(incident, dict) and incident.get("goal_id") == goal["id"]
                 event = None
                 if not same_incident:
+                    farm_recovery_preserved = bool(
+                        isinstance(handoff, dict)
+                        and handoff.get("farm_recovery_preserved")
+                    )
                     event = self.storage.emit_event(
                         "survival.interrupt",
-                        "Critical health: tactical planning yielded to survival autopilot",
+                        (
+                            "Critical health: active farm keeper retained recovery control"
+                            if farm_recovery_preserved
+                            else "Critical health: tactical planning yielded to survival autopilot"
+                        ),
                         severity="warning",
                         interesting=True,
                         goal_id=goal["id"],
