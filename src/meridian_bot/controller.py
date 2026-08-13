@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
-from .campaign import CampaignCoordinator, PhaseOutcome
+from .campaign import (
+    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CampaignCoordinator,
+    PhaseOutcome,
+)
 from .config import BotConfig
 from .criteria import CriteriaEvaluator, EDIBLE_FOOD_NAME_MARKERS
 from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationError, normalize
@@ -143,6 +147,7 @@ BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
 RECENT_INVENTORY_CREATION_RUNTIME_KEY = "recent_inventory_creation_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
+PLANNED_CONTROLLER_STOP_RUNTIME_KEY = "planned_controller_stop_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
 
@@ -1869,6 +1874,8 @@ class BotController:
             self.dependencies["social"] = "disabled"
         self.dependencies["journal"] = "healthy" if self.config.notifications.obsidian_enabled else "disabled"
         self.state = "running"
+        if connect_game:
+            self._account_planned_phase_downtime()
         self._repair_false_faction_troop_quarantines()
         previous_corpus = self.storage.get_runtime("knowledge_corpus_version")
         if previous_corpus != self.knowledge.corpus_version:
@@ -19584,12 +19591,102 @@ class BotController:
         return "unknown"
 
     def safe_stop(self) -> None:
+        self._mark_planned_phase_stop()
         self.state = "stopping"
         self.stop_event.set()
         try:
             self._set_fallback()
         except BrokerError:
             pass
+
+    def _active_campaign_phase_identity(self) -> tuple[str, str, str] | None:
+        goal = self.storage.active_goal()
+        if goal is None:
+            return None
+        run = self.storage.campaign_run(goal["id"])
+        if run is None:
+            return None
+        phase = self.storage.active_campaign_phase(run["id"])
+        if phase is None:
+            return None
+        return str(goal["id"]), str(run["id"]), str(phase["id"])
+
+    def _mark_planned_phase_stop(self) -> None:
+        identity = self._active_campaign_phase_identity()
+        if identity is None:
+            return
+        goal_id, run_id, phase_id = identity
+        existing = self.storage.get_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, {})
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("goal_id") or "") == goal_id
+            and str(existing.get("run_id") or "") == run_id
+            and str(existing.get("phase_id") or "") == phase_id
+            and isinstance(existing.get("stopped_unix"), (int, float))
+        ):
+            return
+        self.storage.set_runtime(
+            PLANNED_CONTROLLER_STOP_RUNTIME_KEY,
+            {
+                "goal_id": goal_id,
+                "run_id": run_id,
+                "phase_id": phase_id,
+                "stopped_at": timestamp(),
+                "stopped_unix": time.time(),
+            },
+        )
+
+    def _account_planned_phase_downtime(self) -> dict[str, Any] | None:
+        marker = self.storage.get_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, {})
+        if not isinstance(marker, dict):
+            return None
+        stopped_unix = marker.get("stopped_unix")
+        if not isinstance(stopped_unix, (int, float)):
+            self.storage.set_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, None)
+            return None
+        identity = self._active_campaign_phase_identity()
+        marker_identity = (
+            str(marker.get("goal_id") or ""),
+            str(marker.get("run_id") or ""),
+            str(marker.get("phase_id") or ""),
+        )
+        if identity is None or identity != marker_identity:
+            self.storage.set_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, None)
+            return None
+        goal_id, run_id, phase_id = identity
+        added_seconds = max(0.0, time.time() - float(stopped_unix))
+        prior = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
+        prior_seconds = 0.0
+        if (
+            isinstance(prior, dict)
+            and str(prior.get("phase_id") or "") == phase_id
+        ):
+            try:
+                prior_seconds = max(0.0, float(prior.get("seconds", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                prior_seconds = 0.0
+        total_seconds = prior_seconds + added_seconds
+        value = {
+            "goal_id": goal_id,
+            "run_id": run_id,
+            "phase_id": phase_id,
+            "seconds": total_seconds,
+            "updated_at": timestamp(),
+        }
+        self.storage.set_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, value)
+        self.storage.set_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, None)
+        self.storage.emit_event(
+            "campaign.phase.downtime_accounted",
+            "Excluded planned controller downtime from the active phase budget",
+            goal_id=goal_id,
+            data={
+                "run_id": run_id,
+                "phase_id": phase_id,
+                "added_seconds": round(added_seconds, 1),
+                "total_seconds": round(total_seconds, 1),
+            },
+        )
+        return value
 
     def close(self) -> None:
         self.stop_event.set()

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from meridian_bot.campaign import CampaignCoordinator
+from meridian_bot.campaign import (
+    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CampaignCoordinator,
+)
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.storage import IdempotencyConflict, InvalidTransition, Storage
 
@@ -811,6 +815,33 @@ class StorageTests(unittest.TestCase):
                     {"sell", "sell_all", "knowledge_search"},
                     {tool["name"] for tool in selected},
                 )
+
+    def test_campaign_time_budget_excludes_accounted_controller_downtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                phase = {
+                    "id": "phase-under-maintenance",
+                    "budget": {"max_actions": 12, "max_minutes": 30},
+                    "attempt_count": 5,
+                    "activated_at": (
+                        datetime.now(timezone.utc) - timedelta(minutes=31)
+                    ).isoformat(),
+                }
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 120},
+                )
+                self.assertIsNone(coordinator.budget_exhausted(phase))
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 0},
+                )
+                exhausted = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(exhausted)
+                self.assertEqual("time_budget", exhausted["kind"])
 
     def test_campaign_manager_compiles_typed_currency_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

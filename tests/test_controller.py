@@ -13,6 +13,7 @@ from meridian_bot.broker import Tool, ToolCallError
 from meridian_bot.campaign import CampaignCoordinator
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
+    PLANNED_CONTROLLER_STOP_RUNTIME_KEY,
     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
     RESEARCH_RETRY_STATE_SCHEMA_VERSION,
     BotController,
@@ -960,6 +961,49 @@ class OnboardingBroker(SimulatedBroker):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_planned_restart_downtime_is_accumulated_for_active_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(goal_payload("planned-downtime"))["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Prepare for a grounded farm.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 12, "max_minutes": 30},
+                    },
+                    mode="start",
+                )
+
+                controller._mark_planned_phase_stop()
+                marker = controller.storage.get_runtime(
+                    PLANNED_CONTROLLER_STOP_RUNTIME_KEY
+                )
+                marker["stopped_unix"] = time.time() - 120
+                controller.storage.set_runtime(
+                    PLANNED_CONTROLLER_STOP_RUNTIME_KEY, marker
+                )
+
+                accounted = controller._account_planned_phase_downtime()
+
+                self.assertEqual(phase["id"], accounted["phase_id"])
+                self.assertGreaterEqual(accounted["seconds"], 119)
+                self.assertIsNone(
+                    controller.storage.get_runtime(
+                        PLANNED_CONTROLLER_STOP_RUNTIME_KEY
+                    )
+                )
+                events = controller.storage.events(
+                    kinds=["campaign.phase.downtime_accounted"]
+                )
+                self.assertEqual(1, len(events["events"]))
+            finally:
+                controller.close()
+
     def test_onboarding_uses_llm_build_after_persona_and_then_waits_for_goals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = replace(

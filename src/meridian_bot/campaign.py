@@ -10,6 +10,9 @@ from .storage import Storage
 from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 
+CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
+
+
 PHASE_KINDS = {
     "general",
     "research_progression",
@@ -1143,19 +1146,34 @@ class CampaignCoordinator:
         )
         return PhaseOutcome(True, False, finished, completion)
 
-    @staticmethod
-    def budget_exhausted(phase: dict[str, Any]) -> dict[str, Any] | None:
+    def budget_exhausted(self, phase: dict[str, Any]) -> dict[str, Any] | None:
         budget = phase.get("budget") if isinstance(phase.get("budget"), dict) else {}
         max_actions = max(8, int(budget.get("max_actions", 24) or 24))
         max_minutes = max(30, int(budget.get("max_minutes", 45) or 45))
         attempts = int(phase.get("attempt_count", 0) or 0)
         activated_at = str(phase.get("activated_at") or phase.get("created_at") or "")
         elapsed_minutes = 0.0
+        downtime_seconds = 0.0
+        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
+        if (
+            isinstance(downtime, dict)
+            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
+        ):
+            try:
+                downtime_seconds = max(0.0, float(downtime.get("seconds", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                downtime_seconds = 0.0
         try:
             activated = datetime.fromisoformat(activated_at.replace("Z", "+00:00"))
             elapsed_minutes = max(
                 0.0,
-                (datetime.now(timezone.utc) - activated.astimezone(timezone.utc)).total_seconds()
+                (
+                    (
+                        datetime.now(timezone.utc)
+                        - activated.astimezone(timezone.utc)
+                    ).total_seconds()
+                    - downtime_seconds
+                )
                 / 60.0,
             )
         except (TypeError, ValueError):
@@ -1166,6 +1184,7 @@ class CampaignCoordinator:
                 "attempts": attempts,
                 "limit": max_actions,
                 "elapsed_minutes": round(elapsed_minutes, 1),
+                "downtime_minutes": round(downtime_seconds / 60.0, 1),
             }
         if elapsed_minutes >= max_minutes:
             return {
@@ -1173,6 +1192,7 @@ class CampaignCoordinator:
                 "elapsed_minutes": round(elapsed_minutes, 1),
                 "limit": max_minutes,
                 "attempts": attempts,
+                "downtime_minutes": round(downtime_seconds / 60.0, 1),
             }
         return None
 
