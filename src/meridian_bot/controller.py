@@ -2056,6 +2056,7 @@ class BotController:
             self._repair_disproved_farm_route_stagnations()
             self._repair_recovered_farm_route_evidence(self.last_observation)
             self._repair_transient_farm_stagnations()
+            self._repair_ambiguous_breakoff_stagnations()
             self._repair_position_unknown_lessons()
             self._repair_transient_cast_evidence()
             self._repair_unscoped_evidence_lookup_lessons()
@@ -9599,6 +9600,84 @@ class BotController:
                 interesting=True,
                 data={"count": len(repaired), "tactics": redact(repaired)},
             )
+        return repaired
+
+    def _repair_ambiguous_breakoff_stagnations(self) -> list[dict[str, Any]]:
+        """Remove safe legacy stalls that discarded landed-hit evidence.
+
+        Older keepers called every non-killing fight return ``broke off without
+        a kill``.  That combined two materially different outcomes: an all-miss
+        exchange and damage dealt to a retained quarry that moved out of melee
+        reach.  The old record cannot reconstruct which occurred.  Give only
+        death-free, on-assignment records with that exact obsolete reason one
+        fresh measurement under the corrected keeper; explicit errors, route
+        stalls, unsafe launches, and the new all-miss reason remain durable.
+        """
+
+        raw = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
+        stagnations = dict(raw) if isinstance(raw, dict) else {}
+        repaired: list[dict[str, Any]] = []
+        affected_goal_ids: set[str] = set()
+        for key, item in list(stagnations.items()):
+            if not isinstance(item, dict):
+                continue
+            stalled = item.get("stalled")
+            stalled = stalled if isinstance(stalled, dict) else {}
+            deltas = item.get("deltas")
+            if not isinstance(deltas, dict):
+                continue
+            obsolete_ambiguous_breakoff = (
+                str(stalled.get("why") or "").strip().casefold()
+                == "broke off without a kill"
+                and item.get("stalled_in_transit") is False
+                and not str(item.get("last_error") or "").strip()
+                and all(
+                    int(deltas.get(name, 0) or 0) <= 0
+                    for name in (
+                        "deaths",
+                        "deaths_in_safe_spot",
+                        "deaths_in_proven_safe_spot",
+                        "withdrawals",
+                        "mulligans",
+                        "logoffs",
+                    )
+                )
+            )
+            if not obsolete_ambiguous_breakoff:
+                continue
+            repaired.append(item)
+            stagnations.pop(key, None)
+            goal_id = str(item.get("goal_id") or str(key).split("|", 1)[0])
+            if goal_id:
+                affected_goal_ids.add(goal_id)
+
+        if not repaired:
+            return []
+        self.storage.set_runtime("farm_tactic_stagnation_v1", stagnations)
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            self._clear_safety_suppression(goal_id)
+            self.storage.set_runtime(
+                f"background_farm_route_failure_handled_v1:{goal_id}", False
+            )
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+        self.storage.emit_event(
+            "background_farm.breakoff_stagnation_repaired",
+            "Removed safe legacy stalls that could not distinguish landed damage from misses",
+            severity="notice",
+            interesting=False,
+            data={
+                "count": len(repaired),
+                "goal_ids": sorted(affected_goal_ids),
+                "reason": "the keeper now retains server-confirmed landed-hit evidence",
+            },
+        )
         return repaired
 
     def _repair_disproved_farm_route_stagnations(self) -> list[dict[str, Any]]:

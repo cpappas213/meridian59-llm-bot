@@ -12730,6 +12730,78 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_ambiguous_breakoff_stagnation_gets_one_corrected_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="repair-ambiguous-breakoff")
+                )["goal"]
+                safe_key = f"{goal['id']}|566|centipede"
+                unsafe_key = f"{goal['id']}|584|spider"
+                explicit_miss_key = f"{goal['id']}|567|centipede"
+                base = {
+                    "goal_id": goal["id"],
+                    "stalled_in_transit": False,
+                    "last_error": None,
+                    "deltas": {
+                        "deaths": 0,
+                        "deaths_in_safe_spot": 0,
+                        "deaths_in_proven_safe_spot": 0,
+                        "withdrawals": 0,
+                        "mulligans": 0,
+                        "logoffs": 0,
+                    },
+                }
+                safe = {
+                    **base,
+                    "room": 566,
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a kill",
+                    },
+                }
+                unsafe = {
+                    **base,
+                    "room": 584,
+                    "deltas": {**base["deltas"], "deaths": 1},
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a kill",
+                    },
+                }
+                explicit_miss = {
+                    **base,
+                    "room": 567,
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a landed hit or a kill",
+                    },
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_stagnation_v1",
+                    {
+                        safe_key: safe,
+                        unsafe_key: unsafe,
+                        explicit_miss_key: explicit_miss,
+                    },
+                )
+
+                repaired = controller._repair_ambiguous_breakoff_stagnations()
+
+                self.assertEqual([safe], repaired)
+                retained = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(safe_key, retained)
+                self.assertIn(unsafe_key, retained)
+                self.assertIn(explicit_miss_key, retained)
+            finally:
+                controller.storage.close()
+
     def test_transit_stall_does_not_defer_the_unreached_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
