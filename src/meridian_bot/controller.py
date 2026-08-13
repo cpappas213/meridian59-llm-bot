@@ -9454,26 +9454,43 @@ class BotController:
             and self._live_spell_readiness(observation, "create weapon")
             is not None
         )
-        steps: list[dict[str, Any]] = [
-            {
-                "id": "farm-bank-transit",
-                "outcome": (
-                    f"Reach source-verified safe staging {launch_name} "
-                    f"(room {launch_room}) for the next preparation action."
-                ),
-                "tool": "travel",
-                "verification": (
-                    f"Current room id is {launch_room} and its source flags include "
-                    "ROOM_SANCTUARY or ROOM_NO_COMBAT."
-                ),
-            }
-        ]
-        if launch_room == TOS_PROVISION_ROOM_ID:
+        supply = self._combat_vigor_supply(observation)
+        vigor = deep_get(
+            observation,
+            "status.vitals.vigor.value",
+            deep_get(observation, "look.vitals.vigor.value", 0),
+        )
+        try:
+            live_vigor = int(vigor or 0)
+        except (TypeError, ValueError):
+            live_vigor = 0
+        nutrition_shortfall = max(
+            0,
+            FARM_FIGHT_VIGOR
+            - max(live_vigor, RESTED_VIGOR_FLOOR)
+            - int(supply.get("vigor_points", 0) or 0),
+        )
+        needs_provisions = (
+            launch_room == TOS_PROVISION_ROOM_ID
+            and nutrition_shortfall > 0
+            and int(supply.get("cookable_casts", 0) or 0) <= 0
+        )
+        steps: list[dict[str, Any]] = []
+        if needs_provisions:
             # This is a concrete food-vendor adapter selected only when that
             # source-verified room is already the staging point. It is not a
             # regional or completion default.
             steps.extend(
                 [
+                    {
+                        "id": "farm-bank-transit",
+                        "outcome": (
+                            f"Reach First Royal Bank of Tos (room {TOS_BANK_ROOM_ID}) "
+                            "before withdrawing the bounded food shortfall."
+                        ),
+                        "tool": "travel",
+                        "verification": f"Current room id is {TOS_BANK_ROOM_ID}.",
+                    },
                     {
                         "id": "withdraw-provision-funds",
                         "outcome": "Withdraw only the live quoted cost of the remaining farm food.",
@@ -9481,10 +9498,13 @@ class BotController:
                         "verification": "Carried shillings increased by the requested amount.",
                     },
                     {
-                        "id": "deposit-before-farm",
-                        "outcome": "After provisioning is complete, deposit any carried shillings before the hazardous phase.",
-                        "tool": "bank",
-                        "verification": "A verified bank receipt permits the current carried amount for this phase.",
+                        "id": "farm-provision-transit",
+                        "outcome": (
+                            f"Return to {launch_name} (room {launch_room}) to obtain "
+                            "the bounded farm provisions."
+                        ),
+                        "tool": "travel",
+                        "verification": f"Current room id is {launch_room}.",
                     },
                     {
                         "id": "buy-farm-food",
@@ -9493,6 +9513,21 @@ class BotController:
                         "verification": f"Verified carried food nutrition plus rested vigor reaches at least {FARM_FIGHT_VIGOR}.",
                     },
                 ]
+            )
+        else:
+            steps.append(
+                {
+                    "id": "farm-staging-transit",
+                    "outcome": (
+                        f"Reach source-verified safe staging {launch_name} "
+                        f"(room {launch_room}) for the next preparation action."
+                    ),
+                    "tool": "travel",
+                    "verification": (
+                        f"Current room id is {launch_room} and its source flags include "
+                        "ROOM_SANCTUARY or ROOM_NO_COMBAT."
+                    ),
+                }
             )
         steps.extend(
             (
@@ -9665,7 +9700,7 @@ class BotController:
                     return action(
                         "travel",
                         {"to": TOS_PROVISION_ROOM_ID},
-                        "farm-bank-transit",
+                        "farm-provision-transit",
                         "Reach the selected safe staging room to obtain a fresh quote from its verified provisioner.",
                     )
                 seller = self._visible_tos_innkeeper(observation)
@@ -9703,7 +9738,7 @@ class BotController:
                 return action(
                     "travel",
                     {"to": TOS_PROVISION_ROOM_ID},
-                    "farm-bank-transit",
+                    "farm-provision-transit",
                     "Return to the selected staging room's verified provisioner with the bounded funds.",
                 )
             return action(
@@ -9717,7 +9752,7 @@ class BotController:
             return action(
                 "travel",
                 {"to": launch_room},
-                "farm-bank-transit",
+                "farm-staging-transit",
                 "Reach the source-verified safe staging room before the keeper launch.",
             )
         rested = deep_get(

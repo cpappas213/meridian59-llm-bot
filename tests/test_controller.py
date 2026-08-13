@@ -11276,6 +11276,34 @@ class ControllerTests(unittest.TestCase):
                     }
 
                 completion = controller.criteria.evaluate(goal, observation(52))
+                controller.last_observation = observation(52)
+                provisioning_plan = with_safe_ending(
+                    controller._structured_farm_controller_plan(goal), 52
+                )
+                provisioning_ids = [
+                    step["id"] for step in provisioning_plan["steps"]
+                ]
+                self.assertLess(
+                    provisioning_ids.index("farm-bank-transit"),
+                    provisioning_ids.index("withdraw-provision-funds"),
+                )
+                self.assertLess(
+                    provisioning_ids.index("withdraw-provision-funds"),
+                    provisioning_ids.index("farm-provision-transit"),
+                )
+                self.assertLess(
+                    provisioning_ids.index("farm-provision-transit"),
+                    provisioning_ids.index("buy-farm-food"),
+                )
+                stored_provisioning = controller._store_execution_plan(
+                    goal,
+                    provisioning_plan,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(
+                    "verified", stored_provisioning["verification"]["status"]
+                )
                 to_bank = controller._structured_farm_preparation_action(
                     goal, observation(52), completion
                 )
@@ -11423,6 +11451,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("create weapon", create["arguments"]["spell"])
                 structured_plan = controller._structured_farm_controller_plan(goal)
                 structured_ids = [step["id"] for step in structured_plan["steps"]]
+                self.assertNotIn("withdraw-provision-funds", structured_ids)
                 self.assertLess(
                     structured_ids.index("create-weapon-before-farm"),
                     structured_ids.index("equip-before-farm"),
