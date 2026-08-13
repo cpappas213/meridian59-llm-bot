@@ -2052,6 +2052,12 @@ class BotController:
             deep_get(observation, "look.room_id"),
         )
         current_room_name = str(deep_get(observation, "look.room.name", ""))
+        if current_room_id is None and not current_room_name.strip():
+            # Startup can load and structurally validate a stored plan before
+            # the first authoritative broker observation.  Unknown location is
+            # not evidence that the character is outside a bank; defer this
+            # live prerequisite check until a room has actually been observed.
+            return None
         at_bank = (
             str(current_room_id) == str(TOS_BANK_ROOM_ID)
             or "bank" in current_room_name.casefold()

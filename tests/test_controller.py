@@ -2728,6 +2728,18 @@ class ControllerTests(unittest.TestCase):
             or "",
         )
 
+    def test_bank_plan_defers_location_check_until_room_is_observed(self) -> None:
+        steps = [
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings.",
+                "verification": "Inventory contains 100 shillings.",
+            }
+        ]
+
+        self.assertIsNone(BotController._bank_plan_error(steps, {}))
+
     def test_intrinsic_sale_evidence_survives_id_churn_only_for_unchanged_inventory(self) -> None:
         reason = (
             'Meidei tells you, "I cannot see how you could bear to part with a mace! '
