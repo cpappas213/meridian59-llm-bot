@@ -10168,6 +10168,97 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_gentle_cap_stagnation_is_repaired_only_with_fresh_source_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="gentle-cap-stagnation-repair")
+                )["goal"]
+
+                def get_room(entity_id: str) -> dict[str, object]:
+                    if entity_id == "location:544":
+                        spawns = [
+                            {
+                                "creature_id": "creature:groundwormlarva",
+                                "creature": "groundworm larva",
+                                "level": 35,
+                                "difficulty": 5,
+                                "role": "monster",
+                            },
+                            {
+                                "creature_id": "creature:fungusbeast",
+                                "creature": "fungus beast",
+                                "level": 50,
+                                "difficulty": 1,
+                                "role": "monster",
+                            },
+                        ]
+                    else:
+                        spawns = [
+                            {
+                                "creature_id": "creature:ogre",
+                                "creature": "ogre",
+                                "level": 60,
+                                "difficulty": 4,
+                                "role": "monster",
+                            }
+                        ]
+                    return {
+                        "status": "found",
+                        "entity": {"spawn_table": {"spawns": spawns}},
+                    }
+
+                controller.knowledge = SimpleNamespace(get=get_room)
+                base = {
+                    "goal_id": goal["id"],
+                    "target": "groundworm larva",
+                    "last_error": None,
+                    "stalled_in_transit": True,
+                    "deltas": {
+                        "deaths": 0,
+                        "deaths_in_safe_spot": 0,
+                        "deaths_in_proven_safe_spot": 0,
+                        "withdrawals": 0,
+                        "mulligans": 0,
+                        "logoffs": 0,
+                    },
+                    "stalled": {
+                        "idle_passes": 33,
+                        "since_seconds": 63,
+                        "why": "room capped by creatures we will not fight",
+                    },
+                }
+                gentle_key = f"{goal['id']}|544|groundworm larva"
+                dangerous_key = f"{goal['id']}|563|groundworm larva"
+                controller.storage.set_runtime(
+                    "farm_tactic_stagnation_v1",
+                    {
+                        gentle_key: {**base, "room": 544, "assigned_room": 544},
+                        dangerous_key: {**base, "room": 563, "assigned_room": 563},
+                    },
+                )
+
+                repaired = controller._repair_gentle_cap_stagnations(observation)
+
+                self.assertEqual([544], [item["room"] for item in repaired])
+                self.assertEqual(
+                    210,
+                    repaired[0]["forgiven_cap_blockers"][0]["attack_rating"],
+                )
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(gentle_key, remaining)
+                self.assertIn(dangerous_key, remaining)
+            finally:
+                controller.storage.close()
+
     def test_survivability_quarantine_releases_after_verified_health_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

@@ -2057,6 +2057,7 @@ class BotController:
             self._repair_recovered_farm_route_evidence(self.last_observation)
             self._repair_transient_farm_stagnations()
             self._repair_ambiguous_breakoff_stagnations()
+            self._repair_gentle_cap_stagnations(self.last_observation)
             self._repair_position_unknown_lessons()
             self._repair_transient_cast_evidence()
             self._repair_unscoped_evidence_lookup_lessons()
@@ -9676,6 +9677,110 @@ class BotController:
                 "count": len(repaired),
                 "goal_ids": sorted(affected_goal_ids),
                 "reason": "the keeper now retains server-confirmed landed-hit evidence",
+            },
+        )
+        return repaired
+
+    def _repair_gentle_cap_stagnations(
+        self, observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Release cap stalls caused by the keeper's obsolete level fallback.
+
+        The old capped-room classifier could reject a source-known creature by
+        level even after its gentle attack rating had passed.  The persisted
+        record does not name the blocking creature, so prose alone is not proof.
+        Re-read the room's current source table and remove only a death-free cap
+        record whose non-prey overlevel spawn is affirmatively forgiven by rating
+        and whose room contains no dangerous or unknown overlevel spawn.
+        """
+
+        raw = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
+        stagnations = dict(raw) if isinstance(raw, dict) else {}
+        repaired: list[dict[str, Any]] = []
+        affected_goal_ids: set[str] = set()
+        for key, item in list(stagnations.items()):
+            if not isinstance(item, dict):
+                continue
+            stalled = item.get("stalled")
+            stalled = stalled if isinstance(stalled, dict) else {}
+            deltas = item.get("deltas")
+            if (
+                str(stalled.get("why") or "").strip().casefold()
+                != "room capped by creatures we will not fight"
+                or str(item.get("last_error") or "").strip()
+                or not isinstance(deltas, dict)
+                or any(
+                    int(deltas.get(name, 0) or 0) > 0
+                    for name in (
+                        "deaths",
+                        "deaths_in_safe_spot",
+                        "deaths_in_proven_safe_spot",
+                        "withdrawals",
+                        "mulligans",
+                        "logoffs",
+                    )
+                )
+            ):
+                continue
+            assessment = self._source_room_overlevel_assessment(
+                item.get("room", item.get("assigned_room")), observation
+            )
+            if (
+                assessment is None
+                or assessment["threats"]
+                or not assessment["forgiven"]
+            ):
+                continue
+            target = str(item.get("target") or "").strip().casefold()
+            forgiven_blockers = [
+                detail
+                for detail in assessment["forgiven"]
+                if target
+                and target not in str(detail.get("name") or "").strip().casefold()
+            ]
+            if not forgiven_blockers:
+                continue
+            repaired.append(
+                {
+                    **item,
+                    "repair_reason": (
+                        "fresh source ratings prove the overlevel cap occupants are "
+                        "gentle non-prey, not unsafe blockers"
+                    ),
+                    "forgiven_cap_blockers": forgiven_blockers,
+                }
+            )
+            stagnations.pop(key, None)
+            goal_id = str(item.get("goal_id") or str(key).split("|", 1)[0])
+            if goal_id:
+                affected_goal_ids.add(goal_id)
+
+        if not repaired:
+            return []
+        self.storage.set_runtime("farm_tactic_stagnation_v1", stagnations)
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            self._clear_safety_suppression(goal_id)
+            self.storage.set_runtime(
+                f"background_farm_route_failure_handled_v1:{goal_id}", False
+            )
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+        self.storage.emit_event(
+            "background_farm.cap_stagnation_repaired",
+            "Removed capped-room stalls created by the obsolete level fallback",
+            severity="notice",
+            interesting=False,
+            data={
+                "count": len(repaired),
+                "rooms": [item.get("room") for item in repaired],
+                "goal_ids": sorted(affected_goal_ids),
+                "reason": "fresh source attack ratings now drive every keeper path",
             },
         )
         return repaired
