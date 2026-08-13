@@ -181,7 +181,7 @@ POLITICAL_FACTION_TROOP_ENTITY_IDS = frozenset(
 LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
-EXECUTION_PLAN_SCHEMA_VERSION = 4
+EXECUTION_PLAN_SCHEMA_VERSION = 5
 EXECUTION_PLAN_MAX_STEPS = 10
 INVALID_PLANNER_ACTION_LIMIT = 2
 INVALID_PLAN_REVISION_LIMIT = 2
@@ -3506,6 +3506,32 @@ class BotController:
                 for match in matches
             ]
 
+        def planned_repetitions(step: dict[str, Any]) -> int:
+            """Read a typed repeat count, with a legacy prose fallback."""
+
+            typed = step.get("repeat_count")
+            if (
+                isinstance(typed, int)
+                and not isinstance(typed, bool)
+                and typed > 0
+            ):
+                return typed
+            text = str(step.get("outcome") or "").casefold()
+            word_values = {word: value for value, word in number_words.items()}
+            quantity = rf"(\d+|{'|'.join(word_values)})"
+            matches: list[str] = []
+            for pattern in (
+                rf"\bcast\b.{{0,60}}\bcreate\s+food\b.{{0,40}}?\b{quantity}\s+(?:times?|casts?)\b",
+                rf"\b{quantity}\s+create\s+food\s+casts?\b",
+                rf"\bcreate\s+food\b.{{0,20}}?\bx\s*{quantity}\b",
+            ):
+                matches.extend(re.findall(pattern, text))
+            values = [
+                int(match) if match.isdigit() else word_values[match]
+                for match in matches
+            ]
+            return max(values) if values else 1
+
         for criterion in (phase or {}).get("success_criteria", []):
             if not isinstance(criterion, dict) or criterion.get("kind") != "inventory_contains":
                 continue
@@ -3603,7 +3629,8 @@ class BotController:
                     for step in cast_steps
                 )
                 planned_casts = max(
-                    len(cast_steps), needed_units if repeat_to_target else 0
+                    sum(planned_repetitions(step) for step in cast_steps),
+                    needed_units if repeat_to_target else 0,
                 )
                 planned_food_purchases = 0
                 for step in steps:
@@ -5485,9 +5512,20 @@ class BotController:
             outcome = str(raw_step.get("outcome") or "").strip()
             verification = str(raw_step.get("verification") or "").strip()
             tool = raw_step.get("tool")
+            repeat_count = raw_step.get("repeat_count", 1)
+            if repeat_count is None:
+                repeat_count = 1
             if not step_id or step_id in ids or not outcome or not verification:
                 raise ModelError(
                     "execution_plan steps require unique non-empty id, outcome, and verification"
+                )
+            if (
+                not isinstance(repeat_count, int)
+                or isinstance(repeat_count, bool)
+                or not 1 <= repeat_count <= 100
+            ):
+                raise ModelError(
+                    f"execution_plan step {step_id} repeat_count must be an integer from 1 to 100"
                 )
             if tool is not None and (not isinstance(tool, str) or tool not in known_tools):
                 raise ModelError(f"execution_plan step {step_id} names unknown tool {tool!r}")
@@ -5525,14 +5563,15 @@ class BotController:
             if map_error is not None:
                 raise ModelError(f"execution_plan step {step_id} {map_error}")
             ids.add(step_id)
-            normalized_steps.append(
-                {
-                    "id": step_id,
-                    "outcome": outcome[:600],
-                    "tool": tool,
-                    "verification": verification[:600],
-                }
-            )
+            normalized_step = {
+                "id": step_id,
+                "outcome": outcome[:600],
+                "tool": tool,
+                "verification": verification[:600],
+            }
+            if repeat_count > 1:
+                normalized_step["repeat_count"] = repeat_count
+            normalized_steps.append(normalized_step)
         sale_recovery_error = self._sale_recovery_plan_error(
             goal, normalized_steps
         )

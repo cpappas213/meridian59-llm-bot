@@ -1843,6 +1843,25 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(100, accepted["safe_ending"]["room_id"])
                 self.assertEqual("finish-safe", accepted["steps"][-1]["id"])
 
+                repeated = with_safe_ending(copy.deepcopy(base), 100)
+                repeated["steps"][0]["repeat_count"] = 3
+                stored_repeated = controller._store_execution_plan(
+                    goal,
+                    repeated,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=True,
+                )
+                self.assertEqual(3, stored_repeated["steps"][0]["repeat_count"])
+                invalid_repeat = with_safe_ending(copy.deepcopy(base), 100)
+                invalid_repeat["steps"][0]["repeat_count"] = 0
+                with self.assertRaisesRegex(ModelError, "repeat_count must be"):
+                    controller._store_execution_plan(
+                        goal,
+                        invalid_repeat,
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=True,
+                    )
+
                 observational = with_safe_ending(
                     {
                         "summary": "Confirm position, then drop the item.",
@@ -2878,6 +2897,23 @@ class ControllerTests(unittest.TestCase):
             }
             for index in range(3)
         ]
+        prose_repeated_cast = [
+            {
+                "id": "cast-three",
+                "tool": "cast",
+                "outcome": "Cast Create Food 3 times to produce 3 food items.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
+        structured_repeated_cast = [
+            {
+                "id": "cast-three-structured",
+                "tool": "cast",
+                "repeat_count": 3,
+                "outcome": "Cast Create Food once per execution.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
 
         self.assertIn(
             "does not cover active phase criterion",
@@ -2894,6 +2930,16 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(
             BotController._phase_inventory_plan_error(
                 phase, separate_casts, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, prose_repeated_cast, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, structured_repeated_cast, observation
             )
         )
 

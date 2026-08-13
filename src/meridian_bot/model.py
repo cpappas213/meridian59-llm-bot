@@ -161,7 +161,9 @@ Account for inventory flow: selling, eating, or dropping an existing required it
 count. For Create Food, multiply the live per-cast reagent list by every planned cast, subtract reagents already
 carried, and explicitly acquire the remainder. Verification prose cannot substitute for those resource inputs.
 If one repeatable plan step will be used multiple times, make its verification name the required total (or
-remaining additional quantity) and keep selecting that same step until the quantity is actually observed.
+remaining additional quantity), set repeat_count to the exact planned number of tool calls, and keep selecting
+that same step until the quantity is actually observed. repeat_count is static resource accounting only: each
+decision=act still makes exactly one broker call.
 Every active phase has a controller-persisted execution_plan. When execution_plan is absent, return
 decision=plan and no tool. Give 1-10 ordered steps with stable ids, one concrete outcome per step,
 the likely broker tool when known, and the observation that will verify the step. List factual
@@ -377,7 +379,7 @@ retrying one portal coordinate merely by changing fine movement or step limits.
 Schema: {{"decision":"plan|act|wait|propose_goal","tool":string|null,"arguments":object,
 "rationale":string,"expected_observation":object,"proposal":object|null,"plan_step_id":string|null,
 "execution_plan":{{"summary":string,"steps":[{{"id":string,"outcome":string,"tool":string|null,
-"verification":string}}],"safe_ending":{{"room_id":integer,"step_id":string,"rationale":string}},
+"verification":string,"repeat_count":integer|null}}],"safe_ending":{{"room_id":integer,"step_id":string,"rationale":string}},
 "assumptions":[string],"revision_reason":string|null,"revision_authorization_id":string|null}}|null}}.
 For propose_goal, proposal must contain objective and 1-20 typed success_criteria, plus optional
 title, constraints, and priority. Supported criterion kinds: {', '.join(CRITERION_KINDS)}.
