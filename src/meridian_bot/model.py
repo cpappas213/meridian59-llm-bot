@@ -245,6 +245,9 @@ financial_context.bank_accounts contains durable last-known balance evidence fro
 When it shows positive funds and selling would consume an item required by the active phase, preserve the item:
 travel to the canonical bank room, live-check/withdraw enough funds, then continue the purchase. A stale balance
 still requires a live bank call before transfer, but it is grounded evidence that this route exists.
+When a recent shop catalogue gives unit prices and the basket quantity is known, multiply them and compare the
+exact total with financial_context.carried_shillings. Any shortfall requires a funding step before purchase;
+nonzero carried cash alone never proves the basket is affordable.
 After an ordinary merchant-preference sale rejection, buyer discovery must precede the next sell or sell_all.
 This rule does not apply to item_not_npc_transferable failures. Include a merchants
 buyer-discovery step unless a recent completed targeted merchants lookup is already present in last_action,

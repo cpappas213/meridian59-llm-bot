@@ -139,6 +139,7 @@ INVALID_PLAN_REVISION_LIMIT = 2
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
+BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
@@ -2032,6 +2033,136 @@ class BotController:
                 )
         return None
 
+    def _shop_plan_affordability_error(
+        self,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> str | None:
+        """Compare quantified planned baskets with recent live catalogue prices."""
+
+        inventory = observation.get("inventory")
+        if not isinstance(inventory, dict) or not isinstance(
+            inventory.get("items"), list
+        ):
+            return None
+        catalog: dict[str, dict[str, Any]] = {}
+        catalog_event_at: str | None = None
+        for event in reversed(
+            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
+        ):
+            data = event.get("data")
+            result = data.get("result") if isinstance(data, dict) else None
+            raw_catalog = result.get("items") if isinstance(result, dict) else None
+            if data.get("tool") != "shop" or not isinstance(raw_catalog, list):
+                continue
+            for item in raw_catalog:
+                if not isinstance(item, dict):
+                    continue
+                name = " ".join(str(item.get("name") or "").split()).casefold()
+                cost = item.get("cost")
+                if (
+                    name
+                    and isinstance(cost, (int, float))
+                    and not isinstance(cost, bool)
+                    and cost >= 0
+                    and name not in catalog
+                ):
+                    catalog[name] = {
+                        "cost": int(cost),
+                        "seller": result.get("seller"),
+                    }
+                    catalog_event_at = catalog_event_at or str(
+                        event.get("occurred_at") or ""
+                    )
+            if catalog:
+                break
+        if not catalog:
+            return None
+
+        number_words = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+
+        def item_pattern(name: str) -> str:
+            if name.endswith("y"):
+                return re.escape(name[:-1]) + r"(?:y|ies)"
+            return re.escape(name) + r"(?:s|es)?"
+
+        available = self._carried_currency(observation)
+        funds_unknown = False
+        for step in steps:
+            if self._is_plan_funding_step(step):
+                funds_unknown = True
+                continue
+            if not self._is_plan_purchase_step(step) or funds_unknown:
+                continue
+            outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+            basket: list[dict[str, Any]] = []
+            for name, item in catalog.items():
+                match = re.search(
+                    rf"\b(\d+|{'|'.join(number_words)})\s+(?:x\s+)?{item_pattern(name)}\b",
+                    outcome,
+                )
+                if not match:
+                    continue
+                raw_quantity = match.group(1)
+                quantity = (
+                    int(raw_quantity)
+                    if raw_quantity.isdigit()
+                    else number_words[raw_quantity]
+                )
+                basket.append(
+                    {
+                        "item": name,
+                        "quantity": quantity,
+                        "unit_cost": item["cost"],
+                        "subtotal": quantity * item["cost"],
+                    }
+                )
+            if not basket:
+                continue
+            basket_cost = sum(item["subtotal"] for item in basket)
+            if basket_cost > available:
+                account = next(
+                    (
+                        account
+                        for account in self._latest_bank_balance_context()
+                        if account.get("last_known_balance", 0) > 0
+                    ),
+                    None,
+                )
+                funding_route = (
+                    f" Durable bank evidence shows {account['last_known_balance']} "
+                    f"shillings in {account['account']!r}; add travel to bank room "
+                    f"{TOS_BANK_ROOM_ID} and a bank check/withdrawal before this purchase."
+                    if account is not None
+                    else " Add a verified funding step before this purchase."
+                )
+                return (
+                    f"execution_plan step {step.get('id')!r} has a grounded basket cost "
+                    f"of {basket_cost} shillings from the live shop catalogue, but only "
+                    f"{available} are carried. Basket: "
+                    + ", ".join(
+                        f"{item['quantity']} {item['item']} @ {item['unit_cost']}"
+                        for item in basket
+                    )
+                    + f". Catalogue observed at {catalog_event_at}. Purpose: a positive "
+                    "cash balance is not proof that the full basket is affordable; "
+                    "fund the exact known cost before purchase."
+                    + funding_route
+                )
+            available -= basket_cost
+        return None
+
     @staticmethod
     def _bank_plan_error(
         steps: list[dict[str, Any]],
@@ -3144,6 +3275,27 @@ class BotController:
         )
         if funding_error is not None:
             self._invalidate_execution_plan(goal, funding_error)
+            return None
+        affordability_error = self._shop_plan_affordability_error(
+            stored_steps, self.last_observation or {}
+        )
+        if affordability_error is not None:
+            self._invalidate_execution_plan(goal, affordability_error)
+            self._set_planner_feedback(
+                goal,
+                affordability_error,
+                failure_context={
+                    "kind": "known_basket_unaffordable",
+                    "purpose": (
+                        "Prevent a known shop basket from executing when carried cash "
+                        "cannot cover its live catalogue price."
+                    ),
+                    "required_response": (
+                        "Add a preceding grounded funding route for the exact known "
+                        "shortfall; preserve active-phase inventory."
+                    ),
+                },
+            )
             return None
         try:
             self._validate_direct_pvp_plan(
@@ -4460,6 +4612,11 @@ class BotController:
         )
         if funding_error is not None:
             raise ModelError(funding_error)
+        affordability_error = self._shop_plan_affordability_error(
+            normalized_steps, self.last_observation or {}
+        )
+        if affordability_error is not None:
+            raise ModelError(affordability_error)
         purchase = grounding.get("purchase_verification")
         if isinstance(purchase, dict) and not purchase.get("static_verified"):
             raise ModelError("execution plan cannot be verified because purchase feasibility is invalid")
@@ -16885,7 +17042,12 @@ class BotController:
     def _latest_bank_balance_context(self) -> list[dict[str, Any]]:
         """Recover the newest durable balance evidence for each known account."""
 
-        accounts: dict[str, dict[str, Any]] = {}
+        cached = self.storage.get_runtime(BANK_BALANCE_CONTEXT_RUNTIME_KEY, [])
+        accounts: dict[str, dict[str, Any]] = {
+            str(account.get("account") or ""): dict(account)
+            for account in cached
+            if isinstance(account, dict) and account.get("account")
+        } if isinstance(cached, list) else {}
         for event in reversed(
             self.storage.latest_events(limit=200, kinds=["action.succeeded"])
         ):
@@ -16901,7 +17063,12 @@ class BotController:
             account = " ".join(
                 str(result.get("account") or "shared mainland account").split()
             )
-            if account in accounts:
+            existing = accounts.get(account)
+            if (
+                isinstance(existing, dict)
+                and str(existing.get("recorded_at") or "")
+                >= str(event.get("occurred_at") or "")
+            ):
                 continue
             accounts[account] = {
                 "account": account,
@@ -16915,7 +17082,14 @@ class BotController:
                 "last_action": result.get("action"),
                 "requires_live_check_before_exact_transfer": True,
             }
-        return list(accounts.values())
+        value = sorted(
+            accounts.values(),
+            key=lambda account: str(account.get("recorded_at") or ""),
+            reverse=True,
+        )
+        if value != cached:
+            self.storage.set_runtime(BANK_BALANCE_CONTEXT_RUNTIME_KEY, value)
+        return value
 
     @staticmethod
     def _sale_item_ids(arguments: dict[str, Any]) -> set[str]:

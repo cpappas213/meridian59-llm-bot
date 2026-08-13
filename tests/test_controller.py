@@ -2922,6 +2922,90 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_shop_plan_affordability_uses_live_catalogue_basket_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="live-catalogue-affordability")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "balance": 1712,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shilling", "amount": 32}
+                        ],
+                        "carry": {"known": True},
+                    }
+                }
+                purchase = [
+                    {
+                        "id": "buy-reagents",
+                        "tool": "shop",
+                        "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                        "verification": "Inventory contains the reagents.",
+                    }
+                ]
+
+                error = controller._shop_plan_affordability_error(
+                    purchase, observation
+                )
+
+                self.assertIn("grounded basket cost of 252", error or "")
+                self.assertIn("only 32 are carried", error or "")
+                self.assertIn("6 elderberry @ 28", error or "")
+                self.assertIn("bank room 54", error or "")
+
+                funded = [
+                    {
+                        "id": "reach-bank",
+                        "tool": "travel",
+                        "outcome": "Travel to bank room 54.",
+                        "verification": "Current room is 54.",
+                    },
+                    {
+                        "id": "withdraw",
+                        "tool": "bank",
+                        "outcome": "Withdraw enough shillings for the basket.",
+                        "verification": "Carried shillings cover 252.",
+                    },
+                    *purchase,
+                ]
+                self.assertIsNone(
+                    controller._shop_plan_affordability_error(
+                        funded, observation
+                    )
+                )
+            finally:
+                controller.storage.close()
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
