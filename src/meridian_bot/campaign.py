@@ -147,7 +147,10 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "shop",
         "bank",
         "cast",
-        "fight",
+        # Sustained combat must be owned by the fast, health-aware keeper. A
+        # foreground fight is only one swing and leaves the character exposed
+        # while the next model turn is being inferred.
+        "autopilot",
         "rest_up",
         "equip_best",
         "knowledge_search",

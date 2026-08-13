@@ -698,6 +698,7 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_journal: list[object] = []
         self.farm_flee_below = 0.75
         self.farm_fight_above_vigor = 100
+        self.farm_use_safe_spots = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
 
@@ -720,6 +721,7 @@ class BackgroundFarmBroker(SimulatedBroker):
                     "hunt": self.farm_hunt,
                     "fleeBelow": self.farm_flee_below,
                     "fightAboveVigor": self.farm_fight_above_vigor,
+                    "useSafeSpots": self.farm_use_safe_spots,
                 },
             }
         if name == "autopilot" and arguments.get("action") == "stop":
@@ -738,6 +740,11 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_running = True
             self.farm_inert = None
             self.farm_mode = str(arguments.get("mode") or self.farm_mode)
+            self.farm_room = int(arguments.get("assigned_room") or self.farm_room)
+            self.farm_hunt = str(arguments.get("hunt") or self.farm_hunt)
+            self.farm_use_safe_spots = bool(
+                arguments.get("use_safe_spots", self.farm_use_safe_spots)
+            )
             return {"running": True, "mode": self.farm_mode}
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
@@ -1971,6 +1978,339 @@ class ControllerTests(unittest.TestCase):
                 {"search": "ants"},
             )
         BotController._guard_map_semantics(phase, "map", {"to": 6})
+
+    def test_combat_training_phase_is_keeper_owned_until_ability_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = BackgroundFarmBroker()
+                broker.farm_running = False
+                broker.tools["fight"] = Tool(
+                    "fight",
+                    "One foreground combat swing.",
+                    {
+                        "type": "object",
+                        "properties": {"agent": {}, "target": {}},
+                        "required": ["agent", "target"],
+                    },
+                )
+                for tool_name in ("rest_up", "equip_best"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="keeper-owned-combat-training",
+                        objective="Raise mace fighting to 20.",
+                        success_criteria=[
+                            {
+                                "id": "mace-20",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 20,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "train_ability",
+                        "objective": "Train mace fighting against ants.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "training_method": "combat",
+                            "prey": "ant",
+                            "room": 6,
+                            "use_safe_spots": False,
+                            "flee_below": 0.70,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+                observation = broker.observe()
+                observation["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 10}]
+                }
+                controller.last_observation = observation
+                completion = controller.criteria.evaluate(goal, observation)
+
+                self.assertTrue(
+                    controller._keeper_combat_work_remains(goal, completion)
+                )
+                self.assertEqual(
+                    {"assigned_room": 6, "hunt": "ant"},
+                    {
+                        key: controller._effective_farm_intent(goal).get(key)
+                        for key in ("assigned_room", "hunt")
+                    },
+                )
+                allowed = {
+                    item["name"] for item in controller._planner_tools(phase)
+                }
+                self.assertIn("autopilot", allowed)
+                self.assertNotIn("fight", allowed)
+                with self.assertRaisesRegex(
+                    ModelError, "foreground fight is unsafe for combat training"
+                ):
+                    controller._execute(
+                        goal,
+                        observation,
+                        {
+                            "decision": "act",
+                            "tool": "fight",
+                            "arguments": {"target": "ant"},
+                        },
+                    )
+
+                plan = with_safe_ending(
+                    controller._structured_farm_controller_plan(goal), 100
+                )
+                stored = controller._store_execution_plan(
+                    goal,
+                    plan,
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                launch = controller._execute(
+                    goal,
+                    observation,
+                    {
+                        "decision": "act",
+                        "tool": "autopilot",
+                        "arguments": {
+                            "action": "start",
+                            "mode": "farm",
+                            "hunt": "ant",
+                            "assigned_room": 6,
+                            "use_safe_spots": False,
+                        },
+                        "plan_step_id": "launch-goal-keeper",
+                    },
+                )
+                self.assertEqual("autopilot", launch["action"])
+                owner = controller.storage.get_runtime(
+                    "background_farm_owner_v1", {}
+                )
+                self.assertEqual(phase["id"], owner["phase_id"])
+                monitoring = controller._manage_background_farm(
+                    goal, observation, completion
+                )
+                self.assertTrue(monitoring["background_farm_monitoring"])
+
+                finished_observation = copy.deepcopy(observation)
+                finished_observation["abilities"]["skills"][0]["ability"] = 20
+                completed = controller._reconcile_existing_campaign_phase(
+                    goal, finished_observation
+                )
+                self.assertTrue(completed["campaign_phase_completed"])
+                self.assertTrue(completed["keeper_released"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual(phase["id"], stored["phase_id"])
+            finally:
+                controller.storage.close()
+
+    def test_combat_training_recipe_is_validated_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                incomplete = {
+                    "kind": "train_ability",
+                    "objective": "Train mace fighting in combat.",
+                    "success_criteria": [
+                        {
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.mace fighting",
+                            "operator": ">=",
+                            "value": 20,
+                        }
+                    ],
+                    "context": {
+                        "training_method": "combat",
+                        "room": 6,
+                        "use_safe_spots": False,
+                    },
+                }
+
+                blocker = controller._campaign_phase_grounding_blocker(incomplete)
+
+                self.assertEqual(
+                    "invalid_combat_training_phase_context", blocker["kind"]
+                )
+                self.assertIn("context.target", blocker["guidance"])
+                self.assertIn(
+                    'training_method="combat"', CAMPAIGN_MANAGER_SYSTEM
+                )
+                self.assertIn("one-swing foreground fight", CAMPAIGN_MANAGER_SYSTEM)
+
+                teacher = {
+                    "kind": "train_ability",
+                    "objective": "Learn mace fighting from a teacher.",
+                    "success_criteria": [
+                        {
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.mace fighting",
+                            "operator": ">=",
+                            "value": 1,
+                        }
+                    ],
+                    "context": {
+                        "training_method": "teacher",
+                        "room": 154,
+                        "target": "mace fighting",
+                        "merchant_class": "CorNothSergeant",
+                    },
+                }
+                self.assertEqual(
+                    {}, controller._campaign_phase_farm_intent(teacher)
+                )
+                self.assertIsNone(
+                    controller._campaign_phase_grounding_blocker(teacher)
+                )
+            finally:
+                controller.storage.close()
+
+    def test_completed_combat_training_keeps_survival_owner_until_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = BackgroundFarmBroker()
+                for tool_name in ("rest_up", "equip_best"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="safe-combat-training-handoff",
+                        objective="Raise mace fighting to 100.",
+                        success_criteria=[
+                            {
+                                "id": "mace-100",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "train_ability",
+                        "objective": "Reach a bounded mace fighting milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "mace-20",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 20,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "training_method": "combat",
+                            "prey": "ant",
+                            "room": 6,
+                            "use_safe_spots": False,
+                            "flee_below": 0.70,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+                planning_observation = broker.observe()
+                planning_observation["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 10}]
+                }
+                controller.last_observation = planning_observation
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        controller._structured_farm_controller_plan(goal), 100
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                broker.room = {"num": 6, "name": "Ant field"}
+                broker.farm_room = 6
+                broker.farm_hunt = "ant"
+                broker.farm_use_safe_spots = False
+                hazardous = broker.observe()
+                hazardous["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 20}]
+                }
+                public_completion = controller.criteria.evaluate(goal, hazardous)
+
+                self.assertIsNone(
+                    controller._reconcile_existing_campaign_phase(goal, hazardous)
+                )
+                self.assertIsNotNone(
+                    controller._phase_completion_checkpoint(phase)
+                )
+                handed_off = controller._manage_background_farm(
+                    goal,
+                    hazardous,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(handed_off["background_safe_ending_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertIsNotNone(
+                    controller.storage.active_campaign_phase(run["id"])
+                )
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
+
+                still_unsafe = controller._manage_background_farm(
+                    goal,
+                    hazardous,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(still_unsafe["background_survival_monitoring"])
+                self.assertTrue(still_unsafe["safe_ending_pending"])
+
+                broker.room = {"num": 100, "name": "Training Hall"}
+                safe = broker.observe()
+                safe["abilities"] = hazardous["abilities"]
+                stopped = controller._manage_background_farm(
+                    goal,
+                    safe,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(stopped["background_keeper_stopping"])
+                completed = controller._reconcile_existing_campaign_phase(goal, safe)
+                self.assertTrue(completed["campaign_phase_completed"])
+                self.assertTrue(completed["keeper_released"])
+            finally:
+                controller.storage.close()
 
     def test_map_route_lookup_without_a_route_is_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
@@ -5440,6 +5780,120 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("merchant_rejected_sale", (archaic_context or {}).get("kind"))
         self.assertIn("Do not retry the same item with this merchant", archaic_guidance)
         self.assertTrue(BotController._failure_invalidates_plan("sell", archaic_reason))
+
+    def test_sale_refusal_replan_requires_buyer_discovery_before_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                for tool_name in ("merchants", "sell"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="sale-refusal-plan-grounding")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Raise funds for equipment.",
+                        "success_criteria": [
+                            {
+                                "id": "equipment-known",
+                                "kind": "state_equals",
+                                "path": "equipment.known",
+                                "value": True,
+                            }
+                        ],
+                        "context": {},
+                    },
+                    mode="start",
+                )
+                controller.last_observation = broker.observe()
+                controller._set_planner_feedback(
+                    goal,
+                    "D'Franco rejected the prior sale.",
+                    failure_context={
+                        "kind": "merchant_rejected_sale",
+                        "required_response": "Change buyer using live evidence.",
+                    },
+                )
+                ungrounded = with_safe_ending(
+                    {
+                        "summary": "Assume a different merchant will buy the sword.",
+                        "steps": [
+                            {
+                                "id": "sell-next",
+                                "outcome": "Sell the rusty sword to a weapon buyer.",
+                                "tool": "sell",
+                                "verification": "Carried currency increases.",
+                            }
+                        ],
+                        "assumptions": ["A different buyer exists."],
+                    },
+                    100,
+                )
+
+                with self.assertRaisesRegex(
+                    ModelError, "buyer-discovery step before its next sell"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        ungrounded,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
+
+                # A subsequent planner rejection may replace the immediate
+                # feedback, but it must not erase the verified sale refusal.
+                controller._record_blocked_action(
+                    goal,
+                    broker.observe(),
+                    "sell",
+                    {"to": 736, "items": [7525]},
+                    "D'Franco refused to buy the mace.",
+                )
+                controller._clear_planner_feedback()
+                with self.assertRaisesRegex(
+                    ModelError, "buyer-discovery step before its next sell"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        ungrounded,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
+
+                grounded = copy.deepcopy(ungrounded)
+                grounded["summary"] = "Discover a verified buyer before selling."
+                grounded["steps"].insert(
+                    0,
+                    {
+                        "id": "find-buyer",
+                        "outcome": "Find merchants whose buying rule matches rusty sword.",
+                        "tool": "merchants",
+                        "verification": "Merchant results list a concrete buyer candidate.",
+                    },
+                )
+                stored = controller._store_execution_plan(
+                    goal,
+                    grounded,
+                    grounding={"valid": True},
+                    revision=False,
+                )
+                self.assertEqual("merchants", stored["steps"][0]["tool"])
+                self.assertIn(
+                    "must include a merchants buyer-discovery step",
+                    PLANNER_SYSTEM,
+                )
+            finally:
+                controller.storage.close()
 
     def test_tactical_context_retains_goal_blocked_actions_after_feedback_clears(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -544,7 +544,8 @@ class StorageTests(unittest.TestCase):
                     {"kind": phase_kind}, tools
                 )
                 self.assertEqual(
-                    {"map", "travel", "go_through", "shop"},
+                    {"map", "travel", "go_through", "shop"}
+                    | ({"autopilot"} if phase_kind == "train_ability" else set()),
                     {tool["name"] for tool in selected},
                 )
 

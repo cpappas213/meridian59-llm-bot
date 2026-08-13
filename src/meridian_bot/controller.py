@@ -2447,6 +2447,7 @@ class BotController:
             and persisted_blocker.get("kind")
             in {
                 "invalid_farm_phase_outcome",
+                "invalid_combat_training_phase_outcome",
                 "invalid_prepare_combat_phase_outcome",
             }
         ):
@@ -2457,7 +2458,7 @@ class BotController:
             self._clear_phase_completion_checkpoint(str(phase["id"]))
             reason = str(
                 persisted_blocker.get("guidance")
-                or "persisted farm phase has no observable farming outcome"
+                or "persisted keeper phase has no observable outcome"
             )
             finished = self.storage.transition_campaign_phase(
                 str(phase["id"]),
@@ -3453,6 +3454,59 @@ class BotController:
                     "verification": verification[:600],
                 }
             )
+        feedback = self._planner_feedback(goal)
+        failure_kind = str(
+            deep_get(feedback or {}, "failure_context.kind", "")
+        )
+        sale_failure_kinds = {
+            "merchant_rejected_sale",
+            "bulk_sale_transferred_nothing",
+        }
+        sale_recovery_required = failure_kind in sale_failure_kinds
+        if not sale_recovery_required:
+            blocked_actions = self.storage.get_runtime("blocked_actions", [])
+            sale_recovery_required = any(
+                isinstance(entry, dict)
+                and entry.get("goal_id") == goal.get("id")
+                and str(
+                    deep_get(
+                        self._failure_context(
+                            str(entry.get("tool") or ""),
+                            str(entry.get("reason") or ""),
+                            self.last_observation or {},
+                        )
+                        or {},
+                        "kind",
+                        "",
+                    )
+                )
+                in sale_failure_kinds
+                for entry in (
+                    blocked_actions if isinstance(blocked_actions, list) else []
+                )
+            )
+        if sale_recovery_required:
+            next_sale = next(
+                (
+                    index
+                    for index, step in enumerate(normalized_steps)
+                    if step.get("tool") in {"sell", "sell_all"}
+                ),
+                None,
+            )
+            buyer_lookup_before_sale = bool(
+                next_sale is not None
+                and any(
+                    step.get("tool") == "merchants"
+                    for step in normalized_steps[:next_sale]
+                )
+            )
+            if next_sale is not None and not buyer_lookup_before_sale:
+                raise ModelError(
+                    "the previous merchant rejected the sale; a replacement plan must "
+                    "include a merchants buyer-discovery step before its next sell or "
+                    "sell_all step, rather than assuming another buyer exists"
+                )
         funding_error = self._plan_funding_error(
             normalized_steps,
             self.last_observation or {},
@@ -3465,9 +3519,8 @@ class BotController:
         farm_intent = self._effective_farm_intent(goal)
         current_completion = self.criteria.evaluate(goal, self.last_observation or {})
         self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
-        farm_work_remains = any(
-            item.get("result", {}).get("met") is not True
-            for item in self._health_progress_criteria(goal, current_completion)
+        farm_work_remains = self._keeper_combat_work_remains(
+            goal, current_completion
         )
         launch_indexes = [
             index
@@ -3475,9 +3528,20 @@ class BotController:
             if step.get("tool") == "autopilot"
             and re.search(r"\b(?:start|launch|farm)\b", step.get("outcome", ""), re.IGNORECASE)
         ]
+        if (
+            isinstance(phase, dict)
+            and phase.get("kind") == "train_ability"
+            and self._campaign_phase_farm_intent(phase).get("assigned_room")
+            is not None
+            and any(step.get("tool") == "fight" for step in normalized_steps)
+        ):
+            raise ModelError(
+                "a grounded combat-training phase cannot contain foreground fight; "
+                "use one autopilot launch so the keeper owns combat between model turns"
+            )
         if not farm_work_remains and launch_indexes:
             raise ModelError(
-                "the HP progression criterion is already met; the plan must not relaunch the farm keeper"
+                "the bounded keeper-combat criterion is already met; the plan must not relaunch the farm keeper"
             )
         if (
             farm_work_remains
@@ -6475,25 +6539,95 @@ class BotController:
         return intent
 
     @staticmethod
+    def _train_ability_uses_combat_keeper(
+        phase: dict[str, Any] | None,
+    ) -> bool:
+        """Distinguish sustained combat training from teachers and casting."""
+
+        if not isinstance(phase, dict) or phase.get("kind") != "train_ability":
+            return False
+        context = phase.get("context")
+        context = context if isinstance(context, dict) else {}
+        method = str(context.get("training_method") or "").strip().casefold()
+        if method:
+            return method == "combat"
+        if context.get("hunt") is not None or context.get("prey") is not None:
+            return True
+        if any(
+            context.get(field) is not None
+            for field in (
+                "teacher",
+                "merchant",
+                "merchant_class",
+                "offering_kind",
+                "spell",
+            )
+        ):
+            return False
+        room = context.get(
+            "assigned_room", context.get("room", context.get("room_id"))
+        )
+        legacy_text = " ".join(
+            str(value or "")
+            for value in (
+                phase.get("objective"),
+                phase.get("rationale"),
+                context.get("strategy"),
+                context.get("notes"),
+            )
+        ).casefold()
+        return bool(
+            room is not None
+            and context.get("target") is not None
+            and any(
+                marker in legacy_text
+                for marker in (
+                    "combat",
+                    "fight",
+                    "hunt",
+                    "prey",
+                    "open-field",
+                    "open field",
+                    "safe spot",
+                )
+            )
+        )
+
+    @staticmethod
     def _campaign_phase_farm_intent(
         phase: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Read the executable farm signature from a durable internal phase.
+        """Read the executable keeper-combat signature from a durable phase.
 
         The campaign manager owns long-running tactical decomposition for a
         strategic supervisor goal. New phases carry typed fields in ``context``;
         the short prose fallback keeps phases persisted by older prompts
         executable across an upgrade.
         """
-        if not isinstance(phase, dict) or phase.get("kind") != "farm":
+        if not isinstance(phase, dict) or phase.get("kind") not in {
+            "farm",
+            "train_ability",
+        }:
+            return {}
+        if (
+            phase.get("kind") == "train_ability"
+            and not BotController._train_ability_uses_combat_keeper(phase)
+        ):
             return {}
         context = phase.get("context")
         context = context if isinstance(context, dict) else {}
+        room = context.get(
+            "assigned_room", context.get("room", context.get("room_id"))
+        )
+        # ``target`` is the established farm field. For train_ability it is
+        # accepted only alongside a room, preserving old grounded phases while
+        # avoiding confusion with an ability/teacher target.
+        hunt = context.get("hunt", context.get("prey"))
+        if hunt is None and (phase.get("kind") == "farm" or room is not None):
+            hunt = context.get("target")
         intent: dict[str, Any] = {
-            "assigned_room": context.get(
-                "assigned_room", context.get("room", context.get("room_id"))
-            ),
-            "hunt": context.get("hunt", context.get("target", context.get("prey"))),
+            "assigned_room": room,
+            "hunt": hunt,
         }
         for field in (
             "use_safe_spots",
@@ -6534,6 +6668,38 @@ class BotController:
         hunt = " ".join(str(intent.get("hunt") or "").casefold().split())
         intent["hunt"] = hunt or None
         return intent
+
+    def _active_keeper_combat_phase(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return an active farm/combat-training phase with a complete recipe."""
+
+        run = self.storage.campaign_run(str(goal.get("id") or ""))
+        phase = self.storage.active_campaign_phase(run["id"]) if run else None
+        if not isinstance(phase, dict):
+            return None
+        intent = self._campaign_phase_farm_intent(phase)
+        if intent.get("assigned_room") is None or not intent.get("hunt"):
+            return None
+        return phase
+
+    def _keeper_combat_work_remains(
+        self,
+        goal: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> bool:
+        """Whether a public HP target or active keeper phase still needs combat."""
+
+        if any(
+            item["result"].get("met") is not True
+            for item in self._health_progress_criteria(goal, completion)
+        ):
+            return True
+        phase = self._active_keeper_combat_phase(goal)
+        return bool(
+            phase is not None
+            and self._phase_completion_checkpoint(phase) is None
+        )
 
     def _effective_farm_intent(self, goal: dict[str, Any]) -> dict[str, Any]:
         """Merge operator-authored goal policy with the active campaign phase.
@@ -6628,8 +6794,7 @@ class BotController:
         equipment preparation are complete. Any unmet deterministic preflight
         falls back to the planner so it can perform the missing preparation.
         """
-        health_criteria = self._health_progress_criteria(goal, completion)
-        if not any(item["result"].get("met") is not True for item in health_criteria):
+        if not self._keeper_combat_work_remains(goal, completion):
             return None
         intent = self._effective_farm_intent(goal)
         if intent.get("assigned_room") is None or not intent.get("hunt"):
@@ -6696,7 +6861,10 @@ class BotController:
 
         run = self.storage.campaign_run(str(goal.get("id") or ""))
         phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        if not isinstance(phase, dict) or phase.get("kind") != "farm":
+        if not isinstance(phase, dict) or phase.get("kind") not in {
+            "farm",
+            "train_ability",
+        }:
             return None
         intent = self._campaign_phase_farm_intent(phase)
         if intent.get("assigned_room") is None or not intent.get("hunt"):
@@ -6946,8 +7114,7 @@ class BotController:
     ) -> dict[str, Any] | None:
         """Advance a grounded farm through safe preparation without an LLM turn."""
 
-        health_criteria = self._health_progress_criteria(goal, completion)
-        if not any(item["result"].get("met") is not True for item in health_criteria):
+        if not self._keeper_combat_work_remains(goal, completion):
             return None
         intent = self._effective_farm_intent(goal)
         if intent.get("assigned_room") is None or not intent.get("hunt"):
@@ -7370,6 +7537,15 @@ class BotController:
         reasons: list[str] = []
         if owner.get("goal_id") and owner.get("goal_id") != goal.get("id"):
             reasons.append("running keeper belongs to a different durable goal")
+        active_phase = self._active_keeper_combat_phase(goal)
+        if (
+            owner.get("phase_id")
+            and (
+                active_phase is None
+                or owner.get("phase_id") != active_phase.get("id")
+            )
+        ):
+            reasons.append("running keeper belongs to a different campaign phase")
         for field in (
             "assigned_room",
             "hunt",
@@ -8231,7 +8407,7 @@ class BotController:
         *,
         force_stop_reason: str | None = None,
     ) -> dict[str, Any] | None:
-        """Give a running farm exclusive control until its bounded HP phase ends."""
+        """Give a running farm exclusive control until its bounded phase ends."""
         full_scan = goal["id"] not in self._farm_full_scan_goals
         status = self.broker.call_tool(
             "autopilot",
@@ -8272,6 +8448,11 @@ class BotController:
             # until a later status call proves the loop has exited.
             health_fraction = self._vital_fraction(observation, "health")
             activity = str(status.get("activity") or "").strip().casefold()
+            current_room = self._observation_room(observation)
+            safe_ending_pending = bool(
+                force_stop_reason
+                and self._verified_safe_staging(current_room) is None
+            )
             quiescent = activity in {
                 "",
                 "idle",
@@ -8281,17 +8462,24 @@ class BotController:
             }
             if (
                 keeper_mode == "survive"
-                and health_fraction is not None
-                and health_fraction < 1.0
                 and (
-                    health_fraction < self.config.policy.rest_health_fraction
-                    or not quiescent
+                    safe_ending_pending
+                    or (
+                        health_fraction is not None
+                        and health_fraction < 1.0
+                        and (
+                            health_fraction
+                            < self.config.policy.rest_health_fraction
+                            or not quiescent
+                        )
+                    )
                 )
             ):
                 return {
                     "background_survival_monitoring": True,
                     "activity": status.get("activity"),
                     "health_fraction": health_fraction,
+                    "safe_ending_pending": safe_ending_pending,
                     "completion": completion,
                 }
             stopped = self.broker.call_tool(
@@ -8315,6 +8503,28 @@ class BotController:
             }
 
         if force_stop_reason:
+            current_room = self._observation_room(observation)
+            if self._verified_safe_staging(current_room) is None:
+                switched = self._ensure_survival_keeper()
+                self.storage.set_runtime("background_farm_owner_v1", {})
+                self.storage.emit_event(
+                    "background_farm.safe_ending_handoff",
+                    "Keeper switched from combat to survival for a safe phase ending",
+                    severity="info",
+                    interesting=False,
+                    goal_id=goal["id"],
+                    data={
+                        "room": current_room,
+                        "reason": force_stop_reason,
+                        "result": redact(switched),
+                    },
+                )
+                return {
+                    "background_safe_ending_handoff": True,
+                    "reason": force_stop_reason,
+                    "result": redact(switched),
+                    "completion": completion,
+                }
             stopped = self.broker.call_tool(
                 "autopilot",
                 {
@@ -8434,14 +8644,19 @@ class BotController:
 
         health_criteria = self._health_progress_criteria(goal, completion)
         unmet_health = [item for item in health_criteria if item["result"].get("met") is not True]
+        active_keeper_phase = self._active_keeper_combat_phase(goal)
+        phase_work_remains = bool(
+            active_keeper_phase is not None
+            and self._phase_completion_checkpoint(active_keeper_phase) is None
+        )
         unhealthy = self._keeper_stall_is_persistent(status)
-        if unmet_health and not unhealthy:
+        if (unmet_health or phase_work_remains) and not unhealthy:
             runtime_key = f"background_farm_notice_at:{goal['id']}"
             last_notice = float(self.storage.get_runtime(runtime_key, 0) or 0)
             if time.time() - last_notice >= 300:
                 self.storage.emit_event(
                     "background_farm.monitored",
-                    "Background farming keeper owns movement and combat for this HP phase",
+                    "Background farming keeper owns movement and combat for this bounded phase",
                     severity="info",
                     interesting=False,
                     goal_id=goal["id"],
@@ -8452,6 +8667,11 @@ class BotController:
                         "safe_spot": redact(status.get("safe_spot")),
                         "health": deep_get(observation, "status.vitals.health"),
                         "targets": [item["criterion"].get("value") for item in unmet_health],
+                        "phase_id": (
+                            active_keeper_phase.get("id")
+                            if active_keeper_phase is not None
+                            else None
+                        ),
                     },
                 )
                 self.storage.set_runtime(runtime_key, time.time())
@@ -8461,7 +8681,7 @@ class BotController:
                 "completion": completion,
             }
 
-        # A healthy keeper is stopped only when its bounded HP criterion is met.
+        # A healthy keeper is stopped only when its bounded criterion is met.
         # A stalled or errored keeper is also released so the planner can repair
         # the tactic on the following turn. Returning here prevents a foreground
         # mutation from racing the keeper during the same controller turn.
@@ -8474,7 +8694,7 @@ class BotController:
                 "why": (
                     "background keeper stalled or errored"
                     if unhealthy
-                    else "bounded max-HP target reached"
+                    else "bounded keeper-combat target reached"
                 ),
             },
             timeout=20,
@@ -8484,7 +8704,7 @@ class BotController:
         reason = (
             "background keeper stalled or errored"
             if unhealthy
-            else "bounded max-HP target reached"
+            else "bounded keeper-combat target reached"
         )
         if unhealthy:
             room = self._farm_room(status, observation)
@@ -10099,7 +10319,11 @@ class BotController:
                         + ", ".join(mutating_tools)
                     ),
                 }
-        if phase.get("kind") != "farm":
+        phase_kind = str(phase.get("kind") or "")
+        context = phase.get("context")
+        context = context if isinstance(context, dict) else {}
+        train_combat = self._train_ability_uses_combat_keeper(phase)
+        if phase_kind != "farm" and not train_combat:
             return None
         intent = self._campaign_phase_farm_intent(phase)
         assigned_room = intent.get("assigned_room")
@@ -10113,13 +10337,18 @@ class BotController:
         if not isinstance(use_safe_spots, bool):
             missing.append("context.use_safe_spots")
         if missing:
+            label = "combat-training" if train_combat else "farm"
             return {
-                "kind": "invalid_farm_phase_context",
+                "kind": (
+                    "invalid_combat_training_phase_context"
+                    if train_combat
+                    else "invalid_farm_phase_context"
+                ),
                 "assigned_room": assigned_room,
                 "hunt": target,
                 "use_safe_spots": use_safe_spots,
                 "guidance": (
-                    "farm phase is not executable; provide structured "
+                    f"{label} phase is not executable; provide structured "
                     + ", ".join(missing)
                     + " instead of relying on rationale prose"
                 ),
@@ -10129,12 +10358,17 @@ class BotController:
             for criterion in criteria
         ):
             return {
-                "kind": "invalid_farm_phase_outcome",
+                "kind": (
+                    "invalid_combat_training_phase_outcome"
+                    if train_combat
+                    else "invalid_farm_phase_outcome"
+                ),
                 "assigned_room": assigned_room,
                 "hunt": target,
                 "guidance": (
-                    "farm phase cannot complete when the keeper merely launches; "
-                    "require an observable farming outcome such as the next max-HP milestone"
+                    f"{('combat-training' if train_combat else 'farm')} phase cannot complete "
+                    "when the keeper merely launches; require an observable outcome such as "
+                    "an ability or max-HP milestone"
                 ),
             }
         if isinstance(observation, dict):
@@ -10908,8 +11142,9 @@ class BotController:
             )
         self._invalidate_execution_plan(goal, reason)
         keeper_result: Any = None
-        keeper_released = phase.get("kind") != "farm"
-        if phase.get("kind") == "farm":
+        keeper_owned_phase = phase.get("kind") in {"farm", "train_ability"}
+        keeper_released = not keeper_owned_phase
+        if keeper_owned_phase:
             try:
                 keeper = self.broker.call_tool(
                     "autopilot",
@@ -12386,6 +12621,22 @@ class BotController:
             else None
         )
         self._guard_map_semantics(campaign_phase, tool, arguments)
+        if (
+            tool == "fight"
+            and isinstance(campaign_phase, dict)
+            and campaign_phase.get("kind") == "train_ability"
+        ):
+            intent = self._campaign_phase_farm_intent(campaign_phase)
+            recipe = (
+                f"{intent.get('hunt')} in room {intent.get('assigned_room')}"
+                if intent.get("hunt") and intent.get("assigned_room") is not None
+                else "a grounded prey and assigned room"
+            )
+            raise ModelError(
+                "foreground fight is unsafe for combat training because it performs only "
+                "one swing and model latency leaves the character exposed; launch the "
+                f"bounded farm keeper for {recipe} instead"
+            )
         self._guard_prepare_combat_sale(
             goal,
             campaign_phase,
@@ -13387,6 +13638,16 @@ class BotController:
                     "background_farm_owner_v1",
                     {
                         "goal_id": goal["id"],
+                        "phase_id": (
+                            campaign_phase.get("id")
+                            if isinstance(campaign_phase, dict)
+                            else None
+                        ),
+                        "phase_kind": (
+                            campaign_phase.get("kind")
+                            if isinstance(campaign_phase, dict)
+                            else None
+                        ),
                         "assigned_room": arguments.get("assigned_room"),
                         "hunt": str(arguments.get("hunt") or "").strip().casefold(),
                         "use_safe_spots": arguments.get("use_safe_spots"),
