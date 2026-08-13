@@ -2030,33 +2030,220 @@ class BotController:
 
         if str((phase or {}).get("kind") or "") != "prepare_combat":
             return None
-        spells = deep_get(observation, "spells.spells", [])
-        direct = [
+        phase_text = canonical_json(
             {
+                "objective": (phase or {}).get("objective"),
+                "context": (phase or {}).get("context"),
+            }
+        ).casefold()
+        needs_weapon = bool(
+            re.search(r"\b(?:weapon|damage|wield|equip)\b", phase_text)
+        )
+        needs_food = bool(
+            re.search(r"\b(?:food|snack|consumable|healing suppl)\w*\b", phase_text)
+        )
+        if not needs_weapon and not needs_food:
+            # Preserve the longstanding generic prepare_combat behavior when a
+            # legacy phase has no descriptive objective/context.
+            needs_weapon = True
+        spells = deep_get(observation, "spells.spells", [])
+        direct: list[dict[str, Any]] = []
+        for spell in spells if isinstance(spells, list) else []:
+            if not isinstance(spell, dict) or spell.get("castable") is not True:
+                continue
+            name = " ".join(str(spell.get("name") or "").split())
+            normalized_name = name.casefold()
+            is_weapon = bool(
+                needs_weapon
+                and re.search(r"\b(?:create|conjure|summon)\s+weapon\b", name, re.I)
+            )
+            is_food = normalized_name == "create food" and needs_food
+            if not (is_weapon or is_food):
+                continue
+            capability = {
                 key: spell.get(key)
                 for key in ("name", "mana", "reagents", "castable", "blocked_by")
                 if spell.get(key) is not None
             }
-            for spell in (spells if isinstance(spells, list) else [])
-            if isinstance(spell, dict)
-            and spell.get("castable") is True
-            and re.search(
-                r"\b(?:create|conjure|summon)\s+weapon\b",
-                str(spell.get("name") or ""),
-                re.IGNORECASE,
-            )
-        ]
+            if is_weapon:
+                capability.update(
+                    {
+                        "npc_transferable": False,
+                        "funding_eligible": False,
+                        "server_semantics": (
+                            "Create Weapon marks its product IA_MADE. Item.CanBeGivenToNPC "
+                            "therefore rejects it before merchant preference is evaluated."
+                        ),
+                    }
+                )
+            elif is_food and spell.get("reagents") == []:
+                capability["server_semantics"] = (
+                    "Create Food has no reagent prerequisite in the verified live spell "
+                    "record; cast it directly without a shopping or funding detour."
+                )
+            direct.append(capability)
         if not direct:
             return None
         return {
             "purpose": (
-                "These live, castable capabilities can directly satisfy the current "
-                "equipment prerequisite. Prefer them before speculative shopping or "
-                "liquidation detours."
+                "These live, castable capabilities directly satisfy requirements named "
+                "by the current preparation phase. Prefer them before speculative "
+                "shopping or liquidation detours and obey their server semantics."
             ),
             "preferred_tool": "cast",
             "capabilities": direct,
         }
+
+    @classmethod
+    def _direct_capability_plan_error(
+        cls,
+        phase: dict[str, Any] | None,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+        assumptions: list[str] | None = None,
+    ) -> str | None:
+        """Reject commerce invented ahead of a verified zero-input capability."""
+
+        direct = cls._direct_phase_capabilities(phase, observation)
+        capabilities = direct.get("capabilities") if isinstance(direct, dict) else []
+        capabilities = capabilities if isinstance(capabilities, list) else []
+        create_food = next(
+            (
+                item
+                for item in capabilities
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip().casefold() == "create food"
+                and item.get("reagents") == []
+            ),
+            None,
+        )
+        if create_food is not None:
+            cast_index = next(
+                (
+                    index
+                    for index, step in enumerate(steps)
+                    if step.get("tool") == "cast"
+                    and "create food"
+                    in " ".join(
+                        str(step.get(field) or "")
+                        for field in ("outcome", "verification")
+                    ).casefold()
+                ),
+                None,
+            )
+            if cast_index is None:
+                return (
+                    "the active phase explicitly requires food and live Create Food is "
+                    "castable with an empty reagent list; include a direct cast step "
+                    "instead of inventing a commerce prerequisite"
+                )
+            detours = [
+                step
+                for step in steps[:cast_index]
+                if step.get("tool") in {"sell", "sell_all"}
+                or cls._is_plan_purchase_step(step)
+            ]
+            if detours:
+                return (
+                    "live Create Food is castable with no reagents, so the proposed "
+                    "pre-cast sale/purchase detour cannot be a prerequisite; remove the "
+                    "commerce steps and cast Create Food directly"
+                )
+            assumption_text = " ".join(assumptions or []).casefold()
+            if "create food" in assumption_text and re.search(
+                r"\b(?:reagent|elderberry|herbs?)\b", assumption_text
+            ):
+                return (
+                    "the plan invents Create Food reagents even though the verified live "
+                    "spell record has an empty reagent list; cast it directly"
+                )
+
+        create_weapon_indexes = [
+            index
+            for index, step in enumerate(steps)
+            if step.get("tool") == "cast"
+            and "create weapon"
+            in " ".join(
+                str(step.get(field) or "")
+                for field in ("outcome", "verification")
+            ).casefold()
+        ]
+        for cast_index in create_weapon_indexes:
+            for step in steps[cast_index + 1 :]:
+                if step.get("tool") not in {"sell", "sell_all"}:
+                    continue
+                sale_text = " ".join(
+                    str(step.get(field) or "")
+                    for field in ("outcome", "verification")
+                ).casefold()
+                if re.search(r"\b(?:created|conjured|summoned)\s+weapon\b", sale_text):
+                    return (
+                        "Create Weapon products are marked IA_MADE and cannot be given "
+                        "to any NPC; use the created weapon as equipment, never as a "
+                        "sale or funding step"
+                    )
+        return None
+
+    def _targeted_sale_grounding_error(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> str | None:
+        """Require exact identity when a sale name could select the wrong instance."""
+
+        if str((phase or {}).get("kind") or "") not in {
+            "prepare_combat",
+            "liquidate_inventory",
+        }:
+            return None
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        ids = {
+            str(item.get("id", item.get("object_id"))).strip().casefold()
+            for item in items
+            if item.get("id", item.get("object_id")) is not None
+        }
+        counts: dict[str, int] = {}
+        for item in items:
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        duplicates = {name for name, count in counts.items() if count > 1}
+        restricted = self._intrinsically_unsellable_item_ids(goal)
+        for step in steps:
+            if step.get("tool") != "sell":
+                continue
+            sale_text = " ".join(
+                str(step.get(field) or "")
+                for field in ("outcome", "verification")
+            ).casefold()
+            mentioned_ids = {
+                item_id
+                for item_id in ids
+                if re.search(rf"\b{re.escape(item_id)}\b", sale_text)
+            }
+            ambiguous_names = sorted(
+                name
+                for name in duplicates
+                if re.search(rf"\b{re.escape(name)}s?\b", sale_text)
+            )
+            if ambiguous_names and not mentioned_ids:
+                return (
+                    "the targeted sale names duplicate inventory item(s) "
+                    + ", ".join(repr(name) for name in ambiguous_names)
+                    + " without an exact current item id. Bind the sale to the intended "
+                    "unequipped inventory id so a protected or non-transferable duplicate "
+                    "cannot be selected"
+                )
+            if restricted and not mentioned_ids:
+                return (
+                    "the targeted sale does not name an exact current inventory id while "
+                    "another carried instance is verified non-transferable; bind the plan "
+                    "to a specific different id before choosing a buyer"
+                )
+        return None
 
     def _execution_plan(self, goal: dict[str, Any]) -> dict[str, Any] | None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
@@ -2225,6 +2412,26 @@ class BotController:
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
         sale_recovery_error = self._sale_recovery_plan_error(goal, stored_steps)
+        direct_capability_error = self._direct_capability_plan_error(
+            phase,
+            stored_steps,
+            self.last_observation or {},
+            value.get("assumptions")
+            if isinstance(value.get("assumptions"), list)
+            else [],
+        )
+        if direct_capability_error is not None:
+            self._invalidate_execution_plan(goal, direct_capability_error)
+            return None
+        sale_grounding_error = self._targeted_sale_grounding_error(
+            goal,
+            phase,
+            stored_steps,
+            self.last_observation or {},
+        )
+        if sale_grounding_error is not None:
+            self._invalidate_execution_plan(goal, sale_grounding_error)
+            return None
         if sale_recovery_error is not None:
             self._invalidate_execution_plan(goal, sale_recovery_error)
             intrinsic_item_reused = "cannot be given to any NPC" in sale_recovery_error
@@ -3551,6 +3758,22 @@ class BotController:
         sale_recovery_error = self._sale_recovery_plan_error(
             goal, normalized_steps
         )
+        direct_capability_error = self._direct_capability_plan_error(
+            phase,
+            normalized_steps,
+            self.last_observation or {},
+            assumptions,
+        )
+        if direct_capability_error is not None:
+            raise ModelError(direct_capability_error)
+        sale_grounding_error = self._targeted_sale_grounding_error(
+            goal,
+            phase,
+            normalized_steps,
+            self.last_observation or {},
+        )
+        if sale_grounding_error is not None:
+            raise ModelError(sale_grounding_error)
         if sale_recovery_error is not None:
             raise ModelError(sale_recovery_error)
         funding_error = self._plan_funding_error(
@@ -15906,6 +16129,16 @@ class BotController:
             "valued_items": valued_items[:30],
             "unknown_value_items": unknown_value_items[:30],
             "npc_transfer_restricted_items": npc_transfer_restricted_items[:30],
+            "npc_transfer_rules": [
+                {
+                    "source": "Create Weapon",
+                    "rule": (
+                        "Every created weapon receives IA_MADE and cannot be given "
+                        "to an NPC, so it is equipment only and never sale funding."
+                    ),
+                    "source_ref": "CreateWeapon.Cast / Item.CanBeGivenToNPC",
+                }
+            ],
             "buyer_candidates": (
                 self.knowledge.buyer_candidates(
                     [

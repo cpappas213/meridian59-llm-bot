@@ -2412,6 +2412,161 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual("cast", context["preferred_tool"])
         self.assertEqual("Create Weapon", context["capabilities"][0]["name"])
 
+    def test_direct_prepare_combat_capabilities_ground_create_food_semantics(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "objective": "Equip a weapon and create consumable food.",
+            "context": {},
+        }
+        observation = {
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Weapon",
+                        "mana": 15,
+                        "reagents": [],
+                        "castable": True,
+                    },
+                    {
+                        "name": "Create Food",
+                        "mana": 10,
+                        "reagents": [],
+                        "castable": True,
+                    },
+                ]
+            }
+        }
+
+        context = BotController._direct_phase_capabilities(phase, observation)
+
+        self.assertIsNotNone(context)
+        capabilities = {
+            item["name"]: item for item in (context or {}).get("capabilities", [])
+        }
+        self.assertFalse(capabilities["Create Weapon"]["npc_transferable"])
+        self.assertFalse(capabilities["Create Weapon"]["funding_eligible"])
+        self.assertIn("no reagent prerequisite", capabilities["Create Food"]["server_semantics"])
+
+        detour = [
+            {
+                "id": "sell-mace",
+                "tool": "sell",
+                "outcome": "Sell mace id 2 to raise funds.",
+                "verification": "Shillings increase.",
+            },
+            {
+                "id": "buy-herbs",
+                "tool": "shop",
+                "outcome": "Buy ElderBerry and Herbs as Create Food reagents.",
+                "verification": "Inventory contains the reagents.",
+            },
+            {
+                "id": "create-food",
+                "tool": "cast",
+                "outcome": "Cast Create Food.",
+                "verification": "Inventory contains food.",
+            },
+        ]
+        self.assertIn(
+            "castable with no reagents",
+            BotController._direct_capability_plan_error(
+                phase, detour, observation, []
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._direct_capability_plan_error(
+                phase,
+                [detour[-1]],
+                observation,
+                [],
+            )
+        )
+        self.assertIn(
+            "invents Create Food reagents",
+            BotController._direct_capability_plan_error(
+                phase,
+                [detour[-1]],
+                observation,
+                ["Create Food requires ElderBerry and Herbs."],
+            )
+            or "",
+        )
+
+        created_weapon_sale = [
+            {
+                "id": "create-weapon",
+                "tool": "cast",
+                "outcome": "Cast Create Weapon.",
+                "verification": "A created weapon appears.",
+            },
+            {
+                "id": "sell-created",
+                "tool": "sell",
+                "outcome": "Sell the created weapon to raise funds.",
+                "verification": "Shillings increase.",
+            },
+        ]
+        weapon_only_phase = {
+            "kind": "prepare_combat",
+            "objective": "Equip a reliable weapon.",
+            "context": {},
+        }
+        self.assertIn(
+            "IA_MADE",
+            BotController._direct_capability_plan_error(
+                weapon_only_phase,
+                created_weapon_sale,
+                observation,
+                [],
+            )
+            or "",
+        )
+        self.assertIn("Create Weapon products are marked IA_MADE", PLANNER_SYSTEM)
+
+    def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="duplicate-sale-grounding")
+                )["goal"]
+                phase = {"kind": "prepare_combat", "context": {}}
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "mace", "in_use": True},
+                            {"id": 2, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 1, "name": "mace"}]},
+                    "look": {"room": {"num": 106}},
+                }
+                vague = [
+                    {
+                        "tool": "sell",
+                        "outcome": "Sell one spare mace.",
+                        "verification": "The mace is removed and shillings increase.",
+                    }
+                ]
+                exact = copy.deepcopy(vague)
+                exact[0]["outcome"] = "Sell the unequipped mace with exact item id 2."
+
+                self.assertIn(
+                    "without an exact current item id",
+                    controller._targeted_sale_grounding_error(
+                        goal, phase, vague, observation
+                    )
+                    or "",
+                )
+                self.assertIsNone(
+                    controller._targeted_sale_grounding_error(
+                        goal, phase, exact, observation
+                    )
+                )
+            finally:
+                controller.storage.close()
+
     def test_execution_plan_drops_toolless_monitor_step_when_qwen_returns_nine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
