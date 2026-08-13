@@ -5152,6 +5152,15 @@ class ControllerTests(unittest.TestCase):
                 stored = controller._execution_plan(goal)
                 self.assertIsNotNone(stored)
                 self.assertEqual("reach-bank", stored["last_action"]["step_id"])
+                next_observation = controller._reconcile_recent_room_transition(
+                    broker.observe()
+                )
+                self.assertEqual(
+                    54,
+                    controller._observation_room(next_observation),
+                )
+                controller.last_observation = next_observation
+                self.assertIsNotNone(controller._execution_plan(goal))
                 self.assertEqual(
                     [],
                     controller.storage.events(kinds=["planner.plan.invalidated"])[
@@ -5161,7 +5170,7 @@ class ControllerTests(unittest.TestCase):
                 reconciled = controller.storage.events(
                     kinds=["action.movement_observation_reconciled"]
                 )["events"]
-                self.assertEqual(1, len(reconciled))
+                self.assertEqual(2, len(reconciled))
                 self.assertEqual(100, reconciled[0]["data"]["stale_observed_room"])
                 self.assertEqual(54, reconciled[0]["data"]["receipt_room"])
             finally:

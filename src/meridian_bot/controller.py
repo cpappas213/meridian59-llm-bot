@@ -140,6 +140,7 @@ GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
+RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
@@ -881,7 +882,35 @@ class BotController:
         )
 
     @staticmethod
+    def _successful_room_transition_receipt(
+        tool: str, result: Any
+    ) -> dict[str, Any] | None:
+        if tool not in FOREGROUND_ROOM_TRANSITION_TOOLS or not isinstance(
+            result, dict
+        ):
+            return None
+        succeeded = (
+            (tool == "travel" and result.get("arrived") is True)
+            or (tool in {"go_through", "leave_raza"} and result.get("left") is True)
+        )
+        if not succeeded:
+            return None
+        room = deep_get(result, "now.room")
+        if not isinstance(room, dict):
+            room = result.get("room")
+        if not isinstance(room, dict) and tool == "travel":
+            room = result.get("destination")
+        if not isinstance(room, dict):
+            return None
+        room_id = room.get("num", room.get("id"))
+        room_name = room.get("name")
+        if room_id is None and room_name is None:
+            return None
+        return dict(room)
+
+    @classmethod
     def _reconcile_successful_room_transition(
+        cls,
         tool: str,
         result: Any,
         observation: dict[str, Any],
@@ -897,32 +926,93 @@ class BotController:
         receipt's authoritative destination.
         """
 
-        if tool not in FOREGROUND_ROOM_TRANSITION_TOOLS or not isinstance(
-            result, dict
-        ):
-            return observation
-        succeeded = (
-            (tool == "travel" and result.get("arrived") is True)
-            or (tool in {"go_through", "leave_raza"} and result.get("left") is True)
-        )
-        if not succeeded:
-            return observation
-        room = deep_get(result, "now.room")
-        if not isinstance(room, dict):
-            room = result.get("room")
-        if not isinstance(room, dict) and tool == "travel":
-            room = result.get("destination")
-        if not isinstance(room, dict):
-            return observation
-        room_id = room.get("num", room.get("id"))
-        room_name = room.get("name")
-        if room_id is None and room_name is None:
+        room = cls._successful_room_transition_receipt(tool, result)
+        if room is None:
             return observation
         reconciled = dict(observation)
         look = observation.get("look")
         look = dict(look) if isinstance(look, dict) else {}
         look["room"] = dict(room)
         reconciled["look"] = look
+        return reconciled
+
+    def _remember_successful_room_transition(
+        self,
+        tool: str,
+        result: Any,
+        *,
+        goal_id: str | None,
+    ) -> None:
+        """Retain one short-lived receipt for the next independent observation."""
+
+        room = self._successful_room_transition_receipt(tool, result)
+        if room is None:
+            return
+        self.storage.set_runtime(
+            RECENT_ROOM_TRANSITION_RUNTIME_KEY,
+            {
+                "tool": tool,
+                "goal_id": goal_id,
+                "room": room,
+                "recorded_at": timestamp(),
+                # The stale client cache normally clears within one controller
+                # cadence, but the intervening model turn can take up to two
+                # minutes. A bounded time/count window avoids overriding a
+                # later genuine manual or out-of-band room transition.
+                "expires_unix": time.time() + 180,
+                "stale_observations_reconciled": 0,
+            },
+        )
+
+    def _reconcile_recent_room_transition(
+        self, observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Carry an authoritative arrival receipt across the next stale look."""
+
+        receipt = self.storage.get_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY)
+        if not isinstance(receipt, dict):
+            return observation
+        expires_unix = receipt.get("expires_unix")
+        if not isinstance(expires_unix, (int, float)) or expires_unix < time.time():
+            self.storage.set_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY, None)
+            return observation
+        room = receipt.get("room")
+        if not isinstance(room, dict):
+            self.storage.set_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY, None)
+            return observation
+        receipt_room = room.get("num", room.get("id", room.get("name")))
+        observed_room = self._observation_room(observation)
+        if str(observed_room) == str(receipt_room):
+            # A second independent observation corroborated the receipt.
+            self.storage.set_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY, None)
+            return observation
+        stale_count = int(receipt.get("stale_observations_reconciled", 0) or 0)
+        if stale_count >= 3:
+            self.storage.set_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY, None)
+            return observation
+        receipt = {
+            **receipt,
+            "stale_observations_reconciled": stale_count + 1,
+        }
+        self.storage.set_runtime(RECENT_ROOM_TRANSITION_RUNTIME_KEY, receipt)
+        reconciled = dict(observation)
+        look = observation.get("look")
+        look = dict(look) if isinstance(look, dict) else {}
+        look["room"] = dict(room)
+        reconciled["look"] = look
+        self.storage.emit_event(
+            "action.movement_observation_reconciled",
+            "Reconciled a stale next-turn room from the recent successful movement receipt",
+            severity="info",
+            interesting=False,
+            goal_id=receipt.get("goal_id"),
+            data={
+                "tool": receipt.get("tool"),
+                "stale_observed_room": observed_room,
+                "receipt_room": receipt_room,
+                "scope": "next_controller_observation",
+            },
+        )
         return reconciled
 
     def _repair_position_unknown_lessons(self) -> list[dict[str, Any]]:
@@ -1380,7 +1470,9 @@ class BotController:
             self._set_fallback()
             if self.config.controller.conversation_enabled:
                 self._start_conversation_listener()
-            self.last_observation = self.broker.observe()
+            self.last_observation = self._reconcile_recent_room_transition(
+                self.broker.observe()
+            )
             self._record_character_progress(self.last_observation)
             self._repair_bank_receipt()
         else:
@@ -6720,7 +6812,9 @@ class BotController:
             self._begin_foreground_action("reconcile_after_action_error")
             if "not in game" in error.casefold() and self.config.game.autojoin:
                 self.broker.ensure_joined()
-            observation = self.broker.observe()
+            observation = self._reconcile_recent_room_transition(
+                self.broker.observe()
+            )
             self.last_observation = observation
             self._remember_safe_staging(observation)
             self.storage.record_snapshot(redact(observation))
@@ -12716,7 +12810,9 @@ class BotController:
         if not self._turn_lock.acquire(blocking=False):
             return {"skipped": "turn already running"}
         try:
-            observation = self.broker.observe()
+            observation = self._reconcile_recent_room_transition(
+                self.broker.observe()
+            )
             self.last_observation = observation
             self._remember_safe_staging(observation)
             self.storage.record_snapshot(redact(observation))
@@ -15369,6 +15465,11 @@ class BotController:
                 tool,
                 result,
                 fresh_observation,
+            )
+            self._remember_successful_room_transition(
+                tool,
+                result,
+                goal_id=goal["id"],
             )
             reconciled_room = self._observation_room(self.last_observation)
             if str(reconciled_room) != str(observed_room):
