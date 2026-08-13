@@ -691,6 +691,42 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(completed.completed)
                 self.assertEqual("succeeded", completed.phase["status"])
 
+    def test_prepare_combat_snack_target_migrates_to_semantic_food(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Create one edible supply.",
+                        "success_criteria": [
+                            {
+                                "id": "food-stock",
+                                "kind": "inventory_contains",
+                                "item": "Snack",
+                                "count": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 30},
+                    },
+                    mode="start",
+                )
+
+                completed = coordinator.evaluate_phase(
+                    goal,
+                    run,
+                    phase,
+                    {"inventory": {"items": [{"name": "apple"}]}},
+                )
+
+                self.assertTrue(completed.completed)
+                persisted = storage.campaign_phases(run["id"])[0]
+                self.assertEqual("food", persisted["success_criteria"][0]["item"])
+
     def test_progression_fallback_uses_controller_evidence_not_human_confirmation(self) -> None:
         goal = goal_payload(
             objective="Raise maximum HP to 25.",

@@ -736,6 +736,18 @@ class CampaignCoordinator:
             ):
                 value["value"] = [value["value"]]
             if (
+                isinstance(value, dict)
+                and phase_kind == "prepare_combat"
+                and value.get("kind") == "inventory_contains"
+                and " ".join(str(value.get("item") or "").split()).casefold()
+                in {"food", "edible food", "snack", "snacks"}
+            ):
+                # Create Food materializes concrete edible items (at MANIAC's
+                # current ability, apples); there is no literal inventory item
+                # named Snack.  Keep the phase's semantic intent while giving
+                # the deterministic evaluator a canonical category.
+                value["item"] = "food"
+            if (
                 migrate_legacy
                 and isinstance(value, dict)
             ):

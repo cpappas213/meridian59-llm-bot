@@ -428,6 +428,9 @@ validate and hand off as an executable farm recipe. Do not combine those aliases
 For prepare_combat, never use phase_action_succeeded alone for a mutating cast, shop, sell, sell_all, or act
 outcome. Adapter return does not prove the intended preparation happened. Include an observable typed target such
 as item_count_at_least for created food, wielding_equals/equipment_known for gear, or inventory_not_full for space.
+When the intended supply is any edible product of Create Food, use item_count_at_least with item="food". This is
+the controller's semantic edible category. Never use item="Snack" or claim food heals health: Create Food yields
+concrete items such as apples and those restore vigor. Preserve the exact desired quantity in the target.
 Phase budgets are normalized to at least 8 actions and 30 minutes; repeated equivalent semantic failure can end
 a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot.
 Each abandon_predicates entry is an OR trigger: if any one becomes deterministically true, the controller ends only
