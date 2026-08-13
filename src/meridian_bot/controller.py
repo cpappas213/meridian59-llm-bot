@@ -736,6 +736,146 @@ class BotController:
         )
         return released
 
+    def _repair_overbroad_safe_spot_quarantines(self) -> list[dict[str, Any]]:
+        """Release room bans created from local square or supply evidence.
+
+        A failed safe-spot coordinate is durable input to the keeper's square
+        selector, not evidence that every other square in the room is unsafe.
+        Likewise, using the last carried healing supply describes preparation,
+        not an intrinsic property of the room/prey tactic. Older controllers
+        promoted either condition to a whole-room quarantine.
+        """
+
+        local_markers = (
+            "repeated safe-spot failures left too little healing margin",
+            "healing supplies were depleted",
+        )
+        raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        if not isinstance(raw, dict):
+            return []
+        quarantines = dict(raw)
+        released: list[dict[str, Any]] = []
+        for key, record in list(quarantines.items()):
+            if not isinstance(record, dict):
+                continue
+            reasons = [
+                str(reason).strip().casefold()
+                for reason in record.get("reasons", [])
+                if str(reason).strip()
+            ]
+            deltas = record.get("deltas")
+            deltas = deltas if isinstance(deltas, dict) else {}
+            consequential = any(
+                int(deltas.get(name, 0) or 0) > 0
+                for name in (
+                    "deaths",
+                    "withdrawals",
+                    "deaths_in_safe_spot",
+                    "deaths_in_proven_safe_spot",
+                )
+            )
+            local_only = bool(reasons) and all(
+                any(marker in reason for marker in local_markers)
+                for reason in reasons
+            )
+            if not local_only or consequential:
+                continue
+            released.append(
+                {
+                    **record,
+                    "released_at": timestamp(),
+                    "release_reason": (
+                        "safe-spot failures are coordinate-scoped and healing "
+                        "supplies are preparation state, not whole-room evidence"
+                    ),
+                }
+            )
+            quarantines.pop(key, None)
+        if not released:
+            return []
+
+        self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+        self._clear_released_farm_retreat_incidents(released)
+        affected_goal_ids = {
+            str(item.get("goal_id") or "") for item in released if item.get("goal_id")
+        }
+
+        def matches_release(lesson: dict[str, Any]) -> bool:
+            summary = str(lesson.get("summary") or "").casefold()
+            if not any(marker in summary for marker in local_markers):
+                return False
+            failed = deep_get(lesson, "failed_state.failed_tactic", {})
+            failed = failed if isinstance(failed, dict) else {}
+            arguments = failed.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            room = arguments.get("assigned_room")
+            target = " ".join(str(arguments.get("hunt") or "").casefold().split())
+            use_safe_spots = arguments.get("use_safe_spots")
+            for item in released:
+                item_room = item.get("assigned_room", item.get("room"))
+                item_target = " ".join(
+                    str(item.get("target") or "").casefold().split()
+                )
+                item_safe_spots = item.get("use_safe_spots")
+                if str(room) != str(item_room):
+                    continue
+                if target and item_target and target != item_target:
+                    continue
+                if (
+                    isinstance(use_safe_spots, bool)
+                    and isinstance(item_safe_spots, bool)
+                    and use_safe_spots != item_safe_spots
+                ):
+                    continue
+                return True
+            return False
+
+        repaired_lessons = [
+            self.storage.update_goal_lesson(
+                lesson["id"],
+                "resolved",
+                evidence={
+                    "repair": (
+                        "the failed coordinates remain excluded by keeper safe-spot "
+                        "evidence; the surrounding room/prey tactic is available"
+                    ),
+                    "at": timestamp(),
+                },
+            )
+            for lesson in self.storage.goal_lessons(
+                statuses=["deferred", "unlocked"], limit=200
+            )
+            if lesson.get("scope") == "tactic" and matches_release(lesson)
+        ]
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
+        suppression = self.storage.get_runtime("safety_suppression_v1")
+        if isinstance(suppression, dict) and "quarantined_farm_tactic" in suppression.get(
+            "blocker_kinds", []
+        ):
+            self.storage.set_runtime("safety_suppression_v1", None)
+            self._clear_planner_feedback()
+        self.storage.emit_event(
+            "background_farm.quarantine_released",
+            "Released room quarantines created from coordinate-local safe-spot failures",
+            severity="notice",
+            interesting=False,
+            data={
+                "rooms": [item.get("room") for item in released],
+                "targets": [item.get("target") for item in released],
+                "lesson_ids": [item.get("id") for item in repaired_lessons],
+                "research_retry_reopened": bool(affected_goal_ids),
+            },
+        )
+        return released
+
     def _repair_recovered_farm_route_evidence(
         self, observation: dict[str, Any]
     ) -> list[dict[str, Any]]:
@@ -1757,6 +1897,7 @@ class BotController:
             )
             self._repair_capability_unlocked_farm_quarantines(self.last_observation)
             self._repair_policy_obsolete_farm_quarantines()
+            self._repair_overbroad_safe_spot_quarantines()
             self._repair_disproved_farm_route_stagnations()
             self._repair_recovered_farm_route_evidence(self.last_observation)
             self._repair_transient_farm_stagnations()
@@ -10136,17 +10277,19 @@ class BotController:
             quarantine_reasons.append("a claimed safe spot failed lethally")
         if safe_spot_disproved:
             tactic_warnings.append("live journal evidence disproved a safe spot")
-        # A wall being disproved is useful tactical learning, but the keeper is
-        # explicitly built to abandon that square and try another one (or fight
-        # in the open).  Quarantine only when repeated wall failures have also
-        # consumed nearly all healing margin.  Health, withdrawal, and death
-        # boundaries above remain immediate fail-closed signals.
-        if safe_spot_failure_count >= 3 and current_supplies <= 1:
-            quarantine_reasons.append(
-                "repeated safe-spot failures left too little healing margin"
+        # A wall being disproved is useful coordinate-local learning. The
+        # keeper already retires that exact square and selects another one;
+        # neither three failed squares nor low carried supplies prove the rest
+        # of the room unsafe. Health, repeated retreat, withdrawal, death, and
+        # live over-level-hostile boundaries above remain fail-closed signals.
+        if safe_spot_disproved and safe_spot_failure_count >= 3:
+            tactic_warnings.append(
+                "multiple safe-spot coordinates were retired; the room remains eligible"
             )
         if supplies_used and current_supplies == 0:
-            quarantine_reasons.append("healing supplies were depleted")
+            tactic_warnings.append(
+                "the last healing supply was consumed; replenish before a later hazardous launch"
+            )
         risk_reasons.extend(recovery_reasons)
         risk_reasons.extend(quarantine_reasons)
 

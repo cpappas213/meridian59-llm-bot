@@ -10044,6 +10044,137 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_safe_spot_coordinate_failures_do_not_quarantine_whole_room(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 583, "name": "Outskirts of Barloque"}
+                broker.farm_room = 583
+                broker.farm_hunt = "slime"
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="coordinate-local-safe-spots")
+                )["goal"]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+                status["journal"] = [
+                    {
+                        "pass": number,
+                        "what": "this is not a safe spot",
+                        "lost": 2,
+                        "where": {"col": number, "row": number + 1},
+                    }
+                    for number in (11, 12, 13)
+                ]
+
+                evidence = controller._farm_status_evidence(
+                    goal, broker.observe(), status
+                )
+
+                self.assertEqual(3, evidence["safe_spot_failure_count"])
+                self.assertEqual([], evidence["quarantine_reasons"])
+                self.assertIn(
+                    "multiple safe-spot coordinates were retired; the room remains eligible",
+                    evidence["tactic_warnings"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_legacy_coordinate_local_quarantines_and_lessons_are_released(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-coordinate-quarantine")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                observation = broker.observe()
+                deferred = controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="autopilot",
+                    arguments={
+                        "action": "start",
+                        "mode": "farm",
+                        "assigned_room": 583,
+                        "hunt": "slime",
+                        "use_safe_spots": True,
+                    },
+                    reason=(
+                        "Background farming exceeded verified survivability in "
+                        "the assigned room: repeated safe-spot failures left too "
+                        "little healing margin"
+                    ),
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                    block=False,
+                )
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1",
+                    {
+                        "583": {
+                            "room": 583,
+                            "assigned_room": 583,
+                            "target": "slime",
+                            "use_safe_spots": True,
+                            "goal_id": goal["id"],
+                            "reasons": [
+                                "repeated safe-spot failures left too little healing margin"
+                            ],
+                            "deltas": {"deaths": 0, "withdrawals": 0},
+                        },
+                        "557": {
+                            "room": 557,
+                            "assigned_room": 557,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "goal_id": goal["id"],
+                            "reasons": [
+                                "repeated retreat episodes reached the farm tactic safety limit"
+                            ],
+                            "deltas": {"deaths": 0, "withdrawals": 1},
+                        },
+                    },
+                )
+                exhaustion = {
+                    "kind": "no_usable_farm_recipe",
+                    "fingerprint": "all-excluded",
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: exhaustion},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"], external_blocker=exhaustion
+                )
+
+                released = controller._repair_overbroad_safe_spot_quarantines()
+
+                self.assertEqual([583], [item["room"] for item in released])
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_quarantine_v1", {}
+                )
+                self.assertNotIn("583", remaining)
+                self.assertIn("557", remaining)
+                lesson = controller.storage.goal_lesson(deferred["lesson"]["id"])
+                self.assertEqual("resolved", lesson["status"])
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime(
+                        RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                    ),
+                )
+                self.assertIsNone(
+                    controller.storage.campaign_run(goal["id"])[
+                        "external_blocker"
+                    ]
+                )
+            finally:
+                controller.storage.close()
+
     def test_survival_fallback_clears_retained_farm_routing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
