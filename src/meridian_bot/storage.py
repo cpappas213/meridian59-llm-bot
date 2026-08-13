@@ -1871,7 +1871,7 @@ class Storage:
 
     def update_action_attempt(self, attempt_id: str, state: str, *, result: Any = None, error_code: str | None = None) -> None:
         sent_at = timestamp() if state == "sent" else None
-        finished_at = timestamp() if state in {"succeeded", "failed", "unknown"} else None
+        finished_at = timestamp() if state in {"succeeded", "partial", "failed", "unknown"} else None
         self._connect().execute(
             """UPDATE action_attempts SET state=?, sent_at=COALESCE(?,sent_at), finished_at=COALESCE(?,finished_at),
                result_json=COALESCE(?,result_json), error_code=? WHERE id=?""",
@@ -2317,9 +2317,9 @@ class Storage:
         result: Any = None,
         verification: Any = None,
     ) -> dict[str, Any]:
-        if status not in {"prepared", "sent", "succeeded", "failed", "unknown", "suppressed"}:
+        if status not in {"prepared", "sent", "succeeded", "partial", "failed", "unknown", "suppressed"}:
             raise ValueError("invalid phase attempt status")
-        terminal = timestamp() if status in {"succeeded", "failed", "unknown", "suppressed"} else None
+        terminal = timestamp() if status in {"succeeded", "partial", "failed", "unknown", "suppressed"} else None
         self._connect().execute(
             """UPDATE phase_attempts SET status=?,action_attempt_id=COALESCE(?,action_attempt_id),
                result_json=COALESCE(?,result_json),verification_json=COALESCE(?,verification_json),

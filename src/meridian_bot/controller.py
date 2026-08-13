@@ -3879,6 +3879,7 @@ class BotController:
         tool: str,
         arguments: dict[str, Any],
         result: Any,
+        status: str | None = None,
     ) -> None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
         if not isinstance(values, dict) or not isinstance(values.get(goal["id"]), dict):
@@ -3890,6 +3891,7 @@ class BotController:
             "arguments": redact(arguments),
             "observed_at": timestamp(),
             "result_summary": str(redact(result))[:1000],
+            **({"status": status} if status else {}),
         }
         value["updated_at"] = timestamp()
         values = dict(values)
@@ -12111,6 +12113,61 @@ class BotController:
                     for step in execution_plan.get("steps", [])
                     if isinstance(step, dict) and str(step.get("id") or "") == step_id
                 )
+                last_plan_action = execution_plan.get("last_action")
+                if (
+                    safe_return_checkpoint is None
+                    and isinstance(last_plan_action, dict)
+                    and last_plan_action.get("status") == "partial_progress"
+                ):
+                    required_step_id = str(last_plan_action.get("step_id") or "")
+                    if step_id != required_step_id:
+                        return self._reject_planner_action(
+                            goal,
+                            "The preceding travel call made verified partial progress but did "
+                            "not reach its destination. Continue that same stored travel step "
+                            f"{required_step_id!r}; do not advance to a later plan step.",
+                            decision=decision,
+                            execution_plan=execution_plan,
+                            result={
+                                "partial_travel_incomplete": True,
+                                "required_plan_step_id": required_step_id,
+                            },
+                        )
+                    prior_arguments = last_plan_action.get("arguments")
+                    current_arguments = (
+                        decision.get("arguments")
+                        if isinstance(decision.get("arguments"), dict)
+                        else {}
+                    )
+                    prior_destination = next(
+                        (
+                            prior_arguments.get(key)
+                            for key in ("to", "destination", "room", "room_id")
+                            if isinstance(prior_arguments, dict)
+                            and prior_arguments.get(key) is not None
+                        ),
+                        None,
+                    )
+                    current_destination = next(
+                        (
+                            current_arguments.get(key)
+                            for key in ("to", "destination", "room", "room_id")
+                            if current_arguments.get(key) is not None
+                        ),
+                        None,
+                    )
+                    if str(current_destination) != str(prior_destination):
+                        return self._reject_planner_action(
+                            goal,
+                            "The incomplete travel step must retain its original destination "
+                            f"{prior_destination!r}; received {current_destination!r}.",
+                            decision=decision,
+                            execution_plan=execution_plan,
+                            result={
+                                "partial_travel_incomplete": True,
+                                "required_destination": prior_destination,
+                            },
+                        )
                 safe_step_id = str(
                     deep_get(execution_plan, "safe_ending.step_id", "")
                 )
@@ -12361,6 +12418,11 @@ class BotController:
             return None
         source: dict[str, Any] | None = None
         last_action = execution_plan.get("last_action")
+        if (
+            isinstance(last_action, dict)
+            and last_action.get("status") == "partial_progress"
+        ):
+            return None
         if isinstance(last_action, dict) and last_action.get("observed_at"):
             source = {
                 "kind": "completed_plan_action",
@@ -13771,6 +13833,90 @@ class BotController:
                         **deferred,
                     }
                 return {"action": tool, "no_progress": True, "reason": no_progress, "result": redact(result)}
+            partial_progress = self._partial_progress_reason(
+                result,
+                observation,
+                tool=tool,
+                arguments=arguments,
+            )
+            if partial_progress:
+                # A multi-hop travel can move through several verified rooms and
+                # then stop on a later transient hop. The RPC produced useful
+                # movement, but `arrived:false` means the plan step's declared
+                # destination is still unmet. Preserve the plan and force the
+                # same step to resume from the new live room on the next turn.
+                self._record_plan_action(
+                    goal,
+                    step_id=str(plan.get("plan_step_id") or "controller-owned-step"),
+                    tool=tool,
+                    arguments=arguments,
+                    result=result,
+                    status="partial_progress",
+                )
+                self.storage.update_action_attempt(
+                    attempt_id,
+                    "partial",
+                    result=redact(result),
+                    error_code="OUTCOME_INCOMPLETE",
+                )
+                finish_phase_attempt(
+                    "partial",
+                    action_attempt_id=attempt_id,
+                    result=result,
+                    verification={
+                        "partial_progress": True,
+                        "outcome_complete": False,
+                        "reason": partial_progress,
+                    },
+                )
+                event = self.storage.emit_event(
+                    "action.partial_progress",
+                    f"Action made partial progress but did not complete: {tool}",
+                    interesting=False,
+                    goal_id=goal["id"],
+                    data={
+                        "tool": tool,
+                        "arguments": redact(arguments),
+                        "reason": partial_progress,
+                        "result": redact(result),
+                        "attempt_id": attempt_id,
+                    },
+                    correlation_id=correlation_id,
+                    policy_decision_id=policy.id,
+                )
+                self.last_observation = self.broker.observe()
+                self.storage.record_snapshot(redact(self.last_observation))
+                self._set_planner_feedback(
+                    goal,
+                    partial_progress
+                    + " The route itself is not disproved. Keep the existing execution "
+                    "plan and repeat this same plan step with the same destination from "
+                    "the newly observed room; do not advance or revise the plan.",
+                    failure_context={
+                        "kind": "partial_progress",
+                        "tool": tool,
+                        "arguments": redact(arguments),
+                        "room": self._observation_room(self.last_observation),
+                        "outcome_complete": False,
+                    },
+                )
+                if assessment_id:
+                    self.storage.complete_consequence(
+                        assessment_id,
+                        outcome={
+                            "action_event_id": event["id"],
+                            "partial_progress": True,
+                            "result": redact(result),
+                        },
+                        succeeded=True,
+                    )
+                return {
+                    "action": tool,
+                    "partial_progress": True,
+                    "outcome_complete": False,
+                    "reason": partial_progress,
+                    "result": redact(result),
+                }
             if (
                 tool == "bank"
                 and arguments.get("action") == "deposit"
@@ -13790,6 +13936,14 @@ class BotController:
             # mislead both the next planner turn and supervisor status into
             # treating a recovered route as still blocked.
             self._clear_planner_feedback()
+            self._record_plan_action(
+                goal,
+                step_id=str(plan.get("plan_step_id") or "controller-owned-step"),
+                tool=tool,
+                arguments=arguments,
+                result=result,
+                status="succeeded",
+            )
             self.storage.update_action_attempt(attempt_id, "succeeded", result=redact(result))
             finish_phase_attempt(
                 "succeeded",
@@ -14635,6 +14789,50 @@ class BotController:
             + "Do not repeat the same call unchanged. Use returned route, exit, inventory, or location evidence to "
             "choose a materially different tool or target; prefer authoritative numeric ids."
         )
+
+    @staticmethod
+    def _partial_progress_reason(
+        result: Any,
+        observation: dict[str, Any],
+        *,
+        tool: str | None = None,
+        arguments: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Recognize useful movement that did not fulfill the requested trip."""
+
+        if tool != "travel" or not isinstance(result, dict):
+            return None
+        if result.get("arrived") is not False:
+            return None
+        before_room = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "status.room.num"),
+        )
+        after_room = deep_get(result, "now.room.num")
+        if (
+            before_room is None
+            or after_room is None
+            or str(before_room) == str(after_room)
+        ):
+            return None
+        requested = next(
+            (
+                (arguments or {}).get(key)
+                for key in ("to", "destination", "room", "room_id")
+                if (arguments or {}).get(key) is not None
+            ),
+            deep_get(result, "destination.num"),
+        )
+        after_name = deep_get(result, "now.room.name")
+        destination_text = (
+            f" destination {requested}" if requested is not None else " the requested destination"
+        )
+        return (
+            f"Travel advanced from room {before_room} to room {after_room}"
+            + (f" ({after_name})" if after_name else "")
+            + f" but did not reach{destination_text}."
+        )[:500]
 
     @staticmethod
     def _no_progress_reason(
@@ -15757,6 +15955,7 @@ class BotController:
             else self.storage.latest_events(limit=1, kinds=["action.succeeded"])
         )
         progress_kinds = [
+            "action.partial_progress",
             "progress.hp_gained",
             "progress.skill_learned",
             "progress.spell_learned",

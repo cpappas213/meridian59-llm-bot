@@ -428,6 +428,40 @@ class NoProgressBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class PartialTravelBroker(SimulatedBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.room = {"num": 1, "name": "Room A"}
+        self.tools["travel"] = Tool(
+            "travel",
+            "Travel to a destination.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "to": {"type": "integer"},
+                },
+                "required": ["agent", "to"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "travel":
+            self.calls.append((name, dict(arguments)))
+            self.room = {"num": 3, "name": "Room C"}
+            return {
+                "arrived": False,
+                "reason": "gave up after 25 hops",
+                "destination": {"num": int(arguments["to"]), "name": "Room Z"},
+                "log": [
+                    {"from": "Room A", "to": "Room B", "ok": True},
+                    {"from": "Room B", "to": "Room C", "ok": True},
+                ],
+                "now": {"room": dict(self.room)},
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
 class UnwieldableWeaponBroker(SimulatedBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -3862,6 +3896,85 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(1, len(suppression))
                 feedback = controller.storage.get_runtime("planner_feedback")
                 self.assertEqual("travel", feedback["blocked_action"]["tool"])
+            finally:
+                controller.storage.close()
+
+    def test_partial_travel_is_not_recorded_as_completed_plan_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = PartialTravelBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                source_verify_safe_rooms(controller, 54)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="partial-travel-plan-step")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Reach the work room, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "reach-work-room",
+                                    "outcome": "Reach room 99.",
+                                    "tool": "travel",
+                                    "verification": "Current room id is 99.",
+                                }
+                            ],
+                        },
+                        54,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "travel",
+                        "arguments": {"to": 99},
+                        "rationale": "Continue to the verified work room.",
+                        "plan_step_id": "reach-work-room",
+                    },
+                )
+
+                self.assertTrue(result["partial_progress"])
+                self.assertFalse(result["outcome_complete"])
+                self.assertEqual(3, broker.room["num"])
+                self.assertEqual(
+                    [], controller.storage.events(kinds=["action.succeeded"])["events"]
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(kinds=["action.partial_progress"])[
+                            "events"
+                        ]
+                    ),
+                )
+                self.assertEqual(
+                    [], controller.storage.events(kinds=["action.no_progress"])["events"]
+                )
+                stored = controller._execution_plan(goal)
+                self.assertIsNotNone(stored)
+                self.assertEqual(
+                    "partial_progress", stored["last_action"]["status"]
+                )
+                self.assertEqual(
+                    "reach-work-room", stored["last_action"]["step_id"]
+                )
+                self.assertIsNone(
+                    controller._plan_revision_authorization(
+                        goal,
+                        stored,
+                        controller.storage.get_runtime("planner_feedback"),
+                    )
+                )
+                feedback = controller.storage.get_runtime("planner_feedback")
+                self.assertIn("repeat this same plan step", feedback["message"])
             finally:
                 controller.storage.close()
 
