@@ -880,6 +880,51 @@ class BotController:
             for value in (room.get("num"), room.get("name"))
         )
 
+    @staticmethod
+    def _reconcile_successful_room_transition(
+        tool: str,
+        result: Any,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Prefer an affirmative movement receipt over a briefly stale look.
+
+        A successful foreground transition returns its arrival room directly.
+        The first separate ``look`` after a long multi-hop travel can still
+        expose the source room from the client's cache.  Mixing that stale room
+        with the fresh inventory/status response makes stored-plan validation
+        reject legitimate room-local follow-up steps such as ``bank``.  Preserve
+        the full fresh observation, but replace only its room with the movement
+        receipt's authoritative destination.
+        """
+
+        if tool not in FOREGROUND_ROOM_TRANSITION_TOOLS or not isinstance(
+            result, dict
+        ):
+            return observation
+        succeeded = (
+            (tool == "travel" and result.get("arrived") is True)
+            or (tool in {"go_through", "leave_raza"} and result.get("left") is True)
+        )
+        if not succeeded:
+            return observation
+        room = deep_get(result, "now.room")
+        if not isinstance(room, dict):
+            room = result.get("room")
+        if not isinstance(room, dict) and tool == "travel":
+            room = result.get("destination")
+        if not isinstance(room, dict):
+            return observation
+        room_id = room.get("num", room.get("id"))
+        room_name = room.get("name")
+        if room_id is None and room_name is None:
+            return observation
+        reconciled = dict(observation)
+        look = observation.get("look")
+        look = dict(look) if isinstance(look, dict) else {}
+        look["room"] = dict(room)
+        reconciled["look"] = look
+        return reconciled
+
     def _repair_position_unknown_lessons(self) -> list[dict[str, Any]]:
         """Resolve route lessons that only captured transient client/protocol loss."""
 
@@ -15167,7 +15212,29 @@ class BotController:
                 )
             if assessment_id:
                 self.storage.complete_consequence(assessment_id, outcome={"action_event_id": event["id"], "result": redact(result)}, succeeded=True)
-            self.last_observation = post_action or self.broker.observe()
+            fresh_observation = post_action or self.broker.observe()
+            observed_room = self._observation_room(fresh_observation)
+            self.last_observation = self._reconcile_successful_room_transition(
+                tool,
+                result,
+                fresh_observation,
+            )
+            reconciled_room = self._observation_room(self.last_observation)
+            if str(reconciled_room) != str(observed_room):
+                self.storage.emit_event(
+                    "action.movement_observation_reconciled",
+                    "Reconciled a stale post-movement room from the successful action receipt",
+                    severity="info",
+                    interesting=False,
+                    goal_id=goal["id"],
+                    data={
+                        "tool": tool,
+                        "stale_observed_room": observed_room,
+                        "receipt_room": reconciled_room,
+                    },
+                    correlation_id=correlation_id,
+                    policy_decision_id=policy.id,
+                )
             if (
                 tool == "leave_raza"
                 and isinstance(result, dict)

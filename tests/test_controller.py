@@ -462,6 +462,46 @@ class PartialTravelBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class StalePostTravelBroker(SimulatedBroker):
+    """Return an authoritative arrival while look briefly retains the source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tools["bank"] = Tool(
+            "bank",
+            "Use a bank in the current room.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": ["agent", "action"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "travel":
+            self.calls.append((name, dict(arguments)))
+            destination = int(arguments["to"])
+            # Deliberately leave self.room unchanged so the immediately
+            # following observe reproduces the live client's stale look.
+            return {
+                "arrived": True,
+                "destination": {
+                    "num": destination,
+                    "name": "First Royal Bank of Tos",
+                },
+                "now": {
+                    "room": {
+                        "num": destination,
+                        "name": "First Royal Bank of Tos",
+                    }
+                },
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
 class UnwieldableWeaponBroker(SimulatedBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -4855,6 +4895,75 @@ class ControllerTests(unittest.TestCase):
                 )
                 feedback = controller.storage.get_runtime("planner_feedback")
                 self.assertIn("repeat this same plan step", feedback["message"])
+            finally:
+                controller.storage.close()
+
+    def test_successful_travel_receipt_prevents_stale_room_plan_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = StalePostTravelBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                source_verify_safe_rooms(controller, 54)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="stale-post-travel-bank-room")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Travel to the bank, check it, and finish safely.",
+                            "steps": [
+                                {
+                                    "id": "reach-bank",
+                                    "outcome": "Travel to First Royal Bank of Tos room 54.",
+                                    "tool": "travel",
+                                    "verification": "Current room id is 54.",
+                                },
+                                {
+                                    "id": "check-bank",
+                                    "outcome": "Check the balance in bank room 54.",
+                                    "tool": "bank",
+                                    "verification": "Bank reports the account balance.",
+                                },
+                            ],
+                        },
+                        54,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "travel",
+                        "arguments": {"to": 54},
+                        "rationale": "Reach the bank before using it.",
+                        "plan_step_id": "reach-bank",
+                    },
+                )
+
+                self.assertEqual("travel", result["action"])
+                self.assertEqual(100, broker.room["num"])
+                self.assertEqual(54, controller._observation_room(controller.last_observation))
+                stored = controller._execution_plan(goal)
+                self.assertIsNotNone(stored)
+                self.assertEqual("reach-bank", stored["last_action"]["step_id"])
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
+                )
+                reconciled = controller.storage.events(
+                    kinds=["action.movement_observation_reconciled"]
+                )["events"]
+                self.assertEqual(1, len(reconciled))
+                self.assertEqual(100, reconciled[0]["data"]["stale_observed_room"])
+                self.assertEqual(54, reconciled[0]["data"]["receipt_room"])
             finally:
                 controller.storage.close()
 
