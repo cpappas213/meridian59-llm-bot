@@ -2867,6 +2867,61 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_positive_bank_balance_protects_phase_required_inventory_from_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="bank-preserves-phase-inventory")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "balance",
+                            "balance": 1712,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                phase = {
+                    "kind": "prepare_combat",
+                    "success_criteria": [
+                        {
+                            "id": "food-stock",
+                            "kind": "inventory_contains",
+                            "item": "food",
+                            "count": 4,
+                        }
+                    ],
+                }
+                observation = {
+                    "inventory": {
+                        "items": [{"id": 17375, "name": "apple"}]
+                    }
+                }
+                sell_plan = [
+                    {
+                        "id": "sell-apple",
+                        "tool": "sell",
+                        "outcome": "Sell apple id 17375 to raise reagent funds.",
+                        "verification": "Apple is removed and shillings increase.",
+                    }
+                ]
+
+                error = controller._phase_required_sale_plan_error(
+                    phase, sell_plan, observation
+                )
+
+                self.assertIn("durable bank evidence shows 1712", error or "")
+                self.assertIn("travel to bank room 54", error or "")
+            finally:
+                controller.storage.close()
+
     def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

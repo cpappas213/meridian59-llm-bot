@@ -2654,6 +2654,114 @@ class BotController:
             )
         return None
 
+    def _phase_required_sale_plan_error(
+        self,
+        phase: dict[str, Any] | None,
+        steps: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> str | None:
+        """Prefer known bank funds over liquidating an active phase outcome."""
+
+        positive_accounts = [
+            account
+            for account in self._latest_bank_balance_context()
+            if isinstance(account.get("last_known_balance"), (int, float))
+            and account["last_known_balance"] > 0
+        ]
+        if not positive_accounts:
+            return None
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        for criterion in (phase or {}).get("success_criteria", []):
+            if not isinstance(criterion, dict) or criterion.get("kind") != "inventory_contains":
+                continue
+            requested = " ".join(
+                str(criterion.get("item") or "").split()
+            ).casefold()
+            semantic_food = requested in {"food", "edible food"}
+            matching = [
+                item
+                for item in items
+                if (
+                    any(
+                        marker
+                        in " ".join(
+                            str(item.get("name") or "").split()
+                        ).casefold()
+                        for marker in EDIBLE_FOOD_NAME_MARKERS
+                    )
+                    if semantic_food
+                    else requested
+                    in " ".join(
+                        str(item.get("name") or "").split()
+                    ).casefold()
+                )
+            ]
+            if not matching:
+                continue
+            for step in steps:
+                tool = str(step.get("tool") or "")
+                if tool not in {"sell", "sell_all"}:
+                    continue
+                text = " ".join(
+                    str(step.get(field) or "")
+                    for field in ("outcome", "verification")
+                ).casefold()
+                if tool == "sell_all":
+                    targets_required_item = not re.search(
+                        r"\b(?:keep|preserve|retain)\b.{0,80}"
+                        + (
+                            r"\b(?:food|edible|snacks?)\b"
+                            if semantic_food
+                            else rf"\b{re.escape(requested)}s?\b"
+                        ),
+                        text,
+                    )
+                    target = "required inventory"
+                else:
+                    selected = next(
+                        (
+                            item
+                            for item in matching
+                            if (
+                                item.get("id", item.get("object_id")) is not None
+                                and re.search(
+                                    rf"\b{re.escape(str(item.get('id', item.get('object_id'))))}\b",
+                                    text,
+                                )
+                            )
+                            or re.search(
+                                rf"\b{re.escape(str(item.get('name') or '').casefold())}s?\b",
+                                text,
+                            )
+                        ),
+                        None,
+                    )
+                    targets_required_item = selected is not None
+                    target = (
+                        f"{selected.get('name')} id "
+                        f"{selected.get('id', selected.get('object_id'))}"
+                        if isinstance(selected, dict)
+                        else "required inventory"
+                    )
+                if not targets_required_item:
+                    continue
+                richest = max(
+                    positive_accounts,
+                    key=lambda account: float(account["last_known_balance"]),
+                )
+                return (
+                    f"execution_plan step {step.get('id')!r} sells {target}, which "
+                    f"currently contributes to active phase criterion {criterion.get('id')!r}, "
+                    f"while durable bank evidence shows {richest['last_known_balance']} "
+                    f"shillings in account {richest['account']!r}. Purpose: do not consume "
+                    "the outcome being assembled when a non-destructive grounded funding "
+                    f"route exists; preserve the {requested} inventory and precede the "
+                    f"purchase with travel to bank room {TOS_BANK_ROOM_ID} plus a live bank "
+                    "check/withdrawal"
+                )
+        return None
+
     def _targeted_sale_grounding_error(
         self,
         goal: dict[str, Any],
@@ -2935,6 +3043,27 @@ class BotController:
         )
         if direct_capability_error is not None:
             self._invalidate_execution_plan(goal, direct_capability_error)
+            return None
+        phase_required_sale_error = self._phase_required_sale_plan_error(
+            phase, stored_steps, self.last_observation or {}
+        )
+        if phase_required_sale_error is not None:
+            self._invalidate_execution_plan(goal, phase_required_sale_error)
+            self._set_planner_feedback(
+                goal,
+                phase_required_sale_error,
+                failure_context={
+                    "kind": "phase_required_inventory_sale",
+                    "purpose": (
+                        "Preserve inventory already satisfying the active phase when "
+                        "durably known bank funds provide a non-destructive route."
+                    ),
+                    "required_response": (
+                        "Replace the sale with separate travel-to-bank and bank "
+                        "check/withdrawal steps before the purchase."
+                    ),
+                },
+            )
             return None
         phase_inventory_error = self._phase_inventory_plan_error(
             phase, stored_steps, self.last_observation or {}
@@ -4305,6 +4434,11 @@ class BotController:
         )
         if direct_capability_error is not None:
             raise ModelError(direct_capability_error)
+        phase_required_sale_error = self._phase_required_sale_plan_error(
+            phase, normalized_steps, self.last_observation or {}
+        )
+        if phase_required_sale_error is not None:
+            raise ModelError(phase_required_sale_error)
         phase_inventory_error = self._phase_inventory_plan_error(
             phase, normalized_steps, self.last_observation or {}
         )
