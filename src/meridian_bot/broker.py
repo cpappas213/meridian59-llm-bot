@@ -309,10 +309,9 @@ class BrokerClient:
             "status": status,
             "inventory": inventory,
         }
-        # Vigor above the resting cap requires food.  Reagents count as a usable
-        # food supply only when the character actually knows Create Food, so keep
-        # the controller's preflight grounded in the broker's verified spell list
-        # rather than inferring knowledge from carried herbs and elderberries.
+        # Spell knowledge is planner context, not an instruction to provision.
+        # In particular, exposing Create Food here must never cause the controller
+        # to insert food, reagent, funding, or eating work on the planner's behalf.
         if "spells" in self.capabilities():
             try:
                 observation["spells"] = self.call_tool(
