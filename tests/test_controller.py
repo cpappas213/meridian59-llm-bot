@@ -11914,6 +11914,19 @@ class ControllerTests(unittest.TestCase):
                     scope="tactic",
                     block=False,
                 )["lesson"]
+                legacy_goal_lesson = controller.learning.defer_goal(
+                    goal,
+                    SimulatedBroker().observe(),
+                    tool="autopilot",
+                    arguments={"action": "start", "mode": "farm"},
+                    reason=(
+                        "Repeated critical-health interrupts show that the "
+                        "current goal exceeds verified combat readiness"
+                    ),
+                    classification="insufficient_combat_power",
+                    scope="goal",
+                    block=False,
+                )["lesson"]
                 controller.storage.set_runtime(
                     "farm_tactic_quarantine_v1",
                     {
@@ -11968,6 +11981,12 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     "resolved",
                     controller.storage.goal_lesson(lesson["id"])["status"],
+                )
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(legacy_goal_lesson["id"])[
+                        "status"
+                    ],
                 )
                 former_policy = next(
                     item for item in released if item["room"] == 557

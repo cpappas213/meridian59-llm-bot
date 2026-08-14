@@ -970,6 +970,22 @@ class BotController:
             if item.get("goal_id")
         }
 
+        def is_legacy_recovery_lesson(lesson: dict[str, Any]) -> bool:
+            if not is_obsolete_farm_recovery_failure(lesson.get("summary")):
+                return False
+            return bool(
+                (
+                    lesson.get("scope") == "tactic"
+                    and lesson.get("classification") == "ineffective_tactic"
+                )
+                or (
+                    lesson.get("scope") == "goal"
+                    and lesson.get("classification") == "insufficient_combat_power"
+                    and "repeated critical-health interrupts"
+                    in str(lesson.get("summary") or "").casefold()
+                )
+            )
+
         repaired_lessons = [
             self.storage.update_goal_lesson(
                 lesson["id"],
@@ -978,7 +994,7 @@ class BotController:
                 evidence={
                     "repair": (
                         "ordinary threshold/rest/withdraw/resume cycles cannot "
-                        "invalidate a productive farm tactic"
+                        "invalidate a productive farm tactic or strategic goal"
                     ),
                     "at": timestamp(),
                 },
@@ -986,9 +1002,7 @@ class BotController:
             for lesson in self.storage.goal_lessons(
                 statuses=["deferred", "unlocked"], limit=200
             )
-            if lesson.get("scope") == "tactic"
-            and lesson.get("classification") == "ineffective_tactic"
-            and is_obsolete_farm_recovery_failure(lesson.get("summary"))
+            if is_legacy_recovery_lesson(lesson)
         ]
         affected_goal_ids.update(
             str(lesson.get("goal_id") or "")

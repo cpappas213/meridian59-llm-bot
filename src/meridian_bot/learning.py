@@ -63,6 +63,7 @@ FARM_RECOVERY_REASON_MARKERS = (
     "health crossed the keeper flee threshold",
     "the keeper had to withdraw",
     "repeated retreat episodes reached",
+    "repeated critical-health interrupts",
 )
 
 
