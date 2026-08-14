@@ -10622,6 +10622,48 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_active_legacy_farm_vigor_recipe_normalizes_without_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="normalize-active-vigor-recipe")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 575.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "context": {
+                            "room": 575,
+                            "target": "giant rat",
+                            "fight_above_vigor": 100,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(goal, {})
+
+                self.assertTrue(result["campaign_phase_policy_migrated"])
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(farm["id"], active["id"])
+                self.assertEqual(80, active["context"]["fight_above_vigor"])
+                self.assertEqual("active", active["status"])
+            finally:
+                controller.storage.close()
+
     def test_background_farm_allows_keeper_to_provision_from_carried_food(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

@@ -15451,6 +15451,32 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
+        phase_context = (
+            dict(phase.get("context"))
+            if isinstance(phase.get("context"), dict)
+            else {}
+        )
+        combat_recipe_phase = phase.get("kind") == "farm" or (
+            phase.get("kind") == "train_ability"
+            and phase_context.get("training_method") == "combat"
+        )
+        policy_normalized = False
+        if (
+            combat_recipe_phase
+            and phase_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR
+            and deep_get(observation, "autopilot.running") is not True
+        ):
+            phase_context["fight_above_vigor"] = FARM_FIGHT_VIGOR
+            phase = self.storage.update_campaign_phase_guardrails(
+                phase["id"],
+                abandon_predicates=phase.get("abandon_predicates", []),
+                context=phase_context,
+                reason=(
+                    "normalized persisted combat vigor policy to the natural "
+                    f"rested floor of {FARM_FIGHT_VIGOR}"
+                ),
+            )
+            policy_normalized = True
         retired_phases: list[dict[str, Any]] = []
         old_required_vigor: int | None = None
         while phase is not None and len(retired_phases) < 2:
@@ -15542,6 +15568,35 @@ class BotController:
                 "campaign_phase_completed": True,
                 "campaign_phase_policy_migrated": True,
                 "phase": retired_phases[-1],
+                "next_phase": phase,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
+        if policy_normalized:
+            reason = (
+                "normalized persisted combat vigor policy to the natural rested "
+                f"floor of {FARM_FIGHT_VIGOR}"
+            )
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.combat_vigor_policy_migrated",
+                "Normalized an active combat phase to the rested vigor floor",
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "phase_id": phase.get("id"),
+                    "new_required_vigor": FARM_FIGHT_VIGOR,
+                    "strategic_goal_preserved": True,
+                },
+            )
+            return {
+                "campaign_phase_policy_migrated": True,
+                "phase": phase,
                 "next_phase": phase,
                 "goal_blocked": False,
                 "goal": self.storage.goal(goal["id"]),
