@@ -15502,6 +15502,23 @@ class BotController:
                 "retired obsolete above-rest vigor recovery stack; ordinary farms "
                 f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
             )
+            if isinstance(phase, dict) and phase.get("kind") in {
+                "farm",
+                "train_ability",
+            }:
+                resumed_context = (
+                    dict(phase.get("context"))
+                    if isinstance(phase.get("context"), dict)
+                    else {}
+                )
+                if resumed_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR:
+                    resumed_context["fight_above_vigor"] = FARM_FIGHT_VIGOR
+                    phase = self.storage.update_campaign_phase_guardrails(
+                        phase["id"],
+                        abandon_predicates=phase.get("abandon_predicates", []),
+                        context=resumed_context,
+                        reason=reason,
+                    )
             self._invalidate_execution_plan(goal, reason)
             self._clear_safety_suppression(str(goal.get("id") or ""))
             self._clear_planner_feedback()

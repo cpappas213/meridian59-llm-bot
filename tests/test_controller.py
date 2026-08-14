@@ -10612,6 +10612,12 @@ class ControllerTests(unittest.TestCase):
                     farm["id"],
                     controller.storage.active_campaign_phase(run["id"])["id"],
                 )
+                self.assertEqual(
+                    80,
+                    controller.storage.active_campaign_phase(run["id"])["context"][
+                        "fight_above_vigor"
+                    ],
+                )
                 self.assertIsNone(controller._execution_plan(goal))
             finally:
                 controller.storage.close()
