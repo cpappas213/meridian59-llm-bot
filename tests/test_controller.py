@@ -10557,10 +10557,36 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="push",
                 )
+                bootstrap = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Earn food money for the obsolete vigor gate.",
+                        "success_criteria": [
+                            {
+                                "id": "legacy-food-funds",
+                                "kind": "numeric_threshold",
+                                "metric": "carried_currency",
+                                "operator": ">=",
+                                "value": 90,
+                            }
+                        ],
+                        "context": {
+                            "reason": "bootstrap_combat_funding",
+                            "room": 563,
+                            "target": "ant",
+                            "fight_above_vigor": 80,
+                            "use_safe_spots": True,
+                            "resume_vigor_phase_id": support["id"],
+                        },
+                    },
+                    mode="push",
+                )
 
                 result = controller._reconcile_existing_campaign_phase(
                     goal,
                     {
+                        "autopilot": {"running": False},
                         "status": {
                             "vitals": {
                                 "vigor": {
@@ -10574,7 +10600,14 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertTrue(result["campaign_phase_policy_migrated"])
-                self.assertEqual("succeeded", controller.storage.campaign_phase(support["id"])["status"])
+                self.assertEqual(
+                    "succeeded",
+                    controller.storage.campaign_phase(bootstrap["id"])["status"],
+                )
+                self.assertEqual(
+                    "succeeded",
+                    controller.storage.campaign_phase(support["id"])["status"],
+                )
                 self.assertEqual(
                     farm["id"],
                     controller.storage.active_campaign_phase(run["id"])["id"],

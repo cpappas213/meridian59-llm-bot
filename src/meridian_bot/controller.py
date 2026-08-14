@@ -15451,53 +15451,86 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
-        context = phase.get("context") if isinstance(phase.get("context"), dict) else {}
-        if (
-            phase.get("kind") == "prepare_combat"
-            and context.get("reason") == "recover_combat_vigor"
-        ):
-            try:
-                required_vigor = int(context.get("required_vigor") or 0)
-            except (TypeError, ValueError):
-                required_vigor = 0
-            if required_vigor > FARM_FIGHT_VIGOR:
-                reason = (
-                    f"retired obsolete {required_vigor}-vigor provisioning gate; "
+        retired_phases: list[dict[str, Any]] = []
+        old_required_vigor: int | None = None
+        while phase is not None and len(retired_phases) < 2:
+            context = (
+                phase.get("context")
+                if isinstance(phase.get("context"), dict)
+                else {}
+            )
+            phase_reason = context.get("reason")
+            obsolete_bootstrap = (
+                phase.get("kind") == "farm"
+                and phase_reason == "bootstrap_combat_funding"
+            )
+            obsolete_recovery = False
+            if (
+                phase.get("kind") == "prepare_combat"
+                and phase_reason == "recover_combat_vigor"
+            ):
+                try:
+                    required_vigor = int(context.get("required_vigor") or 0)
+                except (TypeError, ValueError):
+                    required_vigor = 0
+                obsolete_recovery = required_vigor > FARM_FIGHT_VIGOR
+                if obsolete_recovery:
+                    old_required_vigor = required_vigor
+            if not obsolete_bootstrap and not obsolete_recovery:
+                break
+            if obsolete_bootstrap and deep_get(observation, "autopilot.running") is True:
+                # Never abandon a keeper-owned phase while it may be outside
+                # safe staging. A later safe restart/reconciliation can retire
+                # the obsolete stack without orphaning hazardous movement.
+                break
+            reason = (
+                "retired obsolete combat-provision funding bootstrap"
+                if obsolete_bootstrap
+                else (
+                    f"retired obsolete {old_required_vigor}-vigor provisioning gate; "
                     f"ordinary farms now start at the rested floor of {FARM_FIGHT_VIGOR}"
                 )
-                result_phase = self.storage.transition_campaign_phase(
+            )
+            retired_phases.append(
+                self.storage.transition_campaign_phase(
                     phase["id"], "succeeded", reason=reason, resume_parent=True
                 )
-                next_phase = self.storage.active_campaign_phase(run["id"])
-                self._invalidate_execution_plan(goal, reason)
-                self._clear_safety_suppression(str(goal.get("id") or ""))
-                self._clear_planner_feedback()
-                self.storage.emit_event(
-                    "campaign.combat_vigor_policy_migrated",
-                    "Removed an obsolete above-rest vigor support phase",
-                    severity="notice",
-                    interesting=False,
-                    goal_id=goal.get("id"),
-                    data={
-                        "retired_phase_id": phase.get("id"),
-                        "old_required_vigor": required_vigor,
-                        "new_required_vigor": FARM_FIGHT_VIGOR,
-                        "resumed_parent_phase_id": (
-                            next_phase.get("id") if isinstance(next_phase, dict) else None
-                        ),
-                        "strategic_goal_preserved": True,
-                    },
-                )
-                return {
-                    "campaign_phase_completed": True,
-                    "campaign_phase_policy_migrated": True,
-                    "phase": result_phase,
-                    "next_phase": next_phase,
-                    "goal_blocked": False,
-                    "goal": self.storage.goal(goal["id"]),
-                    "keeper_released": True,
+            )
+            phase = self.storage.active_campaign_phase(run["id"])
+        if retired_phases:
+            reason = (
+                "retired obsolete above-rest vigor recovery stack; ordinary farms "
+                f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
+            )
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.combat_vigor_policy_migrated",
+                "Removed obsolete above-rest vigor support work",
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "retired_phase_ids": [item.get("id") for item in retired_phases],
+                    "old_required_vigor": old_required_vigor,
+                    "new_required_vigor": FARM_FIGHT_VIGOR,
+                    "resumed_parent_phase_id": (
+                        phase.get("id") if isinstance(phase, dict) else None
+                    ),
                     "strategic_goal_preserved": True,
-                }
+                },
+            )
+            return {
+                "campaign_phase_completed": True,
+                "campaign_phase_policy_migrated": True,
+                "phase": retired_phases[-1],
+                "next_phase": phase,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if (
