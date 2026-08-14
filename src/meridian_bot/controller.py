@@ -10103,9 +10103,10 @@ class BotController:
         """Convert an unsatisfied keeper-vigor gate into bounded preparation.
 
         Resting deliberately stops at 80 vigor.  When the selected keeper phase
-        needs more and no carried/cookable food can bridge the gap, repeated
-        launch attempts cannot change the state.  Pause the exact farm as a
-        parent and let a typed child phase fund, acquire, create, and eat food.
+        explicitly needs more than that and no carried/cookable food can bridge
+        the gap, repeated launch attempts cannot change the state.  A target at
+        or below the resting ceiling belongs to the keeper's ordinary recovery
+        loop and must never become a food-acquisition phase.
         """
 
         run = self.storage.campaign_run(str(goal.get("id") or ""))
@@ -10148,6 +10149,11 @@ class BotController:
             required = max(FARM_FIGHT_VIGOR, int(required_raw or FARM_FIGHT_VIGOR))
             current = int(vigor_raw or 0)
         except (TypeError, ValueError):
+            return None
+        if required <= RESTED_VIGOR_FLOOR:
+            # The keeper can recover this shortfall by resting.  Turning a
+            # 78 -> 80 dip into merchant/funding work makes a bounded farm
+            # oscillate between one engagement and one provisioning campaign.
             return None
         supply = self._combat_vigor_supply(observation)
         if (
@@ -15426,6 +15432,7 @@ class BotController:
             policy_normalized = True
         retired_phases: list[dict[str, Any]] = []
         old_required_vigor: int | None = None
+        retired_rest_reachable_recovery = False
         while phase is not None and len(retired_phases) < 2:
             context = (
                 phase.get("context")
@@ -15438,6 +15445,7 @@ class BotController:
                 and phase_reason == "bootstrap_combat_funding"
             )
             obsolete_recovery = False
+            required_vigor: int | None = None
             if (
                 phase.get("kind") == "prepare_combat"
                 and phase_reason == "recover_combat_vigor"
@@ -15446,9 +15454,16 @@ class BotController:
                     required_vigor = int(context.get("required_vigor") or 0)
                 except (TypeError, ValueError):
                     required_vigor = 0
-                obsolete_recovery = required_vigor > FARM_FIGHT_VIGOR
+                # Above-rest gates are normalized away, while an at/below-rest
+                # gate is recoverable by the keeper itself.  Neither belongs in
+                # a persisted food-provisioning phase.
+                obsolete_recovery = required_vigor > 0
                 if obsolete_recovery:
                     old_required_vigor = required_vigor
+                    retired_rest_reachable_recovery = (
+                        retired_rest_reachable_recovery
+                        or required_vigor <= RESTED_VIGOR_FLOOR
+                    )
             if not obsolete_bootstrap and not obsolete_recovery:
                 break
             if obsolete_bootstrap and deep_get(observation, "autopilot.running") is True:
@@ -15460,20 +15475,36 @@ class BotController:
                 "retired obsolete combat-provision funding bootstrap"
                 if obsolete_bootstrap
                 else (
-                    f"retired obsolete {old_required_vigor}-vigor provisioning gate; "
-                    f"ordinary farms now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                    f"retired unnecessary {old_required_vigor}-vigor provisioning gate; "
+                    f"ordinary rest reaches {RESTED_VIGOR_FLOOR} and the keeper owns recovery"
                 )
             )
             retired_phases.append(
                 self.storage.transition_campaign_phase(
-                    phase["id"], "succeeded", reason=reason, resume_parent=True
+                    phase["id"],
+                    (
+                        "superseded"
+                        if obsolete_recovery
+                        and required_vigor is not None
+                        and required_vigor <= RESTED_VIGOR_FLOOR
+                        else "succeeded"
+                    ),
+                    reason=reason,
+                    resume_parent=True,
                 )
             )
             phase = self.storage.active_campaign_phase(run["id"])
         if retired_phases:
             reason = (
-                "retired obsolete above-rest vigor recovery stack; ordinary farms "
-                f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                (
+                    "retired rest-reachable vigor provisioning; ordinary recovery "
+                    "belongs to the keeper"
+                )
+                if retired_rest_reachable_recovery
+                else (
+                    "retired obsolete above-rest vigor recovery stack; ordinary farms "
+                    f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                )
             )
             if isinstance(phase, dict) and phase.get("kind") in {
                 "farm",
@@ -15497,7 +15528,11 @@ class BotController:
             self._clear_planner_feedback()
             self.storage.emit_event(
                 "campaign.combat_vigor_policy_migrated",
-                "Removed obsolete above-rest vigor support work",
+                (
+                    "Removed unnecessary rest-reachable vigor support work"
+                    if retired_rest_reachable_recovery
+                    else "Removed obsolete above-rest vigor support work"
+                ),
                 severity="notice",
                 interesting=False,
                 goal_id=goal.get("id"),

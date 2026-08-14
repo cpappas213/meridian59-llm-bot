@@ -10692,6 +10692,148 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_rested_vigor_shortfall_does_not_push_food_support_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="rested-vigor-is-keeper-work")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants in room 563.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                        "context": {
+                            "room": 563,
+                            "target": "ant",
+                            "fight_above_vigor": 80,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                observation = {
+                    "status": {
+                        "vitals": {
+                            "vigor": {
+                                "value": 78,
+                                "scale_max": 200,
+                                "rested": False,
+                            }
+                        }
+                    },
+                    "inventory": {"items": [], "carry": {"known": True}},
+                    "spells": {"spells": []},
+                }
+
+                support = controller._ensure_combat_vigor_support_phase(
+                    goal, observation
+                )
+
+                self.assertIsNone(support)
+                self.assertEqual(
+                    farm["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+                self.assertEqual(1, len(controller.storage.campaign_phases(run["id"])))
+            finally:
+                controller.storage.close()
+
+    def test_persisted_rested_vigor_support_is_superseded_and_resumes_farm(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="retire-rested-vigor-support")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants in room 563.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                        "context": {
+                            "room": 563,
+                            "target": "ant",
+                            "fight_above_vigor": 80,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                support = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Raise vigor from 78 to 80 with food.",
+                        "success_criteria": [
+                            {
+                                "id": "combat-vigor-80",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.vigor.value",
+                                "operator": ">=",
+                                "value": 80,
+                            }
+                        ],
+                        "context": {
+                            "reason": "recover_combat_vigor",
+                            "required_vigor": 80,
+                            "resume_combat_phase_id": farm["id"],
+                        },
+                    },
+                    mode="push",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(
+                    goal,
+                    {
+                        "autopilot": {"running": False},
+                        "status": {
+                            "vitals": {
+                                "vigor": {
+                                    "value": 78,
+                                    "scale_max": 200,
+                                    "rested": False,
+                                }
+                            }
+                        },
+                    },
+                )
+
+                self.assertTrue(result["campaign_phase_policy_migrated"])
+                self.assertEqual(
+                    "superseded",
+                    controller.storage.campaign_phase(support["id"])["status"],
+                )
+                self.assertEqual(
+                    farm["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+            finally:
+                controller.storage.close()
+
     def test_obsolete_above_rest_vigor_phase_resumes_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
