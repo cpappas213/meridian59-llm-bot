@@ -1452,6 +1452,65 @@ class ControllerTests(unittest.TestCase):
             "negative evidence narrows the available tactics",
             CAMPAIGN_MANAGER_SYSTEM,
         )
+        self.assertIn(
+            "Room and target exclusions are controller-owned evidence",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
+        self.assertIn("last_failure.cause", CAMPAIGN_MANAGER_SYSTEM)
+
+    def test_campaign_manager_room_evidence_preserves_scope_and_positive_results(self) -> None:
+        compact = BotController._campaign_manager_learning_context(
+            {
+                "combat_readiness": {
+                    "farm_tactic_quarantines": [
+                        {
+                            "assigned_room": 584,
+                            "target": "ant",
+                            "effective_use_safe_spots": True,
+                            "reasons": ["retreat budget exhausted"],
+                        }
+                    ],
+                    "farm_room_scorecard": [
+                        {
+                            "room": 544,
+                            "target": "groundworm larva",
+                            "strategy": "safe_spots",
+                            "target_kills": 18,
+                            "deaths": 0,
+                            "withdrawals": 0,
+                            "quarantined": False,
+                        }
+                    ],
+                },
+                "deferred_tactics": [
+                    {
+                        "classification": "route_unavailable",
+                        "summary": "the exact route made no progress",
+                        "failed_tactic": {
+                            "tool": "travel",
+                            "arguments": {"agent": "primary", "to": 106},
+                            "room": {"id": 104, "name": "Joguer's Herbs and Roots"},
+                        },
+                    }
+                ],
+            }
+        )
+
+        evidence = compact["room_evidence"]
+        productive = next(item for item in evidence if item.get("room") == 544)
+        quarantine = next(item for item in evidence if item.get("room") == 584)
+        route = next(
+            item
+            for item in evidence
+            if item.get("classification") == "unavailable_exact_route"
+        )
+        self.assertEqual("productive_if_level_eligible", productive["classification"])
+        self.assertFalse(productive["room_wide_block"])
+        self.assertEqual("exact_room_target_strategy", quarantine["scope"])
+        self.assertFalse(quarantine["room_wide_block"])
+        self.assertEqual(104, route["origin_room"]["id"])
+        self.assertEqual(106, route["destination_room"])
+        self.assertFalse(route["room_wide_block"])
 
     def test_exactly_six_mcp_tools(self) -> None:
         self.assertEqual({"status", "submit_goal", "manage_goal", "proposals", "persona", "events"}, {tool["name"] for tool in TOOLS})
@@ -1935,6 +1994,167 @@ class ControllerTests(unittest.TestCase):
                 values[goal["id"]] = legacy
                 controller.storage.set_runtime("goal_execution_plans_v1", values)
                 self.assertIsNone(controller._execution_plan(goal))
+            finally:
+                controller.storage.close()
+
+    def test_safe_ending_candidates_exclude_only_the_exact_deferred_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                controller.broker = broker
+                observation = broker.observe()
+                source_verify_safe_rooms(controller, 100, 106, 107)
+                controller.knowledge.safe_location_candidates = (  # type: ignore[method-assign]
+                    lambda _room, limit=12: {
+                        "status": "ok",
+                        "from_room_id": 100,
+                        "candidates": [
+                            {"room_id": 106, "name": "Blocked Inn", "distance": 1},
+                            {"room_id": 107, "name": "Other Sanctuary", "distance": 2},
+                        ][:limit],
+                    }
+                )
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-ending-route-evidence")
+                )["goal"]
+                controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="travel",
+                    arguments={"agent": "primary", "to": 106},
+                    reason="every square for that exit refused",
+                    classification="route_unavailable",
+                    scope="tactic",
+                    block=False,
+                )
+                controller.learning.check_action = (  # type: ignore[method-assign]
+                    lambda *_args, **_kwargs: self.fail(
+                        "safe-ending context must not mutate lesson state"
+                    )
+                )
+
+                context = controller._safe_ending_context(observation)
+
+                self.assertEqual(
+                    {100, 107},
+                    {item["room_id"] for item in context["candidates"]},
+                )
+                self.assertEqual(106, context["excluded_exact_routes"][0]["room_id"])
+                self.assertEqual(
+                    "exact_origin_destination_travel",
+                    context["excluded_exact_routes"][0]["scope"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_campaign_turn_repairs_legacy_model_authored_phase_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="repair-legacy-phase-exclusions")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Find a grounded hunting route.",
+                        "success_criteria": [
+                            {
+                                "id": "research",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "context": {
+                            "avoid_rooms": [563, 566],
+                            "avoid_targets": ["ant"],
+                            "purpose": "find a productive room",
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "legacy exclusion-based plan"}},
+                )
+
+                _, active, _ = controller._campaign_turn_state(
+                    goal, broker.observe(), {}
+                )
+
+                self.assertEqual(phase["id"], active["id"])
+                self.assertNotIn("avoid_rooms", active["context"])
+                self.assertNotIn("avoid_targets", active["context"])
+                self.assertEqual(
+                    {
+                        "avoid_rooms": [563, 566],
+                        "avoid_targets": ["ant"],
+                    },
+                    active["context"]["ignored_unverified_tactic_preferences"],
+                )
+                self.assertEqual("find a productive room", active["context"]["purpose"])
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(
+                            kinds=["campaign.phase.guardrails.normalized"]
+                        )["events"]
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_latched_phase_travel_failure_does_not_implicate_researched_room(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-return-failure-cause")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Research a farm, then return safely.",
+                        "success_criteria": [
+                            {
+                                "id": "research",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                controller._latch_phase_completion(
+                    goal, run, phase, {"all_met": True, "criteria": []}
+                )
+
+                cause = controller._phase_action_failure_context(
+                    goal,
+                    phase,
+                    observation,
+                    {"plan_step_id": "obsolete-work-step"},
+                    "travel",
+                    {"agent": "primary", "to": 106},
+                )
+
+                self.assertEqual("safe_return", cause["stage"])
+                self.assertFalse(cause["phase_work_implicated"])
+                self.assertEqual(100, cause["origin_room"]["id"])
+                self.assertEqual(106, cause["destination_room"])
             finally:
                 controller.storage.close()
 

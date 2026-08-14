@@ -548,6 +548,10 @@ class StorageTests(unittest.TestCase):
                                 "value": [],
                             }
                         ],
+                        "context": {
+                            "avoid_rooms": [544],
+                            "farm_recipe": {"room": 544, "target": "groundworm larva"},
+                        },
                     },
                     mode="start",
                 )
@@ -571,12 +575,74 @@ class StorageTests(unittest.TestCase):
                         attempt_id,
                         status="failed",
                         reason="merchant refused the item",
+                        failure_context={
+                            "stage": "safe_return",
+                            "tool": "travel",
+                            "arguments": {"agent": "primary", "to": 106},
+                            "origin_room": {"id": 104, "name": "Joguer's Herbs and Roots"},
+                            "destination_room": 106,
+                            "phase_work_implicated": False,
+                        },
                     )
                     self.assertEqual(attempt_number == 2, result["breaker_tripped"])
 
                 self.assertEqual("active", storage.goal(goal["id"])["status"])
                 self.assertIsNone(storage.active_campaign_phase(run["id"]))
-                self.assertEqual("failed", storage.campaign_phases(run["id"])[0]["status"])
+                failed = storage.campaign_phases(run["id"])[0]
+                self.assertEqual("failed", failed["status"])
+                self.assertEqual("safe_return", failed["last_failure"]["cause"]["stage"])
+                self.assertFalse(
+                    failed["last_failure"]["cause"]["phase_work_implicated"]
+                )
+                summary = coordinator.manager_context(run, None)[
+                    "recent_phase_summaries"
+                ][0]
+                self.assertEqual(
+                    106, summary["last_failure"]["cause"]["destination_room"]
+                )
+                self.assertNotIn("avoid_rooms", summary.get("context", {}))
+
+    def test_manager_phase_discards_unverified_room_and_target_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())[
+                    "goal"
+                ]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Find one grounded candidate.",
+                            "targets": [
+                                {
+                                    "id": "research",
+                                    "type": "phase_action_succeeded",
+                                    "tools": ["hunting_grounds"],
+                                }
+                            ],
+                            "context": {
+                                "avoid_rooms": [544, 566],
+                                "avoid_targets": ["groundworm larva"],
+                            },
+                        },
+                    },
+                )
+
+                self.assertNotIn("avoid_rooms", phase["context"])
+                self.assertNotIn("avoid_targets", phase["context"])
+                self.assertEqual(
+                    {
+                        "avoid_rooms": [544, 566],
+                        "avoid_targets": ["groundworm larva"],
+                    },
+                    phase["context"]["ignored_unverified_tactic_preferences"],
+                )
 
     def test_campaign_breaker_signature_ignores_cache_freshness_noise(self) -> None:
         phase = {"kind": "prepare_combat"}

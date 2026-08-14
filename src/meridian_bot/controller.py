@@ -384,9 +384,52 @@ class BotController:
                     "basis": "source_verified_current_room",
                 },
             )
+        usable_candidates: list[dict[str, Any]] = []
+        excluded_routes: list[dict[str, Any]] = []
+        deferred_tactics = self.storage.goal_lessons(
+            statuses=["deferred"], limit=200
+        )
+        for candidate in candidates:
+            destination = candidate.get("room_id")
+            if destination is None:
+                continue
+            tactic_key = self.learning.tactic_key(
+                "travel",
+                {"agent": self.config.game.agent, "to": destination},
+                observation,
+            )
+            lesson = next(
+                (
+                    item
+                    for item in deferred_tactics
+                    if item.get("scope") == "tactic"
+                    and item.get("tactic_key") == tactic_key
+                ),
+                None,
+            )
+            if lesson is None:
+                usable_candidates.append(candidate)
+                continue
+            evaluation = self.learning.evaluate_retry(lesson, observation)
+            if evaluation.get("met") is True:
+                # Unlocking is owned by the normal learning refresh. Building
+                # planning context must remain read-only, particularly during
+                # diagnostics and status inspection.
+                usable_candidates.append(candidate)
+                continue
+            excluded_routes.append(
+                {
+                    "from_room_id": room_id,
+                    "room_id": destination,
+                    "classification": lesson.get("classification"),
+                    "summary": str(lesson.get("summary") or "")[:300],
+                    "scope": "exact_origin_destination_travel",
+                }
+            )
         return {
             **result,
-            "candidates": candidates[:12],
+            "candidates": usable_candidates[:12],
+            "excluded_exact_routes": excluded_routes[:12],
             "selection_owner": "planning_model",
             "required_source_flags": sorted(SAFE_STAGING_FLAGS),
         }
@@ -12754,6 +12797,59 @@ class BotController:
             },
         )
 
+    def _repair_persisted_phase_tactic_preferences(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Remove legacy model-authored exclusions from an active phase.
+
+        New manager decisions are normalized before persistence, but a live
+        deployment may inherit an active phase written by an older controller.
+        Room and target exclusions are evidence, not planning preferences, and
+        therefore belong to controller-owned route lessons, farm tactic
+        quarantines, and scorecards. Keep the model's proposal only as an audit
+        note and force a fresh execution plan against the repaired contract.
+        """
+
+        if not isinstance(phase, dict):
+            return phase
+        raw_context = phase.get("context")
+        if not isinstance(raw_context, dict) or not any(
+            field in raw_context for field in ("avoid_rooms", "avoid_targets")
+        ):
+            return phase
+
+        context = dict(raw_context)
+        proposed: dict[str, Any] = {}
+        for field in ("avoid_rooms", "avoid_targets"):
+            value = context.pop(field, None)
+            if value not in (None, []):
+                proposed[field] = redact(value)
+        if proposed:
+            existing = context.get("ignored_unverified_tactic_preferences")
+            audit = dict(existing) if isinstance(existing, dict) else {}
+            audit.update(proposed)
+            context["ignored_unverified_tactic_preferences"] = audit
+
+        repaired = self.storage.update_campaign_phase_guardrails(
+            str(phase["id"]),
+            abandon_predicates=list(phase.get("abandon_predicates", [])),
+            context=context,
+            reason=(
+                "discarded legacy model-authored room and target exclusions; "
+                "negative tactic evidence is controller-owned"
+            ),
+        )
+        self._invalidate_execution_plan(
+            goal,
+            (
+                "active phase contained legacy model-authored room or target "
+                "exclusions without controller evidence"
+            ),
+        )
+        return repaired
+
     def _campaign_turn_state(
         self,
         goal: dict[str, Any],
@@ -12762,6 +12858,7 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         """Reconcile the durable internal phase and select one when needed."""
         run, phase = self.campaign.ensure(goal)
+        phase = self._repair_persisted_phase_tactic_preferences(goal, phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if outcome.completed or outcome.failed:
             handoff = (
@@ -13061,24 +13158,15 @@ class BotController:
         return None
 
     def _recent_research_avoid_rooms(self, run: dict[str, Any]) -> set[str]:
-        """Return soft room-diversity hints from the newest research phase."""
+        """Return controller-owned room-wide exclusions.
 
-        run_id = run.get("id") if isinstance(run, dict) else None
-        if not run_id:
-            return set()
-        for prior in reversed(self.storage.campaign_phases(str(run_id))):
-            if prior.get("kind") != "research_progression":
-                continue
-            context = prior.get("context")
-            context = context if isinstance(context, dict) else {}
-            values = context.get("avoid_rooms")
-            if not isinstance(values, list):
-                continue
-            return {
-                str(value)
-                for value in values
-                if isinstance(value, (int, str)) and str(value).strip()
-            }
+        No current negative evidence has room-wide semantics: route lessons are
+        exact origin/destination tactics and farm quarantines are exact
+        room/prey/strategy combinations. Older phases persisted model-authored
+        ``avoid_rooms`` lists, but replaying those opinions as evidence made one
+        unrelated safe-return failure poison productive hunting rooms.
+        """
+
         return set()
 
     def _recent_successful_farm_tactics(
@@ -14563,17 +14651,111 @@ class BotController:
                 if isinstance(item, dict)
             ]
 
+        readiness = value.get("combat_readiness")
+        readiness = readiness if isinstance(readiness, dict) else {}
+        room_evidence: list[dict[str, Any]] = []
+        for quarantine in readiness.get("farm_tactic_quarantines", []):
+            if not isinstance(quarantine, dict):
+                continue
+            room = quarantine.get("assigned_room", quarantine.get("room"))
+            if room is None:
+                continue
+            room_evidence.append(
+                {
+                    "classification": "quarantined_exact_farm_tactic",
+                    "evidence_strength": "hard",
+                    "scope": "exact_room_target_strategy",
+                    "room": room,
+                    "target": quarantine.get("target"),
+                    "use_safe_spots": quarantine.get(
+                        "effective_use_safe_spots",
+                        quarantine.get("use_safe_spots"),
+                    ),
+                    "room_wide_block": False,
+                    "reasons": quarantine.get("reasons", [])[:4]
+                    if isinstance(quarantine.get("reasons"), list)
+                    else [],
+                }
+            )
+        for score in readiness.get("farm_room_scorecard", []):
+            if not isinstance(score, dict) or score.get("room") is None:
+                continue
+            target_kills = int(score.get("target_kills", 0) or 0)
+            deaths = int(score.get("deaths", 0) or 0)
+            withdrawals = int(score.get("withdrawals", 0) or 0)
+            if score.get("quarantined") is True:
+                classification = "quarantined_exact_farm_tactic"
+                strength = "hard"
+            elif target_kills > 0 and deaths == 0:
+                classification = "productive_if_level_eligible"
+                strength = "positive"
+            elif deaths > 0 or withdrawals > 0:
+                classification = "mixed_or_unsafe_observation"
+                strength = "negative"
+            else:
+                classification = "insufficient_yield_evidence"
+                strength = "informational"
+            room_evidence.append(
+                {
+                    "classification": classification,
+                    "evidence_strength": strength,
+                    "scope": "exact_room_target_strategy",
+                    "room": score.get("room"),
+                    "target": score.get("target"),
+                    "strategy": score.get("strategy"),
+                    "target_kills": target_kills,
+                    "deaths": deaths,
+                    "withdrawals": withdrawals,
+                    "room_wide_block": False,
+                }
+            )
+        raw_tactics = value.get("deferred_tactics")
+        raw_tactics = raw_tactics if isinstance(raw_tactics, list) else []
+        for lesson in raw_tactics:
+            if (
+                not isinstance(lesson, dict)
+                or lesson.get("classification") != "route_unavailable"
+            ):
+                continue
+            failed = lesson.get("failed_tactic")
+            failed = failed if isinstance(failed, dict) else {}
+            arguments = failed.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            destination = next(
+                (
+                    arguments.get(key)
+                    for key in ("to", "destination", "room", "room_id")
+                    if arguments.get(key) is not None
+                ),
+                None,
+            )
+            if destination is None:
+                continue
+            room_evidence.append(
+                {
+                    "classification": "unavailable_exact_route",
+                    "evidence_strength": "hard",
+                    "scope": "exact_origin_destination_tool",
+                    "tool": failed.get("tool"),
+                    "origin_room": failed.get("room"),
+                    "destination_room": destination,
+                    "room_wide_block": False,
+                    "summary": str(lesson.get("summary") or "")[:300],
+                }
+            )
+
         return {
             "goal_family": value.get("goal_family"),
             "instructions": value.get("instructions"),
             "lessons": lessons("lessons", 8),
             "deferred_tactics": lessons("deferred_tactics", 12),
-            "combat_readiness": value.get("combat_readiness"),
+            "combat_readiness": readiness,
             "combat_history": (
                 value.get("combat_history", [])[:8]
                 if isinstance(value.get("combat_history"), list)
                 else value.get("combat_history")
             ),
+            "room_evidence": room_evidence[:24],
         }
 
     def _campaign_context(
@@ -16460,6 +16642,70 @@ class BotController:
         )
         self.storage.set_runtime("prepare_combat_sell_quotes_v1", values[-30:])
 
+    def _phase_action_failure_context(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+        plan: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        safety_recovery: bool = False,
+    ) -> dict[str, Any]:
+        """Describe exactly which action failed and whether it was phase work."""
+
+        execution_plan = self._execution_plan(goal)
+        safe_ending = (
+            execution_plan.get("safe_ending")
+            if isinstance(execution_plan, dict)
+            and isinstance(execution_plan.get("safe_ending"), dict)
+            else {}
+        )
+        plan_step_id = str(plan.get("plan_step_id") or "").strip() or None
+        safe_step_id = str(safe_ending.get("step_id") or "").strip()
+        terminal_checkpoint = bool(
+            isinstance(phase, dict)
+            and (
+                self._phase_completion_checkpoint(phase) is not None
+                or self._phase_exhaustion_checkpoint(phase) is not None
+            )
+        )
+        safe_return = bool(
+            safety_recovery
+            or (tool == "travel" and terminal_checkpoint)
+            or (
+                tool == "travel"
+                and plan_step_id is not None
+                and safe_step_id
+                and plan_step_id == safe_step_id
+            )
+        )
+        destination = next(
+            (
+                arguments.get(key)
+                for key in ("to", "destination", "room", "room_id")
+                if arguments.get(key) is not None
+            ),
+            None,
+        )
+        origin_room = {
+            "id": self._observation_room(observation),
+            "name": self._observation_room_name(observation) or None,
+        }
+        return {
+            "stage": "safe_return" if safe_return else "phase_work",
+            "tool": tool,
+            "arguments": redact(arguments),
+            "plan_step_id": plan_step_id,
+            "phase_kind": phase.get("kind") if isinstance(phase, dict) else None,
+            "origin_room": {
+                key: value for key, value in origin_room.items() if value is not None
+            },
+            "destination_room": destination,
+            "phase_work_implicated": not safe_return,
+        }
+
     def _execute(self, goal: dict[str, Any], observation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         tool = str(plan.get("tool") or "")
         safety_recovery = plan.get("safety_recovery") is True
@@ -16671,6 +16917,15 @@ class BotController:
             observation=observation,
             expected_effect=plan.get("expected_observation"),
         )
+        phase_failure_context = self._phase_action_failure_context(
+            goal,
+            campaign_phase,
+            observation,
+            plan,
+            tool,
+            arguments,
+            safety_recovery=safety_recovery,
+        )
         if repeated_signature:
             breaker = self.campaign.trip_breaker(
                 goal,
@@ -16679,6 +16934,7 @@ class BotController:
                 semantic_action=tool,
                 failure_count=self.campaign.ACTION_FAILURE_LIMIT,
                 reason="equivalent action already failed twice in the same verified state",
+                failure_context=phase_failure_context,
             )
             self._invalidate_execution_plan(
                 goal, "campaign circuit breaker rejected an equivalent failed action"
@@ -16709,6 +16965,7 @@ class BotController:
                 result=result,
                 verification=verification,
                 reason=reason,
+                failure_context=phase_failure_context,
             )
 
         preflight = self._safety_preflight(tool, arguments, observation, goal)

@@ -466,7 +466,11 @@ with item/category/value/buyer facts; decide whether to sell, retain, bank, or d
 A broken or absent wielded weapon may push acquire_item, then resume the parent phase. A keeper withdrawal or death
 may push recover. Reuse a recent successful room/prey tactic while it remains level-eligible; seek a materially
 different grounded tactic only after durable safety, stagnation, or route evidence disproves the prior one.
-Treat phase.context.avoid_rooms as a soft diversity hint, never as proof that a room is unusable.
+Room and target exclusions are controller-owned evidence. Never emit phase.context.avoid_rooms or
+phase.context.avoid_targets, never infer them from a phase's failed status, and never treat an exact
+safe-return or origin/destination route failure as evidence against that phase's researched or farm room.
+Use learned_failures.room_evidence, campaign.verified_no_progress_tactics, and structured
+last_failure.cause instead. An exact farm quarantine applies only to its disclosed room/prey/strategy.
 When campaign.research_retry.allowed is false, the controller has already proved that an unchanged
 research_progression lookup returns the same fully rejected candidate set. Do not select
 research_progression again. Select a materially different capability, equipment, supplies, recovery,
@@ -634,6 +638,7 @@ class VllmClient:
                     "tactic_ledger",
                     "research_retry",
                     "manager_feedback",
+                    "verified_no_progress_tactics",
                     "operator_contract",
                     "instructions",
                     "action_breaker_limit",
@@ -661,6 +666,7 @@ class VllmClient:
                     "deferred_tactics",
                     "combat_readiness",
                     "combat_history",
+                    "room_evidence",
                 )
                 if learned.get(key) is not None
             },

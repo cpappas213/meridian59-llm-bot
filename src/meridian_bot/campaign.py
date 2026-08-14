@@ -667,6 +667,20 @@ class CampaignCoordinator:
             if isinstance(phase.get("context"), dict)
             else {}
         )
+        unverified_preferences: dict[str, Any] = {}
+        for field in ("avoid_rooms", "avoid_targets"):
+            proposed = phase_context.pop(field, None)
+            if proposed not in (None, []):
+                unverified_preferences[field] = redact(proposed)
+        if unverified_preferences:
+            # An LLM phase is allowed to choose work, not to manufacture durable
+            # negative evidence. Exact route failures, farm quarantines, and
+            # empirical room outcomes are controller-owned elsewhere. Persist
+            # this only as an audit note; compact manager context deliberately
+            # does not replay it into the next decision.
+            phase_context["ignored_unverified_tactic_preferences"] = (
+                unverified_preferences
+            )
         if raw_targets is not None:
             phase_context["phase_targets"] = redact(raw_targets)
         if ignored_abandon_predicates:
@@ -1312,6 +1326,7 @@ class CampaignCoordinator:
         result: Any = None,
         verification: Any = None,
         reason: str = "",
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if phase is None or phase_attempt_id is None:
             return {"breaker_tripped": False}
@@ -1337,6 +1352,7 @@ class CampaignCoordinator:
             semantic_action=attempt["semantic_action"],
             failure_count=len(failures),
             reason=reason,
+            failure_context=failure_context,
         )
 
     def trip_breaker(
@@ -1348,6 +1364,7 @@ class CampaignCoordinator:
         semantic_action: str,
         failure_count: int,
         reason: str = "",
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if phase is None:
             return {"breaker_tripped": False}
@@ -1360,6 +1377,7 @@ class CampaignCoordinator:
                 "failed",
                 reason=reason or "two equivalent semantic actions failed in unchanged state",
                 resume_parent=False,
+                failure_context=redact(failure_context),
             )
             self.storage.emit_event(
                 "campaign.breaker.tripped",
@@ -1373,6 +1391,7 @@ class CampaignCoordinator:
                     "signature": signature,
                     "failure_count": failure_count,
                     "reason": reason[:1000],
+                    "failure_context": redact(failure_context),
                     "strategic_goal_preserved": True,
                 },
             )
@@ -1452,9 +1471,6 @@ class CampaignCoordinator:
             )
             if value.get(key) is not None
         }
-        avoid_rooms = value.get("avoid_rooms")
-        if isinstance(avoid_rooms, list):
-            compact["avoid_rooms"] = avoid_rooms[:24]
         constraints = value.get("constraints")
         if isinstance(constraints, dict):
             compact["constraints"] = {
@@ -1501,6 +1517,34 @@ class CampaignCoordinator:
                 compact_validation["rejection_reasons"] = rejection_counts
             compact["recipe_validation"] = compact_validation
         return compact
+
+    @staticmethod
+    def _compact_failure_context(value: Any) -> dict[str, Any] | None:
+        """Keep exact causal action identity without replaying arbitrary payloads."""
+
+        if not isinstance(value, dict):
+            return None
+        compact = {
+            key: value.get(key)
+            for key in (
+                "stage",
+                "tool",
+                "plan_step_id",
+                "phase_kind",
+                "origin_room",
+                "destination_room",
+                "phase_work_implicated",
+            )
+            if value.get(key) is not None
+        }
+        arguments = value.get("arguments")
+        if isinstance(arguments, dict):
+            compact["arguments"] = {
+                str(key): item
+                for key, item in list(arguments.items())[:16]
+                if isinstance(item, (str, int, float, bool)) or item is None
+            }
+        return compact or None
 
     @classmethod
     def _compact_phase(cls, phase: Any) -> dict[str, Any] | None:
@@ -1553,6 +1597,9 @@ class CampaignCoordinator:
                 "reason": str(failure.get("reason") or "")[:500],
                 "recorded_at": failure.get("recorded_at"),
             }
+            cause = cls._compact_failure_context(failure.get("cause"))
+            if cause is not None:
+                compact["last_failure"]["cause"] = cause
         return compact
 
     @classmethod

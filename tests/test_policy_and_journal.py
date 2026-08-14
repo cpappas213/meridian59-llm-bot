@@ -367,6 +367,14 @@ class PolicyAndJournalTests(unittest.TestCase):
                     for index in range(100)
                 ],
                 "research_retry": {"allowed": False},
+                "verified_no_progress_tactics": [
+                    {
+                        "tool": "travel",
+                        "room": 104,
+                        "arguments": {"to": 106},
+                        "reason": "every square for that exit refused",
+                    }
+                ],
             }
             with patch.object(
                 client, "_complete", return_value={"decision": "start_phase"}
@@ -376,7 +384,15 @@ class PolicyAndJournalTests(unittest.TestCase):
                     observation={"status": {"vitals": {"health": {"max": 34}}}},
                     campaign_context=campaign,
                     grounded_knowledge=None,
-                    learned_failures=None,
+                    learned_failures={
+                        "room_evidence": [
+                            {
+                                "classification": "productive_if_level_eligible",
+                                "room": 544,
+                                "target": "groundworm larva",
+                            }
+                        ]
+                    },
                     financial_context=None,
                 )
 
@@ -388,6 +404,15 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertTrue(client.last_prompt_metrics["compacted"])
             sent = json.loads(complete.call_args.args[0][1]["content"])
             self.assertEqual(False, sent["campaign"]["research_retry"]["allowed"])
+            self.assertEqual(
+                106,
+                sent["campaign"]["verified_no_progress_tactics"][0]["arguments"][
+                    "to"
+                ],
+            )
+            self.assertEqual(
+                544, sent["learned_failures"]["room_evidence"][0]["room"]
+            )
 
     def test_campaign_manager_timeout_retries_with_minimal_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

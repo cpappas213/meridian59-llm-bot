@@ -2268,6 +2268,7 @@ class Storage:
         *,
         reason: str = "",
         resume_parent: bool = False,
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in {"succeeded", "failed", "superseded", "paused"}:
             raise ValueError("invalid campaign phase transition")
@@ -2276,12 +2277,15 @@ class Storage:
             if row is None:
                 raise NotFound(f"campaign phase not found: {phase_id}")
             now = timestamp()
+            failure = {"reason": reason, "recorded_at": now}
+            if status == "failed" and isinstance(failure_context, dict):
+                failure["cause"] = failure_context
             connection.execute(
                 "UPDATE campaign_phases SET status=?,last_failure_json=CASE WHEN ?='failed' THEN ? ELSE last_failure_json END,updated_at=?,terminal_at=? WHERE id=?",
                 (
                     status,
                     status,
-                    canonical_json({"reason": reason, "recorded_at": now}) if status == "failed" else None,
+                    canonical_json(failure) if status == "failed" else None,
                     now,
                     now if status in {"succeeded", "failed", "superseded"} else None,
                     phase_id,
@@ -2312,6 +2316,7 @@ class Storage:
                     "parent_phase_id": row["parent_phase_id"],
                     "kind": row["kind"],
                     "reason": reason[:1000],
+                    "failure_context": failure.get("cause"),
                     "resumed_parent": active_phase_id,
                 },
             )
