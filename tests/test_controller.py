@@ -11394,6 +11394,14 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                broker = SimulatedBroker()
+                for name in ("bank", "shop", "rest_up", "equip_best"):
+                    broker.tools[name] = Tool(
+                        name,
+                        f"Simulated {name} capability.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
                 source_verify_safe_rooms(controller, 52)
                 goal = controller.storage.submit_goal(
                     goal_payload(
