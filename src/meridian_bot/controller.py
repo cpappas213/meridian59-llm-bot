@@ -4074,6 +4074,28 @@ class BotController:
                 )
         return None
 
+    @staticmethod
+    def _stored_empty_merchant_lookup(last_action: Any) -> bool:
+        if (
+            not isinstance(last_action, dict)
+            or last_action.get("tool") != "merchants"
+            or last_action.get("status") != "succeeded"
+        ):
+            return False
+        summary = " ".join(str(last_action.get("result_summary") or "").split())
+        return bool(
+            re.search(r"['\"]matches['\"]\s*:\s*\[\s*\]", summary)
+            or (
+                all(
+                    re.search(
+                        rf"['\"]{field}['\"]\s*:\s*\[\s*\]",
+                        summary,
+                    )
+                    for field in ("buys_anything", "rules_mentioning")
+                )
+            )
+        )
+
     def _execution_plan(self, goal: dict[str, Any]) -> dict[str, Any] | None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
         if not isinstance(values, dict):
@@ -4241,6 +4263,29 @@ class BotController:
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
         last_action = value.get("last_action")
+        if self._stored_empty_merchant_lookup(last_action):
+            reason = (
+                "the completed merchants step returned no candidate merchants, so "
+                "the stored plan has no grounded seller or destination"
+            )
+            self._invalidate_execution_plan(goal, reason)
+            self._set_planner_feedback(
+                goal,
+                reason,
+                failure_context={
+                    "kind": "merchant_lookup_no_candidates",
+                    "purpose": (
+                        "Retire a legacy plan that incorrectly recorded an empty "
+                        "merchant result as a successful prerequisite."
+                    ),
+                    "required_response": (
+                        "Use an exact source-grounded item query, actual known catalogue "
+                        "stock, or a different acquisition prerequisite; do not continue "
+                        "to travel or shop without a returned merchant."
+                    ),
+                },
+            )
+            return None
         completed_through_step_id = (
             str(last_action.get("step_id") or "")
             if isinstance(last_action, dict)
@@ -18861,6 +18906,20 @@ class BotController:
                     "Change the offered item or buyer using live merchant evidence."
                 ),
             }
+        if tool == "merchants" and "no candidate merchants" in text:
+            return {
+                "kind": "merchant_lookup_no_candidates",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Keep an empty read-only merchant search from satisfying a plan "
+                    "step or authorizing travel to an undefined seller."
+                ),
+                "required_response": (
+                    "Use an exact source-grounded item query, actual known catalogue "
+                    "stock, or a different acquisition prerequisite; do not continue "
+                    "to travel or shop without a returned merchant."
+                ),
+            }
         return {
             "kind": "action_made_no_progress",
             "reason": str(reason)[:500],
@@ -18891,6 +18950,8 @@ class BotController:
                     )
                 )
             )
+        ) or (
+            tool == "merchants" and "no candidate merchants" in text
         ) or tool == "sell" or (
             tool == "sell_all"
             and (
@@ -19272,6 +19333,17 @@ class BotController:
                     f"carried shillings did not move in the requested direction after {action}: "
                     f"before {before_currency}, after {after_currency}"
                 )[:500]
+        if tool == "merchants":
+            candidate_fields = [
+                result.get(key)
+                for key in ("matches", "buys_anything", "rules_mentioning")
+                if isinstance(result.get(key), list)
+            ]
+            if candidate_fields and not any(candidate_fields):
+                return (
+                    "merchant lookup returned no candidate merchants for the "
+                    "requested item/query"
+                )
         if tool in {"map", KNOWLEDGE_TOOL_NAME} and result.get("matches") == []:
             return "authoritative lookup returned no matches"
         if tool == "map" and (arguments or {}).get("to") is not None:

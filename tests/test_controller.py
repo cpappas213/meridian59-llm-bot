@@ -3016,6 +3016,40 @@ class ControllerTests(unittest.TestCase):
 
         self.assertIn("found no route from current room 103", reason or "")
 
+    def test_empty_merchant_lookup_invalidates_undefined_seller_plan(self) -> None:
+        reason = BotController._no_progress_reason(
+            {"matches": []},
+            {"look": {"room": {"num": 103, "name": "The Bhrama & Falcon"}}},
+            tool="merchants",
+            arguments={"sells": "food"},
+        )
+
+        self.assertIn("no candidate merchants", reason or "")
+        self.assertTrue(
+            BotController._failure_invalidates_plan("merchants", reason)
+        )
+        context = BotController._failure_context("merchants", reason or "", {})
+        self.assertEqual("merchant_lookup_no_candidates", context["kind"])
+        self.assertIn("do not continue to travel", context["required_response"])
+        self.assertTrue(
+            BotController._stored_empty_merchant_lookup(
+                {
+                    "tool": "merchants",
+                    "status": "succeeded",
+                    "result_summary": "{'matches': []}",
+                }
+            )
+        )
+        self.assertFalse(
+            BotController._stored_empty_merchant_lookup(
+                {
+                    "tool": "merchants",
+                    "status": "succeeded",
+                    "result_summary": "{'matches': [{'merchant': 'Paddock'}]}",
+                }
+            )
+        )
+
     def test_direct_prepare_combat_capability_highlights_create_weapon(self) -> None:
         context = BotController._direct_phase_capabilities(
             {"kind": "prepare_combat"},
