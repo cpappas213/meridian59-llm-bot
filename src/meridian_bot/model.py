@@ -263,6 +263,10 @@ funding prerequisite or materially change inventory.
 When a recent shop catalogue gives unit prices and the basket quantity is known, multiply them and compare the
 exact total with financial_context.carried_shillings. Any shortfall requires a funding step before purchase;
 nonzero carried cash alone never proves the basket is affordable.
+Once a live catalogue exists for the named seller, a purchase step must replace words such as "enough" or
+"some" with an explicit quantity of each exact catalogue item. The controller revalidates quote-first plans
+after the read-only shop call; an unquantified follow-up purchase is rejected because neither nutrition nor
+affordability can be proved from it.
 After an ordinary merchant-preference sale rejection, buyer discovery must precede the next sell or sell_all.
 This rule does not apply to item_not_npc_transferable failures. Include a merchants
 buyer-discovery step unless a recent completed targeted merchants lookup is already present in last_action,

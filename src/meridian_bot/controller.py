@@ -76,6 +76,28 @@ TOS_CHEESE_NAME = "wheel of cheese"
 SALE_BUYER_REFUSAL_LIMIT = 3
 TOS_CHEESE_VIGOR = 30
 RESTED_VIGOR_FLOOR = 80
+# Source-backed nutrition values used both for keeper provisioning and for
+# deciding how much cash an economic bootstrap actually needs.  Keep the most
+# specific names first because several foods share ordinary suffixes.
+COMBAT_FOOD_VIGOR_VALUES = (
+    ("inky cap", 50),
+    ("chocolate mint", 5),
+    (TOS_CHEESE_NAME, TOS_CHEESE_VIGOR),
+    ("turkey leg", 15),
+    ("mug of", 6),
+    ("meat pie", 30),
+    ("stew", 15),
+    ("loaf of bread", 20),
+    ("waterskin", 3),
+    ("slice of pork", 9),
+    ("bowl of soup", 9),
+    ("spideye", 9),
+    ("bunch of grapes", 7),
+    ("apple", 10),
+    ("edible mushroom", 5),
+    ("drumstick", 9),
+    ("goblet", 3),
+)
 # One cheese after ordinary rest reaches 110. This retains a useful combat
 # buffer without forcing multi-minute stomach-drain waits between phases.
 FARM_FIGHT_VIGOR = 100
@@ -2804,6 +2826,69 @@ class BotController:
                 )
         return None
 
+    def _recent_shop_catalogues(self) -> list[dict[str, Any]]:
+        """Return the newest non-empty live catalogue for each exact seller."""
+
+        catalogues: list[dict[str, Any]] = []
+        seen_sellers: set[str] = set()
+        for event in reversed(
+            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
+        ):
+            data = event.get("data")
+            result = data.get("result") if isinstance(data, dict) else None
+            raw_catalogue = result.get("items") if isinstance(result, dict) else None
+            seller = result.get("seller") if isinstance(result, dict) else None
+            seller_key = str(seller)
+            if (
+                not isinstance(data, dict)
+                or data.get("tool") != "shop"
+                or seller is None
+                or seller_key in seen_sellers
+                or not isinstance(raw_catalogue, list)
+            ):
+                continue
+            items: dict[str, dict[str, Any]] = {}
+            for item in raw_catalogue:
+                if not isinstance(item, dict):
+                    continue
+                name = " ".join(str(item.get("name") or "").split()).casefold()
+                cost = item.get("cost")
+                if (
+                    name
+                    and isinstance(cost, (int, float))
+                    and not isinstance(cost, bool)
+                    and cost >= 0
+                    and name not in items
+                ):
+                    items[name] = {"id": item.get("id"), "cost": int(cost)}
+            if not items:
+                continue
+            seen_sellers.add(seller_key)
+            aliases = {seller_key.casefold()}
+            seller_identity = (
+                self.knowledge.merchant_identity(object_id=seller)
+                if hasattr(self.knowledge, "merchant_identity")
+                else None
+            )
+            if isinstance(seller_identity, dict):
+                aliases.update(
+                    " ".join(str(value or "").split()).casefold()
+                    for value in (
+                        seller_identity.get("merchant_class"),
+                        deep_get(seller_identity, "instance.name"),
+                    )
+                    if str(value or "").strip()
+                )
+            catalogues.append(
+                {
+                    "seller": seller,
+                    "aliases": aliases,
+                    "items": items,
+                    "observed_at": str(event.get("occurred_at") or ""),
+                }
+            )
+        return catalogues
+
     def _shop_plan_affordability_error(
         self,
         steps: list[dict[str, Any]],
@@ -2816,40 +2901,8 @@ class BotController:
             inventory.get("items"), list
         ):
             return None
-        catalog: dict[str, dict[str, Any]] = {}
-        catalog_event_at: str | None = None
-        catalog_seller: Any = None
-        for event in reversed(
-            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
-        ):
-            data = event.get("data")
-            result = data.get("result") if isinstance(data, dict) else None
-            raw_catalog = result.get("items") if isinstance(result, dict) else None
-            if data.get("tool") != "shop" or not isinstance(raw_catalog, list):
-                continue
-            for item in raw_catalog:
-                if not isinstance(item, dict):
-                    continue
-                name = " ".join(str(item.get("name") or "").split()).casefold()
-                cost = item.get("cost")
-                if (
-                    name
-                    and isinstance(cost, (int, float))
-                    and not isinstance(cost, bool)
-                    and cost >= 0
-                    and name not in catalog
-                ):
-                    catalog[name] = {
-                        "cost": int(cost),
-                        "seller": result.get("seller"),
-                    }
-                    catalog_seller = result.get("seller")
-                    catalog_event_at = catalog_event_at or str(
-                        event.get("occurred_at") or ""
-                    )
-            if catalog:
-                break
-        if not catalog:
+        catalogues = self._recent_shop_catalogues()
+        if not catalogues:
             return None
 
         number_words = {
@@ -2879,38 +2932,37 @@ class BotController:
             if not self._is_plan_purchase_step(step):
                 continue
             outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
-            seller_aliases = {
-                str(catalog_seller).strip().casefold()
-            } if catalog_seller is not None else set()
-            seller_identity = (
-                self.knowledge.merchant_identity(object_id=catalog_seller)
-                if hasattr(self.knowledge, "merchant_identity")
-                else None
-            )
-            if isinstance(seller_identity, dict):
-                seller_aliases.update(
-                    " ".join(str(value or "").split()).casefold()
-                    for value in (
-                        seller_identity.get("merchant_class"),
-                        deep_get(seller_identity, "instance.name"),
+            matching_catalogue = next(
+                (
+                    catalogue
+                    for catalogue in catalogues
+                    if any(
+                        re.search(
+                            rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
+                            outcome,
+                        )
+                        for alias in catalogue["aliases"]
+                        if alias
                     )
-                    if str(value or "").strip()
-                )
-            names_same_seller = any(
-                re.search(
-                    rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
-                    outcome,
-                )
-                for alias in seller_aliases
-                if alias
+                ),
+                None,
             )
+            if matching_catalogue is None:
+                # Do not apply one merchant's prices to an unrelated seller.
+                # A quote-first plan remains legal until its exact seller has
+                # produced a catalogue; persisted plans are revalidated after
+                # that read-only action.
+                continue
+            catalog = matching_catalogue["items"]
+            catalog_event_at = matching_catalogue["observed_at"]
+            catalog_seller = matching_catalogue["seller"]
             purchase_match = re.search(
                 r"\b(?:buy|purchase|obtain|acquire)\s+(.+?)"
                 r"(?=\s+from\b|\s+using\b|[.;]|$)",
                 outcome,
             )
             requested_items: list[str] = []
-            if names_same_seller and purchase_match is not None:
+            if purchase_match is not None:
                 for component in re.split(
                     r"\s*,\s*|\s+and\s+", purchase_match.group(1)
                 ):
@@ -2937,8 +2989,6 @@ class BotController:
                     "cannot buy stock the named merchant does not carry; use actual "
                     "catalogue items or choose a different grounded acquisition route"
                 )
-            if funds_unknown:
-                continue
             basket: list[dict[str, Any]] = []
             for name, item in catalog.items():
                 match = re.search(
@@ -2962,6 +3012,15 @@ class BotController:
                     }
                 )
             if not basket:
+                return (
+                    f"execution_plan step {step.get('id')!r} names live seller "
+                    f"{catalog_seller} but does not quantify an exact basket from its "
+                    f"catalogue observed at {catalog_event_at}. Purpose: words such as "
+                    "'enough' or 'some' cannot prove stock, nutrition, or affordability; "
+                    "after a live quote, name the exact quantity of each catalogue item "
+                    "before attempting a purchase"
+                )
+            if funds_unknown:
                 continue
             basket_cost = sum(item["subtotal"] for item in basket)
             if basket_cost > available:
@@ -7578,6 +7637,7 @@ class BotController:
         observation: dict[str, Any] | None = None,
         *,
         allow_open_field: bool = False,
+        allow_rested_vigor: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         normalized = dict(arguments)
         before = dict(arguments)
@@ -7621,10 +7681,16 @@ class BotController:
                     # 75-80% as well as overly aggressive lower proposals.
                     "flee_below": FARM_FLEE_THRESHOLD,
                     # Historical 140-vigor recipes made a fed character wait
-                    # several minutes for stomach room before combat. Keep this
-                    # controller-owned activity boundary consistent across old
-                    # and new goals, just like the farm flee boundary above.
-                    "fight_above_vigor": FARM_FIGHT_VIGOR,
+                    # several minutes for stomach room before combat. Ordinary
+                    # farms use the controller-owned 100-vigor reserve. The
+                    # only exception is a typed economic-bootstrap child phase:
+                    # its health-aware keeper may work from the game's verified
+                    # rested floor until it earns the exact food budget.
+                    "fight_above_vigor": (
+                        RESTED_VIGOR_FLOOR
+                        if allow_rested_vigor
+                        else FARM_FIGHT_VIGOR
+                    ),
                     # Open-field farming is permitted only when durable state
                     # chose it as a materially different tactic: either an
                     # operator-authored public goal or the planner's persisted
@@ -7694,34 +7760,25 @@ class BotController:
             return None
 
     @staticmethod
+    def _combat_food_vigor(name: Any) -> int | None:
+        normalized = " ".join(str(name or "").casefold().split())
+        compact = normalized.replace(" ", "")
+        return next(
+            (
+                value
+                for marker, value in COMBAT_FOOD_VIGOR_VALUES
+                if marker in normalized or marker.replace(" ", "") in compact
+            ),
+            None,
+        )
+
+    @staticmethod
     def _combat_vigor_supply(observation: dict[str, Any]) -> dict[str, Any]:
         """Describe food the keeper can consume or make before an engagement."""
         items = deep_get(observation, "inventory.items", [])
         items = items if isinstance(items, list) else []
-        # viNutrition values from the game source. Counting items alone was not
-        # enough: the deterministic preflight must account for actual nutrition
-        # against the configured farm gate rather than merely count food items.
-        # the controller provisions enough food before handing control to the
-        # background keeper.
-        food_values = (
-            ("inky cap", 50),
-            ("chocolate mint", 5),
-            (TOS_CHEESE_NAME, TOS_CHEESE_VIGOR),
-            ("turkey leg", 15),
-            ("mug of", 6),
-            ("meat pie", 30),
-            ("stew", 15),
-            ("loaf of bread", 20),
-            ("waterskin", 3),
-            ("slice of pork", 9),
-            ("bowl of soup", 9),
-            ("spideye", 9),
-            ("bunch of grapes", 7),
-            ("apple", 10),
-            ("edible mushroom", 5),
-            ("drumstick", 9),
-            ("goblet", 3),
-        )
+        # Counting items alone is not enough: deterministic preflight accounts
+        # for source-backed nutrition against the configured farm gate.
         food_count = 0
         vigor_points = 0
         herbs = 0
@@ -7735,9 +7792,7 @@ class BotController:
                 amount = max(1, int(raw_amount or 1))
             except (TypeError, ValueError):
                 amount = 1
-            food_value = next(
-                (value for marker, value in food_values if marker in name), None
-            )
+            food_value = BotController._combat_food_vigor(name)
             if food_value is not None:
                 food_count += amount
                 vigor_points += food_value * amount
@@ -7762,6 +7817,128 @@ class BotController:
             "cookable_casts": cookable_casts,
             "herbs": herbs,
             "elderberries": elderberries,
+        }
+
+    def _minimum_quoted_vigor_purchase(
+        self,
+        observation: dict[str, Any],
+        required_vigor: int,
+    ) -> dict[str, Any] | None:
+        """Return the cheapest observed edible basket that reaches the vigor gate."""
+
+        vigor = deep_get(
+            observation,
+            "status.vitals.vigor.value",
+            deep_get(observation, "look.vitals.vigor.value", 0),
+        )
+        try:
+            current = int(vigor or 0)
+        except (TypeError, ValueError):
+            return None
+        supply = self._combat_vigor_supply(observation)
+        shortfall = max(
+            0,
+            int(required_vigor)
+            - max(current, RESTED_VIGOR_FLOOR)
+            - int(supply.get("vigor_points", 0) or 0),
+        )
+        if shortfall <= 0:
+            return None
+        candidates: list[dict[str, Any]] = []
+        for catalogue in self._recent_shop_catalogues():
+            for name, item in catalogue["items"].items():
+                nutrition = self._combat_food_vigor(name)
+                if nutrition is None or nutrition <= 0:
+                    continue
+                quantity = max(1, (shortfall + nutrition - 1) // nutrition)
+                candidates.append(
+                    {
+                        "seller": catalogue["seller"],
+                        "item_id": item.get("id"),
+                        "item": name,
+                        "quantity": quantity,
+                        "unit_cost": int(item["cost"]),
+                        "total_cost": quantity * int(item["cost"]),
+                        "nutrition_each": nutrition,
+                        "nutrition_required": shortfall,
+                        "catalogue_observed_at": catalogue["observed_at"],
+                    }
+                )
+        return min(
+            candidates,
+            key=lambda item: (int(item["total_cost"]), int(item["quantity"])),
+            default=None,
+        )
+
+    def _closed_vigor_funding_shortfall(
+        self,
+        observation: dict[str, Any],
+        required_vigor: int,
+    ) -> dict[str, Any] | None:
+        """Describe a quoted food deficit only when ordinary funding is exhausted."""
+
+        purchase = self._minimum_quoted_vigor_purchase(
+            observation, required_vigor
+        )
+        if purchase is None:
+            return None
+        finances = self._financial_context(observation)
+        carried = int(finances.get("carried_shillings", 0) or 0)
+        liquidatable = finances.get("known_liquidatable_inventory_value", 0)
+        try:
+            liquidatable_value = max(0, int(float(liquidatable or 0)))
+        except (TypeError, ValueError):
+            liquidatable_value = 0
+        bank_balance = max(
+            (
+                int(account.get("last_known_balance", 0) or 0)
+                for account in finances.get("bank_accounts", [])
+                if isinstance(account, dict)
+            ),
+            default=0,
+        )
+        known_funds = carried + liquidatable_value + max(0, bank_balance)
+        if known_funds >= int(purchase["total_cost"]):
+            return None
+        if finances.get("buyer_candidates"):
+            return None
+
+        exhausted_ids = {
+            str(item.get("item_id"))
+            for item in finances.get("sale_exhausted_items", [])
+            if isinstance(item, dict) and item.get("item_id") is not None
+        }
+        restricted_ids = {
+            str(item.get("item_id", item.get("id")))
+            for item in finances.get("npc_transfer_restricted_items", [])
+            if isinstance(item, dict)
+            and item.get("item_id", item.get("id")) is not None
+        }
+        protected_ids = {
+            str(item.get("item_id", item.get("id")))
+            for item in finances.get("protected_sale_items", [])
+            if isinstance(item, dict)
+            and item.get("item_id", item.get("id")) is not None
+        }
+        unresolved_inventory = []
+        for item in deep_get(observation, "inventory.items", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").casefold()
+            if "shilling" in name or item.get("equipped") is True or item.get("in_use") is True:
+                continue
+            item_id = str(item.get("id"))
+            if item_id not in exhausted_ids | restricted_ids | protected_ids:
+                unresolved_inventory.append(item_id)
+        if unresolved_inventory:
+            return None
+        return {
+            **purchase,
+            "carried_shillings": carried,
+            "known_funding_total": known_funds,
+            "shortfall": int(purchase["total_cost"]) - known_funds,
+            "bank_balance": bank_balance,
+            "known_liquidatable_inventory_value": liquidatable_value,
         }
 
     def _live_overlevel_hostiles(
@@ -9758,6 +9935,30 @@ class BotController:
             for key in keys
         }
 
+    def _active_funding_bootstrap_phase(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the tightly scoped farm allowed to start at the rested floor."""
+
+        run = self.storage.campaign_run(str(goal.get("id") or ""))
+        phase = self.storage.active_campaign_phase(run["id"]) if run else None
+        context = phase.get("context") if isinstance(phase, dict) else None
+        if (
+            isinstance(phase, dict)
+            and phase.get("kind") == "farm"
+            and isinstance(context, dict)
+            and context.get("reason") == "bootstrap_combat_funding"
+        ):
+            return phase
+        return None
+
+    def _farm_fight_vigor(self, goal: dict[str, Any]) -> int:
+        return (
+            RESTED_VIGOR_FLOOR
+            if self._active_funding_bootstrap_phase(goal) is not None
+            else FARM_FIGHT_VIGOR
+        )
+
     def _farm_launch_origin(
         self,
         goal: dict[str, Any],
@@ -9862,6 +10063,9 @@ class BotController:
             arguments,
             observation,
             allow_open_field=intent.get("use_safe_spots") is False,
+            allow_rested_vigor=(
+                self._active_funding_bootstrap_phase(goal) is not None
+            ),
         )
         if self._safety_preflight("autopilot", arguments, observation, goal):
             return None
@@ -10004,6 +10208,15 @@ class BotController:
             "farm",
             "train_ability",
         }:
+            return None
+        phase_context = (
+            phase.get("context") if isinstance(phase.get("context"), dict) else {}
+        )
+        if phase_context.get("reason") == "bootstrap_combat_funding":
+            # This child phase exists precisely because the ordinary 100-vigor
+            # gate is unaffordable. Its keeper is separately restricted to the
+            # game's rested floor and the exact provision budget, so wrapping it
+            # in another food-support phase would recreate the deadlock.
             return None
 
         vigor_blocker = next(
@@ -10157,6 +10370,122 @@ class BotController:
         )
         return support
 
+    def _ensure_vigor_funding_bootstrap_phase(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Break a closed food-funding deadlock with a bounded keeper child phase."""
+
+        run = self.storage.campaign_run(str(goal.get("id") or ""))
+        phase = self.storage.active_campaign_phase(run["id"]) if run else None
+        context = phase.get("context") if isinstance(phase, dict) else None
+        if (
+            not isinstance(phase, dict)
+            or phase.get("kind") != "prepare_combat"
+            or not isinstance(context, dict)
+            or context.get("reason") != "recover_combat_vigor"
+        ):
+            return None
+        try:
+            required_vigor = int(context.get("required_vigor") or 0)
+        except (TypeError, ValueError):
+            return None
+        shortfall = self._closed_vigor_funding_shortfall(
+            observation, required_vigor
+        )
+        if shortfall is None:
+            return None
+        recipe = context.get("resume_combat_recipe")
+        recipe = recipe if isinstance(recipe, dict) else {}
+        assigned_room = recipe.get("assigned_room")
+        hunt = " ".join(str(recipe.get("hunt") or "").casefold().split())
+        try:
+            assigned_room = int(assigned_room)
+        except (TypeError, ValueError):
+            return None
+        if not hunt:
+            return None
+
+        required_shillings = int(shortfall["total_cost"])
+        support = self.campaign.apply_manager_decision(
+            run,
+            goal,
+            {
+                "decision": "push_support_phase",
+                "phase": {
+                    "kind": "farm",
+                    "objective": (
+                        f"Earn at least {required_shillings} carried shillings with "
+                        f"the bounded keeper so the paused vigor phase can buy its "
+                        "cheapest verified food basket."
+                    ),
+                    "targets": [
+                        {
+                            "id": f"bootstrap-funds-{required_shillings}",
+                            "type": "carried_currency_at_least",
+                            "amount": required_shillings,
+                        }
+                    ],
+                    "abandon_predicates": [],
+                    "budget": {"max_actions": 40, "max_minutes": 90},
+                    "context": {
+                        "reason": "bootstrap_combat_funding",
+                        "room": assigned_room,
+                        "target": hunt,
+                        "use_safe_spots": recipe.get("use_safe_spots") is not False,
+                        "flee_below": FARM_FLEE_THRESHOLD,
+                        "fight_above_vigor": RESTED_VIGOR_FLOOR,
+                        "bank_above": 0,
+                        "break_out_via_logoff": False,
+                        "required_shillings": required_shillings,
+                        "funding_shortfall": redact(shortfall),
+                        "resume_vigor_phase_id": phase.get("id"),
+                    },
+                    "rationale": (
+                        "The live menu proves the food cost, while carried cash, "
+                        "verified bank funds, and every grounded sale route cannot "
+                        "cover it. A health-aware keeper can safely work from the "
+                        "game's rested floor without weakening the ordinary 100-vigor "
+                        "farm policy."
+                    ),
+                },
+                "rationale": "Earn only the exact missing provision budget.",
+            },
+            observation=observation,
+        )
+        if support is None:
+            return None
+        self._invalidate_execution_plan(
+            goal,
+            "known food funding routes are exhausted; start bounded economic bootstrap",
+        )
+        self._clear_safety_suppression(str(goal.get("id") or ""))
+        self._clear_planner_feedback()
+        self.storage.emit_event(
+            "campaign.vigor_funding_bootstrap_started",
+            (
+                f"Paused the infeasible food purchase loop to earn the verified "
+                f"{required_shillings}-shilling provision budget"
+            ),
+            severity="notice",
+            interesting=True,
+            goal_id=goal.get("id"),
+            data={
+                "vigor_phase_id": phase.get("id"),
+                "bootstrap_phase_id": support.get("id"),
+                "required_shillings": required_shillings,
+                "carried_shillings": shortfall.get("carried_shillings"),
+                "funding_shortfall": shortfall.get("shortfall"),
+                "assigned_room": assigned_room,
+                "hunt": hunt,
+                "fight_above_vigor": RESTED_VIGOR_FLOOR,
+                "ordinary_farm_vigor_unchanged": FARM_FIGHT_VIGOR,
+                "strategic_goal_preserved": True,
+            },
+        )
+        return support
+
     def _recent_farm_food_quote(
         self, goal: dict[str, Any]
     ) -> dict[str, int] | None:
@@ -10246,9 +10575,10 @@ class BotController:
             live_vigor = int(vigor or 0)
         except (TypeError, ValueError):
             live_vigor = 0
+        fight_vigor = self._farm_fight_vigor(goal)
         nutrition_shortfall = max(
             0,
-            FARM_FIGHT_VIGOR
+            fight_vigor
             - max(live_vigor, RESTED_VIGOR_FLOOR)
             - int(supply.get("vigor_points", 0) or 0),
         )
@@ -10290,9 +10620,9 @@ class BotController:
                     },
                     {
                         "id": "buy-farm-food",
-                        "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {FARM_FIGHT_VIGOR}-vigor launch gate.",
+                        "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {fight_vigor}-vigor launch gate.",
                         "tool": "shop",
-                        "verification": f"Verified carried food nutrition plus rested vigor reaches at least {FARM_FIGHT_VIGOR}.",
+                        "verification": f"Verified carried food nutrition plus rested vigor reaches at least {fight_vigor}.",
                     },
                 ]
             )
@@ -10407,7 +10737,7 @@ class BotController:
             live_vigor = int(vigor or 0)
         except (TypeError, ValueError):
             return None
-        fight_vigor = FARM_FIGHT_VIGOR
+        fight_vigor = self._farm_fight_vigor(goal)
         prepared_vigor = max(live_vigor, RESTED_VIGOR_FLOOR)
         nutrition_shortfall = max(
             0,
@@ -11018,7 +11348,7 @@ class BotController:
         owner = self.storage.get_runtime("background_farm_owner_v1", {})
         owner = owner if isinstance(owner, dict) else {}
         intent = self._effective_farm_intent(goal)
-        expected = {**intent, "fight_above_vigor": FARM_FIGHT_VIGOR}
+        expected = {**intent, "fight_above_vigor": self._farm_fight_vigor(goal)}
         actual = {
             "assigned_room": self._farm_assigned_room(status),
             "hunt": self._farm_target(status).strip().casefold(),
@@ -15650,6 +15980,18 @@ class BotController:
                     "reason": "recover_combat_vigor",
                     "strategic_goal_preserved": True,
                 }
+            funding_bootstrap = (
+                None
+                if phase_safe_return_checkpoint is not None
+                else self._ensure_vigor_funding_bootstrap_phase(goal, observation)
+            )
+            if funding_bootstrap is not None:
+                return {
+                    "campaign_support_phase_started": True,
+                    "phase": funding_bootstrap,
+                    "reason": "bootstrap_combat_funding",
+                    "strategic_goal_preserved": True,
+                }
             structured_purchase = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -17152,6 +17494,9 @@ class BotController:
                 arguments,
                 observation,
                 allow_open_field=farm_intent.get("use_safe_spots") is False,
+                allow_rested_vigor=(
+                    self._active_funding_bootstrap_phase(goal) is not None
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise ModelError(f"planner supplied invalid {tool} safety arguments: {exc}") from exc

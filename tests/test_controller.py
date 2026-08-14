@@ -3664,7 +3664,7 @@ class ControllerTests(unittest.TestCase):
                     {
                         "id": "buy-reagents",
                         "tool": "shop",
-                        "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                        "outcome": "Buy 6 ElderBerry and 6 Herbs from seller 711.",
                         "verification": "Inventory contains the reagents.",
                     }
                 ]
@@ -3711,6 +3711,46 @@ class ControllerTests(unittest.TestCase):
                     controller._shop_plan_affordability_error(
                         funded, observation
                     )
+                )
+
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 674,
+                            "items": [
+                                {"id": 677, "name": "apple", "cost": 45},
+                                {"id": 680, "name": "loaf of bread", "cost": 108},
+                            ],
+                        },
+                    },
+                )
+                unquantified = [
+                    {
+                        "id": "buy-enough-food",
+                        "tool": "shop",
+                        "outcome": "Buy enough food from seller 674 using carried shillings.",
+                        "verification": "Inventory contains enough food for 100 vigor.",
+                    }
+                ]
+
+                quantity_error = controller._shop_plan_affordability_error(
+                    unquantified, observation
+                )
+
+                self.assertIn("does not quantify an exact basket", quantity_error or "")
+                self.assertIn("words such as 'enough'", quantity_error or "")
+                # Seller scoping must retain the older Joguer quote rather than
+                # incorrectly applying the newer bartender menu to this basket.
+                self.assertIn(
+                    "grounded basket cost of 252",
+                    controller._shop_plan_affordability_error(
+                        purchase, observation
+                    )
+                    or "",
                 )
             finally:
                 controller.storage.close()
@@ -10265,6 +10305,137 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
                 self.assertIsNone(controller.storage.get_runtime("safety_suppression_v1"))
                 self.assertEqual("resolved", controller.storage.goal_lesson(lesson["id"])["status"])
+            finally:
+                controller.storage.close()
+
+    def test_closed_vigor_funding_route_pushes_bounded_bootstrap_farm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="vigor-funding-bootstrap")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants in room 563.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                        "context": {
+                            "room": 563,
+                            "target": "ant",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+                vigor_phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Raise vigor from 78 to 100.",
+                        "success_criteria": [
+                            {
+                                "id": "combat-vigor-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.vigor.value",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                        "context": {
+                            "reason": "recover_combat_vigor",
+                            "required_vigor": 100,
+                            "resume_combat_phase_id": farm["id"],
+                            "resume_combat_recipe": {
+                                "assigned_room": 563,
+                                "hunt": "ant",
+                                "use_safe_spots": True,
+                            },
+                        },
+                    },
+                    mode="push",
+                )
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 674,
+                            "items": [
+                                {"id": 677, "name": "apple", "cost": 45},
+                                {"id": 680, "name": "loaf of bread", "cost": 108},
+                            ],
+                        },
+                    },
+                )
+                observation = {
+                    "status": {
+                        "vitals": {
+                            "vigor": {
+                                "value": 78,
+                                "scale_max": 200,
+                                "rested": False,
+                            }
+                        }
+                    },
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shilling", "amount": 12},
+                            {"id": 2, "name": "herb", "amount": 1},
+                        ],
+                        "carry": {"known": True},
+                    },
+                    "spells": {"spells": []},
+                }
+                controller._financial_context = lambda _observation: {  # type: ignore[method-assign]
+                    "carried_shillings": 12,
+                    "known_liquidatable_inventory_value": 0,
+                    "bank_accounts": [{"last_known_balance": 0}],
+                    "buyer_candidates": [],
+                    "sale_exhausted_items": [{"item_id": "2"}],
+                    "npc_transfer_restricted_items": [],
+                    "protected_sale_items": [],
+                }
+
+                bootstrap = controller._ensure_vigor_funding_bootstrap_phase(
+                    goal, observation
+                )
+
+                self.assertIsNotNone(bootstrap)
+                assert bootstrap is not None
+                self.assertEqual("farm", bootstrap["kind"])
+                self.assertEqual(vigor_phase["id"], bootstrap["parent_phase_id"])
+                self.assertEqual(
+                    "bootstrap_combat_funding", bootstrap["context"]["reason"]
+                )
+                self.assertEqual(90, bootstrap["context"]["required_shillings"])
+                self.assertEqual(80, bootstrap["context"]["fight_above_vigor"])
+                self.assertEqual("carried_currency", bootstrap["success_criteria"][0]["metric"])
+                self.assertEqual(90, bootstrap["success_criteria"][0]["value"])
+                self.assertEqual(80, controller._farm_fight_vigor(goal))
+                normalized, _changes = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {"action": "start", "mode": "farm", "fight_above_vigor": 100},
+                    observation,
+                    allow_rested_vigor=True,
+                )
+                self.assertEqual(80, normalized["fight_above_vigor"])
+                self.assertIsNone(
+                    controller._ensure_combat_vigor_support_phase(goal, observation)
+                )
             finally:
                 controller.storage.close()
 
