@@ -7751,6 +7751,8 @@ class ControllerTests(unittest.TestCase):
                 )
                 guidance = controller._no_progress_guidance("shop", second or "")
                 self.assertIn("read-only success is evidence, not progress", guidance)
+                self.assertIn("still viable in current financial_context", guidance)
+                self.assertNotIn("use sell or guarded sell_all", guidance)
 
                 # A real purchase remains a mutation and is never classified
                 # as a repeated catalogue lookup by this guard.

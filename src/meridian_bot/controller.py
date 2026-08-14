@@ -19059,8 +19059,9 @@ class BotController:
             return (
                 prefix
                 + "The merchant catalogue is already known. This read-only success is evidence, not progress: "
-                "do not inspect the same stock again. Act on it with sufficient carried funds, use sell or "
-                "guarded sell_all to fund the purchase, use a verified direct capability, or replace the plan."
+                "do not inspect the same stock again. Act on it with sufficient carried funds, use only a "
+                "funding route explicitly still viable in current financial_context, use a verified direct "
+                "capability, or replace the plan."
             )
         if tool == "shop" and is_inventory_capacity_refusal(reason):
             capacity = cls._inventory_capacity_context(observation)
