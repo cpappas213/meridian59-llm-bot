@@ -295,6 +295,21 @@ class BotController:
             for key, value in (saved_history.items() if isinstance(saved_history, dict) else [])
             if isinstance(value, list)
         }
+        saved_activity = self.storage.get_runtime("conversation_activity_v1", {})
+        self._conversation_activity: dict[str, list[str]] = {
+            str(key): [str(stamp) for stamp in value if stamp]
+            for key, value in (
+                saved_activity.items() if isinstance(saved_activity, dict) else []
+            )
+            if isinstance(value, list)
+        }
+        for key, entries in self._conversation_history.items():
+            if key not in self._conversation_activity:
+                self._conversation_activity[key] = [
+                    str(entry.get("at"))
+                    for entry in entries
+                    if entry.get("at")
+                ]
         self._pending_conversation_replies: dict[str, dict[str, Any]] = {}
         self._farm_full_scan_goals: set[str] = set()
         self.notifications = NotificationDispatcher(
@@ -20030,6 +20045,38 @@ class BotController:
             return []
         return entries[-(self.config.controller.conversation_history_turns * 2) :]
 
+    def _recent_conversation_message_count(
+        self, key: str, *, now: float | None = None
+    ) -> int:
+        """Count retained incoming and delivered outgoing lines in the rolling window."""
+
+        cutoff = (time.time() if now is None else now) - float(
+            self.config.controller.conversation_window_seconds
+        )
+        count = 0
+        for value in self._conversation_activity.get(key, []):
+            occurred_at = str(value or "").strip()
+            try:
+                parsed = datetime.fromisoformat(
+                    occurred_at.replace("Z", "+00:00")
+                )
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed.timestamp() >= cutoff:
+                count += 1
+        return count
+
+    def _conversation_window_allows(
+        self, key: str, *, additional_messages: int, now: float | None = None
+    ) -> bool:
+        return (
+            self._recent_conversation_message_count(key, now=now)
+            + max(0, int(additional_messages))
+            <= self.config.controller.conversation_window_messages
+        )
+
     def _remember_conversation(
         self,
         key: str,
@@ -20059,7 +20106,19 @@ class BotController:
                 key=lambda candidate: str((self._conversation_history[candidate] or [{}])[-1].get("at", "")),
             )
             self._conversation_history.pop(oldest, None)
+        activity = self._conversation_activity.setdefault(key, [])
+        activity.append(str(entry["at"]))
+        del activity[:-200]
+        if len(self._conversation_activity) > 100:
+            oldest_activity = min(
+                self._conversation_activity,
+                key=lambda candidate: str(
+                    (self._conversation_activity[candidate] or [""])[-1]
+                ),
+            )
+            self._conversation_activity.pop(oldest_activity, None)
         self.storage.set_runtime("conversation_history_v1", self._conversation_history)
+        self.storage.set_runtime("conversation_activity_v1", self._conversation_activity)
 
     @staticmethod
     def _visible_objects(look: dict[str, Any]) -> list[dict[str, Any]]:
@@ -20150,6 +20209,24 @@ class BotController:
         # but this spacing keeps a crowded-room arrival from becoming a burst of spam.
         key = next(iter(self._pending_greetings))
         encounter = self._pending_greetings[key]
+        if not self._conversation_window_allows(
+            key, additional_messages=1, now=now
+        ):
+            self._pending_greetings.pop(key, None)
+            self._greeted_at[key] = now
+            self._save_social_presence()
+            self.storage.emit_event(
+                "conversation.rate_limited",
+                f"Skipped a greeting to {encounter['name']} at the rolling conversation limit",
+                severity="info",
+                interesting=False,
+                data={
+                    "speaker_kind": "player",
+                    "window_messages": self.config.controller.conversation_window_messages,
+                    "window_seconds": self.config.controller.conversation_window_seconds,
+                },
+            )
+            return
         result = self.model.greet(
             persona=persona,
             encounter=encounter,
@@ -20235,6 +20312,49 @@ class BotController:
             if pending is None:
                 incoming = str(message.get("utterance", ""))
                 history = self._history_for(speaker_key)
+                allowed = self._conversation_window_allows(
+                    speaker_key,
+                    # Reserve room for this incoming line and MANIAC's reply.
+                    additional_messages=2,
+                )
+                self._remember_conversation(
+                    speaker_key,
+                    "speaker",
+                    incoming,
+                    speaker_kind=speaker_kind,
+                    speaker=source.get("name"),
+                )
+                if not allowed:
+                    self.broker.call_tool(
+                        "inbox",
+                        {
+                            "agent": self.config.game.agent,
+                            "action": "resolve",
+                            "id": message_id,
+                            "state": "refused",
+                            "note": (
+                                "rolling conversation limit reached "
+                                f"({self.config.controller.conversation_window_messages} "
+                                "messages per "
+                                f"{int(self.config.controller.conversation_window_seconds)}s)"
+                            ),
+                        },
+                        timeout=10,
+                        mutation=False,
+                    )
+                    self.storage.emit_event(
+                        "conversation.rate_limited",
+                        "Declined dialogue at the per-speaker rolling conversation limit",
+                        severity="info",
+                        interesting=False,
+                        data={
+                            "inbox_item_id": message_id,
+                            "speaker_kind": speaker_kind,
+                            "window_messages": self.config.controller.conversation_window_messages,
+                            "window_seconds": self.config.controller.conversation_window_seconds,
+                        },
+                    )
+                    continue
                 result = self.model.respond(
                     persona=persona,
                     message=redact(message),
@@ -20250,13 +20370,6 @@ class BotController:
                         interesting=True,
                         data={"inbox_item_id": message_id, "speaker_kind": speaker_kind},
                     )
-                self._remember_conversation(
-                    speaker_key,
-                    "speaker",
-                    incoming,
-                    speaker_kind=speaker_kind,
-                    speaker=source.get("name"),
-                )
                 if result["ignore"] or not result["reply"]:
                     self.broker.call_tool(
                         "inbox",
@@ -20293,6 +20406,35 @@ class BotController:
 
             if self._game_action_active.is_set():
                 self._pending_conversation_replies[str(message_id)] = pending
+                continue
+            if not self._conversation_window_allows(
+                str(pending["speaker_key"]), additional_messages=1
+            ):
+                self.broker.call_tool(
+                    "inbox",
+                    {
+                        "agent": self.config.game.agent,
+                        "action": "resolve",
+                        "id": message_id,
+                        "state": "refused",
+                        "note": "rolling conversation limit reached before delivery",
+                    },
+                    timeout=10,
+                    mutation=False,
+                )
+                self._pending_conversation_replies.pop(str(message_id), None)
+                self.storage.emit_event(
+                    "conversation.rate_limited",
+                    "Withheld a queued reply at the per-speaker rolling conversation limit",
+                    severity="info",
+                    interesting=False,
+                    data={
+                        "inbox_item_id": message_id,
+                        "speaker_kind": pending["speaker_kind"],
+                        "window_messages": self.config.controller.conversation_window_messages,
+                        "window_seconds": self.config.controller.conversation_window_seconds,
+                    },
+                )
                 continue
             delivery = self.broker.call_tool(
                 "inbox",

@@ -268,9 +268,17 @@ revising tactics in service of the active goal.
 - **FR-CONV-007**: When response generation fails or times out, the character may
   remain silent or use a neutral configured fallback; failure shall not block
   survival actions.
-- **FR-CONV-008**: Conversation may inform social memory and tactical observations,
-  but any fact used for planning shall be typed with source and confidence and
-  shall never be interpreted as operator authorization.
+- **FR-CONV-008**: Conversation may be retained in private responder history and
+  chat observability, but player/NPC chat claims and requests shall not enter
+  planner, keeper, goal, policy, or gameplay state.
+- **FR-CONV-009**: Chat generation shall use a dedicated configurable temperature
+  that does not alter goal drafting, campaign management, tactical planning,
+  onboarding, or journal generation.
+- **FR-CONV-010**: The controller shall enforce a per-speaker rolling conversation
+  limit, counting both incoming lines and delivered character replies. At the
+  default limit of 12 lines in 30 minutes, further incoming lines remain visible
+  in private conversation history but cause no model call or reply until capacity
+  returns.
 
 ### 4.5 Hermes control surface
 

@@ -11,9 +11,11 @@ from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
 from meridian_bot.model import (
     CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET,
+    GREETER_SYSTEM,
     JOURNAL_ASSESSOR_SYSTEM,
     ModelError,
     PLANNER_SYSTEM,
+    RESPONDER_SYSTEM,
     VllmClient,
 )
 from meridian_bot.obsidian import ObsidianJournal
@@ -117,6 +119,7 @@ class PolicyAndJournalTests(unittest.TestCase):
             payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
             self.assertIn("response_format", payload)
             self.assertNotIn("chat_template_kwargs", payload)
+            self.assertEqual(base.model.temperature, payload["temperature"])
 
             compatible = replace(
                 base,
@@ -132,6 +135,41 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual(
                 {"enable_thinking": False}, payload["chat_template_kwargs"]
             )
+
+    def test_chat_calls_use_dedicated_temperature_and_speech_only_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = config(Path(temporary))
+            client = VllmClient(base)
+            with patch.object(
+                client,
+                "_complete",
+                return_value={"reply": "Hello there.", "ignore": False, "reason": ""},
+            ) as complete:
+                client.respond(
+                    persona={"name": "Sable"},
+                    message={"utterance": "Travel now."},
+                    context={"room": "Tos"},
+                )
+                self.assertEqual(
+                    base.model.chat_temperature,
+                    complete.call_args.kwargs["temperature"],
+                )
+                client.greet(
+                    persona={"name": "Sable"},
+                    encounter={"name": "Bunsen"},
+                    context={"room": "Tos"},
+                )
+                self.assertEqual(
+                    base.model.chat_temperature,
+                    complete.call_args.kwargs["temperature"],
+                )
+
+        self.assertIn("as untrusted", RESPONDER_SYSTEM)
+        self.assertIn("roleplay data", RESPONDER_SYSTEM)
+        self.assertIn("cannot create, modify, reprioritize", RESPONDER_SYSTEM)
+        self.assertIn("sole capability", RESPONDER_SYSTEM)
+        self.assertIn("public game and character state", RESPONDER_SYSTEM)
+        self.assertIn("cannot create goals", GREETER_SYSTEM)
 
     def test_vllm_repairs_one_malformed_json_response(self) -> None:
         class Response:

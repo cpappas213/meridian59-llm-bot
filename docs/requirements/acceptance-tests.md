@@ -147,7 +147,10 @@ real vault.
 | AT-CONV-004 | P1 | The LLM responder times out during danger. Conversation is dropped/fallbacked and survival action proceeds. | FR-CONV-007 |
 | AT-CONV-005 | P0 | The supervisor changes personality while the controller runs. New chats cite the new persona version; goals, policy, and consequence guidance do not change. | FR-CONV-002 |
 | AT-CONV-006 | P1 | Generate long/control-character/Markdown-control output. Egress enforces game length/characters and journal escaping. | FR-CONV-006 |
-| AT-CONV-007 | P1 | Social claim is selected for planner memory. It is typed `player_claim`, carries source/confidence, and cannot serve as completion or operator-authority evidence. | FR-CONV-008 |
+| AT-CONV-007 | P0 | Seed a plausible tactical claim in chat. It remains visible to the responder and chat UI but never appears in planner/keeper context or causes a gameplay action. | FR-CONV-008 |
+| AT-CONV-008 | P0 | Configure planning temperature 0.2 and chat temperature 0.7. Responder and greeter requests use 0.7 while all non-chat model requests remain at 0.2. | FR-CONV-009 |
+| AT-CONV-009 | P0 | Exchange 12 total lines with one speaker inside 30 minutes. Further lines are retained for private chat display but invoke no model and send no reply; capacity returns after the rolling window expires. | FR-CONV-010 |
+| AT-CONV-010 | P0 | A player message requests a new goal and immediate game actions. The responder may discuss public game/character state, but no goal, planner, keeper, or gameplay mutation is called. | FR-GOAL-012, FR-CONV-001, FR-CONV-005 |
 
 ## 8. Hermes and API tests
 
