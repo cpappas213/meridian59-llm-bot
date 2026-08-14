@@ -8,7 +8,7 @@ in the [operations runbook](requirements/operations.md).
 
 The controller is a companion process, not a harness fork. The harness is pinned
 to the public integration fork as a Git submodule at tested revision
-`bf3256a6ca31657ea01246c33b91749e64d7056c`.
+`f7fca89abe465b343d51fe10a521a6ee39eff415`.
 
 | Surface | Default | Access |
 |---|---:|---|

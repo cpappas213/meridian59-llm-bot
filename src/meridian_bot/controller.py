@@ -9127,11 +9127,59 @@ class BotController:
             if self._planner_feedback(goal) is not None:
                 self._clear_planner_feedback()
             self._clear_safety_suppression(goal["id"])
+            keeper_handoff = self._handoff_paused_goal_keeper(goal)
+            if keeper_handoff is not None:
+                result["keeper_handoff"] = keeper_handoff
         if isinstance(resulting_goal, dict) and resulting_goal.get("status") == "cancelled":
             self.storage.complete_campaign_run(resulting_goal["id"], status="cancelled")
         if assessment is not None:
             result["cancellation_assessment"] = assessment
         return result
+
+    def _handoff_paused_goal_keeper(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Revoke a paused goal's background keeper without abandoning the character."""
+        owner = self.storage.get_runtime("background_farm_owner_v1", {})
+        owner = owner if isinstance(owner, dict) else {}
+        if owner.get("goal_id") != goal.get("id"):
+            return None
+
+        try:
+            handoff = self._ensure_survival_keeper()
+        except (BrokerError, ValueError) as exc:
+            failure = {
+                "attempted": True,
+                "switched_to_survival": False,
+                "error": str(exc)[:500],
+            }
+            # Keep the ownership record: it is authoritative evidence that a
+            # goal-owned keeper may still be driving and must be reconciled.
+            self.storage.emit_event(
+                "goal.pause_keeper_handoff_failed",
+                "Paused the goal, but could not hand its keeper to survival",
+                severity="error",
+                interesting=True,
+                goal_id=goal["id"],
+                data=redact(failure),
+            )
+            return failure
+
+        self.storage.set_runtime("background_farm_owner_v1", {})
+        response = {
+            "attempted": True,
+            "switched_to_survival": True,
+            "result": redact(handoff),
+        }
+        self.storage.emit_event(
+            "goal.pause_keeper_handoff",
+            "Paused goal handed its background keeper to survival",
+            severity="info",
+            interesting=True,
+            goal_id=goal["id"],
+            data=response,
+        )
+        return response
 
     def _active_goal_cancellation_assessment(
         self, goal: dict[str, Any], payload: dict[str, Any]

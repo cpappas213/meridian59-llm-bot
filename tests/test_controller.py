@@ -4980,6 +4980,95 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_pausing_goal_hands_its_background_keeper_to_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="pause-owned-keeper")
+                )["goal"]
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": "phase-1",
+                        "hunt": "giant rat",
+                        "assigned_room": 586,
+                    },
+                )
+
+                result = controller.manage_goal(
+                    {
+                        "request_id": "pause-owned-keeper-now",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+
+                self.assertEqual("paused", result["goal"]["status"])
+                self.assertTrue(result["keeper_handoff"]["switched_to_survival"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertTrue(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "survive"
+                        and arguments.get("hunt") == ""
+                        and arguments.get("assigned_room") is None
+                        for name, arguments in broker.calls
+                    )
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("background_farm_owner_v1", {})
+                )
+            finally:
+                controller.storage.close()
+
+    def test_pause_keeps_keeper_ownership_when_survival_handoff_fails(self) -> None:
+        class FailingHandoffBroker(BackgroundFarmBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                if name == "autopilot" and arguments.get("action") == "start":
+                    raise ToolCallError("keeper handoff failed")
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.broker = FailingHandoffBroker()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="pause-failed-handoff")
+                )["goal"]
+                owner = {"goal_id": goal["id"], "phase_id": "phase-1"}
+                controller.storage.set_runtime("background_farm_owner_v1", owner)
+
+                result = controller.manage_goal(
+                    {
+                        "request_id": "pause-failed-handoff-now",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+
+                self.assertEqual("paused", result["goal"]["status"])
+                self.assertFalse(result["keeper_handoff"]["switched_to_survival"])
+                self.assertEqual(
+                    owner,
+                    controller.storage.get_runtime("background_farm_owner_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
     def test_open_goal_repair_collapses_equivalent_paused_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
