@@ -10141,10 +10141,17 @@ class ControllerTests(unittest.TestCase):
                 ]
             }
             controller.last_observation = observation
+            source_verify_safe_rooms(controller, 100)
             try:
                 detail = controller.character_status()
 
                 self.assertEqual("Sable", detail["game"]["character_name"])
+                self.assertTrue(detail["game"]["room_properties"]["known"])
+                self.assertTrue(detail["game"]["room_properties"]["safe"])
+                self.assertEqual(
+                    ["ROOM_NO_COMBAT"],
+                    detail["game"]["room_properties"]["flags"],
+                )
                 self.assertEqual(30, len(detail["abilities"]["skills"]))
                 self.assertEqual(27, len(detail["abilities"]["spells"]))
                 self.assertEqual(3, detail["inventory"]["items"][1]["quantity"])
@@ -10222,6 +10229,7 @@ class ControllerTests(unittest.TestCase):
                 active = controller.storage.submit_goal(
                     goal_payload(request_id="supervision-status")
                 )["goal"]
+                source_verify_safe_rooms(controller, 100)
                 controller._begin_foreground_action(
                     "pvp_seek", goal_id=active["id"]
                 )
@@ -10231,6 +10239,12 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertIn("now_local", status)
+                self.assertTrue(status["game"]["room_properties"]["known"])
+                self.assertTrue(status["game"]["room_properties"]["safe"])
+                self.assertEqual(
+                    ["ROOM_NO_COMBAT"],
+                    status["game"]["room_properties"]["flags"],
+                )
                 self.assertEqual("foreground_action", status["controller"]["control_owner"])
                 self.assertEqual("pvp_seek", status["controller"]["foreground_action"]["tool"])
                 self.assertIn("liveness", status["attention"])

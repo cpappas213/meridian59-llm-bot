@@ -285,6 +285,107 @@ def _human_label(value: Any) -> str:
     return str(value).replace("_", " ").strip().title()
 
 
+ROOM_PROPERTY_LABELS = {
+    "ROOM_GUEST_AREA": "guest area",
+    "ROOM_GUILD_PK_ONLY": "guild PvP only",
+    "ROOM_HARD_LEARN": "hard learning",
+    "ROOM_HOMETOWN": "hometown",
+    "ROOM_LAMPS": "lamps",
+    "ROOM_NO_COMBAT": "no combat",
+    "ROOM_NO_PK": "no PvP",
+    "ROOM_OVERRIDE_DEPTH1": "depth override 1",
+    "ROOM_OVERRIDE_DEPTH2": "depth override 2",
+    "ROOM_SAFE_DEATH": "safe death",
+    "ROOM_SAFELOGOFF": "safe logoff",
+    "ROOM_SANCTUARY": "sanctuary",
+    "ROOM_TRIPLE_HEAL": "triple healing",
+}
+
+
+def _room_property_labels(game: dict[str, Any]) -> list[str]:
+    properties = game.get("room_properties")
+    if not isinstance(properties, dict):
+        return []
+    if properties.get("known") is not True:
+        return ["properties unknown"]
+
+    labels: list[str] = []
+    if properties.get("safe") is True:
+        labels.append("safe")
+    flags = properties.get("flags")
+    flag_values = (
+        [str(value) for value in flags]
+        if isinstance(flags, list)
+        else []
+    )
+    flag_priority = {
+        "ROOM_SANCTUARY": 0,
+        "ROOM_NO_COMBAT": 1,
+        "ROOM_NO_PK": 2,
+        "ROOM_SAFELOGOFF": 3,
+        "ROOM_SAFE_DEATH": 4,
+        "ROOM_TRIPLE_HEAL": 5,
+    }
+    for value in sorted(flag_values, key=lambda item: (flag_priority.get(item, 20), item)):
+        labels.append(
+            ROOM_PROPERTY_LABELS.get(
+                value,
+                value.removeprefix("ROOM_").replace("_", " ").casefold(),
+            )
+        )
+    terrain = properties.get("terrain")
+    for value in terrain if isinstance(terrain, list) else []:
+        labels.append(
+            str(value).removeprefix("TERRAIN_").replace("_", " ").casefold()
+        )
+    if properties.get("region"):
+        labels.append(f"region: {' '.join(str(properties['region']).split())}")
+
+    unique: list[str] = []
+    for label in labels:
+        if label and label not in unique:
+            unique.append(label)
+    return unique or ["no special tags"]
+
+
+def _format_room_properties(
+    game: dict[str, Any], *, max_length: int, color: bool
+) -> str:
+    labels = _room_property_labels(game)
+    if not labels or max_length < 8:
+        return ""
+    for count in range(len(labels), 0, -1):
+        omitted = len(labels) - count
+        visible = labels[:count] + ([f"+{omitted}"] if omitted else [])
+        candidate = f"[{', '.join(visible)}]"
+        if len(candidate) <= max_length:
+            properties = game.get("room_properties")
+            style = (
+                "green"
+                if isinstance(properties, dict) and properties.get("safe") is True
+                else "dim"
+                if labels == ["properties unknown"]
+                else "cyan"
+            )
+            return _paint(candidate, style, color)
+    fallback = f"[+{len(labels)} tags]"
+    return _paint(fallback, "cyan", color) if len(fallback) <= max_length else ""
+
+
+def _format_location(game: dict[str, Any], *, width: int, color: bool) -> str:
+    room_id = game.get("room_id", "-")
+    suffix = f" (room {room_id})"
+    available = max(12, width - len("Location ") - len(suffix))
+    name_limit = min(42, max(12, available // 2))
+    name = _one_line(game.get("location"), limit=name_limit)
+    tag_budget = max(0, available - len(name) - 1)
+    tags = _format_room_properties(game, max_length=tag_budget, color=color)
+    return (
+        f"{_paint(name, 'cyan', color)}{suffix}"
+        + (f" {tags}" if tags else "")
+    )
+
+
 def _human_number(value: Any) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
@@ -414,9 +515,9 @@ def render_dashboard(
         (
             f"Controller {_paint(controller.get('state', 'unknown'), _state_style(controller.get('state')), color)} | "
             f"Game {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
-            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
-            f"Location {_paint(_one_line(game.get('location'), limit=36), 'cyan', color)}"
+            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)}"
         ),
+        f"Location {_format_location(game, width=width, color=color)}",
         (
             f"{_paint('HP ' + _meter(vitals, 'health'), _vital_style(vitals.get('health')), color)}  "
             f"{_paint('Mana ' + _meter(vitals, 'mana'), 'blue', color)}  "
@@ -626,10 +727,9 @@ def render_character_status(
         heavy_rule,
         (
             f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
-            f"Connection {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
-            f"Location {_paint(_one_line(game.get('location'), limit=42), 'cyan', color)} "
-            f"(room {game.get('room_id', '-')})"
+            f"Connection {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)}"
         ),
+        f"Location {_format_location(game, width=width, color=color)}",
         (
             f"Observed {game.get('observation_age_seconds', '-')}s ago | "
             f"Risk {_paint(game.get('risk', '-'), _state_style(game.get('risk')), color)} | "

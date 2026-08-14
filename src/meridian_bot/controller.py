@@ -333,6 +333,7 @@ class BotController:
             "known": True,
             "room_id": facts.get("room_id", int(room_id)),
             "name": entity.get("canonical_name"),
+            "region": facts.get("region"),
             "flags": facts.get("flags", []),
             "terrain": facts.get("terrain", []),
             "flag_evidence": facts.get("flag_evidence"),
@@ -341,6 +342,36 @@ class BotController:
                 "source_ref": evidence.get("source_ref"),
                 "corpus_version": evidence.get("corpus_version"),
             },
+        }
+
+    def _room_properties(self, room_id: Any) -> dict[str, Any]:
+        """Return compact source-derived properties for a displayed room."""
+
+        try:
+            numeric_room_id = int(room_id)
+        except (TypeError, ValueError):
+            return {
+                "known": False,
+                "safe": None,
+                "flags": [],
+                "terrain": [],
+                "region": None,
+            }
+        policy = self._pvp_room_policy(numeric_room_id)
+        if not isinstance(policy, dict) or policy.get("known") is not True:
+            return {
+                "known": False,
+                "safe": None,
+                "flags": [],
+                "terrain": [],
+                "region": None,
+            }
+        return {
+            "known": True,
+            "safe": self._is_verified_safe_staging(policy),
+            "flags": sorted(str(value) for value in policy.get("flags", [])),
+            "terrain": sorted(str(value) for value in policy.get("terrain", [])),
+            "region": policy.get("region"),
         }
 
     @staticmethod
@@ -22492,6 +22523,13 @@ class BotController:
                 "character_name": self._character_name(observation),
                 "location": deep_get(observation, "look.room.name", deep_get(observation, "look.room")),
                 "room_id": deep_get(observation, "look.room.num", deep_get(observation, "look.room_id")),
+                "room_properties": self._room_properties(
+                    deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    )
+                ),
                 "position": deep_get(observation, "status.position"),
                 "vitals": deep_get(observation, "status.vitals", deep_get(observation, "look.vitals", {})),
                 "risk": self._risk(observation),
@@ -22831,6 +22869,13 @@ class BotController:
                         "look.room.num",
                         deep_get(observation, "look.room_id"),
                     ),
+                    "room_properties": self._room_properties(
+                        deep_get(
+                            observation,
+                            "look.room.num",
+                            deep_get(observation, "look.room_id"),
+                        )
+                    ),
                     "position": deep_get(observation, "status.position"),
                     "vitals": deep_get(
                         observation,
@@ -22971,6 +23016,18 @@ class BotController:
                 "server": f"{self.config.game.host}:{self.config.game.port}",
                 "character_name": self._character_name(observation),
                 "location": deep_get(observation, "look.room.name", deep_get(observation, "look.room")),
+                "room_id": deep_get(
+                    observation,
+                    "look.room.num",
+                    deep_get(observation, "look.room_id"),
+                ),
+                "room_properties": self._room_properties(
+                    deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    )
+                ),
                 "vitals": deep_get(observation, "status.vitals", deep_get(observation, "look.vitals", {})),
                 "risk": self._risk(observation),
                 "finances": self._financial_context(observation),

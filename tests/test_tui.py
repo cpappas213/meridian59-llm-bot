@@ -47,6 +47,14 @@ class FakeApi:
                 "connection": "joined",
                 "character_name": "Sable",
                 "location": "Tos",
+                "room_id": 50,
+                "room_properties": {
+                    "known": True,
+                    "safe": False,
+                    "flags": ["ROOM_GUILD_PK_ONLY"],
+                    "terrain": ["TERRAIN_CITY"],
+                    "region": "Tos",
+                },
                 "vitals": {
                     "health": {"current": 40, "max": 50},
                     "mana": {"current": 20, "max": 30},
@@ -134,6 +142,17 @@ class FakeApi:
                 "character_name": "Sable",
                 "location": "Tos Inn",
                 "room_id": 52,
+                "room_properties": {
+                    "known": True,
+                    "safe": True,
+                    "flags": [
+                        "ROOM_HOMETOWN",
+                        "ROOM_NO_COMBAT",
+                        "ROOM_SANCTUARY",
+                    ],
+                    "terrain": ["TERRAIN_CITY"],
+                    "region": "Tos",
+                },
                 "vitals": {
                     "health": {"value": 40, "max": 50, "pct": 80},
                     "mana": {"value": 20, "max": 30, "pct": 67},
@@ -329,6 +348,10 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Attempts 2", rendered)
         self.assertIn("Reach the First Royal Bank of Tos safely.", rendered)
         self.assertIn("Plan [verified]: Travel safely to the bank", rendered)
+        self.assertIn(
+            "Location Tos (room 50) [guild PvP only, city, region: Tos]",
+            rendered,
+        )
 
     def test_dashboard_explains_when_campaign_is_between_phases(self) -> None:
         api = FakeApi()
@@ -385,6 +408,11 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Health: 40 / 50 (80%)", rendered)
         self.assertIn("Vigor: 100 / 200 (50%; rested; rest threshold 80)", rendered)
         self.assertIn("Might: 25 (display scale 50; hard cap 70)", rendered)
+        self.assertIn(
+            "Location Tos Inn (room 52) "
+            "[safe, sanctuary, no combat, hometown, city, region: Tos]",
+            rendered,
+        )
         self.assertNotIn("{'value':", rendered)
 
     def test_recent_chat_renders_directions_wraps_and_strips_controls(self) -> None:
