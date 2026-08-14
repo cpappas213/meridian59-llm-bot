@@ -109,7 +109,34 @@ class ApiServers:
                         return self.send_json(200, controller.persona())
                     if parsed.path == "/v1/events":
                         kinds = [part for item in query.get("kinds", []) for part in item.split(",") if part]
-                        return self.send_json(200, controller.storage.events(after_cursor=int(_first(query, "after_cursor", "0")), limit=int(_first(query, "limit", "50")), interesting_only=_bool(_first(query, "interesting_only", "false")), kinds=kinds or None))
+                        limit = int(_first(query, "limit", "50"))
+                        interesting_only = _bool(
+                            _first(query, "interesting_only", "false")
+                        )
+                        if _bool(_first(query, "latest", "false")):
+                            events = controller.storage.latest_events(
+                                limit=limit,
+                                interesting_only=interesting_only,
+                                kinds=kinds or None,
+                            )
+                            result = {
+                                "events": events,
+                                "next_cursor": (
+                                    events[-1]["cursor"] if events else 0
+                                ),
+                                "has_more": False,
+                            }
+                        else:
+                            # Preserve the forward-pagination contract used by
+                            # event consumers and deterministic goal evidence.
+                            result = controller.storage.events(
+                                after_cursor=int(_first(query, "after_cursor", "0")),
+                                limit=limit,
+                                interesting_only=interesting_only,
+                                kinds=kinds or None,
+                            )
+                        result["timezone"] = controller.config.deployment.timezone
+                        return self.send_json(200, result)
                     if parsed.path == "/v1/knowledge/metadata":
                         return self.send_json(200, controller.knowledge.metadata())
                     if parsed.path == "/v1/knowledge/search":

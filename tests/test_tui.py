@@ -216,14 +216,17 @@ class FakeApi:
 
 
 class TuiTests(unittest.TestCase):
-    def test_controller_api_events_requests_newest_status_snapshot(self) -> None:
+    def test_controller_api_events_requests_latest_activity_in_setup_timezone(
+        self,
+    ) -> None:
         api = object.__new__(ControllerApi)
         requests: list[tuple[str, str]] = []
 
         def request(method: str, path: str) -> dict[str, object]:
             requests.append((method, path))
             return {
-                "recent_events": [
+                "timezone": "America/Los_Angeles",
+                "events": [
                     {
                         "cursor": 12554,
                         "occurred_at": "2026-08-14T12:38:04.144Z",
@@ -238,7 +241,15 @@ class TuiTests(unittest.TestCase):
 
         self.assertEqual(12554, events[0]["cursor"])
         self.assertEqual(
-            [("GET", "/v1/status?detail=goal&include_recent_events=5")],
+            "2026-08-14 05:38 PDT", events[0]["display_occurred_at"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "GET",
+                    "/v1/events?latest=true&interesting_only=false&limit=5",
+                )
+            ],
             requests,
         )
 
@@ -254,7 +265,7 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Dodge 12", rendered)
         self.assertIn("Blink 8", rendered)
         self.assertIn("Controller started", rendered)
-        self.assertIn("2026-08-08 12:34Z", rendered)
+        self.assertIn("2026-08-08 12:34 UTC", rendered)
         self.assertIn("[S] Character status", rendered)
         self.assertIn("CURRENT PHASE", rendered)
         self.assertIn("#4 Return Home [active]", rendered)

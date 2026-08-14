@@ -11,7 +11,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import BotConfig
 from .utils import uuid7
@@ -125,15 +127,24 @@ class ControllerApi:
 
     def events(self, *, limit: int = 5) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 20))
-        # /v1/events is a forward-pagination feed: without an after_cursor it
-        # begins at cursor zero and therefore returns the oldest events. The
-        # goal-detail snapshot already contains the bounded newest-event view
-        # intended for operator displays.
         value = self.request(
-            "GET", f"/v1/status?detail=goal&include_recent_events={limit}"
+            "GET",
+            f"/v1/events?latest=true&interesting_only=false&limit={limit}",
         )
-        events = value.get("recent_events")
-        return [item for item in events if isinstance(item, dict)] if isinstance(events, list) else []
+        events = value.get("events")
+        timezone_name = str(value.get("timezone") or "UTC")
+        if not isinstance(events, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            event = dict(item)
+            event["display_occurred_at"] = _event_display_timestamp(
+                event.get("occurred_at"), timezone_name
+            )
+            result.append(event)
+        return result
 
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/v1/goals", payload)
@@ -227,14 +238,18 @@ def _one_line(value: Any, *, limit: int = 100) -> str:
     return textwrap.shorten(text, width=max(8, limit), placeholder="...")
 
 
-def _event_timestamp(value: Any) -> str:
-    """Render enough of an ISO timestamp to make stale event rows obvious."""
+def _event_display_timestamp(value: Any, timezone_name: str = "UTC") -> str:
+    """Render an event in the operator-selected deployment timezone."""
 
     text = str(value or "").strip()
-    if len(text) >= 16 and text[4:5] == "-" and text[10:11] == "T":
-        rendered = text[:16].replace("T", " ")
-        return rendered + ("Z" if text.endswith("Z") else "")
-    return text[:17]
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return text[:20]
+        local = parsed.astimezone(ZoneInfo(timezone_name))
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    except (ValueError, OverflowError, ZoneInfoNotFoundError):
+        return text[:20]
 
 
 def _meter(vitals: dict[str, Any], name: str) -> str:
@@ -522,9 +537,9 @@ def render_dashboard(
         for event in events[-5:]:
             severity = event.get("severity", "info")
             lines.append(
-                f"{_event_timestamp(event.get('occurred_at'))} "
+                f"{event.get('display_occurred_at') or _event_display_timestamp(event.get('occurred_at'))} "
                 f"{_paint(f'{str(severity):>7}', _state_style(severity), color)}  "
-                f"{_one_line(event.get('summary'), limit=max(20, width - 29))}"
+                f"{_one_line(event.get('summary'), limit=max(20, width - 34))}"
             )
     else:
         lines.append("No interesting events yet.")

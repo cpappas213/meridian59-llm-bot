@@ -71,6 +71,25 @@ class ApiTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(goals_request, timeout=2) as response:
                     self.assertEqual({"goals": []}, json.load(response))
+                for index in range(5):
+                    controller.storage.emit_event(
+                        "test.activity",
+                        f"Recent activity {index}",
+                        interesting=False,
+                    )
+                events_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/events?latest=true&interesting_only=false&limit=3",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(events_request, timeout=2) as response:
+                    latest = json.load(response)
+                self.assertEqual(
+                    ["Recent activity 2", "Recent activity 3", "Recent activity 4"],
+                    [event["summary"] for event in latest["events"]],
+                )
+                self.assertEqual(
+                    controller.config.deployment.timezone, latest["timezone"]
+                )
                 character_request = urllib.request.Request(
                     f"http://127.0.0.1:{control_port}/v1/character",
                     headers={"authorization": "Bearer test-token"},
