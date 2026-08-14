@@ -122,7 +122,16 @@ CRITERION_SCHEMA: dict[str, Any] = {
             "enum": list(CRITERION_KINDS),
             "description": "Verifier implementation to use.",
         },
-        "path": {"type": "string", "minLength": 1, "description": "Dot path in the verified observation for state_equals."},
+        "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Dot path in the verified observation for state_equals. Named ability "
+                "ownership may use abilities.skills.<canonical name> or "
+                "abilities.spells.<canonical name>, which resolve to booleans from the "
+                "live ability catalogue."
+            ),
+        },
         "metric": {
             "type": "string",
             "minLength": 1,

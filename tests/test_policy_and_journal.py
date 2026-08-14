@@ -9,7 +9,13 @@ from unittest.mock import patch
 
 from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
-from meridian_bot.model import JOURNAL_ASSESSOR_SYSTEM, ModelError, PLANNER_SYSTEM, VllmClient
+from meridian_bot.model import (
+    CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET,
+    JOURNAL_ASSESSOR_SYSTEM,
+    ModelError,
+    PLANNER_SYSTEM,
+    VllmClient,
+)
 from meridian_bot.obsidian import ObsidianJournal
 from meridian_bot.policy import PolicyEngine
 from meridian_bot.controller import BotController
@@ -323,12 +329,94 @@ class PolicyAndJournalTests(unittest.TestCase):
                 client.manage_campaign(
                     goal={},
                     observation={},
-                    campaign_context={},
+                    campaign_context={
+                        "phase_capabilities": {
+                            "research_progression": ["hunting_grounds"]
+                        }
+                    },
                     grounded_knowledge=None,
                     learned_failures=None,
                     financial_context=None,
                 )
             self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+            messages = complete.call_args.args[0]
+            sent = json.loads(messages[1]["content"])
+            self.assertEqual(
+                ["hunting_grounds"],
+                sent["campaign"]["phase_capabilities"]["research_progression"],
+            )
+            self.assertIn("fact namespaces, not callable tools", messages[0]["content"])
+
+    def test_campaign_manager_enforces_prompt_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            duplicate = {
+                "room": 583,
+                "target": "slime",
+                "reason": "quarantined_farm_phase",
+                "details": ["repeated safe-spot failure " + ("x" * 2000)],
+            }
+            campaign = {
+                "run": {"id": "run-1", "status": "active"},
+                "active_phase": None,
+                "tactic_ledger": {
+                    "unique_rejected_candidates": [duplicate for _ in range(2000)]
+                },
+                "recent_phase_summaries": [
+                    {"id": f"phase-{index}", "objective": "y" * 4000}
+                    for index in range(100)
+                ],
+                "research_retry": {"allowed": False},
+            }
+            with patch.object(
+                client, "_complete", return_value={"decision": "start_phase"}
+            ) as complete:
+                client.manage_campaign(
+                    goal={"title": "Reach 100 HP"},
+                    observation={"status": {"vitals": {"health": {"max": 34}}}},
+                    campaign_context=campaign,
+                    grounded_knowledge=None,
+                    learned_failures=None,
+                    financial_context=None,
+                )
+
+            self.assertIsNotNone(client.last_prompt_metrics)
+            self.assertLessEqual(
+                client.last_prompt_metrics["estimated_tokens"],
+                CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET,
+            )
+            self.assertTrue(client.last_prompt_metrics["compacted"])
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual(False, sent["campaign"]["research_retry"]["allowed"])
+
+    def test_campaign_manager_timeout_retries_with_minimal_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch.object(
+                client,
+                "_complete",
+                side_effect=[
+                    ModelError("model request failed: timed out"),
+                    {"decision": "start_phase"},
+                ],
+            ) as complete:
+                result = client.manage_campaign(
+                    goal={"title": "Reach 100 HP"},
+                    observation={"status": {"vitals": {"health": {"max": 34}}}},
+                    campaign_context={
+                        "run": {"id": "run-1", "status": "active"},
+                        "research_retry": {"allowed": False},
+                    },
+                    grounded_knowledge={"rules": ["grounded"]},
+                    learned_failures=None,
+                    financial_context=None,
+                )
+
+            self.assertEqual("start_phase", result["decision"])
+            self.assertEqual(2, complete.call_count)
+            recovery = json.loads(complete.call_args_list[1].args[0][1]["content"])
+            self.assertTrue(recovery["timeout_recovery"]["prior_request_timed_out"])
+            self.assertEqual("timeout_recovery", client.last_prompt_metrics["mode"])
 
     def test_campaign_manager_and_planner_receive_full_planning_persona(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

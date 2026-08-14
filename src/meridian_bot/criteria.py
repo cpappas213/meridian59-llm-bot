@@ -8,6 +8,42 @@ from .storage import Storage
 from .utils import deep_get
 
 
+# ``inventory_contains`` normally matches a concrete item name.  Internal
+# campaign phases may deliberately request the semantic category ``food``;
+# these are the ordinary edible item names backed by the same source-derived
+# nutrition catalogue used by combat provisioning.  Reagents such as herbs
+# and elderberries are intentionally absent: they are not edible supplies
+# until Create Food converts them.
+EDIBLE_FOOD_NAME_MARKERS = (
+    "inky cap",
+    "chocolate mint",
+    "wheel of cheese",
+    "cheese",
+    "turkey leg",
+    "mug of",
+    "meat pie",
+    "stew",
+    "loaf of bread",
+    "waterskin",
+    "slice of pork",
+    "bowl of soup",
+    "spideye",
+    "bunch of grapes",
+    "apple",
+    "edible mushroom",
+    "drumstick",
+    "goblet",
+)
+
+# Source spell catalogues use class names while the live inventory exposes
+# display names. These two reagent classes have irregular/plural source names
+# that are not substrings of their singular inventory labels.
+INVENTORY_NAME_ALIASES = {
+    "herbs": "herb",
+    "elderberries": "elderberry",
+}
+
+
 @dataclass(frozen=True)
 class CriterionResult:
     id: str
@@ -64,6 +100,34 @@ class CriteriaEvaluator:
             "all_met": all_met,
         }
 
+    @staticmethod
+    def inventory_count(items: Any, requested_item: Any) -> int:
+        """Count a concrete inventory name or a supported semantic category."""
+
+        if not isinstance(items, list):
+            return 0
+        needle = " ".join(str(requested_item or "").split()).casefold()
+        needle = INVENTORY_NAME_ALIASES.get(needle, needle)
+        semantic_food = needle in {"food", "edible food"}
+        count = 0
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            name = " ".join(str(entry.get("name") or "").split()).casefold()
+            name = INVENTORY_NAME_ALIASES.get(name, name)
+            matches = (
+                any(marker in name for marker in EDIBLE_FOOD_NAME_MARKERS)
+                if semantic_food
+                else bool(needle) and needle in name
+            )
+            if not matches:
+                continue
+            try:
+                count += max(1, int(entry.get("amount", 1) or 1))
+            except (TypeError, ValueError):
+                count += 1
+        return count
+
     def _simple(self, criterion_id: str, item: dict[str, Any], goal: dict[str, Any], observation: dict[str, Any]) -> CriterionResult:
         kind = item["kind"]
         if kind == "operator_confirmed":
@@ -83,7 +147,9 @@ class CriteriaEvaluator:
                 else "awaiting explicit operator confirmation",
             )
         if kind == "state_equals":
-            actual = deep_get(observation, str(item.get("path", item.get("metric", ""))))
+            actual = self._state_value(
+                observation, str(item.get("path", item.get("metric", "")))
+            )
             expected = item.get("value")
             return CriterionResult(criterion_id, kind, actual == expected, f"observed {actual!r}; expected {expected!r}")
         if kind in {"numeric_threshold", "numeric_delta"}:
@@ -96,9 +162,8 @@ class CriteriaEvaluator:
             return CriterionResult(criterion_id, kind, met, f"observed {measured!r} {op} {target!r}")
         if kind == "inventory_contains":
             items = deep_get(observation, "inventory.items", [])
-            needle = str(item.get("item", "")).lower()
             wanted = int(item.get("count", 1))
-            count = sum(int(entry.get("amount", 1) or 1) for entry in items if needle in str(entry.get("name", "")).lower()) if isinstance(items, list) else 0
+            count = self.inventory_count(items, item.get("item"))
             return CriterionResult(criterion_id, kind, count >= wanted, f"verified count {count}; required {wanted}")
         if kind == "location_reached":
             location = str(item.get("location", item.get("room", ""))).lower()
@@ -135,6 +200,78 @@ class CriteriaEvaluator:
                 f"matching goal-scoped durable events: {len(page['events'])}{anchor_note}",
             )
         return CriterionResult(criterion_id, kind, False, "unsupported verifier")
+
+    @staticmethod
+    def _state_value(observation: dict[str, Any], path: str) -> Any:
+        """Resolve stable state paths, including broker compatibility aliases."""
+
+        parts = path.split(".", 2)
+        if (
+            len(parts) == 3
+            and parts[0].casefold() == "abilities"
+            and parts[1].casefold() in {"skills", "spells"}
+            and parts[2].strip()
+        ):
+            abilities = observation.get("abilities")
+            if not isinstance(abilities, dict):
+                return None
+            ability_kind = parts[1].casefold()
+            freshness = abilities.get("freshness")
+            if isinstance(freshness, dict):
+                known = freshness.get("known")
+                if known is False:
+                    return None
+                if isinstance(known, dict) and known.get(ability_kind) is False:
+                    return None
+            rows = abilities.get(ability_kind)
+            if not isinstance(rows, list):
+                return None
+            wanted = ability_name_key(parts[2])
+            return any(
+                isinstance(row, dict)
+                and ability_name_key(row.get("name")) == wanted
+                for row in rows
+            )
+
+        if path != "inventory.full":
+            return deep_get(observation, path)
+
+        inventory = observation.get("inventory")
+        if not isinstance(inventory, dict):
+            return None
+        if "full" in inventory:
+            return inventory["full"]
+
+        # Current broker snapshots expose capacity as remaining weight and bulk
+        # rather than the older synthetic ``inventory.full`` flag used by
+        # campaign criteria. Keep that criterion stable for persisted phases and
+        # derive the flag only when the carry snapshot is explicitly known.
+        carry = inventory.get("carry")
+        if not isinstance(carry, dict) or carry.get("known") is not True:
+            return None
+        room_for = carry.get("room_for")
+        if isinstance(room_for, dict):
+            weight = room_for.get("weight")
+            bulk = room_for.get("bulk")
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (weight, bulk)
+            ):
+                return bool(weight <= 0 or bulk <= 0)
+
+        load = carry.get("load")
+        maximum = carry.get("max")
+        if isinstance(load, dict) and isinstance(maximum, dict):
+            weight = load.get("weight")
+            bulk = load.get("bulk")
+            weight_max = maximum.get("weight")
+            bulk_max = maximum.get("bulk")
+            if all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (weight, bulk, weight_max, bulk_max)
+            ):
+                return bool(weight >= weight_max or bulk >= bulk_max)
+        return None
 
     @staticmethod
     def _numeric_metric(observation: dict[str, Any], metric: str) -> Any:

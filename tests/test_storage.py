@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from meridian_bot.campaign import CampaignCoordinator
+from meridian_bot.campaign import (
+    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CampaignCoordinator,
+)
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.storage import IdempotencyConflict, InvalidTransition, Storage
 
@@ -12,6 +18,178 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_inventory_food_category_counts_edible_items_not_reagents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                result = CriteriaEvaluator(storage).evaluate(
+                    {
+                        "id": "food-category",
+                        "success_criteria": [
+                            {
+                                "id": "food",
+                                "kind": "inventory_contains",
+                                "item": "food",
+                                "count": 3,
+                            }
+                        ],
+                    },
+                    {
+                        "inventory": {
+                            "items": [
+                                {"name": "apple", "amount": 2},
+                                {"name": "wheel of cheese"},
+                                {"name": "herb", "amount": 8},
+                                {"name": "elderberry", "amount": 8},
+                            ]
+                        }
+                    },
+                )
+
+                self.assertTrue(result["all_met"])
+                self.assertEqual(
+                    "verified count 3; required 3",
+                    result["criteria"][0]["detail"],
+                )
+
+    def test_compact_campaign_attempt_preserves_verified_failure_reason(self) -> None:
+        compact = CampaignCoordinator._compact_attempt(
+            {
+                "id": "attempt-1",
+                "semantic_action": "sell",
+                "status": "failed",
+                "result": {"messages": ["merchant dialogue omitted from compact context"]},
+                "verification": {
+                    "no_progress": True,
+                    "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                },
+            }
+        )
+
+        self.assertEqual(
+            {
+                "no_progress": True,
+                "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+            },
+            (compact or {}).get("verification"),
+        )
+
+    def test_inventory_not_full_uses_known_broker_capacity_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                evaluator = CriteriaEvaluator(storage)
+                goal = {
+                    "id": "inventory-capacity-compatibility",
+                    "success_criteria": [
+                        {
+                            "id": "capacity",
+                            "kind": "state_equals",
+                            "path": "inventory.full",
+                            "value": False,
+                        }
+                    ],
+                }
+
+                available = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": True,
+                                "room_for": {"weight": 2566, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+                full = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": True,
+                                "room_for": {"weight": 0, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+                unknown = evaluator.evaluate(
+                    goal,
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": False,
+                                "room_for": {"weight": 2566, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+
+                self.assertTrue(available["all_met"])
+                self.assertFalse(full["all_met"])
+                self.assertFalse(unknown["all_met"])
+
+    def test_named_ability_state_path_resolves_live_catalogue_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                evaluator = CriteriaEvaluator(storage)
+                goal = {
+                    "id": "named-ability-membership",
+                    "success_criteria": [
+                        {
+                            "id": "has-punch",
+                            "kind": "state_equals",
+                            "path": "abilities.skills.Punch",
+                            "value": True,
+                        },
+                        {
+                            "id": "punch-level",
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.punch",
+                            "operator": ">=",
+                            "value": 1,
+                        },
+                    ],
+                }
+
+                learned = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": True}},
+                            "skills": [{"name": "PUNCH", "ability": 18}],
+                        }
+                    },
+                )
+                absent = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": True}},
+                            "skills": [{"name": "mace fighting", "ability": 32}],
+                        }
+                    },
+                )
+                unknown = evaluator.evaluate(
+                    goal,
+                    {
+                        "abilities": {
+                            "freshness": {"known": {"skills": False}},
+                            "skills": [{"name": "punch", "ability": 18}],
+                        }
+                    },
+                )
+
+                self.assertTrue(learned["all_met"])
+                self.assertEqual(
+                    "observed True; expected True",
+                    learned["criteria"][0]["detail"],
+                )
+                self.assertFalse(absent["criteria"][0]["met"])
+                self.assertEqual(
+                    "observed None; expected True",
+                    unknown["criteria"][0]["detail"],
+                )
+                self.assertFalse(unknown["all_met"])
+
     def test_higher_priority_preemption_requeues_and_automatically_resumes_goal(
         self,
     ) -> None:
@@ -98,6 +276,108 @@ class StorageTests(unittest.TestCase):
 
                 self.assertIsNone(result)
                 self.assertEqual(active["id"], storage.active_goal()["id"])
+
+    def test_operator_pause_and_resume_keep_campaign_lifecycle_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Raise max HP to the next local milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "value": 101,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-campaign-lifecycle",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                        "reason": "operator requested a reversible pause",
+                    }
+                )
+
+                self.assertEqual("paused", storage.goal(goal["id"])["status"])
+                self.assertIsNone(storage.campaign_run(goal["id"]))
+                paused_run = storage.campaign_run(goal["id"], include_terminal=True)
+                self.assertEqual("paused", paused_run["status"])
+                self.assertEqual(phase["id"], paused_run["active_phase_id"])
+                self.assertEqual(
+                    "paused",
+                    next(
+                        item["status"]
+                        for item in storage.campaign_phases(run["id"])
+                        if item["id"] == phase["id"]
+                    ),
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-campaign-lifecycle",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                        "reason": "operator requested a fresh retry",
+                    }
+                )
+
+                self.assertEqual("active", storage.goal(goal["id"])["status"])
+                resumed_run = storage.campaign_run(goal["id"])
+                self.assertEqual(run["id"], resumed_run["id"])
+                self.assertEqual(phase["id"], resumed_run["active_phase_id"])
+                self.assertEqual(
+                    phase["id"], storage.active_campaign_phase(run["id"])["id"]
+                )
+
+    def test_migration_repairs_paused_goal_with_active_campaign_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "bot.sqlite3"
+            with Storage(database) as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Raise max HP to the next local milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "value": 101,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "UPDATE goals SET status='paused' WHERE id=?", (goal["id"],)
+                )
+                connection.execute("DELETE FROM schema_migrations WHERE version=4")
+                connection.commit()
+
+            with Storage(database) as repaired:
+                migrated_run = repaired.campaign_run(
+                    goal["id"], include_terminal=True
+                )
+                self.assertEqual("paused", migrated_run["status"])
+                self.assertEqual(phase["id"], migrated_run["active_phase_id"])
+                self.assertEqual(
+                    "paused", repaired.campaign_phase(phase["id"])["status"]
+                )
 
     def test_blocking_strategic_goal_closes_active_campaign_and_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -326,7 +606,14 @@ class StorageTests(unittest.TestCase):
             phase, "equip_best", {}, first, {"equipment.wielding": "mace"}
         )
         second_signature = coordinator.action_signature(
-            phase, "equip_best", {}, second, {"equipment.wielding": "mace"}
+            phase,
+            "equip_best",
+            {},
+            second,
+            {
+                "status": "equipment ready",
+                "detail": "the best weapon should now be wielded",
+            },
         )
         self.assertEqual(first_signature, second_signature)
 
@@ -337,12 +624,24 @@ class StorageTests(unittest.TestCase):
                 {"name": "inventory"},
                 {"name": "act"},
                 {"name": "equip_best"},
+                {"name": "merchants"},
+                {"name": "shop"},
+                {"name": "sell"},
+                {"name": "sell_all"},
                 {"name": "fight"},
             ],
         )
 
         self.assertEqual(
-            {"inventory", "act", "equip_best"},
+            {
+                "inventory",
+                "act",
+                "equip_best",
+                "merchants",
+                "shop",
+                "sell",
+                "sell_all",
+            },
             {tool["name"] for tool in selected},
         )
 
@@ -364,6 +663,83 @@ class StorageTests(unittest.TestCase):
             {tool["name"] for tool in selected},
         )
 
+    def test_max_health_research_compiles_only_executable_recipe_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(
+                    goal_payload(
+                        request_id="typed-hp-research-adapter",
+                        objective="Raise maximum HP to at least 100.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                    )
+                )["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Find an executable farm recipe.",
+                            "targets": [
+                                {
+                                    "id": "recipe",
+                                    "type": "phase_action_succeeded",
+                                    "tools": [
+                                        "prey",
+                                        "knowledge_search",
+                                        "hunting_grounds",
+                                    ],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                        },
+                    },
+                )
+
+                self.assertEqual(
+                    ["hunting_grounds"],
+                    phase["success_criteria"][0]["tools"],
+                )
+
+                storage.transition_campaign_phase(
+                    phase["id"], "failed", reason="exercise invalid target"
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "must require exactly.*hunting_grounds"
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "research_progression",
+                                "objective": "Use an incompatible evidence alias.",
+                                "targets": [
+                                    {
+                                        "id": "alias-only",
+                                        "type": "phase_action_succeeded",
+                                        "tools": ["prey"],
+                                    }
+                                ],
+                                "abandon_predicates": [],
+                            },
+                        },
+                    )
+
     def test_purchase_and_training_phases_allow_guarded_go_exit_recovery(self) -> None:
         tools = [
             {"name": "map"},
@@ -379,9 +755,39 @@ class StorageTests(unittest.TestCase):
                     {"kind": phase_kind}, tools
                 )
                 self.assertEqual(
-                    {"map", "travel", "go_through", "shop"},
+                    {"map", "travel", "go_through", "shop"}
+                    | ({"autopilot"} if phase_kind == "train_ability" else set()),
                     {tool["name"] for tool in selected},
                 )
+
+        training = CampaignCoordinator.tools_for_phase(
+            {"kind": "train_ability"},
+            [
+                {"name": "prey"},
+                {"name": "hunting_grounds"},
+                {"name": "rest_up"},
+            ],
+        )
+        self.assertEqual(
+            {"prey", "hunting_grounds", "rest_up"},
+            {tool["name"] for tool in training},
+        )
+
+    def test_farm_phase_exposes_typed_cast_for_safe_preparation(self) -> None:
+        selected = CampaignCoordinator.tools_for_phase(
+            {"kind": "farm"},
+            [
+                {"name": "cast"},
+                {"name": "act"},
+                {"name": "equip_best"},
+                {"name": "autopilot"},
+            ],
+        )
+
+        self.assertEqual(
+            {"cast", "equip_best", "autopilot"},
+            {tool["name"] for tool in selected},
+        )
 
     def test_return_home_phase_can_use_the_one_way_raza_exit(self) -> None:
         selected = CampaignCoordinator.tools_for_phase(
@@ -479,6 +885,42 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(completed.completed)
                 self.assertEqual("succeeded", completed.phase["status"])
 
+    def test_prepare_combat_snack_target_migrates_to_semantic_food(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Create one edible supply.",
+                        "success_criteria": [
+                            {
+                                "id": "food-stock",
+                                "kind": "inventory_contains",
+                                "item": "Snack",
+                                "count": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 30},
+                    },
+                    mode="start",
+                )
+
+                completed = coordinator.evaluate_phase(
+                    goal,
+                    run,
+                    phase,
+                    {"inventory": {"items": [{"name": "apple"}]}},
+                )
+
+                self.assertTrue(completed.completed)
+                persisted = storage.campaign_phases(run["id"])[0]
+                self.assertEqual("food", persisted["success_criteria"][0]["item"])
+
     def test_progression_fallback_uses_controller_evidence_not_human_confirmation(self) -> None:
         goal = goal_payload(
             objective="Raise maximum HP to 25.",
@@ -563,6 +1005,50 @@ class StorageTests(unittest.TestCase):
                     {"sell", "sell_all", "knowledge_search"},
                     {tool["name"] for tool in selected},
                 )
+
+    def test_farm_phase_keeps_merchant_lookup_with_provisioning(self) -> None:
+        selected = CampaignCoordinator.tools_for_phase(
+            {"kind": "farm"},
+            [
+                {"name": "merchants"},
+                {"name": "shop"},
+                {"name": "cast"},
+                {"name": "autopilot"},
+                {"name": "sell_all"},
+            ],
+        )
+
+        self.assertEqual(
+            {"merchants", "shop", "cast", "autopilot"},
+            {tool["name"] for tool in selected},
+        )
+
+    def test_campaign_time_budget_excludes_accounted_controller_downtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                phase = {
+                    "id": "phase-under-maintenance",
+                    "budget": {"max_actions": 12, "max_minutes": 30},
+                    "attempt_count": 5,
+                    "activated_at": (
+                        datetime.now(timezone.utc) - timedelta(minutes=31)
+                    ).isoformat(),
+                }
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 120},
+                )
+                self.assertIsNone(coordinator.budget_exhausted(phase))
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 0},
+                )
+                exhausted = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(exhausted)
+                self.assertEqual("time_budget", exhausted["kind"])
 
     def test_campaign_manager_compiles_typed_currency_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -693,6 +1179,40 @@ class StorageTests(unittest.TestCase):
                                     "target": "groundworm larva",
                                     "use_safe_spots": True,
                                 },
+                            },
+                        },
+                    )
+
+    def test_campaign_manager_rejects_action_only_mutating_combat_preparation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+
+                with self.assertRaisesRegex(
+                    ValueError, "mutating action success alone.*cast"
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "prepare_combat",
+                                "objective": "Create food for later combat.",
+                                "targets": [
+                                    {
+                                        "id": "cast-returned",
+                                        "type": "phase_action_succeeded",
+                                        "tools": ["cast"],
+                                    }
+                                ],
+                                "abandon_predicates": [],
                             },
                         },
                     )

@@ -16,7 +16,7 @@ autojoin = true
 
 [harness]
 root = "../vendor/m59-harness"
-expected_revision = "f19549e86be52cd861ec6151be5f7b19d882d7d5"
+expected_revision = "8363f8582c154f00be5db13e7d6d7353e50868c8"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -29,7 +29,7 @@ name = "YOUR_MODEL_ID"
 # auto preserves legacy behavior: no key means no auth; a key means Bearer.
 # Prefer an explicit value: none, bearer (OpenAI/Codex), or anthropic (Claude).
 auth_mode = "none"
-planner_timeout_seconds = 90
+planner_timeout_seconds = 120
 responder_timeout_seconds = 45
 max_output_tokens = 4096
 temperature = 0.2

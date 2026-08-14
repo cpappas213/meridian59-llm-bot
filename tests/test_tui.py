@@ -62,11 +62,25 @@ class FakeApi:
                 "version": 2,
                 "priority": 50,
                 "progress_percent": 25,
+                "execution_plan": {
+                    "status": "verified",
+                    "summary": "Travel safely to the bank and verify arrival.",
+                },
                 "criteria": [
                     {"kind": "location_reached", "met": False, "detail": "Not there yet."}
                 ],
             },
             "campaign": {
+                "execution": {
+                    "status": "active",
+                    "active_phase": {
+                        "ordinal": 4,
+                        "kind": "return_home",
+                        "status": "active",
+                        "objective": "Reach the First Royal Bank of Tos safely.",
+                        "attempt_count": 2,
+                    },
+                },
                 "development": {
                     "skills": [{"name": "Dodge", "ability": 12}],
                     "spells": [{"name": "Blink", "ability": 8}],
@@ -214,6 +228,21 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Blink 8", rendered)
         self.assertIn("Controller started", rendered)
         self.assertIn("[S] Character status", rendered)
+        self.assertIn("CURRENT PHASE", rendered)
+        self.assertIn("#4 Return Home [active]", rendered)
+        self.assertIn("Attempts 2", rendered)
+        self.assertIn("Reach the First Royal Bank of Tos safely.", rendered)
+        self.assertIn("Plan [verified]: Travel safely to the bank", rendered)
+
+    def test_dashboard_explains_when_campaign_is_between_phases(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["campaign"]["execution"]["active_phase"] = None
+
+        rendered = render_dashboard(status, api.goals(), api.events(), width=100)
+
+        self.assertIn("CURRENT PHASE", rendered)
+        self.assertIn("campaign manager is selecting the next phase", rendered)
 
     def test_dashboard_color_mode_marks_states_vitals_and_sections(self) -> None:
         api = FakeApi()

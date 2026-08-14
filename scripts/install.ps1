@@ -484,7 +484,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "f19549e86be52cd861ec6151be5f7b19d882d7d5"
+expected_revision = "8363f8582c154f00be5db13e7d6d7353e50868c8"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -495,7 +495,7 @@ state_file = "$escapedInstall/data/harness-fleet-state.json"
 base_url = "$ModelBaseUrl"
 name = "$ModelName"
 auth_mode = "$ModelAuthMode"
-planner_timeout_seconds = 90
+planner_timeout_seconds = 120
 responder_timeout_seconds = 45
 max_output_tokens = 4096
 temperature = 0.2

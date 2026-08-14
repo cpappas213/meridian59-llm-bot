@@ -10,14 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from meridian_bot.broker import Tool, ToolCallError
+from meridian_bot.campaign import CampaignCoordinator
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
+    PLANNED_CONTROLLER_STOP_RUNTIME_KEY,
     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+    RESEARCH_RETRY_STATE_SCHEMA_VERSION,
     BotController,
 )
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.mcp import TOOLS
-from meridian_bot.model import ModelError, PLANNER_SYSTEM
+from meridian_bot.model import CAMPAIGN_MANAGER_SYSTEM, ModelError, PLANNER_SYSTEM
 from meridian_bot.persona import PERSONA_FIELDS
 from meridian_bot.simulator import SimulatedBroker
 from meridian_bot.config import OnboardingConfig
@@ -426,6 +429,139 @@ class NoProgressBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class PartialTravelBroker(SimulatedBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.room = {"num": 1, "name": "Room A"}
+        self.tools["travel"] = Tool(
+            "travel",
+            "Travel to a destination.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "to": {"type": "integer"},
+                },
+                "required": ["agent", "to"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "travel":
+            self.calls.append((name, dict(arguments)))
+            self.room = {"num": 3, "name": "Room C"}
+            return {
+                "arrived": False,
+                "reason": "gave up after 25 hops",
+                "destination": {"num": int(arguments["to"]), "name": "Room Z"},
+                "log": [
+                    {"from": "Room A", "to": "Room B", "ok": True},
+                    {"from": "Room B", "to": "Room C", "ok": True},
+                ],
+                "now": {"room": dict(self.room)},
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
+class StalePostTravelBroker(SimulatedBroker):
+    """Return an authoritative arrival while look briefly retains the source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tools["bank"] = Tool(
+            "bank",
+            "Use a bank in the current room.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": ["agent", "action"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "travel":
+            self.calls.append((name, dict(arguments)))
+            destination = int(arguments["to"])
+            # Deliberately leave self.room unchanged so the immediately
+            # following observe reproduces the live client's stale look.
+            return {
+                "arrived": True,
+                "destination": {
+                    "num": destination,
+                    "name": "First Royal Bank of Tos",
+                },
+                "now": {
+                    "room": {
+                        "num": destination,
+                        "name": "First Royal Bank of Tos",
+                    }
+                },
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
+class StalePostCreateFoodBroker(SimulatedBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inventory_items = [{"id": 7, "name": "apple", "amount": 1}]
+        self.tools["cast"] = Tool(
+            "cast",
+            "Cast a spell and optionally observe created inventory.",
+            {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "spell": {"type": "string"},
+                    "observe_created": {"type": "boolean"},
+                },
+                "required": ["agent", "spell"],
+            },
+        )
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "cast":
+            self.calls.append((name, dict(arguments)))
+            # Return the broker's authoritative delta while deliberately
+            # retaining a stale inventory cache for the next observation.
+            return {
+                "cast": True,
+                "spell": "create food",
+                "mana_spent": 10,
+                "created": [{"name": "apple", "amount": 1}],
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
+class UnverifiedCreateFoodBroker(StalePostCreateFoodBroker):
+    def __init__(self, *, mana_spent: int) -> None:
+        super().__init__()
+        self.mana_spent = mana_spent
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "cast":
+            self.calls.append((name, dict(arguments)))
+            return {
+                "cast": True,
+                "spell": "create food",
+                "mana_spent": self.mana_spent,
+                "created": [],
+                "messages": [],
+                "what_the_mana_says": (
+                    "NOTHING was spent — the cast did not happen at all."
+                    if self.mana_spent == 0
+                    else (
+                        "half cost (5 of 10) — the spell was cast and FAILED its roll"
+                        if self.mana_spent == 5
+                        else "full cost — the spell was cast"
+                    )
+                ),
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
 class UnwieldableWeaponBroker(SimulatedBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -696,6 +832,7 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_journal: list[object] = []
         self.farm_flee_below = 0.75
         self.farm_fight_above_vigor = 100
+        self.farm_use_safe_spots = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
 
@@ -718,6 +855,7 @@ class BackgroundFarmBroker(SimulatedBroker):
                     "hunt": self.farm_hunt,
                     "fleeBelow": self.farm_flee_below,
                     "fightAboveVigor": self.farm_fight_above_vigor,
+                    "useSafeSpots": self.farm_use_safe_spots,
                 },
             }
         if name == "autopilot" and arguments.get("action") == "stop":
@@ -736,6 +874,11 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_running = True
             self.farm_inert = None
             self.farm_mode = str(arguments.get("mode") or self.farm_mode)
+            self.farm_room = int(arguments.get("assigned_room") or self.farm_room)
+            self.farm_hunt = str(arguments.get("hunt") or self.farm_hunt)
+            self.farm_use_safe_spots = bool(
+                arguments.get("use_safe_spots", self.farm_use_safe_spots)
+            )
             return {"running": True, "mode": self.farm_mode}
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
@@ -818,6 +961,49 @@ class OnboardingBroker(SimulatedBroker):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_planned_restart_downtime_is_accumulated_for_active_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(goal_payload("planned-downtime"))["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Prepare for a grounded farm.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 12, "max_minutes": 30},
+                    },
+                    mode="start",
+                )
+
+                controller._mark_planned_phase_stop()
+                marker = controller.storage.get_runtime(
+                    PLANNED_CONTROLLER_STOP_RUNTIME_KEY
+                )
+                marker["stopped_unix"] = time.time() - 120
+                controller.storage.set_runtime(
+                    PLANNED_CONTROLLER_STOP_RUNTIME_KEY, marker
+                )
+
+                accounted = controller._account_planned_phase_downtime()
+
+                self.assertEqual(phase["id"], accounted["phase_id"])
+                self.assertGreaterEqual(accounted["seconds"], 119)
+                self.assertIsNone(
+                    controller.storage.get_runtime(
+                        PLANNED_CONTROLLER_STOP_RUNTIME_KEY
+                    )
+                )
+                events = controller.storage.events(
+                    kinds=["campaign.phase.downtime_accounted"]
+                )
+                self.assertEqual(1, len(events["events"]))
+            finally:
+                controller.close()
+
     def test_onboarding_uses_llm_build_after_persona_and_then_waits_for_goals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = replace(
@@ -1258,6 +1444,14 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("`pvp_engage only` defines a closed, expiring local opportunity", PLANNER_SYSTEM)
         self.assertIn("If pvp_seek reports route_unavailable or travel_error", PLANNER_SYSTEM)
         self.assertIn("phase_outcome_checkpoint", PLANNER_SYSTEM)
+        self.assertIn("corrective constraints, not generic obstacles", PLANNER_SYSTEM)
+        self.assertIn("shop only inspects a merchant's stock", PLANNER_SYSTEM)
+        self.assertIn("Create Weapon directly supplies", PLANNER_SYSTEM)
+        self.assertIn("read-only catalogue or status lookup is evidence, not progress", PLANNER_SYSTEM)
+        self.assertIn(
+            "negative evidence narrows the available tactics",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
 
     def test_exactly_six_mcp_tools(self) -> None:
         self.assertEqual({"status", "submit_goal", "manage_goal", "proposals", "persona", "events"}, {tool["name"] for tool in TOOLS})
@@ -1640,6 +1834,45 @@ class ControllerTests(unittest.TestCase):
                         revision=False,
                     )
 
+                keeper_stop = {
+                    "summary": "Stop the completed farm, then return safely.",
+                    "steps": [
+                        {
+                            "id": "stop-farm",
+                            "outcome": "After the farm criterion is verified, stop autopilot and ensure we are in safe room 100.",
+                            "tool": "autopilot",
+                            "arguments": {"action": "stop"},
+                            "verification": "Autopilot is stopped and current room id is 100.",
+                        }
+                    ],
+                    "safe_ending": {
+                        "room_id": 100,
+                        "step_id": "stop-farm",
+                        "rationale": "Return to the source-verified safe staging room.",
+                    },
+                }
+                normalized_keeper_stop = controller._store_execution_plan(
+                    goal,
+                    keeper_stop,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(
+                    ["stop-farm", "stop-farm-safe-travel"],
+                    [step["id"] for step in normalized_keeper_stop["steps"]],
+                )
+                self.assertEqual(
+                    "travel", normalized_keeper_stop["steps"][-1]["tool"]
+                )
+                self.assertEqual(
+                    "stop-farm-safe-travel",
+                    normalized_keeper_stop["safe_ending"]["step_id"],
+                )
+                self.assertEqual(
+                    "separated_keeper_stop_from_safe_ending",
+                    normalized_keeper_stop["normalizations"][0]["kind"],
+                )
+
                 accepted = controller._store_execution_plan(
                     goal,
                     with_safe_ending(base, 100),
@@ -1648,6 +1881,25 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual(100, accepted["safe_ending"]["room_id"])
                 self.assertEqual("finish-safe", accepted["steps"][-1]["id"])
+
+                repeated = with_safe_ending(copy.deepcopy(base), 100)
+                repeated["steps"][0]["repeat_count"] = 3
+                stored_repeated = controller._store_execution_plan(
+                    goal,
+                    repeated,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=True,
+                )
+                self.assertEqual(3, stored_repeated["steps"][0]["repeat_count"])
+                invalid_repeat = with_safe_ending(copy.deepcopy(base), 100)
+                invalid_repeat["steps"][0]["repeat_count"] = 0
+                with self.assertRaisesRegex(ModelError, "repeat_count must be"):
+                    controller._store_execution_plan(
+                        goal,
+                        invalid_repeat,
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=True,
+                    )
 
                 observational = with_safe_ending(
                     {
@@ -1686,6 +1938,32 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_autopilot_stop_is_not_classified_as_farm_launch(self) -> None:
+        self.assertFalse(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "After max HP reaches 36, stop the completed farm.",
+                }
+            )
+        )
+        self.assertTrue(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Launch autopilot farm for ants in room 563.",
+                }
+            )
+        )
+        self.assertTrue(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Start farming ants and stop when max HP reaches 36.",
+                }
+            )
+        )
+
     def test_safe_ending_travel_may_also_satisfy_the_public_location_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -1715,6 +1993,1908 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual("travel", result["action"])
                 self.assertEqual("succeeded", controller.storage.goal(goal["id"])["status"])
+            finally:
+                controller.storage.close()
+
+    def test_execution_plan_enforces_commerce_semantics_and_funding_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                for name in ("shop", "sell", "sell_all", "merchants"):
+                    broker.tools[name] = Tool(
+                        name,
+                        f"Test {name} capability.",
+                        {"type": "object", "properties": {}},
+                    )
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="commerce-plan-semantics")
+                )["goal"]
+                grounding = controller.knowledge.validate_goal(goal)
+
+                mislabeled_sale = with_safe_ending(
+                    {
+                        "summary": "Sell loot and withdraw safely.",
+                        "steps": [
+                            {
+                                "id": "sell-mushrooms",
+                                "outcome": "Sell mushrooms to the merchant.",
+                                "tool": "shop",
+                                "verification": "The merchant bought the loot and shillings increased.",
+                            }
+                        ],
+                    },
+                    100,
+                )
+                with self.assertRaisesRegex(ModelError, "cannot produce its stated outcome"):
+                    controller._store_execution_plan(
+                        goal,
+                        mislabeled_sale,
+                        grounding=grounding,
+                        revision=False,
+                    )
+
+                unfunded_purchase = with_safe_ending(
+                    {
+                        "summary": "Buy a mace and withdraw safely.",
+                        "steps": [
+                            {
+                                "id": "buy-mace",
+                                "outcome": "Purchase a mace from the merchant.",
+                                "tool": "shop",
+                                "verification": "Inventory contains the purchased mace.",
+                            }
+                        ],
+                    },
+                    100,
+                )
+                with self.assertRaisesRegex(ModelError, "zero carried shillings"):
+                    controller._store_execution_plan(
+                        goal,
+                        unfunded_purchase,
+                        grounding=grounding,
+                        revision=False,
+                    )
+
+                funded_purchase = copy.deepcopy(unfunded_purchase)
+                funded_purchase["steps"].insert(
+                    0,
+                    {
+                        "id": "fund-purchase",
+                        "outcome": "Sell ordinary mushrooms to raise purchase funds.",
+                        "tool": "sell",
+                        "verification": "The sale transfers mushrooms and increases shillings.",
+                    },
+                )
+                stored = controller._store_execution_plan(
+                    goal,
+                    funded_purchase,
+                    grounding=grounding,
+                    revision=False,
+                )
+                self.assertEqual("sell", stored["steps"][0]["tool"])
+                self.assertEqual("shop", stored["steps"][1]["tool"])
+            finally:
+                controller.storage.close()
+
+    def test_plan_funding_check_defers_until_inventory_is_observed(self) -> None:
+        purchase = [
+            {
+                "id": "buy-food",
+                "tool": "shop",
+                "outcome": "Purchase edible food.",
+                "verification": "Inventory contains the purchased food.",
+            }
+        ]
+
+        self.assertIsNone(BotController._plan_funding_error(purchase, {}))
+        self.assertIsNone(
+            BotController._plan_funding_error(
+                purchase,
+                {"inventory": {"items": [], "carry": {"known": False}}},
+            )
+        )
+        self.assertIn(
+            "zero carried shillings",
+            BotController._plan_funding_error(
+                purchase,
+                {"inventory": {"items": [], "carry": {"known": True}}},
+            )
+            or "",
+        )
+
+    def test_prepare_combat_sale_guards_preserve_loadout_and_require_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="prepare-combat-sale-guards")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Acquire a working weapon.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                observation = {
+                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "mace", "in_use": True},
+                            {"id": 78, "name": "mace"},
+                            {"id": 88, "name": "mushroom"},
+                        ]
+                    },
+                    "equipment": {
+                        "equipped": [{"id": 77, "name": "mace"}],
+                        "wielding": ["mace"],
+                    },
+                }
+
+                with self.assertRaisesRegex(ModelError, "preserve goal-relevant equipment"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell_all",
+                        {"merchant": 10, "ignore_loadout": True},
+                        observation,
+                    )
+                with self.assertRaisesRegex(ModelError, "preserve all candidate weapons"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell_all",
+                        {"merchant": 10, "max_weapons": 1},
+                        observation,
+                    )
+
+                with self.assertRaisesRegex(
+                    ModelError,
+                    r"equipped item id\(s\) 77.*unequipped duplicate item id\(s\) 78",
+                ):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 10, "items": [77], "confirm": False},
+                        observation,
+                    )
+                with self.assertRaisesRegex(ModelError, "equipped item"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 10, "items": ["mace"], "confirm": False},
+                        observation,
+                    )
+
+                sale = {"to": 10, "items": [88], "confirm": True}
+                with self.assertRaisesRegex(ModelError, "unquoted targeted sale"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        sale,
+                        observation,
+                    )
+                quote = {**sale, "confirm": False}
+                controller._record_prepare_combat_sell_quote(
+                    goal,
+                    phase,
+                    quote,
+                    observation,
+                    {"sold": False, "offered_price": 12},
+                )
+                controller._guard_prepare_combat_sale(
+                    goal,
+                    phase,
+                    "sell",
+                    sale,
+                    observation,
+                )
+            finally:
+                controller.storage.close()
+
+    def test_liquidation_sale_guard_preserves_phase_keep_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="liquidation-sale-guards")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "liquidate_inventory",
+                        "objective": "Sell ordinary excess loot.",
+                        "success_criteria": [],
+                        "context": {"keep_candidates": ["mace", "sapphire"]},
+                    },
+                    mode="start",
+                )
+                observation = {
+                    "look": {"room": {"num": 106, "name": "Brownestone Inn"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "mace"},
+                            {"id": 88, "name": "mushroom"},
+                        ]
+                    },
+                }
+
+                with self.assertRaisesRegex(ModelError, "retained keep_candidate.*mace"):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        phase,
+                        "sell",
+                        {"to": 736, "items": [77], "confirm": False},
+                        observation,
+                    )
+
+                bulk = {"merchant": 736, "keep": ["reagent"]}
+                controller._guard_prepare_combat_sale(
+                    goal, phase, "sell_all", bulk, observation
+                )
+                self.assertFalse(bulk["ignore_loadout"])
+                self.assertEqual(["mace", "reagent", "sapphire"], bulk["keep"])
+
+                plan_error = controller._protected_phase_sale_step_error(
+                    phase,
+                    {
+                        "tool": "sell",
+                        "outcome": "Get a read-only quote for the mace.",
+                    },
+                )
+                retained_error = controller._protected_phase_sale_step_error(
+                    phase,
+                    {
+                        "tool": "sell",
+                        "outcome": "Sell mushrooms while keeping the mace and sapphire.",
+                    },
+                )
+                self.assertIn("keep_candidate 'mace'", plan_error or "")
+                self.assertIsNone(retained_error)
+            finally:
+                controller.storage.close()
+
+    def test_train_ability_rejects_map_as_creature_spawn_search(self) -> None:
+        phase = {
+            "kind": "train_ability",
+            "context": {"target": "ant", "room": 6},
+        }
+        error = BotController._map_step_error(
+            phase,
+            {
+                "tool": "map",
+                "outcome": "Use map to find a reachable ant room.",
+                "verification": "Map lists a candidate room with ants.",
+            },
+        )
+        valid = BotController._map_step_error(
+            phase,
+            {
+                "tool": "map",
+                "outcome": "Verify the route to exact room 6.",
+                "verification": "Map returns a non-empty route to room 6.",
+            },
+        )
+
+        self.assertIn("map.search only matches room names", error or "")
+        self.assertIsNone(valid)
+        with self.assertRaisesRegex(ModelError, "cannot establish creature occupancy"):
+            BotController._guard_map_semantics(
+                phase,
+                "map",
+                {"search": "ants"},
+            )
+        BotController._guard_map_semantics(phase, "map", {"to": 6})
+
+    def test_combat_training_phase_is_keeper_owned_until_ability_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = BackgroundFarmBroker()
+                broker.farm_running = False
+                broker.tools["fight"] = Tool(
+                    "fight",
+                    "One foreground combat swing.",
+                    {
+                        "type": "object",
+                        "properties": {"agent": {}, "target": {}},
+                        "required": ["agent", "target"],
+                    },
+                )
+                for tool_name in ("rest_up", "equip_best"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="keeper-owned-combat-training",
+                        objective="Raise mace fighting to 20.",
+                        success_criteria=[
+                            {
+                                "id": "mace-20",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 20,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "train_ability",
+                        "objective": "Train mace fighting against ants.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "training_method": "combat",
+                            "prey": "ant",
+                            "room": 6,
+                            "use_safe_spots": False,
+                            "flee_below": 0.70,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+                observation = broker.observe()
+                observation["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 10}]
+                }
+                controller.last_observation = observation
+                completion = controller.criteria.evaluate(goal, observation)
+
+                self.assertTrue(
+                    controller._keeper_combat_work_remains(goal, completion)
+                )
+                self.assertEqual(
+                    {"assigned_room": 6, "hunt": "ant"},
+                    {
+                        key: controller._effective_farm_intent(goal).get(key)
+                        for key in ("assigned_room", "hunt")
+                    },
+                )
+                allowed = {
+                    item["name"] for item in controller._planner_tools(phase)
+                }
+                self.assertIn("autopilot", allowed)
+                self.assertNotIn("fight", allowed)
+                with self.assertRaisesRegex(
+                    ModelError, "foreground fight is unsafe for combat training"
+                ):
+                    controller._execute(
+                        goal,
+                        observation,
+                        {
+                            "decision": "act",
+                            "tool": "fight",
+                            "arguments": {"target": "ant"},
+                        },
+                    )
+
+                plan = with_safe_ending(
+                    controller._structured_farm_controller_plan(goal), 100
+                )
+                stored = controller._store_execution_plan(
+                    goal,
+                    plan,
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                launch = controller._execute(
+                    goal,
+                    observation,
+                    {
+                        "decision": "act",
+                        "tool": "autopilot",
+                        "arguments": {
+                            "action": "start",
+                            "mode": "farm",
+                            "hunt": "ant",
+                            "assigned_room": 6,
+                            "use_safe_spots": False,
+                        },
+                        "plan_step_id": "launch-goal-keeper",
+                    },
+                )
+                self.assertEqual("autopilot", launch["action"])
+                owner = controller.storage.get_runtime(
+                    "background_farm_owner_v1", {}
+                )
+                self.assertEqual(phase["id"], owner["phase_id"])
+                monitoring = controller._manage_background_farm(
+                    goal, observation, completion
+                )
+                self.assertTrue(monitoring["background_farm_monitoring"])
+
+                finished_observation = copy.deepcopy(observation)
+                finished_observation["abilities"]["skills"][0]["ability"] = 20
+                completed = controller._reconcile_existing_campaign_phase(
+                    goal, finished_observation
+                )
+                self.assertTrue(completed["campaign_phase_completed"])
+                self.assertTrue(completed["keeper_released"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual(phase["id"], stored["phase_id"])
+            finally:
+                controller.storage.close()
+
+    def test_combat_training_recipe_is_validated_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                incomplete = {
+                    "kind": "train_ability",
+                    "objective": "Train mace fighting in combat.",
+                    "success_criteria": [
+                        {
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.mace fighting",
+                            "operator": ">=",
+                            "value": 20,
+                        }
+                    ],
+                    "context": {
+                        "training_method": "combat",
+                        "room": 6,
+                        "use_safe_spots": False,
+                    },
+                }
+
+                blocker = controller._campaign_phase_grounding_blocker(incomplete)
+
+                self.assertEqual(
+                    "invalid_combat_training_phase_context", blocker["kind"]
+                )
+                self.assertIn("context.target", blocker["guidance"])
+                self.assertIn(
+                    'training_method="combat"', CAMPAIGN_MANAGER_SYSTEM
+                )
+                self.assertIn("one-swing foreground fight", CAMPAIGN_MANAGER_SYSTEM)
+
+                teacher = {
+                    "kind": "train_ability",
+                    "objective": "Learn mace fighting from a teacher.",
+                    "success_criteria": [
+                        {
+                            "kind": "numeric_threshold",
+                            "metric": "ability.skill.mace fighting",
+                            "operator": ">=",
+                            "value": 1,
+                        }
+                    ],
+                    "context": {
+                        "training_method": "teacher",
+                        "room": 154,
+                        "target": "mace fighting",
+                        "merchant_class": "CorNothSergeant",
+                    },
+                }
+                self.assertEqual(
+                    {}, controller._campaign_phase_farm_intent(teacher)
+                )
+                self.assertIsNone(
+                    controller._campaign_phase_grounding_blocker(teacher)
+                )
+            finally:
+                controller.storage.close()
+
+    def test_completed_combat_training_releases_survival_owner_after_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = BackgroundFarmBroker()
+                for tool_name in ("rest_up", "equip_best"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="safe-combat-training-handoff",
+                        objective="Raise mace fighting to 100.",
+                        success_criteria=[
+                            {
+                                "id": "mace-100",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "train_ability",
+                        "objective": "Reach a bounded mace fighting milestone.",
+                        "success_criteria": [
+                            {
+                                "id": "mace-20",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 20,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "training_method": "combat",
+                            "prey": "ant",
+                            "room": 6,
+                            "use_safe_spots": False,
+                            "flee_below": 0.70,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+                planning_observation = broker.observe()
+                planning_observation["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 10}]
+                }
+                controller.last_observation = planning_observation
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        controller._structured_farm_controller_plan(goal), 100
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                broker.room = {"num": 6, "name": "Ant field"}
+                broker.farm_room = 6
+                broker.farm_hunt = "ant"
+                broker.farm_use_safe_spots = False
+                hazardous = broker.observe()
+                hazardous["abilities"] = {
+                    "skills": [{"name": "Mace Fighting", "ability": 20}]
+                }
+                public_completion = controller.criteria.evaluate(goal, hazardous)
+
+                self.assertIsNone(
+                    controller._reconcile_existing_campaign_phase(goal, hazardous)
+                )
+                self.assertIsNotNone(
+                    controller._phase_completion_checkpoint(phase)
+                )
+                handed_off = controller._manage_background_farm(
+                    goal,
+                    hazardous,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(handed_off["background_safe_ending_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertIsNotNone(
+                    controller.storage.active_campaign_phase(run["id"])
+                )
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
+
+                broker.vitals["health"] = {"current": 80, "max": 100}
+                recovering = broker.observe()
+                recovering["abilities"] = hazardous["abilities"]
+                still_unsafe = controller._manage_background_farm(
+                    goal,
+                    recovering,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(still_unsafe["background_survival_monitoring"])
+                self.assertTrue(still_unsafe["safe_ending_pending"])
+
+                # Survive mode does not choose the model-selected sanctuary.
+                # At full health it must release movement even while still in
+                # the monster room, allowing foreground safe-ending travel.
+                broker.vitals["health"] = {"current": 100, "max": 100}
+                recovered = broker.observe()
+                recovered["abilities"] = hazardous["abilities"]
+                stopped = controller._manage_background_farm(
+                    goal,
+                    recovered,
+                    public_completion,
+                    force_stop_reason="phase outcome verified",
+                )
+                self.assertTrue(stopped["background_keeper_stopping"])
+                self.assertFalse(broker.farm_running)
+
+                broker.room = {"num": 100, "name": "Training Hall"}
+                safe = broker.observe()
+                safe["abilities"] = hazardous["abilities"]
+                completed = controller._reconcile_existing_campaign_phase(goal, safe)
+                self.assertTrue(completed["campaign_phase_completed"])
+                self.assertTrue(completed["keeper_released"])
+            finally:
+                controller.storage.close()
+
+    def test_exhausted_farm_returns_to_verified_safety_before_phase_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller_config = config(Path(temporary))
+            controller = BotController(controller_config)
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                controller.model = FixedModel()
+                source_verify_safe_rooms(controller, 100)
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="safe-budget-exhaustion",
+                        title="Increase maximum health",
+                        objective="Increase maximum health to 101.",
+                        success_criteria=[
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants until maximum health reaches 101.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 180},
+                        "context": {
+                            "room": 6,
+                            "target": "ant",
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Exercise the safe exhaustion boundary.",
+                    },
+                    mode="start",
+                )
+                controller.last_observation = broker.observe()
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Farm from safe staging and return safely.",
+                            "steps": [
+                                {
+                                    "id": "launch-goal-keeper",
+                                    "outcome": "Launch the ant farm in assigned room 6.",
+                                    "tool": "autopilot",
+                                    "verification": "Keeper reports the ant farm for room 6.",
+                                }
+                            ],
+                            "assumptions": [],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                for index in range(8):
+                    attempt_id = controller.storage.create_phase_attempt(
+                        phase["id"],
+                        semantic_action="autopilot",
+                        signature=f"budget-attempt-{index}",
+                        expected_effect={"max_health": 101},
+                    )
+                    controller.storage.update_phase_attempt(
+                        attempt_id,
+                        "succeeded",
+                        verification={"no_progress": False},
+                    )
+
+                broker.room = {"num": 6, "name": "Ant field"}
+                broker.farm_room = 6
+                broker.farm_hunt = "ant"
+                broker.farm_use_safe_spots = False
+
+                handed_off = controller.turn()
+
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertIsNotNone(active)
+                self.assertEqual("active", active["status"])
+                self.assertEqual(8, active["attempt_count"])
+                self.assertIsNotNone(
+                    controller._phase_exhaustion_checkpoint(active)
+                )
+                self.assertTrue(handed_off["background_safe_ending_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertTrue(broker.farm_running)
+                execution = controller.status(detail="supervision")["campaign"][
+                    "execution"
+                ]
+                self.assertTrue(execution["phase_exhaustion_latched"])
+                self.assertTrue(execution["safe_return_pending"])
+
+                controller.storage.close()
+                controller = BotController(controller_config)
+                controller.broker = broker
+                controller.model = FixedModel()
+                source_verify_safe_rooms(controller, 100)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertIsNotNone(
+                    controller._phase_exhaustion_checkpoint(active),
+                    "restart must retain the pending safe-return boundary",
+                )
+
+                keeper_stopped = controller.turn()
+                self.assertTrue(keeper_stopped["background_keeper_stopping"])
+                self.assertFalse(broker.farm_running)
+
+                safe_return = controller.turn()
+                self.assertEqual("travel", safe_return["action"])
+                self.assertEqual(100, broker.room["num"])
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(
+                    8,
+                    active["attempt_count"],
+                    "safe-return travel must not consume the exhausted phase budget",
+                )
+
+                finalized = controller.turn()
+                self.assertTrue(finalized["campaign_phase_budget_exhausted"])
+                self.assertEqual("failed", finalized["phase"]["status"])
+                self.assertFalse(finalized["goal_blocked"])
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller._phase_exhaustion_checkpoint(finalized["phase"])
+                )
+                self.assertEqual(100, broker.room["num"])
+            finally:
+                controller.storage.close()
+
+    def test_map_route_lookup_without_a_route_is_no_progress(self) -> None:
+        reason = BotController._no_progress_reason(
+            {
+                "destination": {"num": 6, "name": "The Deep Dark Woods of Marion"},
+                "route": None,
+            },
+            {"look": {"room": {"num": 103, "name": "The Bhrama & Falcon"}}},
+            tool="map",
+            arguments={"to": 6},
+        )
+
+        self.assertIn("found no route from current room 103", reason or "")
+
+    def test_direct_prepare_combat_capability_highlights_create_weapon(self) -> None:
+        context = BotController._direct_phase_capabilities(
+            {"kind": "prepare_combat"},
+            {
+                "spells": {
+                    "spells": [
+                        {
+                            "name": "Create Weapon",
+                            "mana": 15,
+                            "reagents": [],
+                            "castable": True,
+                        },
+                        {"name": "Blink", "castable": True},
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNotNone(context)
+        self.assertEqual("cast", context["preferred_tool"])
+        self.assertEqual("Create Weapon", context["capabilities"][0]["name"])
+
+    def test_direct_prepare_combat_capabilities_ground_create_food_semantics(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "objective": "Equip a weapon and create consumable food.",
+            "context": {},
+        }
+        observation = {
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Weapon",
+                        "mana": 15,
+                        "reagents": [],
+                        "castable": True,
+                    },
+                    {
+                        "name": "Create Food",
+                        "mana": 10,
+                        "reagents": [],
+                        "castable": True,
+                    },
+                ]
+            }
+        }
+
+        context = BotController._direct_phase_capabilities(phase, observation)
+
+        self.assertIsNotNone(context)
+        capabilities = {
+            item["name"]: item for item in (context or {}).get("capabilities", [])
+        }
+        self.assertFalse(capabilities["Create Weapon"]["npc_transferable"])
+        self.assertFalse(capabilities["Create Weapon"]["funding_eligible"])
+        self.assertIn("no reagent prerequisite", capabilities["Create Food"]["server_semantics"])
+
+        blocked_food_observation = copy.deepcopy(observation)
+        blocked_food = blocked_food_observation["spells"]["spells"][1]
+        blocked_food.update(
+            {
+                "castable": False,
+                "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                "blocked_by": [
+                    "needs 2 x ElderBerry, carrying 0",
+                    "needs 2 x Herbs, carrying 0",
+                ],
+            }
+        )
+        blocked_context = BotController._direct_phase_capabilities(
+            phase, blocked_food_observation
+        )
+        blocked_capabilities = {
+            item["name"]: item
+            for item in (blocked_context or {}).get("capabilities", [])
+        }
+        self.assertFalse(blocked_capabilities["Create Food"]["castable"])
+        self.assertEqual(
+            ["2 x ElderBerry", "2 x Herbs"],
+            blocked_capabilities["Create Food"]["reagents"],
+        )
+        self.assertIn(
+            "Acquire exactly its listed reagents",
+            blocked_capabilities["Create Food"]["server_semantics"],
+        )
+
+        stocked_food_observation = copy.deepcopy(blocked_food_observation)
+        stocked_food_observation["inventory"] = {
+            "items": [
+                {"name": "elderberry", "amount": 2},
+                {"name": "herb", "amount": 2},
+            ]
+        }
+        stocked_context = BotController._direct_phase_capabilities(
+            phase, stocked_food_observation
+        )
+        stocked_food = next(
+            item
+            for item in (stocked_context or {}).get("capabilities", [])
+            if item.get("name") == "Create Food"
+        )
+        self.assertTrue(stocked_food["castable"])
+        self.assertNotIn("blocked_by", stocked_food)
+        self.assertTrue(stocked_food["availability_reconciled_from_inventory"])
+        self.assertIsNone(
+            BotController._direct_capability_plan_error(
+                phase,
+                [
+                    {
+                        "id": "buy-live-reagents",
+                        "tool": "shop",
+                        "outcome": "Buy 2 ElderBerry and 2 Herbs.",
+                        "verification": "Inventory contains the live listed reagents.",
+                    },
+                    {
+                        "id": "cast-after-reagents",
+                        "tool": "cast",
+                        "outcome": "Cast Create Food.",
+                        "verification": "Inventory contains food.",
+                    },
+                ],
+                blocked_food_observation,
+                ["Create Food needs 2 ElderBerry and 2 Herbs."],
+            )
+        )
+
+        detour = [
+            {
+                "id": "sell-mace",
+                "tool": "sell",
+                "outcome": "Sell mace id 2 to raise funds.",
+                "verification": "Shillings increase.",
+            },
+            {
+                "id": "buy-herbs",
+                "tool": "shop",
+                "outcome": "Buy ElderBerry and Herbs as Create Food reagents.",
+                "verification": "Inventory contains the reagents.",
+            },
+            {
+                "id": "create-food",
+                "tool": "cast",
+                "outcome": "Cast Create Food.",
+                "verification": "Inventory contains food.",
+            },
+        ]
+        self.assertIn(
+            "castable with no reagents",
+            BotController._direct_capability_plan_error(
+                phase, detour, observation, []
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._direct_capability_plan_error(
+                phase,
+                [detour[-1]],
+                observation,
+                [],
+            )
+        )
+        self.assertIn(
+            "invents Create Food reagents",
+            BotController._direct_capability_plan_error(
+                phase,
+                [detour[-1]],
+                observation,
+                ["Create Food requires ElderBerry and Herbs."],
+            )
+            or "",
+        )
+
+        created_weapon_sale = [
+            {
+                "id": "create-weapon",
+                "tool": "cast",
+                "outcome": "Cast Create Weapon.",
+                "verification": "A created weapon appears.",
+            },
+            {
+                "id": "sell-created",
+                "tool": "sell",
+                "outcome": "Sell the newly created mace with the exact id from create-weapon.",
+                "verification": "A merchant buys that mace and shillings increase.",
+            },
+        ]
+        weapon_only_phase = {
+            "kind": "prepare_combat",
+            "objective": "Equip a reliable weapon.",
+            "context": {},
+        }
+        self.assertIn(
+            "IA_MADE",
+            BotController._direct_capability_plan_error(
+                weapon_only_phase,
+                created_weapon_sale,
+                observation,
+                [],
+            )
+            or "",
+        )
+        self.assertIn(
+            "assumes a Create Weapon product is sellable",
+            BotController._direct_capability_plan_error(
+                weapon_only_phase,
+                created_weapon_sale[:1],
+                observation,
+                [
+                    "At least one merchant will accept the newly created mace as sellable funding."
+                ],
+            )
+            or "",
+        )
+        self.assertIn("Create Weapon products are marked IA_MADE", PLANNER_SYSTEM)
+
+    def test_create_food_context_quantifies_remaining_phase_requirement(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "objective": "Create food supplies.",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+            "context": {},
+        }
+        observation = {
+            "inventory": {"items": [{"name": "apple", "amount": 1}]},
+            "abilities": {
+                "spells": [{"name": "Create Food", "ability": 25}]
+            },
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Food",
+                        "mana": 10,
+                        "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                        "castable": False,
+                        "blocked_by": ["needs reagents"],
+                    }
+                ]
+            },
+        }
+
+        context = BotController._direct_phase_capabilities(phase, observation)
+        capability = (context or {})["capabilities"][0]
+
+        self.assertEqual(["apple"], capability["production"]["possible_products_at_current_ability"])
+        self.assertEqual("vigor, not health", capability["production"]["restores"])
+        self.assertEqual(
+            {
+                "criterion_id": "food_stock",
+                "required_total": 4,
+                "currently_carried": 1,
+                "remaining": 3,
+                "casts_required": 3,
+                "reagents_required_for_remaining_casts": [
+                    "6 x ElderBerry",
+                    "6 x Herbs",
+                ],
+                "verification_category": "food",
+            },
+            capability["phase_requirement"],
+        )
+
+    def test_phase_inventory_plan_requires_exact_remaining_quantity(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+        }
+        observation = {
+            "inventory": {"items": [{"name": "apple", "amount": 1}]}
+        }
+        insufficient = [
+            {
+                "id": "one-cast",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": "Inventory contains an apple.",
+            }
+        ]
+        quantified = [
+            {
+                "id": "finish-food",
+                "tool": "cast",
+                "outcome": "Cast Create Food as needed.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
+        separate_casts = [
+            {
+                "id": f"cast-{index}",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": "Another apple appears.",
+            }
+            for index in range(3)
+        ]
+        prose_repeated_cast = [
+            {
+                "id": "cast-three",
+                "tool": "cast",
+                "outcome": "Cast Create Food 3 times to produce 3 food items.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
+        structured_repeated_cast = [
+            {
+                "id": "cast-three-structured",
+                "tool": "cast",
+                "repeat_count": 3,
+                "outcome": "Cast Create Food once per execution.",
+                "verification": "Inventory contains 4 total edible food items.",
+            }
+        ]
+
+        self.assertIn(
+            "does not cover active phase criterion",
+            BotController._phase_inventory_plan_error(
+                phase, insufficient, observation
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, quantified, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, separate_casts, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, prose_repeated_cast, observation
+            )
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, structured_repeated_cast, observation
+            )
+        )
+
+    def test_food_plan_accounts_for_removals_and_per_cast_reagents(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "success_criteria": [
+                {
+                    "id": "food_stock",
+                    "kind": "inventory_contains",
+                    "item": "food",
+                    "count": 4,
+                }
+            ],
+        }
+        observation = {
+            "inventory": {
+                "items": [
+                    {"id": 10, "name": "apple"},
+                    {"id": 20, "name": "elderberry", "amount": 2},
+                    {"id": 30, "name": "herb", "amount": 2},
+                ]
+            },
+            "spells": {
+                "spells": [
+                    {
+                        "name": "Create Food",
+                        "reagents": ["2 x ElderBerry", "2 x Herbs"],
+                    }
+                ]
+            },
+        }
+        three_casts = [
+            {
+                "id": f"cast-{index}",
+                "tool": "cast",
+                "outcome": "Cast Create Food once.",
+                "verification": f"Inventory contains {index + 2} edible food items total.",
+            }
+            for index in range(3)
+        ]
+        sell_existing = [
+            {
+                "id": "sell-apple",
+                "tool": "sell",
+                "outcome": "Sell apple id 10.",
+                "verification": "Apple id 10 is gone and shillings increase.",
+            },
+            *three_casts,
+        ]
+
+        self.assertIn(
+            "plans to remove 1",
+            BotController._phase_inventory_plan_error(
+                phase, sell_existing, observation
+            )
+            or "",
+        )
+        self.assertIn(
+            "elderberry is 2 per cast",
+            BotController._phase_inventory_plan_error(
+                phase, three_casts, observation
+            )
+            or "",
+        )
+
+        grounded = [
+            {
+                "id": "buy-reagents",
+                "tool": "shop",
+                "outcome": "Buy 4 ElderBerry and 4 Herbs.",
+                "verification": (
+                    "Inventory contains 6 ElderBerry total and 6 Herbs total."
+                ),
+            },
+            *three_casts,
+        ]
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, grounded, observation
+            )
+        )
+
+        stocked = copy.deepcopy(observation)
+        stocked["inventory"]["items"][1]["amount"] = 6
+        stocked["inventory"]["items"][2]["amount"] = 6
+        self.assertEqual(
+            6,
+            CriteriaEvaluator.inventory_count(
+                stocked["inventory"]["items"], "Herbs"
+            ),
+        )
+        self.assertIsNone(
+            BotController._phase_inventory_plan_error(
+                phase, three_casts, stocked
+            )
+        )
+
+    def test_financial_context_retains_latest_known_bank_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="durable-bank-balance-context")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "withdraw",
+                            "balance": 1712,
+                            "balance_observed": False,
+                        },
+                    },
+                )
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shilling", "amount": 32},
+                            {"id": 2, "name": "apple"},
+                        ]
+                    }
+                }
+
+                financial = controller._financial_context(observation)
+
+                self.assertEqual(
+                    1712,
+                    financial["bank_accounts"][0]["last_known_balance"],
+                )
+                self.assertIn(
+                    "preserving that required inventory",
+                    financial["banking_policy"]["funding_guidance"],
+                )
+
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "withdraw",
+                            "balance": 1600,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                refreshed = controller._financial_context(observation)
+                self.assertEqual(
+                    1600,
+                    refreshed["bank_accounts"][0]["last_known_balance"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_positive_bank_balance_protects_phase_required_inventory_from_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="bank-preserves-phase-inventory")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "action": "balance",
+                            "balance": 1712,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                phase = {
+                    "kind": "prepare_combat",
+                    "success_criteria": [
+                        {
+                            "id": "food-stock",
+                            "kind": "inventory_contains",
+                            "item": "food",
+                            "count": 4,
+                        }
+                    ],
+                }
+                observation = {
+                    "inventory": {
+                        "items": [{"id": 17375, "name": "apple"}]
+                    }
+                }
+                sell_plan = [
+                    {
+                        "id": "sell-apple",
+                        "tool": "sell",
+                        "outcome": "Sell apple id 17375 to raise reagent funds.",
+                        "verification": "Apple is removed and shillings increase.",
+                    }
+                ]
+
+                error = controller._phase_required_sale_plan_error(
+                    phase, sell_plan, observation
+                )
+
+                self.assertIn("durable bank evidence shows 1712", error or "")
+                self.assertIn("travel to bank room 54", error or "")
+            finally:
+                controller.storage.close()
+
+    def test_shop_plan_affordability_uses_live_catalogue_basket_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="live-catalogue-affordability")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: bank",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "bank",
+                        "result": {
+                            "account": "jasper-tos-barloque",
+                            "balance": 1712,
+                            "balance_observed": True,
+                        },
+                    },
+                )
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shilling", "amount": 32}
+                        ],
+                        "carry": {"known": True},
+                    }
+                }
+                purchase = [
+                    {
+                        "id": "buy-reagents",
+                        "tool": "shop",
+                        "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                        "verification": "Inventory contains the reagents.",
+                    }
+                ]
+
+                error = controller._shop_plan_affordability_error(
+                    purchase, observation
+                )
+
+                self.assertIn("grounded basket cost of 252", error or "")
+                self.assertIn("only 32 are carried", error or "")
+                self.assertIn("6 elderberry @ 28", error or "")
+                self.assertIn("bank room 54", error or "")
+
+                funded = [
+                    {
+                        "id": "reach-bank",
+                        "tool": "travel",
+                        "outcome": "Travel to bank room 54.",
+                        "verification": "Current room is 54.",
+                    },
+                    {
+                        "id": "withdraw",
+                        "tool": "bank",
+                        "outcome": "Withdraw enough shillings for the basket.",
+                        "verification": "Carried shillings cover 252.",
+                    },
+                    *purchase,
+                ]
+                self.assertIsNone(
+                    controller._shop_plan_affordability_error(
+                        funded, observation
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_quantified_shop_step_requires_exact_live_basket_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="quantified-shop-action")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                step = {
+                    "id": "buy-reagents",
+                    "tool": "shop",
+                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                    "verification": "Inventory contains the required reagents.",
+                }
+
+                underfilled = controller._quantified_shop_action_error(
+                    step,
+                    {
+                        "seller": 711,
+                        "buy_ids": [714, 714, 714, 712, 712, 712],
+                    },
+                )
+
+                self.assertIn("requires exactly 6 elderberry", underfilled or "")
+                self.assertIn("3 herb (id 712)", underfilled or "")
+                self.assertIn("send the exact repeated live item ids", underfilled or "")
+                self.assertIsNone(
+                    controller._quantified_shop_action_error(
+                        step,
+                        {
+                            "seller": 711,
+                            "buy_ids": [714] * 6 + [712] * 6,
+                        },
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_underfilled_quantified_shop_action_is_returned_to_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = ShopBroker()
+                broker.inventory_items.append(
+                    {"id": 2, "name": "shilling", "amount": 284, "can": []}
+                )
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="reject-underfilled-shop-action")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Buy the exact reagent basket.",
+                            "steps": [
+                                {
+                                    "id": "buy-reagents",
+                                    "tool": "shop",
+                                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                                    "verification": "Inventory contains the reagent basket.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                controller.model = DecisionSequenceModel(
+                    [
+                        {
+                            "decision": "act",
+                            "tool": "shop",
+                            "arguments": {
+                                "seller": 711,
+                                "buy_ids": [714, 714, 714, 712, 712, 712],
+                            },
+                            "rationale": "Buy only half of the declared basket.",
+                            "expected_observation": {},
+                            "proposal": None,
+                            "plan_step_id": "buy-reagents",
+                        }
+                    ]
+                )  # type: ignore[assignment]
+
+                rejected = controller.turn()
+
+                self.assertTrue(rejected["planner_action_rejected"])
+                self.assertTrue(rejected["quantified_shop_basket_mismatch"])
+                self.assertFalse(any(name == "shop" for name, _ in broker.calls))
+                feedback = controller._planner_feedback(goal)
+                self.assertIn("requires exactly 6 elderberry", feedback["message"])
+                self.assertIn("Correct the rejected arguments", feedback["failure_context"]["required_response"])
+            finally:
+                controller.storage.close()
+
+    def test_completed_purchase_prefix_is_not_revalidated_as_future_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = ShopBroker()
+                controller.broker = broker
+                broker.inventory_items.append(
+                    {"id": 2, "name": "shilling", "amount": 284, "can": []}
+                )
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="completed-purchase-prefix")
+                )["goal"]
+                controller.storage.emit_event(
+                    "action.succeeded",
+                    "Action succeeded: shop",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "shop",
+                        "result": {
+                            "seller": 711,
+                            "items": [
+                                {"id": 714, "name": "elderberry", "cost": 28},
+                                {"id": 712, "name": "herb", "cost": 14},
+                            ],
+                        },
+                    },
+                )
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Buy the reagent basket and finish safely.",
+                            "steps": [
+                                {
+                                    "id": "buy-reagents",
+                                    "tool": "shop",
+                                    "outcome": "Buy 6 ElderBerry and 6 Herbs from Joguer.",
+                                    "verification": "Inventory contains the reagent basket.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                controller._record_plan_action(
+                    goal,
+                    step_id="buy-reagents",
+                    tool="shop",
+                    arguments={"seller": 711, "buy_ids": [714] * 6 + [712] * 6},
+                    result={"bought": [714] * 6 + [712] * 6},
+                    status="succeeded",
+                )
+                broker.inventory_items[-1]["amount"] = 158
+                controller.last_observation = broker.observe()
+
+                stored = controller._execution_plan(goal)
+
+                self.assertIsNotNone(stored)
+                self.assertEqual("buy-reagents", stored["last_action"]["step_id"])
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_duplicate_targeted_sale_plan_requires_exact_current_item_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="duplicate-sale-grounding")
+                )["goal"]
+                phase = {"kind": "prepare_combat", "context": {}}
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "mace", "in_use": True},
+                            {"id": 2, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 1, "name": "mace"}]},
+                    "look": {"room": {"num": 106}},
+                }
+                vague = [
+                    {
+                        "tool": "sell",
+                        "outcome": "Sell one spare mace.",
+                        "verification": "The mace is removed and shillings increase.",
+                    }
+                ]
+                exact = copy.deepcopy(vague)
+                exact[0]["outcome"] = "Sell the unequipped mace with exact item id 2."
+
+                self.assertIn(
+                    "without an exact current item id",
+                    controller._targeted_sale_grounding_error(
+                        goal, phase, vague, observation
+                    )
+                    or "",
+                )
+                self.assertIsNone(
+                    controller._targeted_sale_grounding_error(
+                        goal, phase, exact, observation
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_bank_plan_requires_separate_preceding_travel(self) -> None:
+        observation = {
+            "look": {"room": {"num": 106, "name": "Brownestone Inn"}}
+        }
+        invalid = [
+            {
+                "id": "balance",
+                "tool": "bank",
+                "outcome": "Check the balance at Tos bank room 54.",
+                "verification": "A positive bank balance is shown.",
+            }
+        ]
+        valid = [
+            {
+                "id": "reach-bank",
+                "tool": "travel",
+                "outcome": "Travel to First Royal Bank of Tos, room 54.",
+                "verification": "Current room id is 54.",
+            },
+            invalid[0],
+        ]
+
+        self.assertIn(
+            "calls bank before reaching a verified bank room",
+            BotController._bank_plan_error(invalid, observation) or "",
+        )
+        self.assertIsNone(BotController._bank_plan_error(valid, observation))
+        self.assertIsNone(
+            BotController._bank_plan_error(
+                invalid,
+                {"look": {"room": {"num": 54, "name": "First Royal Bank of Tos"}}},
+            )
+        )
+
+    def test_bank_plan_ignores_completed_prefix_after_leaving_bank(self) -> None:
+        steps = [
+            {
+                "id": "check-balance",
+                "tool": "bank",
+                "outcome": "Check the balance at Tos bank room 54.",
+                "verification": "The account balance is shown.",
+            },
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings at Tos bank room 54.",
+                "verification": "Inventory contains 100 shillings.",
+            },
+            {
+                "id": "reach-shop",
+                "tool": "travel",
+                "outcome": "Travel to Joguer's Herbs and Roots, room 104.",
+                "verification": "Current room id is 104.",
+            },
+            {
+                "id": "buy-reagents",
+                "tool": "shop",
+                "outcome": "Buy Create Food reagents from Joguer.",
+                "verification": "Inventory contains the required reagents.",
+            },
+        ]
+        observation = {
+            "look": {"room": {"num": 104, "name": "Joguer's Herbs and Roots"}}
+        }
+
+        self.assertIsNone(
+            BotController._bank_plan_error(
+                steps,
+                observation,
+                completed_through_step_id="reach-shop",
+            )
+        )
+
+    def test_bank_plan_still_checks_future_bank_step_after_completed_prefix(self) -> None:
+        steps = [
+            {
+                "id": "inspect",
+                "tool": "look",
+                "outcome": "Inspect the current room.",
+                "verification": "The room is observed.",
+            },
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings.",
+                "verification": "Inventory contains 100 shillings.",
+            },
+        ]
+
+        self.assertIn(
+            "calls bank before reaching a verified bank room",
+            BotController._bank_plan_error(
+                steps,
+                {"look": {"room": {"num": 104, "name": "Joguer's Herbs and Roots"}}},
+                completed_through_step_id="inspect",
+            )
+            or "",
+        )
+
+    def test_bank_plan_defers_location_check_until_room_is_observed(self) -> None:
+        steps = [
+            {
+                "id": "withdraw-funds",
+                "tool": "bank",
+                "outcome": "Withdraw 100 shillings.",
+                "verification": "Inventory contains 100 shillings.",
+            }
+        ]
+
+        self.assertIsNone(BotController._bank_plan_error(steps, {}))
+
+    def test_intrinsic_sale_evidence_survives_id_churn_only_for_unchanged_inventory(self) -> None:
+        reason = (
+            'Meidei tells you, "I cannot see how you could bear to part with a mace! '
+            'I certainly couldn\'t be the one to take it off your hands."'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="intrinsic-id-churn")
+                )["goal"]
+                first = {
+                    "look": {"room": {"num": 103}},
+                    "inventory": {
+                        "carry": {
+                            "known": True,
+                            "items": 2,
+                            "load": {"weight": 0, "bulk": 0, "exact": True},
+                            "weight_max": 2700,
+                            "bulk_max": 2700,
+                        },
+                        "items": [
+                            {"id": 10, "name": "mace"},
+                            {"id": 20, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 10, "name": "mace"}]},
+                }
+                second = copy.deepcopy(first)
+                second["inventory"]["items"] = [
+                    {"id": 30, "name": "mace"},
+                    {"id": 40, "name": "mace"},
+                ]
+                second["equipment"]["equipped"] = [{"id": 30, "name": "mace"}]
+                current = copy.deepcopy(second)
+                current["inventory"]["items"] = [
+                    {"id": 50, "name": "mace"},
+                    {"id": 60, "name": "mace"},
+                ]
+                current["equipment"]["equipped"] = [{"id": 50, "name": "mace"}]
+
+                self.assertEqual(
+                    controller.learning.profile(first)["inventory_load_hash"],
+                    controller.learning.profile(second)["inventory_load_hash"],
+                )
+                controller._record_blocked_action(
+                    goal, first, "sell", {"to": 1, "items": [10]}, reason
+                )
+                self.assertEqual(
+                    set(),
+                    controller._intrinsically_unsellable_item_names(goal, current),
+                )
+                controller._record_blocked_action(
+                    goal, second, "sell", {"to": 2, "items": [40]}, reason
+                )
+
+                self.assertEqual(
+                    {"mace"},
+                    controller._intrinsically_unsellable_item_names(goal, current),
+                )
+                self.assertEqual(
+                    {"10", "40", "50", "60"},
+                    controller._intrinsically_unsellable_item_ids(goal, current),
+                )
+                self.assertIsNotNone(
+                    controller._intrinsic_sale_block(
+                        goal, {"to": 3, "items": [60]}, current
+                    )
+                )
+                plan_error = controller._targeted_sale_grounding_error(
+                    goal,
+                    {"kind": "prepare_combat", "context": {}},
+                    [
+                        {
+                            "tool": "sell",
+                            "outcome": "Sell exact mace id 60.",
+                            "verification": "Shillings increase.",
+                        }
+                    ],
+                    current,
+                )
+                self.assertIn("across item-id churn", plan_error or "")
+
+                materially_changed = copy.deepcopy(current)
+                materially_changed["inventory"]["items"].append(
+                    {"id": 70, "name": "mace"}
+                )
+                materially_changed["inventory"]["carry"]["items"] = 3
+                self.assertEqual(
+                    set(),
+                    controller._intrinsically_unsellable_item_names(
+                        goal, materially_changed
+                    ),
+                )
             finally:
                 controller.storage.close()
 
@@ -1813,6 +3993,99 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_execution_plan_allows_ten_bounded_steps_but_rejects_eleven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="ten-step-plan")
+                )["goal"]
+
+                def plan(action_count: int) -> dict[str, Any]:
+                    return with_safe_ending(
+                        {
+                            "summary": "Execute one bounded commerce phase.",
+                            "steps": [
+                                {
+                                    "id": f"action-{index}",
+                                    "outcome": f"Complete bounded action {index}.",
+                                    "tool": "act",
+                                    "verification": "Observe the requested state change.",
+                                }
+                                for index in range(action_count)
+                            ],
+                        },
+                        100,
+                    )
+
+                stored = controller._store_execution_plan(
+                    goal,
+                    plan(9),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(10, len(stored["steps"]))
+
+                with self.assertRaisesRegex(ModelError, "1-10 ordered steps"):
+                    controller._store_execution_plan(
+                        goal,
+                        plan(10),
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=True,
+                    )
+            finally:
+                controller.storage.close()
+
+    def test_execution_plan_step_cannot_claim_a_second_tool_action(self) -> None:
+        self.assertIn(
+            "separate equip_best/wear_best step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "shop",
+                    "outcome": "Buy a war mace, then equip it.",
+                    "verification": "The war mace is wielded.",
+                }
+            )
+            or "",
+        )
+        self.assertIn(
+            "separate shop step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "travel",
+                    "outcome": "Travel to the merchant, then buy armor.",
+                    "verification": "Armor is carried.",
+                }
+            )
+            or "",
+        )
+        self.assertIn(
+            "separate escape_underworld/go_through/leave_raza/travel/walk_to step",
+            BotController._commerce_step_error(
+                {
+                    "tool": "sell",
+                    "outcome": (
+                        "Quote the local buyer; if not, travel to the alternate buyer."
+                    ),
+                    "verification": "A quote is returned or the room changes.",
+                }
+            )
+            or "",
+        )
+        self.assertIsNone(
+            BotController._commerce_step_error(
+                {
+                    "tool": "shop",
+                    "outcome": "Read the catalogue, then buy the quoted armor.",
+                    "verification": "Armor is carried.",
+                }
+            )
+        )
+
     def test_farm_execution_plan_rejects_later_out_of_phase_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -1885,6 +4158,78 @@ class ControllerTests(unittest.TestCase):
                         grounding=controller.knowledge.validate_goal(goal),
                         revision=False,
                     )
+            finally:
+                controller.storage.close()
+
+    def test_farm_execution_plan_accepts_merchant_provisioning_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = CatalogBroker()
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="farm-plan-merchant-provisioning",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm after replenishing one missing reagent.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "context": {
+                            "target": "ant",
+                            "room": 26,
+                            "use_safe_spots": False,
+                        },
+                    },
+                    mode="start",
+                )
+
+                stored = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Find the missing farm reagent, then launch.",
+                            "steps": [
+                                {
+                                    "id": "find-reagent-seller",
+                                    "outcome": "Find a merchant stocking elderberry.",
+                                    "tool": "merchants",
+                                    "verification": "The catalogue returns a placed seller and room id.",
+                                },
+                                {
+                                    "id": "launch-farm",
+                                    "outcome": "Launch the bounded ant farm in assigned room 26.",
+                                    "tool": "autopilot",
+                                    "verification": "Keeper reports the requested farm policy.",
+                                },
+                            ],
+                        },
+                        52,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                self.assertEqual("verified", stored["verification"]["status"])
+                self.assertEqual("merchants", stored["steps"][0]["tool"])
             finally:
                 controller.storage.close()
 
@@ -1968,6 +4313,10 @@ class ControllerTests(unittest.TestCase):
                     {"id": 2, "name": "shilling", "amount": 10, "can": []}
                 )
                 controller.last_observation = broker.observe()
+                controller.last_observation["look"]["room"] = {
+                    "num": 54,
+                    "name": "First Royal Bank of Tos",
+                }
                 payload = goal_payload(request_id="legacy-zero-currency-plan")
                 payload["constraints"] = {
                     **payload.get("constraints", {}),
@@ -3143,7 +5492,428 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_durable_lesson_immediately_ends_only_the_reselected_campaign_phase(self) -> None:
+    def test_partial_travel_is_not_recorded_as_completed_plan_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = PartialTravelBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                source_verify_safe_rooms(controller, 54)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="partial-travel-plan-step")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Reach the work room, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "reach-work-room",
+                                    "outcome": "Reach room 99.",
+                                    "tool": "travel",
+                                    "verification": "Current room id is 99.",
+                                }
+                            ],
+                        },
+                        54,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "travel",
+                        "arguments": {"to": 99},
+                        "rationale": "Continue to the verified work room.",
+                        "plan_step_id": "reach-work-room",
+                    },
+                )
+
+                self.assertTrue(result["partial_progress"])
+                self.assertFalse(result["outcome_complete"])
+                self.assertEqual(3, broker.room["num"])
+                self.assertEqual(
+                    [], controller.storage.events(kinds=["action.succeeded"])["events"]
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(kinds=["action.partial_progress"])[
+                            "events"
+                        ]
+                    ),
+                )
+                self.assertEqual(
+                    [], controller.storage.events(kinds=["action.no_progress"])["events"]
+                )
+                stored = controller._execution_plan(goal)
+                self.assertIsNotNone(stored)
+                self.assertEqual(
+                    "partial_progress", stored["last_action"]["status"]
+                )
+                self.assertEqual(
+                    "reach-work-room", stored["last_action"]["step_id"]
+                )
+                self.assertIsNone(
+                    controller._plan_revision_authorization(
+                        goal,
+                        stored,
+                        controller.storage.get_runtime("planner_feedback"),
+                    )
+                )
+                feedback = controller.storage.get_runtime("planner_feedback")
+                self.assertIn("repeat this same plan step", feedback["message"])
+            finally:
+                controller.storage.close()
+
+    def test_successful_travel_receipt_prevents_stale_room_plan_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = StalePostTravelBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                source_verify_safe_rooms(controller, 54)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="stale-post-travel-bank-room")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Travel to the bank, check it, and finish safely.",
+                            "steps": [
+                                {
+                                    "id": "reach-bank",
+                                    "outcome": "Travel to First Royal Bank of Tos room 54.",
+                                    "tool": "travel",
+                                    "verification": "Current room id is 54.",
+                                },
+                                {
+                                    "id": "check-bank",
+                                    "outcome": "Check the balance in bank room 54.",
+                                    "tool": "bank",
+                                    "verification": "Bank reports the account balance.",
+                                },
+                            ],
+                        },
+                        54,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "travel",
+                        "arguments": {"to": 54},
+                        "rationale": "Reach the bank before using it.",
+                        "plan_step_id": "reach-bank",
+                    },
+                )
+
+                self.assertEqual("travel", result["action"])
+                self.assertEqual(100, broker.room["num"])
+                self.assertEqual(54, controller._observation_room(controller.last_observation))
+                stored = controller._execution_plan(goal)
+                self.assertIsNotNone(stored)
+                self.assertEqual("reach-bank", stored["last_action"]["step_id"])
+                next_observation = controller._reconcile_recent_room_transition(
+                    broker.observe()
+                )
+                self.assertEqual(
+                    54,
+                    controller._observation_room(next_observation),
+                )
+                controller.last_observation = next_observation
+                self.assertIsNotNone(controller._execution_plan(goal))
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
+                )
+                reconciled = controller.storage.events(
+                    kinds=["action.movement_observation_reconciled"]
+                )["events"]
+                self.assertEqual(2, len(reconciled))
+                self.assertEqual(100, reconciled[0]["data"]["stale_observed_room"])
+                self.assertEqual(54, reconciled[0]["data"]["receipt_room"])
+            finally:
+                controller.storage.close()
+
+    def test_create_food_delta_reconciles_next_stale_inventory_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = StalePostCreateFoodBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="stale-post-create-food")
+                )["goal"]
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertEqual("cast", result["action"])
+                cast_arguments = next(
+                    arguments for name, arguments in broker.calls if name == "cast"
+                )
+                self.assertTrue(cast_arguments["observe_created"])
+                stale = broker.observe()
+                self.assertEqual(
+                    1,
+                    CriteriaEvaluator.inventory_count(
+                        stale["inventory"]["items"], "food"
+                    ),
+                )
+                reconciled = controller._reconcile_recent_inventory_creation(stale)
+                self.assertEqual(
+                    2,
+                    CriteriaEvaluator.inventory_count(
+                        reconciled["inventory"]["items"], "food"
+                    ),
+                )
+                events = controller.storage.events(
+                    kinds=["action.inventory_observation_reconciled"]
+                )["events"]
+                self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_zero_mana_cast_does_not_complete_plan_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = UnverifiedCreateFoodBroker(mana_spent=0)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="zero-mana-create-food")
+                )["goal"]
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["no_progress"])
+                self.assertIn("did not happen", result["reason"])
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["action.succeeded"])["events"],
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(kinds=["action.transient_failure"])[
+                            "events"
+                        ]
+                    ),
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+            finally:
+                controller.storage.close()
+
+    def test_half_cost_failed_cast_preserves_plan_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = UnverifiedCreateFoodBroker(mana_spent=5)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="failed-roll-create-food")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create one required food item, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "create-food",
+                                    "tool": "cast",
+                                    "outcome": "Cast Create Food to produce 1 food.",
+                                    "verification": "inventory shows at least 2 food items.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["transient_failure"])
+                self.assertTrue(result["plan_step_preserved"])
+                self.assertIn("FAILED its roll", result["reason"])
+                retained = controller._execution_plan(goal)
+                self.assertIsNotNone(retained)
+                self.assertEqual(
+                    "transient_failure", retained["last_action"]["status"]
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["planner.plan.invalidated"])[
+                        "events"
+                    ],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_transient_cast_repair_removes_legacy_block_from_result_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = UnverifiedCreateFoodBroker(mana_spent=5)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-failed-roll-create-food")
+                )["goal"]
+                arguments = {
+                    "agent": "primary",
+                    "observe_created": True,
+                    "spell": "create food",
+                }
+                controller._record_blocked_action(
+                    goal,
+                    broker.observe(),
+                    "cast",
+                    arguments,
+                    "create food spent 5 mana but produced no verified carried item",
+                )
+                controller.storage.emit_event(
+                    "action.no_progress",
+                    "Action made no progress: cast",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "cast",
+                        "arguments": arguments,
+                        "result": {
+                            "cast": True,
+                            "spell": "create food",
+                            "mana_spent": 5,
+                            "created": [],
+                            "what_the_mana_says": (
+                                "half cost (5 of 10) — the spell was cast and "
+                                "FAILED its roll"
+                            ),
+                        },
+                        "reason": (
+                            "create food spent 5 mana but produced no verified "
+                            "carried item"
+                        ),
+                    },
+                )
+
+                repaired = controller._repair_transient_cast_evidence()
+
+                self.assertEqual([], repaired)
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+                events = controller.storage.events(
+                    kinds=["cast.transient_evidence_repaired"]
+                )["events"]
+                self.assertEqual(1, len(events))
+                self.assertEqual(1, events[0]["data"]["blocked_action_count"])
+            finally:
+                controller.storage.close()
+
+    def test_full_cost_creation_without_delta_requires_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = UnverifiedCreateFoodBroker(mana_spent=10)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="unverified-create-food")
+                )["goal"]
+                controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create one required food item, then finish safely.",
+                            "steps": [
+                                {
+                                    "id": "create-food",
+                                    "tool": "cast",
+                                    "outcome": "Cast Create Food to produce 1 food.",
+                                    "verification": "inventory shows at least 2 food items.",
+                                }
+                            ],
+                        },
+                        100,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create food"},
+                        "rationale": "Create one required food item.",
+                        "plan_step_id": "create-food",
+                    },
+                )
+
+                self.assertTrue(result["no_progress"])
+                self.assertIn("produced no verified carried item", result["reason"])
+                self.assertIsNone(controller._execution_plan(goal))
+                self.assertEqual(
+                    [],
+                    controller.storage.events(kinds=["action.succeeded"])["events"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_durable_lesson_allows_one_plan_revision_before_phase_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -3177,7 +5947,7 @@ class ControllerTests(unittest.TestCase):
                     }
                 )  # type: ignore[assignment]
 
-                result = controller._execute(
+                first = controller._execute(
                     goal,
                     broker.observe(),
                     {
@@ -3188,14 +5958,36 @@ class ControllerTests(unittest.TestCase):
                     },
                 )
 
-                self.assertTrue(result["campaign_breaker"]["breaker_tripped"])
-                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertTrue(first["retry_suppressed"])
+                self.assertNotIn("campaign_breaker", first)
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertEqual(
+                    phase["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+                feedback = controller.storage.get_runtime("planner_feedback")
+                self.assertIn("Choose different arguments or a different tool", feedback["message"])
+
+                repeated = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "inventory",
+                        "arguments": {},
+                        "rationale": "Ignore the feedback and retry unchanged.",
+                        "expected_observation": {"inventory": "changed"},
+                    },
+                )
+
+                self.assertTrue(repeated["campaign_breaker"]["breaker_tripped"])
+                self.assertTrue(repeated["strategic_goal_preserved"])
                 self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
                 self.assertEqual(
                     "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
                 )
-                self.assertEqual(phase["id"], result["campaign_breaker"]["phase_id"])
+                self.assertEqual(
+                    phase["id"], repeated["campaign_breaker"]["phase_id"]
+                )
             finally:
                 controller.storage.close()
 
@@ -3412,7 +6204,6 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="start",
                 )
-
                 _, active, _ = controller._campaign_turn_state(
                     goal,
                     broker.observe(),
@@ -3515,6 +6306,54 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.get_runtime(
                         "phase_completion_checkpoints_v1", {}
                     ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_persisted_action_only_mutating_preparation_is_retired(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="persisted-action-only-preparation")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Legacy equipment and food preparation.",
+                        "success_criteria": [
+                            {
+                                "id": "equip-returned",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["equip_best"],
+                            },
+                            {
+                                "id": "cast-returned",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["cast"],
+                            },
+                        ],
+                        "abandon_predicates": [],
+                        "context": {},
+                    },
+                    mode="start",
+                )
+
+                outcome = controller._evaluate_campaign_phase(
+                    goal, run, phase, SimulatedBroker().observe()
+                )
+
+                self.assertTrue(outcome.failed)
+                self.assertEqual("failed", outcome.phase["status"])
+                self.assertEqual(
+                    "invalid_prepare_combat_phase_outcome",
+                    outcome.detail["grounding_blocker"]["kind"],
+                )
+                self.assertIn(
+                    "observable equipment, inventory, or capacity state",
+                    outcome.detail["reason"],
                 )
             finally:
                 controller.storage.close()
@@ -3833,6 +6672,58 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual("hunting_grounds", action["tool"])
                 self.assertEqual({"for_level": 24, "limit": 6}, action["arguments"])
+                self.assertEqual("find-prey", action["plan_step_id"])
+            finally:
+                controller.storage.close()
+
+    def test_manager_research_executes_required_hunting_grounds_despite_prey_alias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                phase = {
+                    "kind": "research_progression",
+                    "success_criteria": [
+                        {
+                            "id": "candidate",
+                            "kind": "phase_action_succeeded",
+                            "tools": ["hunting_grounds"],
+                        }
+                    ],
+                    "context": {},
+                }
+                observation = {
+                    "look": {
+                        "room": {"num": 106, "name": "Brownestone Inn"},
+                        "vitals": {"health": {"value": 34, "max": 34}},
+                    },
+                    "status": {
+                        "vitals": {"health": {"value": 34, "max": 34}}
+                    },
+                }
+                execution_plan = {
+                    "steps": [
+                        {
+                            "id": "find-prey",
+                            "tool": "prey",
+                            "outcome": "Find eligible prey for the current level.",
+                        },
+                        {
+                            "id": "finish-safe",
+                            "tool": "travel",
+                            "outcome": "Remain safely at Brownestone Inn.",
+                        },
+                    ],
+                    "safe_ending": {"room_id": 106, "step_id": "finish-safe"},
+                }
+
+                action = controller._structured_research_progression_action(
+                    phase, observation, execution_plan
+                )
+
+                self.assertEqual("hunting_grounds", action["tool"])
+                self.assertEqual({"for_level": 34, "limit": 6}, action["arguments"])
                 self.assertEqual("find-prey", action["plan_step_id"])
             finally:
                 controller.storage.close()
@@ -4568,6 +7459,44 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_identical_read_only_shop_catalogue_replay_invalidates_purchase_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = {
+                    "look": {"room": {"num": 52, "name": "Bhrama & Falcon"}}
+                }
+                arguments = {"seller": 10}
+                result = {"items": [{"id": 348, "name": "mace", "cost": 40}]}
+
+                first = controller._repeated_evidence_reason(
+                    "shop", arguments, result, observation
+                )
+                second = controller._repeated_evidence_reason(
+                    "shop", arguments, result, observation
+                )
+
+                self.assertIsNone(first)
+                self.assertIn("identical evidence lookup", second or "")
+                self.assertTrue(
+                    controller._failure_invalidates_plan("shop", second)
+                )
+                guidance = controller._no_progress_guidance("shop", second or "")
+                self.assertIn("read-only success is evidence, not progress", guidance)
+
+                # A real purchase remains a mutation and is never classified
+                # as a repeated catalogue lookup by this guard.
+                self.assertIsNone(
+                    controller._repeated_evidence_reason(
+                        "shop",
+                        {"seller": 10, "buy_ids": [348]},
+                        result,
+                        observation,
+                    )
+                )
+            finally:
+                controller.storage.close()
+
     def test_server_refusal_message_is_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
             {"verb": "get", "messages": ["You're unable to pick up Paddock."]},
@@ -4652,6 +7581,15 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Do not retry this purchase at any quantity", guidance)
         self.assertIn("sell confirm:false", guidance)
         self.assertIn("verified bank", guidance)
+        reason = 'Frisconar says, "Come back when you have enough money for the flask."'
+        self.assertTrue(BotController._failure_invalidates_plan("shop", reason))
+        context = BotController._failure_context(
+            "shop",
+            reason,
+            {"inventory": {"items": []}},
+        )
+        self.assertEqual("purchase_funds_insufficient", context["kind"])
+        self.assertIn("Invalidate the current purchase tactic", context["purpose"])
 
     def test_inventory_capacity_feedback_reports_cause_without_prescribing_solution(self) -> None:
         observation = {
@@ -4963,6 +7901,385 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertIn("not interested", rejected or "")
         self.assertIsNone(quoted)
+
+    def test_live_no_need_sale_refusal_invalidates_only_the_execution_plan(self) -> None:
+        reason = 'Caramo tells you, "I simply have no need for that."'
+
+        context = BotController._failure_context("sell", reason, {})
+        guidance = BotController._no_progress_guidance("sell", reason)
+
+        self.assertEqual("merchant_rejected_sale", (context or {}).get("kind"))
+        self.assertIn("only this item/merchant tactic", (context or {}).get("purpose", ""))
+        self.assertIn("Do not retry the same item with this merchant", guidance)
+        self.assertTrue(BotController._failure_invalidates_plan("sell", reason))
+        self.assertFalse(BotController._failure_invalidates_plan("travel", reason))
+
+        archaic_reason = 'Pritchett tells you, "Whyfore dost you offer me that?"'
+        archaic_context = BotController._failure_context("sell", archaic_reason, {})
+        archaic_guidance = BotController._no_progress_guidance("sell", archaic_reason)
+        self.assertEqual("merchant_rejected_sale", (archaic_context or {}).get("kind"))
+        self.assertIn("Do not retry the same item with this merchant", archaic_guidance)
+        self.assertTrue(BotController._failure_invalidates_plan("sell", archaic_reason))
+
+    def test_intrinsic_item_refusal_blocks_only_exact_item_across_merchants(self) -> None:
+        reason = (
+            'Meidei tells you, "I cannot see how you could bear to part with a mace! '
+            'I certainly couldn\'t be the one to take it off your hands."'
+        )
+        context = BotController._failure_context("sell", reason, {})
+        guidance = BotController._no_progress_guidance("sell", reason)
+
+        self.assertEqual("item_not_npc_transferable", (context or {}).get("kind"))
+        self.assertEqual(
+            "server_can_be_given_to_npc_check", (context or {}).get("source")
+        )
+        self.assertIn("before evaluating buyer preference", (context or {}).get("purpose", ""))
+        self.assertIn("Do not try this item id with another merchant", guidance)
+        self.assertIn("do not repeat buyer discovery", guidance)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="intrinsic-item-sale-refusal")
+                )["goal"]
+                observation = {
+                    "look": {"room": {"num": 103, "name": "Raza Inn"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 7887, "name": "mace", "in_use": True},
+                            {"id": 11420, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {"equipped": [{"id": 7887, "name": "mace"}]},
+                }
+                controller._record_blocked_action(
+                    goal,
+                    observation,
+                    "sell",
+                    {"to": 674, "items": [7887], "confirm": False},
+                    reason,
+                )
+                elsewhere = copy.deepcopy(observation)
+                elsewhere["look"]["room"] = {"num": 106, "name": "Other shop"}
+
+                self.assertIsNotNone(
+                    controller._blocked_action(
+                        goal,
+                        elsewhere,
+                        "sell",
+                        {"to": 999, "items": [7887], "confirm": False},
+                    )
+                )
+                self.assertIsNone(
+                    controller._blocked_action(
+                        goal,
+                        elsewhere,
+                        "sell",
+                        {"to": 999, "items": [11420], "confirm": False},
+                    )
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "exact instance cannot be given to any NPC"
+                ):
+                    controller._guard_prepare_combat_sale(
+                        goal,
+                        {"kind": "prepare_combat", "context": {}},
+                        "sell",
+                        {"to": 999, "items": [7887], "confirm": False},
+                        observation,
+                    )
+
+                reused = [
+                    {
+                        "id": "sell-blocked-mace",
+                        "tool": "sell",
+                        "outcome": "Sell exact mace item id 7887 to merchant 999.",
+                        "verification": "Carried shillings increase after selling id 7887.",
+                    }
+                ]
+                replacement = copy.deepcopy(reused)
+                replacement[0]["outcome"] = "Sell exact mace item id 11420."
+                replacement[0]["verification"] = (
+                    "Carried shillings increase after selling id 11420."
+                )
+                self.assertIn(
+                    "cannot be given to any NPC",
+                    controller._sale_recovery_plan_error(goal, reused) or "",
+                )
+                self.assertIsNone(
+                    controller._sale_recovery_plan_error(goal, replacement)
+                )
+                self.assertIn("item_not_npc_transferable", PLANNER_SYSTEM)
+                self.assertIn("Never call merchants", PLANNER_SYSTEM)
+            finally:
+                controller.storage.close()
+
+    def test_sale_refusal_replan_requires_buyer_discovery_before_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                for tool_name in ("merchants", "sell"):
+                    broker.tools[tool_name] = Tool(
+                        tool_name,
+                        f"Test {tool_name} tool.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="sale-refusal-plan-grounding")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Raise funds for equipment.",
+                        "success_criteria": [
+                            {
+                                "id": "equipment-known",
+                                "kind": "state_equals",
+                                "path": "equipment.known",
+                                "value": True,
+                            }
+                        ],
+                        "context": {},
+                    },
+                    mode="start",
+                )
+                controller.last_observation = broker.observe()
+                controller._set_planner_feedback(
+                    goal,
+                    "D'Franco rejected the prior sale.",
+                    failure_context={
+                        "kind": "merchant_rejected_sale",
+                        "required_response": "Change buyer using live evidence.",
+                    },
+                )
+                ungrounded = with_safe_ending(
+                    {
+                        "summary": "Assume a different merchant will buy the sword.",
+                        "steps": [
+                            {
+                                "id": "sell-next",
+                                "outcome": "Sell the rusty sword to a weapon buyer.",
+                                "tool": "sell",
+                                "verification": "Carried currency increases.",
+                            }
+                        ],
+                        "assumptions": ["A different buyer exists."],
+                    },
+                    100,
+                )
+
+                with self.assertRaisesRegex(
+                    ModelError, "buyer-discovery step before its next sell"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        ungrounded,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
+
+                # A subsequent planner rejection may replace the immediate
+                # feedback, but it must not erase the verified sale refusal.
+                controller._clear_planner_feedback()
+                legacy = controller._store_execution_plan(
+                    goal,
+                    ungrounded,
+                    grounding={"valid": True},
+                    revision=False,
+                )
+                controller._record_blocked_action(
+                    goal,
+                    broker.observe(),
+                    "sell",
+                    {"to": 736, "items": [7525]},
+                    "D'Franco refused to buy the mace.",
+                )
+                controller._clear_planner_feedback()
+                self.assertIsNone(controller._execution_plan(goal))
+                invalidations = controller.storage.events(
+                    kinds=["planner.plan.invalidated"]
+                )["events"]
+                self.assertTrue(invalidations)
+                self.assertIn(
+                    "previous merchant rejected",
+                    invalidations[-1]["data"]["reason"],
+                )
+                self.assertEqual(legacy["goal_id"], goal["id"])
+                with self.assertRaisesRegex(
+                    ModelError, "buyer-discovery step before its next sell"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        ungrounded,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
+
+                grounded = copy.deepcopy(ungrounded)
+                grounded["summary"] = "Discover a verified buyer before selling."
+                grounded["steps"].insert(
+                    0,
+                    {
+                        "id": "find-buyer",
+                        "outcome": "Find merchants whose buying rule matches rusty sword.",
+                        "tool": "merchants",
+                        "verification": "Merchant results list a concrete buyer candidate.",
+                    },
+                )
+                combined_lookup = copy.deepcopy(grounded)
+                combined_lookup["steps"][0]["outcome"] = (
+                    "Find a compatible buyer and then travel to its room."
+                )
+                combined_lookup["steps"][0]["verification"] = (
+                    "Current room matches the discovered merchant room."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "assigns room movement to merchants"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        combined_lookup,
+                        grounding={"valid": True},
+                        revision=False,
+                    )
+                stored = controller._store_execution_plan(
+                    goal,
+                    grounded,
+                    grounding={"valid": True},
+                    revision=False,
+                )
+                self.assertEqual("merchants", stored["steps"][0]["tool"])
+                self.assertIn(
+                    "buyer discovery must precede the next sell",
+                    PLANNER_SYSTEM,
+                )
+
+                controller.storage.emit_event(
+                    "action.no_progress",
+                    "Repeated buyer discovery returned known evidence",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "merchants",
+                        "arguments": {
+                            "agent": "primary",
+                            "buys": "rusty sword",
+                        },
+                        "reason": (
+                            "repeated identical evidence lookup returned no new evidence"
+                        ),
+                        "result": {
+                            "buys_anything": [
+                                {"merchant": "Assassin", "room": 110}
+                            ],
+                            "rules_mentioning": [],
+                        },
+                    },
+                )
+                controller._clear_planner_feedback()
+                self.assertIsNone(controller._execution_plan(goal))
+                migration_feedback = controller._planner_feedback(goal)
+                self.assertIn(
+                    "omits the repeated merchants lookup",
+                    migration_feedback["message"],
+                )
+                self.assertNotIn(
+                    "with a merchants buyer-discovery step",
+                    migration_feedback["message"],
+                )
+                controller._clear_planner_feedback()
+                consumed = controller._store_execution_plan(
+                    goal,
+                    ungrounded,
+                    grounding={"valid": True},
+                    revision=True,
+                )
+                self.assertEqual("sell", consumed["steps"][0]["tool"])
+
+                repeated_lookup = copy.deepcopy(grounded)
+                repeated_lookup["steps"][0]["outcome"] = (
+                    "Find merchants that buy rusty sword."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "already completed with candidate results"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        repeated_lookup,
+                        grounding={"valid": True},
+                        revision=True,
+                    )
+
+                refused_buyer = copy.deepcopy(ungrounded)
+                refused_buyer["steps"][0]["outcome"] = (
+                    "Sell the rusty sword to D'Franco merchant 736."
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "merchant 736.*already rejected"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        refused_buyer,
+                        grounding={"valid": True},
+                        revision=True,
+                    )
+            finally:
+                controller.storage.close()
+
+    def test_tactical_context_retains_goal_blocked_actions_after_feedback_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="blocked-tactic-context")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.set_runtime(
+                    "blocked_actions",
+                    [
+                        {
+                            "goal_id": "other-goal",
+                            "tool": "sell",
+                            "arguments": {"to": 1, "items": [2]},
+                            "room": 10,
+                            "reason": "irrelevant",
+                        },
+                        {
+                            "goal_id": goal["id"],
+                            "tool": "sell",
+                            "arguments": {"to": 736, "items": [7525, 7526]},
+                            "room": 106,
+                            "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                            "suppressed_count": 1,
+                        },
+                    ],
+                )
+
+                context = controller._campaign_context(run, None, audience="tactical")
+
+                self.assertEqual(
+                    [
+                        {
+                            "tool": "sell",
+                            "arguments": {"to": 736, "items": [7525, 7526]},
+                            "room": 106,
+                            "reason": 'Pritchett tells you, "Whyfore dost you offer me that?"',
+                            "suppressed_count": 1,
+                        }
+                    ],
+                    context["verified_no_progress_tactics"],
+                )
+                self.assertIn(
+                    "do not restore an exact failed tool/argument/room tactic",
+                    context["instructions"],
+                )
+            finally:
+                controller.storage.close()
 
     def test_sell_all_with_only_refusals_is_factual_no_progress(self) -> None:
         reason = BotController._no_progress_reason(
@@ -5573,6 +8890,40 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_source_gentle_overlevel_spawn_uses_grounded_attack_rating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                controller.knowledge = SimpleNamespace(
+                    get=lambda _entity_id: {
+                        "status": "found",
+                        "entity": {
+                            "spawn_table": {
+                                "spawns": [
+                                    {
+                                        "creature_id": "creature:fungusbeast",
+                                        "creature": "fungus beast",
+                                        "level": 50,
+                                        "difficulty": 1,
+                                        "role": "monster",
+                                        "chance": 65,
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                )
+
+                threats = controller._source_room_overlevel_hostiles(
+                    544, broker.observe()
+                )
+
+                self.assertEqual([], threats)
+            finally:
+                controller.storage.close()
+
     def test_blocked_farm_goal_reconciles_against_current_candidate_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -5888,7 +9239,7 @@ class ControllerTests(unittest.TestCase):
             BotController._spawn_is_hostile({"creature": "Unknown NPC", "level": 50})
         )
 
-    def test_repeated_safety_suppression_escalates_and_pauses_at_budget(self) -> None:
+    def test_repeated_safety_suppression_retires_tactic_without_pausing_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -5928,8 +9279,12 @@ class ControllerTests(unittest.TestCase):
                         },
                     )
 
-                self.assertTrue(result["goal_paused"])
-                self.assertEqual("paused", controller.storage.goal(goal["id"])["status"])
+                self.assertTrue(result["tactic_deferred"])
+                self.assertNotIn("goal_paused", result)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller.storage.get_runtime("safety_suppression_v1")
+                )
                 stalled = controller.storage.events(kinds=["planner.stalled"])["events"]
                 self.assertEqual(1, len(stalled))
                 self.assertEqual(3, stalled[0]["data"]["same_blocker_count"])
@@ -6361,6 +9716,47 @@ class ControllerTests(unittest.TestCase):
                 broker.vitals["vigor"] = {"value": 93, "scale_max": 200, "rested": True}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(goal_payload(request_id="farm-vigor-gate"))["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 575.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "context": {
+                            "room": 575,
+                            "target": "giant rat",
+                            "fight_above_vigor": 140,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                stale_lesson = controller.learning.defer_goal(
+                    goal,
+                    broker.observe(),
+                    tool="autopilot",
+                    arguments={
+                        "action": "start",
+                        "mode": "farm",
+                        "hunt": "giant rat",
+                        "assigned_room": 575,
+                    },
+                    reason=(
+                        "Repeated deterministic safety suppression exhausted the "
+                        "controller wait budget: recover combat vigor before launch"
+                    ),
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                )["lesson"]
 
                 result = controller._execute(
                     goal,
@@ -6379,9 +9775,31 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertTrue(result["safety_suppressed"])
+                self.assertTrue(result["campaign_support_phase_started"])
                 self.assertIn("recover_combat_vigor", {item["kind"] for item in result["blockers"]})
                 blocker = next(item for item in result["blockers"] if item["kind"] == "recover_combat_vigor")
                 self.assertIn("resting stops at 80 vigor", blocker["guidance"])
+                support = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual("prepare_combat", support["kind"])
+                self.assertEqual(farm["id"], support["parent_phase_id"])
+                self.assertEqual(
+                    {
+                        "id": "combat-vigor-100",
+                        "kind": "numeric_threshold",
+                        "metric": "status.vitals.vigor.value",
+                        "operator": ">=",
+                        "value": 100,
+                    },
+                    support["success_criteria"][0],
+                )
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(
+                    controller.storage.get_runtime("safety_suppression_v1")
+                )
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(stale_lesson["id"])["status"],
+                )
                 self.assertFalse(any(name == "autopilot" for name, _ in broker.calls))
             finally:
                 controller.storage.close()
@@ -6813,6 +10231,41 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_gentle_overlevel_live_creature_does_not_block_farm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                controller.knowledge = SimpleNamespace(
+                    resolve=lambda _query, **_: {
+                        "status": "found",
+                        "entity": {
+                            "id": "creature:fungusbeast",
+                            "facts": {"level": 50, "difficulty": 1},
+                            "evidence": {"source_ref": "monster/fungus.kod"},
+                        },
+                    }
+                )
+                observation = broker.observe()
+                observation["look"]["objects"] = [
+                    {
+                        "id": 9123,
+                        "name": "fungus beast",
+                        "distance": 4,
+                        "reachable": True,
+                        "is_player": False,
+                        "relation": "hostile",
+                        "can": ["attack", "look"],
+                    }
+                ]
+
+                threats = controller._live_overlevel_hostiles(observation)
+
+                self.assertEqual([], threats)
+            finally:
+                controller.storage.close()
+
     def test_running_farm_hands_off_on_dynamic_overlevel_hostile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -6943,6 +10396,196 @@ class ControllerTests(unittest.TestCase):
                 )["events"]
                 self.assertEqual(1, len(events))
                 self.assertEqual([586], events[0]["data"]["rooms"])
+            finally:
+                controller.storage.close()
+
+    def test_level_only_quarantine_is_repaired_only_with_gentle_source_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="gentle-level-quarantine-repair")
+                )["goal"]
+                lesson = controller.storage.create_goal_lesson(
+                    {
+                        "goal_id": goal["id"],
+                        "goal_family": "goal-family:gentle-level-repair",
+                        "tactic_key": "tactic:room-544-larva",
+                        "classification": "ineffective_tactic",
+                        "scope": "tactic",
+                        "confidence": 0.9,
+                        "summary": (
+                            "Background farming exceeded verified survivability "
+                            "in the assigned room: live room contains a "
+                            "source-resolved hostile above the verified danger band"
+                        ),
+                        "failed_state": {},
+                        "evidence_event_ids": [],
+                        "retry_when": {"mode": "any", "conditions": []},
+                        "suggested_goals": [],
+                    }
+                )
+
+                def get_room(entity_id: str) -> dict[str, object]:
+                    if entity_id == "location:544":
+                        spawn = {
+                            "creature_id": "creature:fungusbeast",
+                            "creature": "fungus beast",
+                            "level": 50,
+                            "difficulty": 1,
+                            "role": "monster",
+                        }
+                    else:
+                        spawn = {
+                            "creature_id": "creature:ogre",
+                            "creature": "ogre",
+                            "level": 60,
+                            "difficulty": 4,
+                            "role": "monster",
+                        }
+                    return {
+                        "status": "found",
+                        "entity": {"spawn_table": {"spawns": [spawn]}},
+                    }
+
+                controller.knowledge = SimpleNamespace(get=get_room)
+                old_reason = (
+                    "Background farming exceeded verified survivability in the "
+                    "assigned room: live room contains a source-resolved hostile "
+                    "above the verified danger band"
+                )
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1",
+                    {
+                        "544": {
+                            "room": 544,
+                            "target": "groundworm larva",
+                            "goal_id": goal["id"],
+                            "lesson_id": lesson["id"],
+                            "reasons": [old_reason],
+                        },
+                        "563": {
+                            "room": 563,
+                            "target": "ant",
+                            "reasons": [old_reason],
+                        },
+                    },
+                )
+
+                released = controller._repair_gentle_overlevel_farm_quarantines(
+                    observation
+                )
+
+                self.assertEqual([544], [item["room"] for item in released])
+                self.assertEqual(
+                    210,
+                    released[0]["forgiven_overlevel_spawns"][0]["attack_rating"],
+                )
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_quarantine_v1", {}
+                )
+                self.assertNotIn("544", remaining)
+                self.assertIn("563", remaining)
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(lesson["id"])["status"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_gentle_cap_stagnation_is_repaired_only_with_fresh_source_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="gentle-cap-stagnation-repair")
+                )["goal"]
+
+                def get_room(entity_id: str) -> dict[str, object]:
+                    if entity_id == "location:544":
+                        spawns = [
+                            {
+                                "creature_id": "creature:groundwormlarva",
+                                "creature": "groundworm larva",
+                                "level": 35,
+                                "difficulty": 5,
+                                "role": "monster",
+                            },
+                            {
+                                "creature_id": "creature:fungusbeast",
+                                "creature": "fungus beast",
+                                "level": 50,
+                                "difficulty": 1,
+                                "role": "monster",
+                            },
+                        ]
+                    else:
+                        spawns = [
+                            {
+                                "creature_id": "creature:ogre",
+                                "creature": "ogre",
+                                "level": 60,
+                                "difficulty": 4,
+                                "role": "monster",
+                            }
+                        ]
+                    return {
+                        "status": "found",
+                        "entity": {"spawn_table": {"spawns": spawns}},
+                    }
+
+                controller.knowledge = SimpleNamespace(get=get_room)
+                base = {
+                    "goal_id": goal["id"],
+                    "target": "groundworm larva",
+                    "last_error": None,
+                    "stalled_in_transit": True,
+                    "deltas": {
+                        "deaths": 0,
+                        "deaths_in_safe_spot": 0,
+                        "deaths_in_proven_safe_spot": 0,
+                        "withdrawals": 0,
+                        "mulligans": 0,
+                        "logoffs": 0,
+                    },
+                    "stalled": {
+                        "idle_passes": 33,
+                        "since_seconds": 63,
+                        "why": "room capped by creatures we will not fight",
+                    },
+                }
+                gentle_key = f"{goal['id']}|544|groundworm larva"
+                dangerous_key = f"{goal['id']}|563|groundworm larva"
+                controller.storage.set_runtime(
+                    "farm_tactic_stagnation_v1",
+                    {
+                        gentle_key: {**base, "room": 544, "assigned_room": 544},
+                        dangerous_key: {**base, "room": 563, "assigned_room": 563},
+                    },
+                )
+
+                repaired = controller._repair_gentle_cap_stagnations(observation)
+
+                self.assertEqual([544], [item["room"] for item in repaired])
+                self.assertEqual(
+                    210,
+                    repaired[0]["forgiven_cap_blockers"][0]["attack_rating"],
+                )
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(gentle_key, remaining)
+                self.assertIn(dangerous_key, remaining)
             finally:
                 controller.storage.close()
 
@@ -7103,6 +10746,137 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual(0.8, former_policy["prior_flee_threshold"])
                 self.assertEqual(0.6, former_policy["current_flee_threshold"])
+            finally:
+                controller.storage.close()
+
+    def test_safe_spot_coordinate_failures_do_not_quarantine_whole_room(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 583, "name": "Outskirts of Barloque"}
+                broker.farm_room = 583
+                broker.farm_hunt = "slime"
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="coordinate-local-safe-spots")
+                )["goal"]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+                status["journal"] = [
+                    {
+                        "pass": number,
+                        "what": "this is not a safe spot",
+                        "lost": 2,
+                        "where": {"col": number, "row": number + 1},
+                    }
+                    for number in (11, 12, 13)
+                ]
+
+                evidence = controller._farm_status_evidence(
+                    goal, broker.observe(), status
+                )
+
+                self.assertEqual(3, evidence["safe_spot_failure_count"])
+                self.assertEqual([], evidence["quarantine_reasons"])
+                self.assertIn(
+                    "multiple safe-spot coordinates were retired; the room remains eligible",
+                    evidence["tactic_warnings"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_legacy_coordinate_local_quarantines_and_lessons_are_released(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-coordinate-quarantine")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                observation = broker.observe()
+                deferred = controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="autopilot",
+                    arguments={
+                        "action": "start",
+                        "mode": "farm",
+                        "assigned_room": 583,
+                        "hunt": "slime",
+                        "use_safe_spots": True,
+                    },
+                    reason=(
+                        "Background farming exceeded verified survivability in "
+                        "the assigned room: repeated safe-spot failures left too "
+                        "little healing margin"
+                    ),
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                    block=False,
+                )
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1",
+                    {
+                        "583": {
+                            "room": 583,
+                            "assigned_room": 583,
+                            "target": "slime",
+                            "use_safe_spots": True,
+                            "goal_id": goal["id"],
+                            "reasons": [
+                                "repeated safe-spot failures left too little healing margin"
+                            ],
+                            "deltas": {"deaths": 0, "withdrawals": 0},
+                        },
+                        "557": {
+                            "room": 557,
+                            "assigned_room": 557,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "goal_id": goal["id"],
+                            "reasons": [
+                                "repeated retreat episodes reached the farm tactic safety limit"
+                            ],
+                            "deltas": {"deaths": 0, "withdrawals": 1},
+                        },
+                    },
+                )
+                exhaustion = {
+                    "kind": "no_usable_farm_recipe",
+                    "fingerprint": "all-excluded",
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: exhaustion},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"], external_blocker=exhaustion
+                )
+
+                released = controller._repair_overbroad_safe_spot_quarantines()
+
+                self.assertEqual([583], [item["room"] for item in released])
+                remaining = controller.storage.get_runtime(
+                    "farm_tactic_quarantine_v1", {}
+                )
+                self.assertNotIn("583", remaining)
+                self.assertIn("557", remaining)
+                lesson = controller.storage.goal_lesson(deferred["lesson"]["id"])
+                self.assertEqual("resolved", lesson["status"])
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime(
+                        RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                    ),
+                )
+                self.assertIsNone(
+                    controller.storage.campaign_run(goal["id"])[
+                        "external_blocker"
+                    ]
+                )
             finally:
                 controller.storage.close()
 
@@ -7374,6 +11148,54 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_manual_fight_uses_margin_above_disengage_instead_of_full_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="manual-combat-start-margin")
+                )["goal"]
+                broker = CombatBroker()
+                observation = broker.observe()
+                observation["status"]["vitals"]["health"] = {
+                    "current": 85,
+                    "max": 100,
+                }
+                observation["look"]["vitals"]["health"] = {
+                    "current": 85,
+                    "max": 100,
+                }
+
+                manual = controller._combat_preflight(
+                    "fight",
+                    {"target": "giant rat", "disengage_at": 0.7},
+                    observation,
+                    goal,
+                )
+                autonomous = controller._combat_preflight(
+                    "autopilot",
+                    {"action": "start", "mode": "farm", "hunt": "giant rat"},
+                    observation,
+                    goal,
+                )
+
+                self.assertNotIn("recover_health", {item["kind"] for item in manual})
+                self.assertIn("recover_health", {item["kind"] for item in autonomous})
+
+                observation["status"]["vitals"]["health"]["current"] = 79
+                observation["look"]["vitals"]["health"]["current"] = 79
+                low = controller._combat_preflight(
+                    "fight",
+                    {"target": "giant rat", "disengage_at": 0.7},
+                    observation,
+                    goal,
+                )
+                blocker = next(item for item in low if item["kind"] == "recover_health")
+                self.assertAlmostEqual(0.8, blocker["minimum_start_fraction"])
+                self.assertIn("one-swing fight", blocker["guidance"])
+            finally:
+                controller.storage.close()
+
     def test_running_background_farm_exclusively_owns_hp_phase(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -7572,6 +11394,14 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                broker = SimulatedBroker()
+                for name in ("bank", "shop", "rest_up", "equip_best"):
+                    broker.tools[name] = Tool(
+                        name,
+                        f"Simulated {name} capability.",
+                        {"type": "object", "properties": {"agent": {}}},
+                    )
+                controller.broker = broker
                 source_verify_safe_rooms(controller, 52)
                 goal = controller.storage.submit_goal(
                     goal_payload(
@@ -7662,6 +11492,34 @@ class ControllerTests(unittest.TestCase):
                     }
 
                 completion = controller.criteria.evaluate(goal, observation(52))
+                controller.last_observation = observation(52)
+                provisioning_plan = with_safe_ending(
+                    controller._structured_farm_controller_plan(goal), 52
+                )
+                provisioning_ids = [
+                    step["id"] for step in provisioning_plan["steps"]
+                ]
+                self.assertLess(
+                    provisioning_ids.index("farm-bank-transit"),
+                    provisioning_ids.index("withdraw-provision-funds"),
+                )
+                self.assertLess(
+                    provisioning_ids.index("withdraw-provision-funds"),
+                    provisioning_ids.index("farm-provision-transit"),
+                )
+                self.assertLess(
+                    provisioning_ids.index("farm-provision-transit"),
+                    provisioning_ids.index("buy-farm-food"),
+                )
+                stored_provisioning = controller._store_execution_plan(
+                    goal,
+                    provisioning_plan,
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(
+                    "verified", stored_provisioning["verification"]["status"]
+                )
                 to_bank = controller._structured_farm_preparation_action(
                     goal, observation(52), completion
                 )
@@ -7789,6 +11647,135 @@ class ControllerTests(unittest.TestCase):
                         goal, armor_only, completion
                     )
                 )
+
+                conjure_ready = copy.deepcopy(armor_only)
+                conjure_ready["spells"] = {
+                    "spells": [
+                        {
+                            "name": "Create Weapon",
+                            "mana": 15,
+                            "reagents": [],
+                            "castable": True,
+                        }
+                    ]
+                }
+                controller.last_observation = conjure_ready
+                create = controller._structured_farm_preparation_action(
+                    goal, conjure_ready, completion
+                )
+                self.assertEqual("cast", create["tool"])
+                self.assertEqual("create weapon", create["arguments"]["spell"])
+                structured_plan = controller._structured_farm_controller_plan(goal)
+                structured_ids = [step["id"] for step in structured_plan["steps"]]
+                self.assertNotIn("withdraw-provision-funds", structured_ids)
+                self.assertLess(
+                    structured_ids.index("create-weapon-before-farm"),
+                    structured_ids.index("equip-before-farm"),
+                )
+                self.assertLess(
+                    structured_ids.index("equip-before-farm"),
+                    structured_ids.index("launch-goal-keeper"),
+                )
+
+                invalid_weapon_plan = [
+                    {
+                        "id": "wrong-prerequisite",
+                        "tool": "cast",
+                        "outcome": "Cast Create Food before combat.",
+                        "verification": "Food appears in inventory.",
+                    },
+                    {
+                        "id": "launch-unarmed",
+                        "tool": "autopilot",
+                        "outcome": "Launch farm for groundworm larva in room 557.",
+                        "verification": "Keeper is running.",
+                    },
+                ]
+                self.assertIn(
+                    "live Create Weapon is castable",
+                    controller._farm_weapon_plan_error(
+                        invalid_weapon_plan,
+                        conjure_ready,
+                        launch_index=1,
+                    ),
+                )
+                valid_weapon_plan = [
+                    {
+                        "id": "create",
+                        "tool": "cast",
+                        "outcome": "Cast Create Weapon.",
+                        "verification": "A usable weapon appears in inventory.",
+                    },
+                    {
+                        "id": "equip",
+                        "tool": "equip_best",
+                        "outcome": "Equip the created weapon.",
+                        "verification": "A weapon is wielded.",
+                    },
+                    invalid_weapon_plan[-1],
+                ]
+                self.assertIsNone(
+                    controller._farm_weapon_plan_error(
+                        valid_weapon_plan,
+                        conjure_ready,
+                        launch_index=2,
+                    )
+                )
+
+                broker = BackgroundFarmBroker()
+                broker.tools["cast"] = Tool(
+                    "cast",
+                    "Cast a known spell.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "spell": {"type": "string"},
+                        },
+                    },
+                )
+                broker.tools["equip_best"] = Tool(
+                    "equip_best",
+                    "Equip the best carried weapon.",
+                    {"type": "object", "properties": {"agent": {}}},
+                )
+                controller.broker = broker
+                with self.assertRaisesRegex(
+                    ModelError, "live Create Weapon is castable"
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        with_safe_ending(
+                            {
+                                "summary": "Substitute food for a missing weapon.",
+                                "steps": invalid_weapon_plan,
+                                "assumptions": [],
+                            },
+                            52,
+                        ),
+                        grounding={
+                            "valid": True,
+                            "corpus": {"corpus_version": "test"},
+                        },
+                        revision=False,
+                    )
+                stored = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Create, equip, and then launch.",
+                            "steps": valid_weapon_plan,
+                            "assumptions": [],
+                        },
+                        52,
+                    ),
+                    grounding={
+                        "valid": True,
+                        "corpus": {"corpus_version": "test"},
+                    },
+                    revision=False,
+                )
+                self.assertEqual("verified", stored["verification"]["status"])
 
                 carrying_mace = copy.deepcopy(armor_only)
                 carrying_mace["inventory"]["items"].append(
@@ -8081,7 +12068,17 @@ class ControllerTests(unittest.TestCase):
                     goal,
                     step_id="read-inventory",
                     tool="inventory",
+                    arguments={"scope": "all"},
                     result={"items": []},
+                )
+
+                recorded = controller._execution_plan(goal)
+                authorization = controller._plan_revision_authorization(
+                    goal, recorded, None
+                )
+                self.assertEqual(
+                    {"scope": "all"},
+                    authorization["source"]["arguments"],
                 )
 
                 result = controller.turn()
@@ -8092,6 +12089,9 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertIsNone(result["execution_plan"]["last_action"])
                 self.assertIsNone(controller._planner_feedback(goal))
+                self.assertIn(
+                    "exact prior tool arguments", PLANNER_SYSTEM
+                )
             finally:
                 controller.storage.close()
 
@@ -8622,6 +12622,263 @@ class ControllerTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual("route_unavailable", result["lesson"]["classification"])
+            finally:
+                controller.storage.close()
+
+    def test_repeated_transit_cycle_retires_only_active_farm_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 563
+                broker.farm_hunt = "ant"
+                # The keeper alternates this label with ``travelling`` while
+                # bouncing. Detection must rely on launch-scoped movement
+                # counters rather than the controller's sampling instant.
+                broker.farm_activity = "hunting: ant"
+                broker.room = {"num": 586, "name": "The Sweet Grass Prairies"}
+                broker.farm_placement = {
+                    "assigned_room": 563,
+                    "assignment_deferred": False,
+                    "standing_where_assigned": False,
+                    "relocations": 31,
+                    "drifted": 27,
+                    "drifted_to": ["583 x13", "586 x14"],
+                    "returned_to_assignment": 2,
+                    "failed": 1,
+                    "why_not": [
+                        {
+                            "room": 586,
+                            "why": "every square for that exit refused (2 tried)",
+                        }
+                    ],
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="cycling-farm-route",
+                        objective="Raise max HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        constraints={
+                            "operator_notes": (
+                                "hunt=ant; assigned_room=563; use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ant in room 563.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 563,
+                            "target": "ant",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Use a bounded safe-wall farm.",
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 563,
+                        "hunt": "ant",
+                        "origin_room": 567,
+                        "started_at": time.time() - 600,
+                    },
+                )
+                controller.storage.set_runtime(
+                    f"background_farm_snapshot_v2:{goal['id']}",
+                    {
+                        "launch_placement": {
+                            "relocations": 4,
+                            "drifted": 0,
+                            "failed": 1,
+                            "returned_to_assignment": 2,
+                            "drifted_to": {},
+                        },
+                        "launch_started_at": time.time() - 600,
+                        "pass_floor": 300,
+                    },
+                )
+                observation = broker.observe()
+
+                result = controller._manage_background_farm(
+                    goal,
+                    observation,
+                    controller.criteria.evaluate(goal, observation),
+                )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(result["background_farm_route_failed"])
+                self.assertFalse(result["goal_paused"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertEqual("farm_transit_cycle", result["failure"]["kind"])
+                self.assertEqual(
+                    {"583": 13, "586": 14}, result["failure"]["cycle_rooms"]
+                )
+                self.assertEqual("", result["failure"]["last_error"])
+                self.assertTrue(controller._farm_stagnation_blocks(result["failure"]))
+                result["failure"]["recorded_at"] = "2000-01-01T00:00:00.000Z"
+                self.assertFalse(controller._farm_stagnation_blocks(result["failure"]))
+                self.assertEqual("route_unavailable", result["lesson"]["classification"])
+                self.assertEqual("tactic", result["lesson"]["scope"])
+            finally:
+                controller.storage.close()
+
+    def test_assignment_deferral_retires_only_active_farm_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.farm_activity = "travelling"
+                broker.room = {"num": 557, "name": "The Lowlands"}
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                    "standing_where_assigned": False,
+                    "failed": 0,
+                    "relocations": 2,
+                    "returned_to_assignment": 1,
+                    "why_not": [],
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="deferred-farm-assignment",
+                        objective="Raise max HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae in room 566.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 100,
+                        },
+                        "rationale": "Use a bounded safe-wall farm.",
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+                observation = broker.observe()
+
+                result = controller._manage_background_farm(
+                    goal,
+                    observation,
+                    controller.criteria.evaluate(goal, observation),
+                )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(result["background_farm_assignment_deferred"])
+                self.assertFalse(result["goal_blocked"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertFalse(broker.farm_running)
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertEqual(
+                    "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
+                )
+                stagnation = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )[f"{goal['id']}|566|groundworm larva"]
+                self.assertEqual("farm_assignment_deferred", stagnation["kind"])
+                # A successful arrival does not negate an exhausted in-room
+                # wall search; the exact tactic receives a bounded cooldown.
+                self.assertTrue(controller._farm_stagnation_blocks(stagnation))
+                self.assertEqual(
+                    [], controller._repair_disproved_farm_route_stagnations()
+                )
+                self.assertIn(
+                    f"{goal['id']}|566|groundworm larva",
+                    controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
+                )
+                self.assertEqual("ineffective_tactic", result["lesson"]["classification"])
+                self.assertEqual("tactic", result["lesson"]["scope"])
+                feedback = controller._planner_feedback(goal)
+                self.assertEqual(
+                    "farm_assignment_deferred", feedback["failure_context"]["kind"]
+                )
+                self.assertIn("different grounded", feedback["message"])
+                events = controller.storage.goal_events(
+                    goal["id"],
+                    kinds=["background_farm.assignment_deferred"],
+                    limit=10,
+                )
+                self.assertEqual(1, len(events))
             finally:
                 controller.storage.close()
 
@@ -9276,6 +13533,26 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_typed_keeper_wait_uses_its_expected_window(self) -> None:
+        now_ms = time.time() * 1000
+        status = {
+            "stalled": {
+                "idle_passes": 36,
+                "since_seconds": 35,
+                "why": "unarmed - 13 mana, needs 15 to make one",
+            },
+            "waiting_on": {
+                "code": "MANA_FOR_CREATE_WEAPON",
+                "expected_ms": 40_000,
+                "since": now_ms - 35_000,
+            },
+        }
+
+        self.assertFalse(BotController._keeper_stall_is_persistent(status))
+
+        status["waiting_on"]["since"] = now_ms - 50_000
+        self.assertTrue(BotController._keeper_stall_is_persistent(status))
+
     def test_transient_productive_stagnation_is_repaired_on_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -9313,6 +13590,78 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
                 )
                 self.assertFalse(controller._farm_stagnation_blocks(record))
+            finally:
+                controller.storage.close()
+
+    def test_ambiguous_breakoff_stagnation_gets_one_corrected_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="repair-ambiguous-breakoff")
+                )["goal"]
+                safe_key = f"{goal['id']}|566|centipede"
+                unsafe_key = f"{goal['id']}|584|spider"
+                explicit_miss_key = f"{goal['id']}|567|centipede"
+                base = {
+                    "goal_id": goal["id"],
+                    "stalled_in_transit": False,
+                    "last_error": None,
+                    "deltas": {
+                        "deaths": 0,
+                        "deaths_in_safe_spot": 0,
+                        "deaths_in_proven_safe_spot": 0,
+                        "withdrawals": 0,
+                        "mulligans": 0,
+                        "logoffs": 0,
+                    },
+                }
+                safe = {
+                    **base,
+                    "room": 566,
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a kill",
+                    },
+                }
+                unsafe = {
+                    **base,
+                    "room": 584,
+                    "deltas": {**base["deltas"], "deaths": 1},
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a kill",
+                    },
+                }
+                explicit_miss = {
+                    **base,
+                    "room": 567,
+                    "stalled": {
+                        "idle_passes": 7,
+                        "since_seconds": 62,
+                        "why": "broke off without a landed hit or a kill",
+                    },
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_stagnation_v1",
+                    {
+                        safe_key: safe,
+                        unsafe_key: unsafe,
+                        explicit_miss_key: explicit_miss,
+                    },
+                )
+
+                repaired = controller._repair_ambiguous_breakoff_stagnations()
+
+                self.assertEqual([safe], repaired)
+                retained = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(safe_key, retained)
+                self.assertIn(unsafe_key, retained)
+                self.assertIn(explicit_miss_key, retained)
             finally:
                 controller.storage.close()
 
@@ -9516,6 +13865,100 @@ class ControllerTests(unittest.TestCase):
                         statuses=["deferred"], goal_id=goal["id"]
                     ),
                 )
+            finally:
+                controller.storage.close()
+
+    def test_critical_farm_recovery_preserves_active_phase_and_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 535
+                broker.room = {
+                    "num": 535,
+                    "name": "West Merchant Way through Ilerian Woods",
+                }
+                broker.vitals["health"] = {"current": 10, "max": 26}
+                broker.farm_did.update({"kills": 4, "withdrawals": 0})
+                broker.farm_journal = [
+                    {
+                        "at": 1000 + index,
+                        "pass": 10 + index,
+                        "what": "killed",
+                        "target": "giant rat",
+                    }
+                    for index in range(4)
+                ]
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="critical-farm-recovery",
+                        objective="Reach 27 max HP.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-27",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 535 until max HP reaches 27.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-max-hp-27",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "target": "giant rat",
+                            "room": 535,
+                            "use_safe_spots": True,
+                            "flee_below": 0.75,
+                            "fight_above_vigor": 100,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller.turn()
+
+                self.assertTrue(result["survival_interrupt"])
+                self.assertTrue(result["background_farm"]["farm_recovery_preserved"])
+                self.assertFalse(result["background_farm"]["switched_to_survival"])
+                self.assertEqual("farm", broker.farm_mode)
+                self.assertTrue(broker.farm_running)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active["id"])
+                self.assertEqual("active", active["status"])
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.goal_lessons(
+                        statuses=["deferred"], goal_id=goal["id"]
+                    ),
+                )
+                events = controller.storage.goal_events(
+                    goal["id"],
+                    kinds=["background_farm.critical_recovery_monitored"],
+                    limit=10,
+                )
+                self.assertEqual(1, len(events))
+                self.assertTrue(events[0]["data"]["campaign_phase_preserved"])
             finally:
                 controller.storage.close()
 
@@ -9934,6 +14377,504 @@ class ControllerTests(unittest.TestCase):
                 controller._degrade("model", ModelError("different failure"))
                 events = controller.storage.events(kinds=["dependency.model.unhealthy"])["events"]
                 self.assertEqual(2, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_campaign_tactic_ledger_deduplicates_research_rejections(self) -> None:
+        rejected = {
+            "room": 583,
+            "target": "slime",
+            "blocker": {
+                "kind": "quarantined_farm_phase",
+                "evidence": {
+                    "reasons": ["repeated safe-spot failures"],
+                    "large_raw_snapshot": "x" * 20_000,
+                },
+            },
+        }
+        history = [
+            {
+                "id": f"research-{index}",
+                "kind": "research_progression",
+                "status": "failed",
+                "context": {
+                    "recipe_validation": {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "same-candidate-set",
+                        "candidate_count": 1,
+                        "rejected": [copy.deepcopy(rejected)],
+                    }
+                },
+            }
+            for index in range(8)
+        ]
+
+        projected = CampaignCoordinator._tactic_ledger(history, None)
+
+        self.assertEqual(1, len(projected["unique_rejected_candidates"]))
+        self.assertEqual(1, len(projected["research_candidate_sets"]))
+        self.assertNotIn("large_raw_snapshot", repr(projected))
+
+    def test_research_retry_gate_requires_material_state_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                observation = broker.observe()
+                observation["equipment"] = {
+                    "known": True,
+                    "equipped": [{"id": 1, "name": "mace"}],
+                    "wielding": ["mace"],
+                    "fresh_ms": 100,
+                    "changed_ms": 500,
+                }
+                observation["abilities"] = {
+                    "skills": [{"id": 2, "name": "mace fighting", "ability": 30}],
+                    "spells": [],
+                    "freshness": {"age_ms": {"skills": 100, "spells": 200}},
+                }
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="research-retry-state")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
+                record = {
+                    "fingerprint": "same-candidate-set",
+                    "repeat_count": 3,
+                    "phase_ids": ["one", "two", "three"],
+                    "candidate_count": 1,
+                    "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": baseline,
+                    "retry_state_fingerprint": controller._research_retry_state_fingerprint(
+                        goal, observation
+                    ),
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                unchanged = controller._research_retry_gate(goal, observation)
+                self.assertFalse(unchanged["allowed"])
+                stored = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertTrue(stored["retry_state_fingerprint"])
+
+                volatile_only = copy.deepcopy(observation)
+                volatile_only["equipment"]["fresh_ms"] = 900
+                volatile_only["equipment"]["changed_ms"] = 1300
+                volatile_only["abilities"]["freshness"]["age_ms"] = {
+                    "skills": 900,
+                    "spells": 1000,
+                }
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, observation),
+                    controller._research_retry_state_fingerprint(goal, volatile_only),
+                )
+
+                changed = copy.deepcopy(observation)
+                changed["inventory"]["items"].append(
+                    {"id": 2, "name": "leather armor", "amount": 1}
+                )
+                reopened = controller._research_retry_gate(goal, changed)
+
+                self.assertTrue(reopened["allowed"])
+                self.assertTrue(reopened["state_changed"])
+                retained = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertEqual(3, retained["repeat_count"])
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, observation),
+                    retained["retry_state_fingerprint"],
+                )
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, changed),
+                    retained["retry_pending_state_fingerprint"],
+                )
+                self.assertIsNone(
+                    controller.storage.campaign_run(goal["id"])["external_blocker"]
+                )
+                self.assertTrue(
+                    controller._research_retry_gate(goal, changed)["allowed"]
+                )
+
+                repeated = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "four"},
+                    {
+                        "fingerprint": "same-candidate-set",
+                        "candidate_count": 1,
+                        "rejected": [],
+                    },
+                    changed,
+                )
+                self.assertEqual(4, repeated["repeat_count"])
+                self.assertFalse(
+                    controller._research_retry_gate(goal, changed)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_legacy_research_exhaustion_gets_one_bounded_migration_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-research-retry-migration")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                record = {
+                    "fingerprint": "legacy-candidate-set",
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 0,
+                    "rejected": [],
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                migrated = controller._research_retry_gate(goal, observation)
+                still_pending = controller._research_retry_gate(goal, observation)
+
+                consumed = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "three"},
+                    {
+                        "status": "no_usable_candidate",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
+                repeated = controller._research_retry_gate(goal, observation)
+
+                self.assertTrue(migrated["allowed"])
+                self.assertTrue(migrated["migration_retry"])
+                self.assertTrue(still_pending["allowed"])
+                self.assertTrue(still_pending["migration_retry"])
+                self.assertFalse(repeated["allowed"])
+                self.assertEqual(3, consumed["repeat_count"])
+                stored = controller.storage.get_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+                )[goal["id"]]
+                self.assertEqual(
+                    RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    stored["retry_state_schema"],
+                )
+                self.assertNotIn("retry_migration_pending_at", stored)
+            finally:
+                controller.storage.close()
+
+    def test_semantically_identical_empty_research_counts_across_raw_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="semantic-research-exhaustion")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {
+                        goal["id"]: {
+                            # Legacy records persisted the raw-result hash and
+                            # did not carry a canonical semantic identity.
+                            "fingerprint": "raw-result-and-avoid-set-one",
+                            "repeat_count": 1,
+                            "phase_ids": ["research-one"],
+                            "candidate_count": 0,
+                            "rejected": [],
+                        }
+                    },
+                )
+                second = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "research-two"},
+                    {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "different-raw-result-and-avoid-set",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
+                third = controller._record_research_recipe_exhaustion(
+                    goal,
+                    run,
+                    {"id": "research-three"},
+                    {
+                        "status": "no_usable_candidate",
+                        "fingerprint": "third-raw-result-variant",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    observation,
+                )
+
+                self.assertEqual(2, second["repeat_count"])
+                self.assertEqual(3, third["repeat_count"])
+                self.assertEqual(second["fingerprint"], third["fingerprint"])
+                self.assertEqual(
+                    ["research-one", "research-two"], second["phase_ids"]
+                )
+                self.assertFalse(
+                    controller._research_retry_gate(goal, observation)["allowed"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_research_failures_do_not_reopen_gate_but_removed_route_blocker_does(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="negative-research-evidence")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
+                record = {
+                    "fingerprint": "closed-candidate-set",
+                    "semantic_identity": {
+                        "status": "no_usable_candidate",
+                        "candidate_count": 0,
+                        "rejected": [],
+                    },
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": baseline,
+                    "retry_state_fingerprint": controller._research_retry_state_fingerprint(
+                        goal, observation
+                    ),
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+
+                controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="prey",
+                    arguments={"max_health": 34, "purpose": "advance"},
+                    reason="repeated identical evidence lookup returned no new evidence",
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                    block=False,
+                )
+                controller.storage.set_runtime(
+                    "blocked_actions",
+                    [
+                        {
+                            "goal_id": goal["id"],
+                            "tool": "prey",
+                            "arguments": {"max_health": 34},
+                            "room": 106,
+                            "reason": "identical evidence lookup",
+                        }
+                    ],
+                )
+
+                self.assertEqual(
+                    controller._research_retry_state_fingerprint(goal, observation),
+                    record["retry_state_fingerprint"],
+                )
+                self.assertFalse(
+                    controller._research_retry_gate(goal, observation)["allowed"]
+                )
+
+                route = controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="travel",
+                    arguments={"to": 563},
+                    reason="route to 563 is unavailable from room 106",
+                    classification="route_unavailable",
+                    scope="tactic",
+                    block=False,
+                )["lesson"]
+                narrowed = controller._research_retry_gate(goal, observation)
+                self.assertFalse(narrowed["allowed"])
+
+                controller.storage.update_goal_lesson(route["id"], "resolved")
+                reopened = controller._research_retry_gate(goal, observation)
+                self.assertTrue(reopened["allowed"])
+                self.assertIn(
+                    "blocking_evidence_removed", reopened["enabling_changes"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_campaign_manager_retries_invalid_context_label_as_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="manager-tool-correction")
+                )["goal"]
+                calls: list[dict[str, object]] = []
+
+                def manage_campaign(**kwargs: object) -> dict[str, object]:
+                    calls.append(kwargs)
+                    tool = "room_info" if len(calls) == 1 else "hunting_grounds"
+                    return {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Collect one grounded progression result.",
+                            "targets": [
+                                {
+                                    "id": "research-result",
+                                    "type": "phase_action_succeeded",
+                                    "tools": [tool],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "budget": {"max_actions": 8, "max_minutes": 30},
+                            "context": {},
+                            "rationale": "Inspect progression evidence.",
+                        },
+                        "rationale": "Choose bounded research.",
+                        "evidence": [],
+                    }
+
+                controller.model = SimpleNamespace(
+                    manage_campaign=manage_campaign
+                )  # type: ignore[assignment]
+
+                _, phase, _ = controller._campaign_turn_state(
+                    goal, SimulatedBroker().observe(), {}
+                )
+
+                self.assertEqual(2, len(calls))
+                first_context = calls[0]["campaign_context"]
+                self.assertIsInstance(first_context, dict)
+                self.assertIn(
+                    "hunting_grounds",
+                    first_context["phase_capabilities"]["research_progression"],
+                )
+                self.assertNotIn(
+                    "room_info",
+                    first_context["phase_capabilities"]["research_progression"],
+                )
+                feedback = calls[1]["campaign_context"]["manager_feedback"]
+                self.assertIn("room_info", feedback["validation_error"])
+                self.assertEqual("research_progression", phase["kind"])
+                self.assertEqual(
+                    ["hunting_grounds"], phase["success_criteria"][0]["tools"]
+                )
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(
+                            kinds=["campaign.manager.revision_requested"]
+                        )["events"]
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_invalid_manager_output_cannot_reopen_exhausted_research(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="invalid-manager-closed-research")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                state_fingerprint = controller._research_retry_state_fingerprint(
+                    goal, observation
+                )
+                state = controller._research_retry_state(goal, observation)
+                record = {
+                    "fingerprint": "closed-candidate-set",
+                    "repeat_count": 2,
+                    "phase_ids": ["one", "two"],
+                    "candidate_count": 1,
+                    "rejected": [],
+                    "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                    "retry_state": state,
+                    "retry_state_fingerprint": state_fingerprint,
+                }
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {goal["id"]: record},
+                )
+                controller.storage.update_campaign_memory(
+                    run["id"],
+                    external_blocker={"kind": "no_usable_farm_recipe", **record},
+                )
+                calls: list[dict[str, object]] = []
+
+                def invalid_manager(**kwargs: object) -> dict[str, object]:
+                    calls.append(kwargs)
+                    return {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Repeat the closed lookup.",
+                            "targets": [
+                                {
+                                    "id": "invalid-tool",
+                                    "type": "phase_action_succeeded",
+                                    "tools": ["room_options_by_candidate"],
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "budget": {"max_actions": 8, "max_minutes": 30},
+                            "context": {},
+                        },
+                        "rationale": "Invalid test response.",
+                        "evidence": [],
+                    }
+
+                controller.model = SimpleNamespace(
+                    manage_campaign=invalid_manager
+                )  # type: ignore[assignment]
+
+                _, phase, _ = controller._campaign_turn_state(
+                    goal, observation, {}
+                )
+
+                self.assertEqual(2, len(calls))
+                self.assertEqual("prepare_combat", phase["kind"])
+                self.assertTrue(phase["context"]["research_exhaustion_support"])
+                self.assertEqual(
+                    0,
+                    len(
+                        [
+                            item
+                            for item in controller.storage.campaign_phases(run["id"])
+                            if item["kind"] == "research_progression"
+                        ]
+                    ),
+                )
             finally:
                 controller.storage.close()
 
