@@ -7297,7 +7297,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_post_death_farm_gate_pushes_flask_support_and_resumes_recipe(
+    def test_post_death_does_not_force_flask_support_or_block_farm(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -7368,48 +7368,67 @@ class ControllerTests(unittest.TestCase):
                     ],
                 )
 
-                support = controller._ensure_farm_healing_support_phase(
-                    goal, broker.observe()
-                )
-
-                self.assertEqual("acquire_item", support["kind"])
-                self.assertEqual(farm["id"], support["parent_phase_id"])
-                self.assertEqual(
+                observation = broker.observe()
+                blockers = controller._combat_preflight(
+                    "autopilot",
                     {
-                        "id": "post-death-healing-flasks-4",
-                        "kind": "inventory_contains",
-                        "item": "flask",
-                        "count": 4,
+                        "mode": "farm",
+                        "assigned_room": 545,
+                        "hunt": "centipede",
+                        "use_safe_spots": True,
+                        "flee_below": 0.60,
+                        "fight_above_vigor": 80,
                     },
-                    support["success_criteria"][0],
-                )
-                paused_farm = next(
-                    phase
-                    for phase in controller.storage.campaign_phases(run["id"])
-                    if phase["id"] == farm["id"]
-                )
-                self.assertEqual("paused", paused_farm["status"])
-                self.assertIsNone(
-                    controller._ensure_farm_healing_support_phase(
-                        goal, broker.observe()
-                    )
-                )
-
-                supplied = broker.observe()
-                supplied["inventory"]["items"] = [
-                    {"id": 10, "name": "flask", "amount": 4}
-                ]
-                completed = controller.campaign.evaluate_phase(
+                    observation,
                     goal,
-                    run,
-                    support,
-                    supplied,
                 )
 
-                self.assertTrue(completed.completed)
-                resumed = controller.storage.active_campaign_phase(run["id"])
-                self.assertEqual(farm["id"], resumed["id"])
-                self.assertEqual("active", resumed["status"])
+                self.assertNotIn(
+                    "replenish_healing_supplies_after_death",
+                    {blocker.get("kind") for blocker in blockers},
+                )
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(farm["id"], active["id"])
+                self.assertEqual("active", active["status"])
+                self.assertEqual(1, len(controller.storage.campaign_phases(run["id"])))
+
+                legacy_support = controller.campaign.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "push_support_phase",
+                        "phase": {
+                            "kind": "acquire_item",
+                            "objective": "Acquire at least 4 healing flasks.",
+                            "success_criteria": [
+                                {
+                                    "id": "post-death-healing-flasks-4",
+                                    "kind": "inventory_contains",
+                                    "item": "flask",
+                                    "count": 4,
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "budget": {"max_actions": 40, "max_minutes": 90},
+                            "context": {
+                                "reason": "replenish_healing_supplies_after_death"
+                            },
+                            "rationale": "Legacy controller policy.",
+                        },
+                    },
+                    observation=observation,
+                )
+
+                migrated = controller._reconcile_existing_campaign_phase(
+                    goal, observation
+                )
+
+                self.assertTrue(migrated["campaign_phase_policy_migrated"])
+                self.assertEqual(legacy_support["id"], migrated["phase"]["id"])
+                self.assertEqual("superseded", migrated["phase"]["status"])
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(farm["id"], active["id"])
+                self.assertEqual("active", active["status"])
             finally:
                 controller.storage.close()
 

@@ -8183,16 +8183,6 @@ class BotController:
                         "evidence": stagnation,
                     }
                 )
-            readiness = self.learning.readiness_summary(observation)
-            if readiness.get("recent_combat_deaths") and int(readiness.get("healing_supply_count", 0) or 0) < 4:
-                blockers.append(
-                    {
-                        "kind": "replenish_healing_supplies_after_death",
-                        "healing_supply_count": readiness.get("healing_supply_count", 0),
-                        "minimum": 4,
-                        "guidance": "carry at least four verified healing flasks before another background farm",
-                    }
-                )
         if tool in PVP_TOOL_NAMES:
             if tool == PVP_SEEK_TOOL_NAME:
                 route_failure = self.storage.get_runtime(
@@ -10087,107 +10077,6 @@ class BotController:
             },
             "proposal": None,
         }
-
-    def _ensure_farm_healing_support_phase(
-        self,
-        goal: dict[str, Any],
-        observation: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Turn the post-death flask gate into executable supporting work.
-
-        A deterministic preflight that only suppresses the farm cannot satisfy
-        itself.  Preserve the selected farm as a paused parent, acquire the
-        exact inventory threshold used by the preflight, then let ordinary
-        phase completion resume that same recipe.
-        """
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        if not isinstance(phase, dict) or phase.get("kind") not in {
-            "farm",
-            "train_ability",
-        }:
-            return None
-        intent = self._campaign_phase_farm_intent(phase)
-        if intent.get("assigned_room") is None or not intent.get("hunt"):
-            return None
-        readiness = self.learning.readiness_summary(observation)
-        deaths = int(readiness.get("recent_combat_deaths", 0) or 0)
-        carried = int(readiness.get("healing_supply_count", 0) or 0)
-        minimum = 4
-        if deaths <= 0 or carried >= minimum:
-            return None
-
-        support = self.campaign.apply_manager_decision(
-            run,
-            goal,
-            {
-                "decision": "push_support_phase",
-                "phase": {
-                    "kind": "acquire_item",
-                    "objective": (
-                        f"Acquire at least {minimum} healing flasks before resuming "
-                        f"the {intent['hunt']} farm in room {intent['assigned_room']}."
-                    ),
-                    "success_criteria": [
-                        {
-                            "id": f"post-death-healing-flasks-{minimum}",
-                            "kind": "inventory_contains",
-                            "item": "flask",
-                            "count": minimum,
-                        }
-                    ],
-                    "abandon_predicates": [],
-                    "budget": {"max_actions": 40, "max_minutes": 90},
-                    "context": {
-                        "item": "flask",
-                        "required_count": minimum,
-                        "current_count": carried,
-                        "missing_count": minimum - carried,
-                        "reason": "replenish_healing_supplies_after_death",
-                        "resume_farm_phase_id": phase.get("id"),
-                        "resume_farm_recipe": redact(intent),
-                        "research_hint": (
-                            "Use merchants to find a live flask seller, then obtain a "
-                            "fresh shop quote before buying. Flasks are the source-"
-                            "verified Healer item."
-                        ),
-                    },
-                    "rationale": (
-                        "The controller's post-death farm preflight requires four "
-                        "verified healing flasks; acquire the missing supplies as a "
-                        "bounded child phase instead of repeatedly suppressing launch."
-                    ),
-                },
-                "rationale": "Satisfy the deterministic post-death healing gate.",
-            },
-            observation=observation,
-        )
-        if support is None:
-            return None
-        self._invalidate_execution_plan(
-            goal,
-            "post-death healing supplies require a bounded acquisition support phase",
-        )
-        self._clear_safety_suppression(str(goal.get("id") or ""))
-        self.storage.emit_event(
-            "campaign.farm.healing_support_started",
-            (
-                f"Paused farm to acquire {minimum - carried} additional healing "
-                "flask(s) required by post-death safety"
-            ),
-            severity="notice",
-            interesting=False,
-            goal_id=goal.get("id"),
-            data={
-                "farm_phase_id": phase.get("id"),
-                "support_phase_id": support.get("id"),
-                "current_count": carried,
-                "required_count": minimum,
-                "farm_recipe_preserved": True,
-            },
-        )
-        return support
 
     def _ensure_combat_vigor_support_phase(
         self,
@@ -15456,6 +15345,49 @@ class BotController:
             if isinstance(phase.get("context"), dict)
             else {}
         )
+        obsolete_healing_gate = (
+            phase.get("kind") == "acquire_item"
+            and phase_context.get("reason")
+            == "replenish_healing_supplies_after_death"
+        )
+        if (
+            obsolete_healing_gate
+            and deep_get(observation, "autopilot.running") is not True
+        ):
+            reason = (
+                "retired obsolete controller-imposed post-death flask phase; "
+                "healing supplies are now planner discretion"
+            )
+            retired = self.storage.transition_campaign_phase(
+                phase["id"], "superseded", reason=reason, resume_parent=True
+            )
+            resumed = self.storage.active_campaign_phase(run["id"])
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.post_death_healing_policy_migrated",
+                "Removed obsolete controller-imposed healing-supply work",
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "retired_phase_id": retired.get("id"),
+                    "resumed_parent_phase_id": (
+                        resumed.get("id") if isinstance(resumed, dict) else None
+                    ),
+                    "strategic_goal_preserved": True,
+                },
+            )
+            return {
+                "campaign_phase_policy_migrated": True,
+                "phase": retired,
+                "next_phase": resumed,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
         combat_recipe_phase = phase.get("kind") == "farm" or (
             phase.get("kind") == "train_ability"
             and phase_context.get("training_method") == "combat"
@@ -16108,18 +16040,6 @@ class BotController:
             )
             if farm_control is not None:
                 return farm_control
-            healing_support = (
-                None
-                if phase_safe_return_checkpoint is not None
-                else self._ensure_farm_healing_support_phase(goal, observation)
-            )
-            if healing_support is not None:
-                return {
-                    "campaign_support_phase_started": True,
-                    "phase": healing_support,
-                    "reason": "replenish_healing_supplies_after_death",
-                    "strategic_goal_preserved": True,
-                }
             vigor_support = (
                 None
                 if phase_safe_return_checkpoint is not None
