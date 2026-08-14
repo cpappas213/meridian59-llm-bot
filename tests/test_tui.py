@@ -5,6 +5,7 @@ import io
 import unittest
 
 from meridian_bot.tui import (
+    ControllerApi,
     ControllerApiError,
     prompt_goal_command,
     prompt_new_goal,
@@ -215,6 +216,32 @@ class FakeApi:
 
 
 class TuiTests(unittest.TestCase):
+    def test_controller_api_events_requests_newest_status_snapshot(self) -> None:
+        api = object.__new__(ControllerApi)
+        requests: list[tuple[str, str]] = []
+
+        def request(method: str, path: str) -> dict[str, object]:
+            requests.append((method, path))
+            return {
+                "recent_events": [
+                    {
+                        "cursor": 12554,
+                        "occurred_at": "2026-08-14T12:38:04.144Z",
+                        "summary": "Newest event",
+                    }
+                ]
+            }
+
+        api.request = request
+
+        events = api.events(limit=5)
+
+        self.assertEqual(12554, events[0]["cursor"])
+        self.assertEqual(
+            [("GET", "/v1/status?detail=goal&include_recent_events=5")],
+            requests,
+        )
+
     def test_dashboard_renders_goal_queue_vitals_and_abilities(self) -> None:
         api = FakeApi()
 
@@ -227,6 +254,7 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Dodge 12", rendered)
         self.assertIn("Blink 8", rendered)
         self.assertIn("Controller started", rendered)
+        self.assertIn("2026-08-08 12:34Z", rendered)
         self.assertIn("[S] Character status", rendered)
         self.assertIn("CURRENT PHASE", rendered)
         self.assertIn("#4 Return Home [active]", rendered)

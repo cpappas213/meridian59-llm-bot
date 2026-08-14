@@ -124,10 +124,15 @@ class ControllerApi:
         return [item for item in goals if isinstance(item, dict)] if isinstance(goals, list) else []
 
     def events(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 20))
+        # /v1/events is a forward-pagination feed: without an after_cursor it
+        # begins at cursor zero and therefore returns the oldest events. The
+        # goal-detail snapshot already contains the bounded newest-event view
+        # intended for operator displays.
         value = self.request(
-            "GET", f"/v1/events?interesting_only=true&limit={max(1, min(limit, 20))}"
+            "GET", f"/v1/status?detail=goal&include_recent_events={limit}"
         )
-        events = value.get("events")
+        events = value.get("recent_events")
         return [item for item in events if isinstance(item, dict)] if isinstance(events, list) else []
 
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -220,6 +225,16 @@ def _terminal_colors_enabled() -> bool:
 def _one_line(value: Any, *, limit: int = 100) -> str:
     text = " ".join(str(value or "-").split())
     return textwrap.shorten(text, width=max(8, limit), placeholder="...")
+
+
+def _event_timestamp(value: Any) -> str:
+    """Render enough of an ISO timestamp to make stale event rows obvious."""
+
+    text = str(value or "").strip()
+    if len(text) >= 16 and text[4:5] == "-" and text[10:11] == "T":
+        rendered = text[:16].replace("T", " ")
+        return rendered + ("Z" if text.endswith("Z") else "")
+    return text[:17]
 
 
 def _meter(vitals: dict[str, Any], name: str) -> str:
@@ -507,9 +522,9 @@ def render_dashboard(
         for event in events[-5:]:
             severity = event.get("severity", "info")
             lines.append(
-                f"{str(event.get('occurred_at', ''))[11:19]} "
+                f"{_event_timestamp(event.get('occurred_at'))} "
                 f"{_paint(f'{str(severity):>7}', _state_style(severity), color)}  "
-                f"{_one_line(event.get('summary'), limit=width - 20)}"
+                f"{_one_line(event.get('summary'), limit=max(20, width - 29))}"
             )
     else:
         lines.append("No interesting events yet.")
