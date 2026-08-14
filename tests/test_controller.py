@@ -14696,6 +14696,82 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_cooperative_farm_stop_is_not_reissued_every_turn(self) -> None:
+        class DelayedHardStopBroker(BackgroundFarmBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "stop"
+                    and arguments.get("hard") is True
+                ):
+                    self.calls.append((name, dict(arguments)))
+                    return {"running": True, "stopping": True}
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = DelayedHardStopBroker()
+                broker.farm_stalled = {
+                    "idle_passes": 5,
+                    "since_seconds": 45,
+                    "why": "broke off without a landed hit or a kill",
+                }
+                broker.farm_room = 575
+                broker.room = {"num": 575, "name": "The King's Way"}
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="delayed-cooperative-stop")
+                )["goal"]
+                observation = broker.observe()
+                completion = controller.criteria.evaluate(goal, observation)
+
+                first = controller._manage_background_farm(
+                    goal, observation, completion
+                )
+                second = controller._manage_background_farm(
+                    goal, observation, completion
+                )
+
+                self.assertTrue(first["background_farm_stopped"])
+                self.assertTrue(second["background_farm_stopping"])
+                self.assertTrue(second["already_requested"])
+                stop_calls = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "stop"
+                ]
+                self.assertEqual(1, len(stop_calls))
+                stagnations = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertEqual(
+                    1, stagnations[f"{goal['id']}|575|giant rat"]["count"]
+                )
+
+                broker.farm_running = False
+                finished = controller._manage_background_farm(
+                    goal, observation, completion
+                )
+                self.assertIsNone(finished)
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime(
+                        controller._background_farm_stop_key(goal["id"]), {}
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
     def test_stagnation_uses_launch_deltas_not_lifetime_deaths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

@@ -96,6 +96,9 @@ FARM_TRANSIT_CYCLE_MAX_ROOMS = 3
 # old keeper run ended in a transient stall.  After a bounded cooldown it may
 # be retried; a fresh persistent stall records a new cooldown immediately.
 FARM_STAGNATION_RETRY_SECONDS = 15 * 60
+# A hard keeper stop is cooperative: the current pass may take several seconds
+# to unwind. Do not reissue and relearn the same stop on every controller turn.
+FARM_STOP_RETRY_SECONDS = 2 * 60
 # Keep a bounded audit trail of recovery episodes. These are ordinary work
 # cycles and never escalate to quarantine merely because they repeat.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
@@ -11927,6 +11930,81 @@ class BotController:
             self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
         return record
 
+    @staticmethod
+    def _background_farm_stop_key(goal_id: str) -> str:
+        return f"background_farm_stop_pending_v1:{goal_id}"
+
+    def _request_background_farm_stop(
+        self, goal: dict[str, Any], reason: str
+    ) -> dict[str, Any]:
+        """Request one cooperative hard stop and latch it until status confirms exit."""
+        result = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                "hard": True,
+                "why": reason,
+            },
+            timeout=20,
+            mutation=True,
+        )
+        self.storage.set_runtime(
+            self._background_farm_stop_key(str(goal["id"])),
+            {
+                "requested_at": timestamp(),
+                "requested_at_epoch": time.time(),
+                "reason": reason,
+            },
+        )
+        return result if isinstance(result, dict) else {"result": redact(result)}
+
+    def _pending_background_farm_stop(
+        self,
+        goal: dict[str, Any],
+        status: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Hold ownership while one hard stop unwinds; retry only after a bounded wait."""
+        key = self._background_farm_stop_key(str(goal["id"]))
+        pending = self.storage.get_runtime(key, {})
+        pending = pending if isinstance(pending, dict) else {}
+        if not pending:
+            return None
+        if status.get("running") is not True or self._keeper_is_inert(status):
+            self.storage.set_runtime(key, {})
+            return None
+
+        requested_at = pending.get("requested_at_epoch")
+        age = (
+            max(0.0, time.time() - float(requested_at))
+            if isinstance(requested_at, (int, float))
+            else 0.0
+        )
+        if age >= FARM_STOP_RETRY_SECONDS:
+            self.storage.set_runtime(key, {})
+            self.storage.emit_event(
+                "background_farm.stop_retry",
+                "Keeper did not finish a requested stop within the retry window",
+                severity="warning",
+                interesting=True,
+                goal_id=goal["id"],
+                data={
+                    "age_seconds": round(age, 1),
+                    "reason": pending.get("reason"),
+                    "activity": status.get("activity"),
+                },
+            )
+            return None
+        return {
+            "background_farm_stopping": True,
+            "already_requested": True,
+            "reason": pending.get("reason"),
+            "age_seconds": round(age, 1),
+            "activity": status.get("activity"),
+            "completion": completion,
+        }
+
     def _manage_background_farm(
         self,
         goal: dict[str, Any],
@@ -11958,6 +12036,11 @@ class BotController:
         )
         if route_failure is not None:
             return route_failure
+        pending_stop = self._pending_background_farm_stop(
+            goal, status, completion
+        )
+        if pending_stop is not None:
+            return pending_stop
         # Upstream now implements ordinary stop as an inert telemetry loop.
         # Once route diagnosis has had its chance, it is safe for foreground or
         # campaign work to proceed and must not be stopped again forever.
@@ -12013,16 +12096,8 @@ class BotController:
                     "safe_ending_pending": safe_ending_pending,
                     "completion": completion,
                 }
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "foreground campaign work is taking permanent ownership",
-                },
-                timeout=20,
-                mutation=True,
+            stopped = self._request_background_farm_stop(
+                goal, "foreground campaign work is taking permanent ownership"
             )
             self.storage.set_runtime("background_farm_owner_v1", {})
             return {
@@ -12056,17 +12131,7 @@ class BotController:
                     "result": redact(switched),
                     "completion": completion,
                 }
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": force_stop_reason,
-                },
-                timeout=20,
-                mutation=True,
-            )
+            stopped = self._request_background_farm_stop(goal, force_stop_reason)
             self.storage.set_runtime("background_farm_owner_v1", {})
             return {
                 "background_farm_stopping": True,
@@ -12078,16 +12143,8 @@ class BotController:
 
         mismatch = self._background_farm_mismatch(goal, status)
         if mismatch:
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "the running farm does not match the active durable goal",
-                },
-                timeout=20,
-                mutation=True,
+            stopped = self._request_background_farm_stop(
+                goal, "the running farm does not match the active durable goal"
             )
             self.storage.set_runtime("background_farm_owner_v1", {})
             self._set_planner_feedback(
@@ -12224,27 +12281,13 @@ class BotController:
         # A stalled or errored keeper is also released so the planner can repair
         # the tactic on the following turn. Returning here prevents a foreground
         # mutation from racing the keeper during the same controller turn.
-        stopped = self.broker.call_tool(
-            "autopilot",
-            {
-                "agent": self.config.game.agent,
-                "action": "stop",
-                "hard": True,
-                "why": (
-                    "background keeper stalled or errored"
-                    if unhealthy
-                    else "bounded keeper-combat target reached"
-                ),
-            },
-            timeout=20,
-            mutation=True,
-        )
-        self.storage.set_runtime("background_farm_owner_v1", {})
         reason = (
             "background keeper stalled or errored"
             if unhealthy
             else "bounded keeper-combat target reached"
         )
+        stopped = self._request_background_farm_stop(goal, reason)
+        self.storage.set_runtime("background_farm_owner_v1", {})
         if unhealthy:
             room = self._farm_room(status, observation)
             assigned_room = self._farm_assigned_room(status)
@@ -18240,6 +18283,9 @@ class BotController:
                 )
                 self.storage.set_runtime(
                     f"background_farm_route_failure_handled_v1:{goal['id']}", False
+                )
+                self.storage.set_runtime(
+                    self._background_farm_stop_key(str(goal["id"])), {}
                 )
                 self.storage.set_runtime(
                     "background_farm_owner_v1",
