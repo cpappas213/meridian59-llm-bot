@@ -228,11 +228,6 @@ not impose a weapon cap while selling. Prefer a targeted sell quote with confirm
 uncertain sale. Use sell_all only for ordinary excess loot when its loadout protections are appropriate.
 During liquidate_inventory, phase.context.keep_candidates is an authoritative retain list: never quote, offer,
 or sell those items. When using sell_all, include every keep_candidate name in keep and preserve the loadout.
-When a prepare_combat phase has phase.context.reason=recover_combat_vigor, the parent combat phase is deliberately
-suspended until the typed vigor target is observed. Use the disclosed verified_supply and funding facts to build a
-real recovery sequence: obtain a fresh quote, calculate its exact total and deficit, fund that deficit through a
-verified bank withdrawal or guarded sale, acquire food or exact Create Food reagents, then consume the resulting
-edible items. Do not retry autopilot, lower the required vigor, or finish merely because a purchase/cast returned.
 For a targeted sell, never offer an inventory id present in equipment.equipped or marked in_use/equipped.
 When duplicate items share a name, select the exact unequipped instance id so the active loadout is preserved.
 When feedback says item_not_npc_transferable or CanBeGivenToNPC=false, the server rejected that exact item
@@ -337,14 +332,11 @@ not rationale prose, are the action that will occur, so verify they agree before
 canonical bank destination is First Royal Bank of Tos, room 54; use that exact destination if the plan
 chooses banking. Otherwise proceed with the carried wealth instead of treating it as unresolved safety work.
 One successful bank balance call is sufficient evidence; never repeat it in an unchanged state. If carried
-shillings are already zero, deposit-before-hazard is complete. That does not make a required purchase free:
-when live preflight requires food, carried food is insufficient, and a confirmed bank balance can cover the
-live quote, travel to room 54, withdraw only the remaining quoted cost, return to room 52, and buy enough
-nutrition before launching. Do not retry a knowingly unaffordable shop call.
+shillings are already zero, deposit-before-hazard is complete. Do not retry a knowingly unaffordable shop call.
 Honor the durable goal's explicit use_safe_spots value, or the active internal farm phase's explicit
 use_safe_spots value: true requests wall trials; false requests bounded open-field
 combat and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.60
-for ordinary bounded farms, hold_resume_above at least 0.90, fight_above_vigor exactly 80, and
+for ordinary bounded farms, hold_resume_above at least 0.90 and fight_above_vigor 80 by default, and
 break_out_via_logoff=false until stable room saving is verified. A safe_spot.works label alone is not proof.
 Keeper banking is optional: use bank_above=0 unless the current financial_context and plan deliberately
 select special farm banking trips. If selected, use bank_above=400 or higher. Never request a positive
@@ -370,9 +362,13 @@ If the HP/progression criterion is already met, omit every farm/autopilot launch
 remaining recovery and explicit finish criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
 Before starting, compare live numeric vigor with fight_above_vigor. Resting reaches the ordinary 80-vigor
-keeper floor, so do not require food or spending solely to launch combat. Verified edible food remains useful
-optional endurance, and carried herbs and elderberries are usable only when the verified spell list says the
-character knows Create Food. If a retreat
+keeper floor, so food and spending are never implicit launch requirements. The controller will not insert a
+food, reagent, or food-funding phase. You own that tactical choice: omit eat_before_fighting and buy_food (or
+set both false) for ordinary rested-floor farming. Set eat_before_fighting=true with an explicit
+fight_above_vigor above 80 only when you deliberately want the keeper to consume carried or created food.
+Set buy_food=true only when you deliberately want paid food acquisition and current financial evidence makes
+that route viable. Buying, creating, carrying, and eating food are separate choices. Carried herbs and
+elderberries are usable only when the verified spell list says the character knows Create Food. If a retreat
 happens before the assigned room is reached, treat it as hazardous-route evidence and do not condemn
 the destination room.
 Once it is running, do not issue travel, bank, equipment,
@@ -502,7 +498,8 @@ other negative evidence narrows the available tactics and never authorizes anoth
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
-and fight_above_vigor (80). The controller persists and enforces these fields across planning turns. If choosing
+and fight_above_vigor (80 by default). Optional booleans eat_before_fighting and buy_food are false when
+omitted; include them only for a deliberate food tactic. The controller persists and enforces these fields across planning turns. If choosing
 open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
 it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey

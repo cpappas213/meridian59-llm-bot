@@ -1463,6 +1463,8 @@ class CampaignCoordinator:
                 "use_safe_spots",
                 "flee_below",
                 "fight_above_vigor",
+                "eat_before_fighting",
+                "buy_food",
                 "next_hp_milestone",
                 "selection_basis",
                 "deterministic_fallback",
@@ -1488,6 +1490,8 @@ class CampaignCoordinator:
                     "use_safe_spots",
                     "flee_below",
                     "fight_above_vigor",
+                    "eat_before_fighting",
+                    "buy_food",
                     "selection_basis",
                 )
                 if recipe.get(key) is not None

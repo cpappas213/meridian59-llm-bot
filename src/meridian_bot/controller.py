@@ -66,38 +66,9 @@ TRANSIENT_MOVEMENT_FAILURE_MARKERS = (
 )
 
 TOS_BANK_ROOM_ID = 54
-# These IDs describe one concrete provisioning adapter, not a default home or
-# completion destination. Goal policy and farm staging must never derive from
-# them.
-TOS_PROVISION_ROOM_ID = 52
 RAZA_EXIT_SAFE_ROOM_ID = 52
-TOS_INNKEEPER_NAME = "paddock"
-TOS_CHEESE_NAME = "wheel of cheese"
 SALE_BUYER_REFUSAL_LIMIT = 3
-TOS_CHEESE_VIGOR = 30
 RESTED_VIGOR_FLOOR = 80
-# Source-backed nutrition values used both for keeper provisioning and for
-# deciding how much cash an economic bootstrap actually needs.  Keep the most
-# specific names first because several foods share ordinary suffixes.
-COMBAT_FOOD_VIGOR_VALUES = (
-    ("inky cap", 50),
-    ("chocolate mint", 5),
-    (TOS_CHEESE_NAME, TOS_CHEESE_VIGOR),
-    ("turkey leg", 15),
-    ("mug of", 6),
-    ("meat pie", 30),
-    ("stew", 15),
-    ("loaf of bread", 20),
-    ("waterskin", 3),
-    ("slice of pork", 9),
-    ("bowl of soup", 9),
-    ("spideye", 9),
-    ("bunch of grapes", 7),
-    ("apple", 10),
-    ("edible mushroom", 5),
-    ("drumstick", 9),
-    ("goblet", 3),
-)
 # Ordinary keeper farms may start at the game's natural rested floor. Combat
 # safety comes from the health/flee envelope; food is optional endurance, not a
 # prerequisite that can deadlock a character with no money or provisions.
@@ -7684,7 +7655,6 @@ class BotController:
         observation: dict[str, Any] | None = None,
         *,
         allow_open_field: bool = False,
-        allow_rested_vigor: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         normalized = dict(arguments)
         before = dict(arguments)
@@ -7717,6 +7687,24 @@ class BotController:
             effective_bank_above = int(requested_bank_above)
             if 0 < effective_bank_above < BROKER_WALKING_MONEY:
                 effective_bank_above = BROKER_WALKING_MONEY
+            eat_before_fighting = arguments.get("eat_before_fighting") is True
+            buy_food = arguments.get("buy_food") is True
+            try:
+                requested_fight_vigor = float(
+                    arguments.get("fight_above_vigor", FARM_FIGHT_VIGOR)
+                )
+            except (TypeError, ValueError):
+                requested_fight_vigor = float(FARM_FIGHT_VIGOR)
+            # Rested vigor is the viable default. A higher target is accepted
+            # only as part of an explicit planner-owned eating tactic; merely
+            # carrying food can never raise the keeper's hidden launch floor.
+            effective_fight_vigor: int | float = FARM_FIGHT_VIGOR
+            if eat_before_fighting:
+                effective_fight_vigor = min(
+                    200, max(FARM_FIGHT_VIGOR, requested_fight_vigor)
+                )
+                if float(effective_fight_vigor).is_integer():
+                    effective_fight_vigor = int(effective_fight_vigor)
             normalized.update(
                 {
                     "rest_below": max(
@@ -7727,14 +7715,11 @@ class BotController:
                     # preference. Normalize old queued recipes that still say
                     # 75-80% as well as overly aggressive lower proposals.
                     "flee_below": FARM_FLEE_THRESHOLD,
-                    # The keeper may work from the game's verified rested floor.
-                    # Higher model- or goal-authored values are normalized away:
-                    # food is useful endurance but is not a launch prerequisite.
-                    "fight_above_vigor": (
-                        RESTED_VIGOR_FLOOR
-                        if allow_rested_vigor
-                        else FARM_FIGHT_VIGOR
-                    ),
+                    "fight_above_vigor": effective_fight_vigor,
+                    # Food automation is opt-in. These explicit false values
+                    # also clear legacy keeper policy restored by the broker.
+                    "eat_before_fighting": eat_before_fighting,
+                    "buy_food": buy_food,
                     # Open-field farming is permitted only when durable state
                     # chose it as a materially different tactic: either an
                     # operator-authored public goal or the planner's persisted
@@ -7802,188 +7787,6 @@ class BotController:
             return float(current) / float(maximum) if float(maximum) > 0 else None
         except (TypeError, ValueError, ZeroDivisionError):
             return None
-
-    @staticmethod
-    def _combat_food_vigor(name: Any) -> int | None:
-        normalized = " ".join(str(name or "").casefold().split())
-        compact = normalized.replace(" ", "")
-        return next(
-            (
-                value
-                for marker, value in COMBAT_FOOD_VIGOR_VALUES
-                if marker in normalized or marker.replace(" ", "") in compact
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _combat_vigor_supply(observation: dict[str, Any]) -> dict[str, Any]:
-        """Describe food the keeper can consume or make before an engagement."""
-        items = deep_get(observation, "inventory.items", [])
-        items = items if isinstance(items, list) else []
-        # Counting items alone is not enough: deterministic preflight accounts
-        # for source-backed nutrition against the configured farm gate.
-        food_count = 0
-        vigor_points = 0
-        herbs = 0
-        elderberries = 0
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).casefold().strip()
-            raw_amount = item.get("amount", item.get("quantity", 1))
-            try:
-                amount = max(1, int(raw_amount or 1))
-            except (TypeError, ValueError):
-                amount = 1
-            food_value = BotController._combat_food_vigor(name)
-            if food_value is not None:
-                food_count += amount
-                vigor_points += food_value * amount
-            if name in {"herb", "herbs"}:
-                herbs += amount
-            if name in {"elderberry", "elderberries", "elder berry", "elder berries"}:
-                elderberries += amount
-
-        spells = deep_get(observation, "spells.spells", [])
-        spells = spells if isinstance(spells, list) else []
-        knows_create_food = any(
-            isinstance(spell, dict)
-            and str(spell.get("name", "")).casefold().strip() == "create food"
-            for spell in spells
-        )
-        cookable_casts = min(herbs // 2, elderberries // 2) if knows_create_food else 0
-        return {
-            "available": food_count > 0 or cookable_casts > 0,
-            "food_count": food_count,
-            "vigor_points": vigor_points,
-            "knows_create_food": knows_create_food,
-            "cookable_casts": cookable_casts,
-            "herbs": herbs,
-            "elderberries": elderberries,
-        }
-
-    def _minimum_quoted_vigor_purchase(
-        self,
-        observation: dict[str, Any],
-        required_vigor: int,
-    ) -> dict[str, Any] | None:
-        """Return the cheapest observed edible basket that reaches the vigor gate."""
-
-        vigor = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            current = int(vigor or 0)
-        except (TypeError, ValueError):
-            return None
-        supply = self._combat_vigor_supply(observation)
-        shortfall = max(
-            0,
-            int(required_vigor)
-            - max(current, RESTED_VIGOR_FLOOR)
-            - int(supply.get("vigor_points", 0) or 0),
-        )
-        if shortfall <= 0:
-            return None
-        candidates: list[dict[str, Any]] = []
-        for catalogue in self._recent_shop_catalogues():
-            for name, item in catalogue["items"].items():
-                nutrition = self._combat_food_vigor(name)
-                if nutrition is None or nutrition <= 0:
-                    continue
-                quantity = max(1, (shortfall + nutrition - 1) // nutrition)
-                candidates.append(
-                    {
-                        "seller": catalogue["seller"],
-                        "item_id": item.get("id"),
-                        "item": name,
-                        "quantity": quantity,
-                        "unit_cost": int(item["cost"]),
-                        "total_cost": quantity * int(item["cost"]),
-                        "nutrition_each": nutrition,
-                        "nutrition_required": shortfall,
-                        "catalogue_observed_at": catalogue["observed_at"],
-                    }
-                )
-        return min(
-            candidates,
-            key=lambda item: (int(item["total_cost"]), int(item["quantity"])),
-            default=None,
-        )
-
-    def _closed_vigor_funding_shortfall(
-        self,
-        observation: dict[str, Any],
-        required_vigor: int,
-    ) -> dict[str, Any] | None:
-        """Describe a quoted food deficit only when ordinary funding is exhausted."""
-
-        purchase = self._minimum_quoted_vigor_purchase(
-            observation, required_vigor
-        )
-        if purchase is None:
-            return None
-        finances = self._financial_context(observation)
-        carried = int(finances.get("carried_shillings", 0) or 0)
-        liquidatable = finances.get("known_liquidatable_inventory_value", 0)
-        try:
-            liquidatable_value = max(0, int(float(liquidatable or 0)))
-        except (TypeError, ValueError):
-            liquidatable_value = 0
-        bank_balance = max(
-            (
-                int(account.get("last_known_balance", 0) or 0)
-                for account in finances.get("bank_accounts", [])
-                if isinstance(account, dict)
-            ),
-            default=0,
-        )
-        known_funds = carried + liquidatable_value + max(0, bank_balance)
-        if known_funds >= int(purchase["total_cost"]):
-            return None
-        if finances.get("buyer_candidates"):
-            return None
-
-        exhausted_ids = {
-            str(item.get("item_id"))
-            for item in finances.get("sale_exhausted_items", [])
-            if isinstance(item, dict) and item.get("item_id") is not None
-        }
-        restricted_ids = {
-            str(item.get("item_id", item.get("id")))
-            for item in finances.get("npc_transfer_restricted_items", [])
-            if isinstance(item, dict)
-            and item.get("item_id", item.get("id")) is not None
-        }
-        protected_ids = {
-            str(item.get("item_id", item.get("id")))
-            for item in finances.get("protected_sale_items", [])
-            if isinstance(item, dict)
-            and item.get("item_id", item.get("id")) is not None
-        }
-        unresolved_inventory = []
-        for item in deep_get(observation, "inventory.items", []):
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").casefold()
-            if "shilling" in name or item.get("equipped") is True or item.get("in_use") is True:
-                continue
-            item_id = str(item.get("id"))
-            if item_id not in exhausted_ids | restricted_ids | protected_ids:
-                unresolved_inventory.append(item_id)
-        if unresolved_inventory:
-            return None
-        return {
-            **purchase,
-            "carried_shillings": carried,
-            "known_funding_total": known_funds,
-            "shortfall": int(purchase["total_cost"]) - known_funds,
-            "bank_balance": bank_balance,
-            "known_liquidatable_inventory_value": liquidatable_value,
-        }
 
     def _live_overlevel_hostiles(
         self,
@@ -8135,46 +7938,16 @@ class BotController:
             blockers.append({"kind": "recover_mana", "mana_fraction": mana, "guidance": "return to full mana before a new hazardous encounter"})
         rested = deep_get(observation, "status.vitals.vigor.rested", deep_get(observation, "look.vitals.vigor.rested"))
         if rested is False:
-            blockers.append({"kind": "recover_vigor", "guidance": "eat or rest until the game reports rested"})
+            blockers.append(
+                {
+                    "kind": "recover_vigor",
+                    "guidance": (
+                        "rest until the game reports rested; food is an optional "
+                        "planner-owned tactic, never a controller prerequisite"
+                    ),
+                }
+            )
         if tool == "autopilot" and arguments.get("mode") == "farm":
-            vigor = deep_get(
-                observation,
-                "status.vitals.vigor.value",
-                deep_get(
-                    observation,
-                    "status.vitals.vigor.current",
-                    deep_get(observation, "look.vitals.vigor.value"),
-                ),
-            )
-            fight_vigor = int(
-                arguments.get("fight_above_vigor", FARM_FIGHT_VIGOR)
-                or FARM_FIGHT_VIGOR
-            )
-            if (
-                isinstance(vigor, (int, float))
-                and vigor < fight_vigor
-                and fight_vigor > RESTED_VIGOR_FLOOR
-            ):
-                supply = self._combat_vigor_supply(observation)
-                verified_food_shortfall = (
-                    int(supply.get("vigor_points", 0) or 0)
-                    < max(0, fight_vigor - int(vigor))
-                    and int(supply.get("cookable_casts", 0) or 0) <= 0
-                )
-                if not supply["available"] or verified_food_shortfall:
-                    blockers.append(
-                        {
-                            "kind": "recover_combat_vigor",
-                            "vigor": vigor,
-                            "minimum": fight_vigor,
-                            "supply": supply,
-                            "guidance": (
-                                f"acquire enough edible food before launching the keeper so verified nutrition can raise vigor to at least {fight_vigor}; "
-                                "this explicit above-rest threshold cannot be reached by sitting. Carried herbs and elderberries "
-                                "count only when the verified spell list contains Create Food"
-                            ),
-                        }
-                    )
             assigned_room = arguments.get("assigned_room")
             current_room = deep_get(observation, "look.room.num")
             if (
@@ -9756,7 +9529,7 @@ class BotController:
         notes = str(constraints.get("operator_notes") or "") if isinstance(constraints, dict) else ""
         room_match = re.search(r"\bassigned_room\s*=\s*(\d+)\b", notes, re.IGNORECASE)
         hunt_match = re.search(
-            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
             notes,
             re.IGNORECASE,
         )
@@ -9764,7 +9537,12 @@ class BotController:
             "assigned_room": int(room_match.group(1)) if room_match else None,
             "hunt": " ".join(hunt_match.group(1).casefold().split()) if hunt_match else None,
         }
-        for field in ("use_safe_spots", "break_out_via_logoff"):
+        for field in (
+            "use_safe_spots",
+            "break_out_via_logoff",
+            "eat_before_fighting",
+            "buy_food",
+        ):
             match = re.search(
                 rf"\b{field}\s*=\s*(true|false)\b", notes, re.IGNORECASE
             )
@@ -9887,6 +9665,8 @@ class BotController:
             "hold_resume_above",
             "rest_below",
             "fight_above_vigor",
+            "eat_before_fighting",
+            "buy_food",
             "bank_above",
             "pull_within",
         ):
@@ -9973,29 +9753,15 @@ class BotController:
             for key in keys
         }
 
-    def _active_funding_bootstrap_phase(
-        self, goal: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """Return the tightly scoped farm allowed to start at the rested floor."""
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        context = phase.get("context") if isinstance(phase, dict) else None
-        if (
-            isinstance(phase, dict)
-            and phase.get("kind") == "farm"
-            and isinstance(context, dict)
-            and context.get("reason") == "bootstrap_combat_funding"
-        ):
-            return phase
-        return None
-
     def _farm_fight_vigor(self, goal: dict[str, Any]) -> int:
-        return (
-            RESTED_VIGOR_FLOOR
-            if self._active_funding_bootstrap_phase(goal) is not None
-            else FARM_FIGHT_VIGOR
-        )
+        intent = self._effective_farm_intent(goal)
+        if intent.get("eat_before_fighting") is not True:
+            return FARM_FIGHT_VIGOR
+        try:
+            requested = int(intent.get("fight_above_vigor") or FARM_FIGHT_VIGOR)
+        except (TypeError, ValueError):
+            return FARM_FIGHT_VIGOR
+        return min(200, max(FARM_FIGHT_VIGOR, requested))
 
     def _farm_launch_origin(
         self,
@@ -10101,9 +9867,6 @@ class BotController:
             arguments,
             observation,
             allow_open_field=intent.get("use_safe_spots") is False,
-            allow_rested_vigor=(
-                self._active_funding_bootstrap_phase(goal) is not None
-            ),
         )
         if self._safety_preflight("autopilot", arguments, observation, goal):
             return None
@@ -10123,365 +9886,6 @@ class BotController:
             },
             "proposal": None,
         }
-
-    def _ensure_combat_vigor_support_phase(
-        self,
-        goal: dict[str, Any],
-        observation: dict[str, Any],
-        *,
-        blockers: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any] | None:
-        """Convert an unsatisfied keeper-vigor gate into bounded preparation.
-
-        Resting deliberately stops at 80 vigor.  When the selected keeper phase
-        explicitly needs more than that and no carried/cookable food can bridge
-        the gap, repeated launch attempts cannot change the state.  A target at
-        or below the resting ceiling belongs to the keeper's ordinary recovery
-        loop and must never become a food-acquisition phase.
-        """
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        if not isinstance(phase, dict) or phase.get("kind") not in {
-            "farm",
-            "train_ability",
-        }:
-            return None
-        phase_context = (
-            phase.get("context") if isinstance(phase.get("context"), dict) else {}
-        )
-        if phase_context.get("reason") == "bootstrap_combat_funding":
-            # Legacy child phases may still be present while persisted campaign
-            # state is reconciled. Never wrap one in another food-support phase.
-            return None
-
-        vigor_blocker = next(
-            (
-                item
-                for item in (blockers or [])
-                if isinstance(item, dict)
-                and item.get("kind") == "recover_combat_vigor"
-            ),
-            None,
-        )
-        required_raw = (
-            vigor_blocker.get("minimum")
-            if isinstance(vigor_blocker, dict)
-            # Farm launch normalizes every historical/model-proposed value to
-            # this controller-owned policy boundary.
-            else FARM_FIGHT_VIGOR
-        )
-        vigor_raw = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            required = max(FARM_FIGHT_VIGOR, int(required_raw or FARM_FIGHT_VIGOR))
-            current = int(vigor_raw or 0)
-        except (TypeError, ValueError):
-            return None
-        if required <= RESTED_VIGOR_FLOOR:
-            # The keeper can recover this shortfall by resting.  Turning a
-            # 78 -> 80 dip into merchant/funding work makes a bounded farm
-            # oscillate between one engagement and one provisioning campaign.
-            return None
-        supply = self._combat_vigor_supply(observation)
-        if (
-            current >= required
-            or bool(supply.get("available"))
-            or (
-                blockers is not None
-                and not isinstance(vigor_blocker, dict)
-            )
-        ):
-            return None
-
-        intent = self._campaign_phase_farm_intent(phase)
-        finances = self._financial_context(observation)
-        support = self.campaign.apply_manager_decision(
-            run,
-            goal,
-            {
-                "decision": "push_support_phase",
-                "phase": {
-                    "kind": "prepare_combat",
-                    "objective": (
-                        f"Raise verified vigor from {current} to at least {required} "
-                        "by obtaining and consuming edible food before resuming combat."
-                    ),
-                    "success_criteria": [
-                        {
-                            "id": f"combat-vigor-{required}",
-                            "kind": "numeric_threshold",
-                            "metric": "status.vitals.vigor.value",
-                            "operator": ">=",
-                            "value": required,
-                        }
-                    ],
-                    "abandon_predicates": [],
-                    "budget": {"max_actions": 40, "max_minutes": 90},
-                    "context": {
-                        "reason": "recover_combat_vigor",
-                        "required_vigor": required,
-                        "current_vigor": current,
-                        "vigor_shortfall": required - current,
-                        "verified_supply": redact(supply),
-                        "funding": {
-                            "carried_shillings": finances.get("carried_shillings"),
-                            "bank_accounts": redact(finances.get("bank_accounts", [])),
-                            "buyer_candidates": redact(finances.get("buyer_candidates", [])),
-                            "purchase_quote_required": True,
-                            "instruction": (
-                                "Obtain a fresh merchant quote, compute the exact total and "
-                                "deficit, then fund it with a verified bank withdrawal or a "
-                                "guarded sale before purchasing."
-                            ),
-                        },
-                        "allowed_recovery": [
-                            "sell guarded excess inventory after a fresh quote",
-                            "withdraw verified bank funds",
-                            "buy edible food or exact Create Food reagents",
-                            "cast Create Food only when its live reagent check is satisfied",
-                            "consume verified edible food until the vigor target is observed",
-                        ],
-                        "resume_combat_phase_id": phase.get("id"),
-                        "resume_combat_recipe": redact(intent),
-                    },
-                    "rationale": (
-                        "The deterministic combat preflight cannot be satisfied by "
-                        "resting alone; perform the missing resource work in the smallest "
-                        "bounded child phase while preserving the strategic goal."
-                    ),
-                },
-                "rationale": "Satisfy the deterministic keeper-vigor prerequisite.",
-            },
-            observation=observation,
-        )
-        if support is None:
-            return None
-        self._invalidate_execution_plan(
-            goal, "combat vigor requires a bounded preparation support phase"
-        )
-        self._clear_safety_suppression(str(goal.get("id") or ""))
-        self._clear_planner_feedback()
-        resolved_lesson_ids: list[str] = []
-        for lesson in self.storage.goal_lessons(
-            statuses=["deferred", "unlocked"],
-            goal_id=str(goal.get("id") or ""),
-            limit=50,
-        ):
-            summary = str(lesson.get("summary") or "").casefold()
-            if (
-                lesson.get("scope") == "tactic"
-                and lesson.get("classification") == "ineffective_tactic"
-                and "deterministic safety suppression" in summary
-                and "vigor" in summary
-            ):
-                resolved = self.storage.update_goal_lesson(
-                    lesson["id"],
-                    "resolved",
-                    resolution_goal_id=str(goal.get("id") or ""),
-                    evidence={
-                        "repair": "bounded combat-vigor support phase started",
-                        "support_phase_id": support.get("id"),
-                        "required_vigor": required,
-                        "at": timestamp(),
-                    },
-                )
-                resolved_lesson_ids.append(str(resolved["id"]))
-        self.storage.emit_event(
-            "campaign.combat_vigor_support_started",
-            (
-                f"Paused combat phase to raise vigor from {current} to {required} "
-                "through verified provisioning"
-            ),
-            severity="notice",
-            interesting=False,
-            goal_id=goal.get("id"),
-            data={
-                "combat_phase_id": phase.get("id"),
-                "support_phase_id": support.get("id"),
-                "current_vigor": current,
-                "required_vigor": required,
-                "vigor_shortfall": required - current,
-                "resolved_safety_lesson_ids": resolved_lesson_ids,
-                "strategic_goal_preserved": True,
-            },
-        )
-        return support
-
-    def _ensure_vigor_funding_bootstrap_phase(
-        self,
-        goal: dict[str, Any],
-        observation: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Break a closed food-funding deadlock with a bounded keeper child phase."""
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        context = phase.get("context") if isinstance(phase, dict) else None
-        if (
-            not isinstance(phase, dict)
-            or phase.get("kind") != "prepare_combat"
-            or not isinstance(context, dict)
-            or context.get("reason") != "recover_combat_vigor"
-        ):
-            return None
-        try:
-            required_vigor = int(context.get("required_vigor") or 0)
-        except (TypeError, ValueError):
-            return None
-        shortfall = self._closed_vigor_funding_shortfall(
-            observation, required_vigor
-        )
-        if shortfall is None:
-            return None
-        recipe = context.get("resume_combat_recipe")
-        recipe = recipe if isinstance(recipe, dict) else {}
-        assigned_room = recipe.get("assigned_room")
-        hunt = " ".join(str(recipe.get("hunt") or "").casefold().split())
-        try:
-            assigned_room = int(assigned_room)
-        except (TypeError, ValueError):
-            return None
-        if not hunt:
-            return None
-
-        required_shillings = int(shortfall["total_cost"])
-        support = self.campaign.apply_manager_decision(
-            run,
-            goal,
-            {
-                "decision": "push_support_phase",
-                "phase": {
-                    "kind": "farm",
-                    "objective": (
-                        f"Earn at least {required_shillings} carried shillings with "
-                        f"the bounded keeper so the paused vigor phase can buy its "
-                        "cheapest verified food basket."
-                    ),
-                    "targets": [
-                        {
-                            "id": f"bootstrap-funds-{required_shillings}",
-                            "type": "carried_currency_at_least",
-                            "amount": required_shillings,
-                        }
-                    ],
-                    "abandon_predicates": [],
-                    "budget": {"max_actions": 40, "max_minutes": 90},
-                    "context": {
-                        "reason": "bootstrap_combat_funding",
-                        "room": assigned_room,
-                        "target": hunt,
-                        "use_safe_spots": recipe.get("use_safe_spots") is not False,
-                        "flee_below": FARM_FLEE_THRESHOLD,
-                        "fight_above_vigor": RESTED_VIGOR_FLOOR,
-                        "bank_above": 0,
-                        "break_out_via_logoff": False,
-                        "required_shillings": required_shillings,
-                        "funding_shortfall": redact(shortfall),
-                        "resume_vigor_phase_id": phase.get("id"),
-                    },
-                    "rationale": (
-                        "The live menu proves the food cost, while carried cash, "
-                        "verified bank funds, and every grounded sale route cannot "
-                        "cover it. A health-aware keeper can safely work from the "
-                        "game's rested floor while preserving the ordinary combat "
-                        "health policy."
-                    ),
-                },
-                "rationale": "Earn only the exact missing provision budget.",
-            },
-            observation=observation,
-        )
-        if support is None:
-            return None
-        self._invalidate_execution_plan(
-            goal,
-            "known food funding routes are exhausted; start bounded economic bootstrap",
-        )
-        self._clear_safety_suppression(str(goal.get("id") or ""))
-        self._clear_planner_feedback()
-        self.storage.emit_event(
-            "campaign.vigor_funding_bootstrap_started",
-            (
-                f"Paused the infeasible food purchase loop to earn the verified "
-                f"{required_shillings}-shilling provision budget"
-            ),
-            severity="notice",
-            interesting=True,
-            goal_id=goal.get("id"),
-            data={
-                "vigor_phase_id": phase.get("id"),
-                "bootstrap_phase_id": support.get("id"),
-                "required_shillings": required_shillings,
-                "carried_shillings": shortfall.get("carried_shillings"),
-                "funding_shortfall": shortfall.get("shortfall"),
-                "assigned_room": assigned_room,
-                "hunt": hunt,
-                "fight_above_vigor": RESTED_VIGOR_FLOOR,
-                "ordinary_farm_vigor_unchanged": FARM_FIGHT_VIGOR,
-                "strategic_goal_preserved": True,
-            },
-        )
-        return support
-
-    def _recent_farm_food_quote(
-        self, goal: dict[str, Any]
-    ) -> dict[str, int] | None:
-        """Return the newest live Paddock cheese quote for this goal.
-
-        Merchant template ids are runtime evidence, not durable game facts.
-        Reusing the most recent quote avoids another model turn while keeping
-        deterministic provisioning bound to what the ordinary client saw.
-        """
-
-        for event in reversed(
-            self.storage.goal_events(
-                goal["id"], kinds=["action.succeeded"], limit=100
-            )
-        ):
-            data = event.get("data") if isinstance(event, dict) else None
-            if not isinstance(data, dict) or data.get("tool") != "shop":
-                continue
-            result = data.get("result")
-            items = result.get("items") if isinstance(result, dict) else None
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if (
-                    isinstance(item, dict)
-                    and str(item.get("name") or "").strip().casefold()
-                    == TOS_CHEESE_NAME
-                    and isinstance(item.get("id"), int)
-                    and isinstance(item.get("cost"), int)
-                    and int(item["cost"]) > 0
-                    and isinstance(result.get("seller"), int)
-                ):
-                    return {
-                        "seller": int(result["seller"]),
-                        "item_id": int(item["id"]),
-                        "cost": int(item["cost"]),
-                    }
-        return None
-
-    @staticmethod
-    def _visible_tos_innkeeper(observation: dict[str, Any]) -> int | None:
-        objects = deep_get(observation, "look.objects", [])
-        for item in objects if isinstance(objects, list) else []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip().casefold()
-            capabilities = item.get("can")
-            if (
-                name == TOS_INNKEEPER_NAME
-                and isinstance(item.get("id"), int)
-                and isinstance(capabilities, list)
-                and "buy" in capabilities
-            ):
-                return int(item["id"])
-        return None
 
     def _structured_farm_controller_plan(
         self,
@@ -10506,82 +9910,20 @@ class BotController:
             and self._live_spell_readiness(observation, "create weapon")
             is not None
         )
-        supply = self._combat_vigor_supply(observation)
-        vigor = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            live_vigor = int(vigor or 0)
-        except (TypeError, ValueError):
-            live_vigor = 0
-        fight_vigor = self._farm_fight_vigor(goal)
-        nutrition_shortfall = max(
-            0,
-            fight_vigor
-            - max(live_vigor, RESTED_VIGOR_FLOOR)
-            - int(supply.get("vigor_points", 0) or 0),
-        )
-        needs_provisions = (
-            launch_room == TOS_PROVISION_ROOM_ID
-            and nutrition_shortfall > 0
-            and int(supply.get("cookable_casts", 0) or 0) <= 0
-        )
-        steps: list[dict[str, Any]] = []
-        if needs_provisions:
-            # This is a concrete food-vendor adapter selected only when that
-            # source-verified room is already the staging point. It is not a
-            # regional or completion default.
-            steps.extend(
-                [
-                    {
-                        "id": "farm-bank-transit",
-                        "outcome": (
-                            f"Reach First Royal Bank of Tos (room {TOS_BANK_ROOM_ID}) "
-                            "before withdrawing the bounded food shortfall."
-                        ),
-                        "tool": "travel",
-                        "verification": f"Current room id is {TOS_BANK_ROOM_ID}.",
-                    },
-                    {
-                        "id": "withdraw-provision-funds",
-                        "outcome": "Withdraw only the live quoted cost of the remaining farm food.",
-                        "tool": "bank",
-                        "verification": "Carried shillings increased by the requested amount.",
-                    },
-                    {
-                        "id": "farm-provision-transit",
-                        "outcome": (
-                            f"Return to {launch_name} (room {launch_room}) to obtain "
-                            "the bounded farm provisions."
-                        ),
-                        "tool": "travel",
-                        "verification": f"Current room id is {launch_room}.",
-                    },
-                    {
-                        "id": "buy-farm-food",
-                        "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {fight_vigor}-vigor launch gate.",
-                        "tool": "shop",
-                        "verification": f"Verified carried food nutrition plus rested vigor reaches at least {fight_vigor}.",
-                    },
-                ]
-            )
-        else:
-            steps.append(
-                {
-                    "id": "farm-staging-transit",
-                    "outcome": (
-                        f"Reach source-verified safe staging {launch_name} "
-                        f"(room {launch_room}) for the next preparation action."
-                    ),
-                    "tool": "travel",
-                    "verification": (
-                        f"Current room id is {launch_room} and its source flags include "
-                        "ROOM_SANCTUARY or ROOM_NO_COMBAT."
-                    ),
-                }
-            )
+        steps: list[dict[str, Any]] = [
+            {
+                "id": "farm-staging-transit",
+                "outcome": (
+                    f"Reach source-verified safe staging {launch_name} "
+                    f"(room {launch_room}) for the next preparation action."
+                ),
+                "tool": "travel",
+                "verification": (
+                    f"Current room id is {launch_room} and its source flags include "
+                    "ROOM_SANCTUARY or ROOM_NO_COMBAT."
+                ),
+            }
+        ]
         steps.extend(
             (
                 [
@@ -10638,8 +9980,8 @@ class BotController:
             "steps": steps,
             "assumptions": [],
             "revision_reason": (
-                "Bind launch staging to source safety facts and live state; use "
-                "the Tos food adapter only when its room is already that staging point."
+                "Bind launch staging to source safety facts and live state. Food "
+                "acquisition and consumption remain planner-owned optional tactics."
             ),
         }
         return (
@@ -10668,25 +10010,6 @@ class BotController:
             return None
         launch_room = int(launch_origin["room_id"])
         readiness = self.learning.readiness_summary(observation)
-        supply = self._combat_vigor_supply(observation)
-        vigor = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            live_vigor = int(vigor or 0)
-        except (TypeError, ValueError):
-            return None
-        fight_vigor = self._farm_fight_vigor(goal)
-        prepared_vigor = max(live_vigor, RESTED_VIGOR_FLOOR)
-        nutrition_shortfall = max(
-            0,
-            fight_vigor
-            - prepared_vigor
-            - int(supply.get("vigor_points", 0) or 0),
-        )
-        can_make_food = int(supply.get("cookable_casts", 0) or 0) > 0
 
         def action(
             tool: str,
@@ -10740,66 +10063,6 @@ class BotController:
                 "proposal": None,
                 "plan_step_id": step_id,
             }
-
-        if nutrition_shortfall > 0 and not can_make_food:
-            if launch_room != TOS_PROVISION_ROOM_ID:
-                # The deterministic adapter only knows this exact vendor/bank
-                # pair. Let the tactical planner locate supplies elsewhere;
-                # never turn one provider into a regional travel policy.
-                return None
-            quote = self._recent_farm_food_quote(goal)
-            if quote is None:
-                if str(current_room) != str(TOS_PROVISION_ROOM_ID):
-                    return action(
-                        "travel",
-                        {"to": TOS_PROVISION_ROOM_ID},
-                        "farm-provision-transit",
-                        "Reach the selected safe staging room to obtain a fresh quote from its verified provisioner.",
-                    )
-                seller = self._visible_tos_innkeeper(observation)
-                if seller is None:
-                    return None
-                return action(
-                    "shop",
-                    {"seller": seller},
-                    "buy-farm-food",
-                    "Read Paddock's live catalog before moving any money.",
-                )
-
-            cheese_needed = max(
-                1,
-                (nutrition_shortfall + TOS_CHEESE_VIGOR - 1)
-                // TOS_CHEESE_VIGOR,
-            )
-            required_funds = cheese_needed * int(quote["cost"])
-            carried = self._carried_currency(observation)
-            if carried < required_funds:
-                if str(current_room) != str(TOS_BANK_ROOM_ID):
-                    return action(
-                        "travel",
-                        {"to": TOS_BANK_ROOM_ID},
-                        "farm-bank-transit",
-                        "Reach the verified Tos bank to withdraw only the food shortfall.",
-                    )
-                return action(
-                    "bank",
-                    {"action": "withdraw", "amount": required_funds - carried},
-                    "withdraw-provision-funds",
-                    "Withdraw exactly the remaining live quoted food cost.",
-                )
-            if str(current_room) != str(TOS_PROVISION_ROOM_ID):
-                return action(
-                    "travel",
-                    {"to": TOS_PROVISION_ROOM_ID},
-                    "farm-provision-transit",
-                    "Return to the selected staging room's verified provisioner with the bounded funds.",
-                )
-            return action(
-                "shop",
-                {"seller": quote["seller"], "buy_ids": [quote["item_id"]]},
-                "buy-farm-food",
-                "Buy one verified wheel at a time until carried nutrition reaches the gate.",
-            )
 
         if str(current_room) != str(launch_room):
             return action(
@@ -11289,7 +10552,12 @@ class BotController:
         owner = self.storage.get_runtime("background_farm_owner_v1", {})
         owner = owner if isinstance(owner, dict) else {}
         intent = self._effective_farm_intent(goal)
-        expected = {**intent, "fight_above_vigor": self._farm_fight_vigor(goal)}
+        expected = {
+            **intent,
+            "fight_above_vigor": self._farm_fight_vigor(goal),
+            "eat_before_fighting": intent.get("eat_before_fighting") is True,
+            "buy_food": intent.get("buy_food") is True,
+        }
         actual = {
             "assigned_room": self._farm_assigned_room(status),
             "hunt": self._farm_target(status).strip().casefold(),
@@ -11298,6 +10566,16 @@ class BotController:
                 status,
                 "policy.fightAboveVigor",
                 deep_get(status, "policy.fight_above_vigor"),
+            ),
+            "eat_before_fighting": deep_get(
+                status,
+                "policy.eatBeforeFighting",
+                deep_get(status, "policy.eat_before_fighting"),
+            ),
+            "buy_food": deep_get(
+                status,
+                "policy.buyFood",
+                deep_get(status, "policy.buy_food"),
             ),
         }
         reasons: list[str] = []
@@ -11317,6 +10595,8 @@ class BotController:
             "hunt",
             "use_safe_spots",
             "fight_above_vigor",
+            "eat_before_fighting",
+            "buy_food",
         ):
             wanted = expected.get(field)
             if wanted is not None and str(actual.get(field)) != str(wanted):
@@ -15447,6 +14727,7 @@ class BotController:
         policy_normalized = False
         if (
             combat_recipe_phase
+            and phase_context.get("eat_before_fighting") is not True
             and phase_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR
             and deep_get(observation, "autopilot.running") is not True
         ):
@@ -15513,13 +14794,7 @@ class BotController:
             retired_phases.append(
                 self.storage.transition_campaign_phase(
                     phase["id"],
-                    (
-                        "superseded"
-                        if obsolete_recovery
-                        and required_vigor is not None
-                        and required_vigor <= RESTED_VIGOR_FLOOR
-                        else "succeeded"
-                    ),
+                    "superseded",
                     reason=reason,
                     resume_parent=True,
                 )
@@ -15546,7 +14821,11 @@ class BotController:
                     if isinstance(phase.get("context"), dict)
                     else {}
                 )
-                if resumed_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR:
+                if (
+                    resumed_context.get("eat_before_fighting") is not True
+                    and resumed_context.get("fight_above_vigor")
+                    != FARM_FIGHT_VIGOR
+                ):
                     resumed_context["fight_above_vigor"] = FARM_FIGHT_VIGOR
                     phase = self.storage.update_campaign_phase_guardrails(
                         phase["id"],
@@ -16121,30 +15400,6 @@ class BotController:
             )
             if farm_control is not None:
                 return farm_control
-            vigor_support = (
-                None
-                if phase_safe_return_checkpoint is not None
-                else self._ensure_combat_vigor_support_phase(goal, observation)
-            )
-            if vigor_support is not None:
-                return {
-                    "campaign_support_phase_started": True,
-                    "phase": vigor_support,
-                    "reason": "recover_combat_vigor",
-                    "strategic_goal_preserved": True,
-                }
-            funding_bootstrap = (
-                None
-                if phase_safe_return_checkpoint is not None
-                else self._ensure_vigor_funding_bootstrap_phase(goal, observation)
-            )
-            if funding_bootstrap is not None:
-                return {
-                    "campaign_support_phase_started": True,
-                    "phase": funding_bootstrap,
-                    "reason": "bootstrap_combat_funding",
-                    "strategic_goal_preserved": True,
-                }
             structured_purchase = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -17647,9 +16902,6 @@ class BotController:
                 arguments,
                 observation,
                 allow_open_field=farm_intent.get("use_safe_spots") is False,
-                allow_rested_vigor=(
-                    self._active_funding_bootstrap_phase(goal) is not None
-                ),
             )
         except (TypeError, ValueError) as exc:
             raise ModelError(f"planner supplied invalid {tool} safety arguments: {exc}") from exc
@@ -17778,18 +17030,6 @@ class BotController:
                     str(item.get("guidance") or item.get("kind")) for item in preflight
                 ),
             )
-            vigor_support = self._ensure_combat_vigor_support_phase(
-                goal, observation, blockers=preflight
-            )
-            if vigor_support is not None:
-                return {
-                    "action": tool,
-                    "safety_suppressed": True,
-                    "blockers": preflight,
-                    "campaign_support_phase_started": True,
-                    "phase": vigor_support,
-                    "strategic_goal_preserved": True,
-                }
             suppression = self._record_safety_suppression(
                 goal, observation, tool, arguments, preflight
             )

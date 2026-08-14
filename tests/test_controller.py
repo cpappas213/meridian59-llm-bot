@@ -832,6 +832,8 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_journal: list[object] = []
         self.farm_flee_below = 0.75
         self.farm_fight_above_vigor = 80
+        self.farm_eat_before_fighting = False
+        self.farm_buy_food = False
         self.farm_use_safe_spots = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
@@ -855,6 +857,8 @@ class BackgroundFarmBroker(SimulatedBroker):
                     "hunt": self.farm_hunt,
                     "fleeBelow": self.farm_flee_below,
                     "fightAboveVigor": self.farm_fight_above_vigor,
+                    "eatBeforeFighting": self.farm_eat_before_fighting,
+                    "buyFood": self.farm_buy_food,
                     "useSafeSpots": self.farm_use_safe_spots,
                 },
             }
@@ -876,6 +880,14 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_mode = str(arguments.get("mode") or self.farm_mode)
             self.farm_room = int(arguments.get("assigned_room") or self.farm_room)
             self.farm_hunt = str(arguments.get("hunt") or self.farm_hunt)
+            self.farm_fight_above_vigor = int(
+                arguments.get("fight_above_vigor")
+                or self.farm_fight_above_vigor
+            )
+            self.farm_eat_before_fighting = bool(
+                arguments.get("eat_before_fighting", False)
+            )
+            self.farm_buy_food = bool(arguments.get("buy_food", False))
             self.farm_use_safe_spots = bool(
                 arguments.get("use_safe_spots", self.farm_use_safe_spots)
             )
@@ -10510,134 +10522,38 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_closed_vigor_funding_route_pushes_bounded_bootstrap_farm(self) -> None:
+    def test_food_automation_requires_explicit_planner_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
-                goal = controller.storage.submit_goal(
-                    goal_payload(request_id="vigor-funding-bootstrap")
-                )["goal"]
-                run = controller.storage.ensure_campaign_run(goal)
-                farm = controller.storage.create_campaign_phase(
-                    run,
-                    {
-                        "kind": "farm",
-                        "objective": "Farm ants in room 563.",
-                        "success_criteria": [
-                            {
-                                "id": "hp-100",
-                                "kind": "numeric_threshold",
-                                "metric": "status.vitals.health.max",
-                                "operator": ">=",
-                                "value": 100,
-                            }
-                        ],
-                        "context": {
-                            "room": 563,
-                            "target": "ant",
-                            "use_safe_spots": True,
-                            "fight_above_vigor": 100,
-                        },
-                    },
-                    mode="start",
-                )
-                vigor_phase = controller.storage.create_campaign_phase(
-                    run,
-                    {
-                        "kind": "prepare_combat",
-                        "objective": "Raise vigor from 78 to 100.",
-                        "success_criteria": [
-                            {
-                                "id": "combat-vigor-100",
-                                "kind": "numeric_threshold",
-                                "metric": "status.vitals.vigor.value",
-                                "operator": ">=",
-                                "value": 100,
-                            }
-                        ],
-                        "context": {
-                            "reason": "recover_combat_vigor",
-                            "required_vigor": 100,
-                            "resume_combat_phase_id": farm["id"],
-                            "resume_combat_recipe": {
-                                "assigned_room": 563,
-                                "hunt": "ant",
-                                "use_safe_spots": True,
-                            },
-                        },
-                    },
-                    mode="push",
-                )
-                controller.storage.emit_event(
-                    "action.succeeded",
-                    "Action succeeded: shop",
-                    goal_id=goal["id"],
-                    data={
-                        "tool": "shop",
-                        "result": {
-                            "seller": 674,
-                            "items": [
-                                {"id": 677, "name": "apple", "cost": 45},
-                                {"id": 680, "name": "loaf of bread", "cost": 108},
-                            ],
-                        },
-                    },
-                )
-                observation = {
-                    "status": {
-                        "vitals": {
-                            "vigor": {
-                                "value": 78,
-                                "scale_max": 200,
-                                "rested": False,
-                            }
-                        }
-                    },
-                    "inventory": {
-                        "items": [
-                            {"id": 1, "name": "shilling", "amount": 12},
-                            {"id": 2, "name": "herb", "amount": 1},
-                        ],
-                        "carry": {"known": True},
-                    },
-                    "spells": {"spells": []},
-                }
-                controller._financial_context = lambda _observation: {  # type: ignore[method-assign]
-                    "carried_shillings": 12,
-                    "known_liquidatable_inventory_value": 0,
-                    "bank_accounts": [{"last_known_balance": 0}],
-                    "buyer_candidates": [],
-                    "sale_exhausted_items": [{"item_id": "2"}],
-                    "npc_transfer_restricted_items": [],
-                    "protected_sale_items": [],
-                }
-
-                bootstrap = controller._ensure_vigor_funding_bootstrap_phase(
-                    goal, observation
-                )
-
-                self.assertIsNotNone(bootstrap)
-                assert bootstrap is not None
-                self.assertEqual("farm", bootstrap["kind"])
-                self.assertEqual(vigor_phase["id"], bootstrap["parent_phase_id"])
-                self.assertEqual(
-                    "bootstrap_combat_funding", bootstrap["context"]["reason"]
-                )
-                self.assertEqual(90, bootstrap["context"]["required_shillings"])
-                self.assertEqual(80, bootstrap["context"]["fight_above_vigor"])
-                self.assertEqual("carried_currency", bootstrap["success_criteria"][0]["metric"])
-                self.assertEqual(90, bootstrap["success_criteria"][0]["value"])
-                self.assertEqual(80, controller._farm_fight_vigor(goal))
-                normalized, _changes = controller._normalize_combat_arguments(
+                observation = {"inventory": {"items": []}}
+                ordinary, _changes = controller._normalize_combat_arguments(
                     "autopilot",
-                    {"action": "start", "mode": "farm", "fight_above_vigor": 100},
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "fight_above_vigor": 140,
+                    },
                     observation,
-                    allow_rested_vigor=True,
                 )
-                self.assertEqual(80, normalized["fight_above_vigor"])
-                self.assertIsNone(
-                    controller._ensure_combat_vigor_support_phase(goal, observation)
+                self.assertEqual(80, ordinary["fight_above_vigor"])
+                self.assertFalse(ordinary["eat_before_fighting"])
+                self.assertFalse(ordinary["buy_food"])
+
+                planned, _changes = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "fight_above_vigor": 140,
+                        "eat_before_fighting": True,
+                        "buy_food": True,
+                    },
+                    observation,
                 )
+                self.assertEqual(140, planned["fight_above_vigor"])
+                self.assertTrue(planned["eat_before_fighting"])
+                self.assertTrue(planned["buy_food"])
             finally:
                 controller.storage.close()
 
@@ -10700,6 +10616,8 @@ class ControllerTests(unittest.TestCase):
                     if name == "autopilot" and arguments.get("action") == "start"
                 )
                 self.assertEqual(80, call["fight_above_vigor"])
+                self.assertFalse(call["eat_before_fighting"])
+                self.assertFalse(call["buy_food"])
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(farm["id"], active["id"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
@@ -10751,11 +10669,22 @@ class ControllerTests(unittest.TestCase):
                     "spells": {"spells": []},
                 }
 
-                support = controller._ensure_combat_vigor_support_phase(
-                    goal, observation
+                blockers = controller._combat_preflight(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "fight_above_vigor": 140,
+                        "eat_before_fighting": True,
+                    },
+                    observation,
+                    goal,
                 )
 
-                self.assertIsNone(support)
+                self.assertIn("recover_vigor", {item["kind"] for item in blockers})
+                self.assertNotIn(
+                    "recover_combat_vigor", {item["kind"] for item in blockers}
+                )
                 self.assertEqual(
                     farm["id"],
                     controller.storage.active_campaign_phase(run["id"])["id"],
@@ -10945,11 +10874,11 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertTrue(result["campaign_phase_policy_migrated"])
                 self.assertEqual(
-                    "succeeded",
+                    "superseded",
                     controller.storage.campaign_phase(bootstrap["id"])["status"],
                 )
                 self.assertEqual(
-                    "succeeded",
+                    "superseded",
                     controller.storage.campaign_phase(support["id"])["status"],
                 )
                 self.assertEqual(
@@ -11008,6 +10937,52 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_explicit_food_recipe_survives_campaign_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="preserve-planned-food-recipe")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats with planned food endurance.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "context": {
+                            "room": 575,
+                            "target": "giant rat",
+                            "fight_above_vigor": 140,
+                            "eat_before_fighting": True,
+                            "buy_food": False,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(goal, {})
+
+                self.assertIsNone(result)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(farm["id"], active["id"])
+                self.assertEqual(140, active["context"]["fight_above_vigor"])
+                self.assertTrue(active["context"]["eat_before_fighting"])
+                self.assertFalse(active["context"]["buy_food"])
+                self.assertEqual(140, controller._farm_fight_vigor(goal))
+            finally:
+                controller.storage.close()
+
     def test_background_farm_allows_keeper_to_provision_from_carried_food(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -11029,6 +11004,8 @@ class ControllerTests(unittest.TestCase):
                             "hunt": "giant rat",
                             "assigned_room": 586,
                             "fight_above_vigor": 140,
+                            "eat_before_fighting": True,
+                            "buy_food": False,
                         },
                         "rationale": "Let the keeper eat before leaving the sanctuary.",
                     },
@@ -11036,7 +11013,14 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual("autopilot", result["action"])
                 self.assertNotIn("recover_combat_vigor", {item["kind"] for item in result.get("blockers", [])})
-                self.assertTrue(any(name == "autopilot" for name, _ in broker.calls))
+                call = next(
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                )
+                self.assertEqual(140, call["fight_above_vigor"])
+                self.assertTrue(call["eat_before_fighting"])
+                self.assertFalse(call["buy_food"])
             finally:
                 controller.storage.close()
 
@@ -11072,6 +11056,8 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(0.7, call["rest_below"])
                 self.assertEqual(0.60, call["flee_below"])
                 self.assertEqual(80, call["fight_above_vigor"])
+                self.assertFalse(call["eat_before_fighting"])
+                self.assertFalse(call["buy_food"])
                 self.assertTrue(call["use_safe_spots"])
                 self.assertEqual(0.9, call["hold_resume_above"])
                 self.assertFalse(call["break_out_via_logoff"])

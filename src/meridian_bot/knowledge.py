@@ -2591,7 +2591,7 @@ class KnowledgeBase:
             malformed_farm_fields = []
             farm_note_patterns = {
                 "assigned_room": r"\bassigned_room\s*=\s*\d+\b",
-                "hunt": r"\bhunt\s*=\s*[a-z][a-z ]*?(?=[,;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+                "hunt": r"\bhunt\s*=\s*[a-z][a-z ]*?(?=[,;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
                 "use_safe_spots": r"\buse_safe_spots\s*=\s*(?:true|false)\b",
             }
             for field, pattern in farm_note_patterns.items():
@@ -2666,7 +2666,7 @@ class KnowledgeBase:
             }:
                 entities.append(assigned["entity"])
         hunt_match = re.search(
-            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
             operator_notes,
             re.IGNORECASE,
         )
