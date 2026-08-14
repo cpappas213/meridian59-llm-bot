@@ -170,6 +170,32 @@ class PolicyAndJournalTests(unittest.TestCase):
         self.assertIn("sole capability", RESPONDER_SYSTEM)
         self.assertIn("public game and character state", RESPONDER_SYSTEM)
         self.assertIn("cannot create goals", GREETER_SYSTEM)
+        self.assertIn("ASCII punctuation", RESPONDER_SYSTEM)
+        self.assertIn("censor into symbol noise", GREETER_SYSTEM)
+
+    def test_generated_game_speech_is_wire_safe_and_avoids_server_censor_noise(
+        self,
+    ) -> None:
+        raw = (
+            "Oh … “you’re here”—perfect. Your fucking sacrifice can bring shit. "
+            "~Bred `Cmarkup and café."
+        )
+
+        clean = VllmClient._game_speech_text(raw, 220)
+
+        self.assertEqual(
+            'Oh ... "you\'re here"-perfect. Your blasting sacrifice can bring filth. '
+            "red markup and cafe.",
+            clean,
+        )
+        self.assertTrue(all(0x20 <= ord(character) <= 0x7E for character in clean))
+        self.assertNotRegex(clean.casefold(), r"fuck|shit|asshole|cocksuck")
+        self.assertNotIn("~", clean)
+        self.assertNotIn("`", clean)
+
+        shortened = VllmClient._game_speech_text(raw, 40)
+        self.assertLessEqual(len(shortened), 40)
+        self.assertTrue(shortened.endswith("..."))
 
     def test_vllm_repairs_one_malformed_json_response(self) -> None:
         class Response:
