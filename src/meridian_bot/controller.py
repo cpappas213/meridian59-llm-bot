@@ -73,6 +73,7 @@ TOS_PROVISION_ROOM_ID = 52
 RAZA_EXIT_SAFE_ROOM_ID = 52
 TOS_INNKEEPER_NAME = "paddock"
 TOS_CHEESE_NAME = "wheel of cheese"
+SALE_BUYER_REFUSAL_LIMIT = 3
 TOS_CHEESE_VIGOR = 30
 RESTED_VIGOR_FLOOR = 80
 # One cheese after ordinary rest reaches 110. This retains a useful combat
@@ -2817,6 +2818,7 @@ class BotController:
             return None
         catalog: dict[str, dict[str, Any]] = {}
         catalog_event_at: str | None = None
+        catalog_seller: Any = None
         for event in reversed(
             self.storage.latest_events(limit=200, kinds=["action.succeeded"])
         ):
@@ -2841,6 +2843,7 @@ class BotController:
                         "cost": int(cost),
                         "seller": result.get("seller"),
                     }
+                    catalog_seller = result.get("seller")
                     catalog_event_at = catalog_event_at or str(
                         event.get("occurred_at") or ""
                     )
@@ -2873,9 +2876,69 @@ class BotController:
             if self._is_plan_funding_step(step):
                 funds_unknown = True
                 continue
-            if not self._is_plan_purchase_step(step) or funds_unknown:
+            if not self._is_plan_purchase_step(step):
                 continue
             outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+            seller_aliases = {
+                str(catalog_seller).strip().casefold()
+            } if catalog_seller is not None else set()
+            seller_identity = (
+                self.knowledge.merchant_identity(object_id=catalog_seller)
+                if hasattr(self.knowledge, "merchant_identity")
+                else None
+            )
+            if isinstance(seller_identity, dict):
+                seller_aliases.update(
+                    " ".join(str(value or "").split()).casefold()
+                    for value in (
+                        seller_identity.get("merchant_class"),
+                        deep_get(seller_identity, "instance.name"),
+                    )
+                    if str(value or "").strip()
+                )
+            names_same_seller = any(
+                re.search(
+                    rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
+                    outcome,
+                )
+                for alias in seller_aliases
+                if alias
+            )
+            purchase_match = re.search(
+                r"\b(?:buy|purchase|obtain|acquire)\s+(.+?)"
+                r"(?=\s+from\b|\s+using\b|[.;]|$)",
+                outcome,
+            )
+            requested_items: list[str] = []
+            if names_same_seller and purchase_match is not None:
+                for component in re.split(
+                    r"\s*,\s*|\s+and\s+", purchase_match.group(1)
+                ):
+                    quantified = re.match(
+                        rf"^(?:\d+|{'|'.join(number_words)})\s+(?:x\s+)?(.+?)$",
+                        component.strip(),
+                    )
+                    if quantified is not None:
+                        requested_items.append(quantified.group(1).strip())
+            missing_items = [
+                requested
+                for requested in requested_items
+                if not any(
+                    re.fullmatch(item_pattern(name), requested) is not None
+                    for name in catalog
+                )
+            ]
+            if missing_items:
+                return (
+                    f"execution_plan step {step.get('id')!r} claims the already-observed "
+                    f"seller offers {', '.join(repr(item) for item in missing_items)}, but "
+                    "those quantified items are absent from that seller's live shop "
+                    f"catalogue observed at {catalog_event_at}. Purpose: a shop action "
+                    "cannot buy stock the named merchant does not carry; use actual "
+                    "catalogue items or choose a different grounded acquisition route"
+                )
+            if funds_unknown:
+                continue
             basket: list[dict[str, Any]] = []
             for name, item in catalog.items():
                 match = re.search(
@@ -4279,18 +4342,28 @@ class BotController:
                 "buyer discovery" in sale_recovery_error
                 and "already completed" in sale_recovery_error
             )
+            sale_evidence_exhausted = (
+                "exhausting its source-catalogue sale hypothesis"
+                in sale_recovery_error
+            )
             required_response = (
                 "Build a replacement plan that selects a different exact inventory "
                 "item id or uses a non-sale funding route; merchant discovery cannot "
                 "make the rejected item transferable."
                 if intrinsic_item_reused
                 else (
-                    "Build a replacement plan that omits the repeated merchants lookup, "
-                    "uses a different candidate from its completed result, and preserves "
-                    "a separate travel step before the sale."
-                    if discovery_already_completed
-                    else "Build a replacement plan that discovers a compatible buyer "
-                    "before attempting another sale."
+                    "Build a replacement plan that does not sell or run buyer discovery "
+                    "for this exact item id; use a non-sale prerequisite or materially "
+                    "change inventory."
+                    if sale_evidence_exhausted
+                    else (
+                        "Build a replacement plan that omits the repeated merchants lookup, "
+                        "uses a different candidate from its completed result, and preserves "
+                        "a separate travel step before the sale."
+                        if discovery_already_completed
+                        else "Build a replacement plan that discovers a compatible buyer "
+                        "before attempting another sale."
+                    )
                 )
             )
             self._set_planner_feedback(
@@ -4302,14 +4375,24 @@ class BotController:
                     "kind": (
                         "item_not_npc_transferable"
                         if intrinsic_item_reused
-                        else "merchant_rejected_sale"
+                        else (
+                            "sale_evidence_exhausted"
+                            if sale_evidence_exhausted
+                            else "merchant_rejected_sale"
+                        )
                     ),
                     "purpose": (
                         "Retire a persisted plan that reused an exact inventory item "
                         "the server proved cannot be given to any NPC."
                         if intrinsic_item_reused
-                        else "Retire a persisted pre-enforcement commerce plan after "
-                        "durable evidence disproved its assumed buyer."
+                        else (
+                            "Retire only the exact carried item as a funding route after "
+                            "bounded independent live refusals, without blocking rooms, "
+                            "other items, or the strategic goal."
+                            if sale_evidence_exhausted
+                            else "Retire a persisted pre-enforcement commerce plan after "
+                            "durable evidence disproved its assumed buyer."
+                        )
                     ),
                     "required_response": required_response,
                 },
@@ -4327,17 +4410,32 @@ class BotController:
         )
         if affordability_error is not None:
             self._invalidate_execution_plan(goal, affordability_error)
+            stock_absent = (
+                "absent from that seller's live shop catalogue"
+                in affordability_error
+            )
             self._set_planner_feedback(
                 goal,
                 affordability_error,
                 failure_context={
-                    "kind": "known_basket_unaffordable",
+                    "kind": (
+                        "named_seller_missing_stock"
+                        if stock_absent
+                        else "known_basket_unaffordable"
+                    ),
                     "purpose": (
-                        "Prevent a known shop basket from executing when carried cash "
+                        "Prevent travel or purchase based on items absent from the named "
+                        "seller's already-observed live catalogue."
+                        if stock_absent
+                        else "Prevent a known shop basket from executing when carried cash "
                         "cannot cover its live catalogue price."
                     ),
                     "required_response": (
-                        "Add a preceding grounded funding route for the exact known "
+                        "Use items actually listed by that seller or choose a different "
+                        "source-grounded seller/acquisition prerequisite; more money does "
+                        "not make missing stock available."
+                        if stock_absent
+                        else "Add a preceding grounded funding route for the exact known "
                         "shortfall; preserve active-phase inventory."
                     ),
                 },
@@ -6243,6 +6341,137 @@ class BotController:
             # The item failed Monster.ReqOffer's CanBeGivenToNPC check before
             # ObjectDesired/buyer preference. Buyer discovery cannot repair it.
             return None
+
+        observation = self.last_observation or {}
+        exhausted_items = self._sale_exhausted_items(
+            self._merchant_sale_refusals(goal, observation)
+        )
+        planned_sales_text = canonical_json(
+            [
+                step
+                for step in steps
+                if step.get("tool") in {"sell", "sell_all"}
+            ]
+        ).casefold()
+        for exhausted in exhausted_items:
+            item_id = str(exhausted.get("item_id") or "").casefold()
+            if not item_id or re.search(
+                rf"\b{re.escape(item_id)}\b", planned_sales_text
+            ) is None:
+                continue
+            return (
+                f"exact carried item {item_id} has been rejected by "
+                f"{exhausted.get('distinct_refusing_buyers')} independent live "
+                "buyers, exhausting its source-catalogue sale hypothesis for the "
+                "unchanged inventory; use a non-sale funding route or materially "
+                "change inventory instead of visiting another merchant"
+            )
+        for sale_index, planned_sale in enumerate(steps):
+            if planned_sale.get("tool") not in {"sell", "sell_all"}:
+                continue
+            sale_text = canonical_json(planned_sale).casefold()
+            preceding_movements = [
+                step
+                for step in steps[:sale_index]
+                if step.get("tool") in MOVEMENT_TOOLS
+            ]
+            destination_text = canonical_json(
+                [*(preceding_movements[-1:] or []), planned_sale]
+            ).casefold()
+            for refusal in self._merchant_sale_refusals(goal, observation):
+                item_ids = {
+                    str(value).casefold()
+                    for value in refusal.get("item_ids", [])
+                    if str(value).strip()
+                }
+                item_names = {
+                    " ".join(str(value).split()).casefold()
+                    for value in refusal.get("item_names", [])
+                    if str(value).strip()
+                }
+                same_item = any(
+                    re.search(rf"\b{re.escape(item_id)}\b", sale_text)
+                    for item_id in item_ids
+                ) or any(
+                    re.search(rf"\b{re.escape(item_name)}s?\b", sale_text)
+                    for item_name in item_names
+                )
+                if not same_item:
+                    continue
+                aliases = {
+                    str(value).casefold()
+                    for value in deep_get(refusal, "merchant.aliases", [])
+                    if str(value).strip()
+                }
+                alias_match = next(
+                    (alias for alias in aliases if alias in sale_text),
+                    None,
+                )
+                refused_room = refusal.get("room")
+                room_match = (
+                    refused_room is not None
+                    and re.search(
+                        rf"(?<!\d){re.escape(str(refused_room))}(?!\d)",
+                        destination_text,
+                    )
+                    is not None
+                )
+                if alias_match is None and not room_match:
+                    continue
+                if alias_match is None:
+                    finances = self._financial_context(observation)
+                    distinct_buyer_named = any(
+                        str(candidate.get("merchant") or "").casefold()
+                        in sale_text
+                        for item_row in finances.get("buyer_candidates", [])
+                        if isinstance(item_row, dict)
+                        and " ".join(
+                            str(item_row.get("item") or "").split()
+                        ).casefold()
+                        in item_names
+                        for candidate in item_row.get("candidates", [])
+                        if isinstance(candidate, dict)
+                        and any(
+                            str(room) == str(refused_room)
+                            for room in candidate.get("room_ids", [])
+                        )
+                    )
+                    if distinct_buyer_named:
+                        continue
+                    return (
+                        f"the proposed sale routes the same item back to room "
+                        f"{refused_room} without naming a grounded merchant distinct "
+                        "from the buyer that already refused it there; identify the "
+                        "different merchant explicitly or use another candidate room/item"
+                    )
+                item = next(iter(sorted(item_names or item_ids)), "offered item")
+                live_name = deep_get(refusal, "merchant.live_name")
+                source_classes = deep_get(
+                    refusal, "merchant.source_classes", []
+                )
+                buyer_names = [
+                    str(value)
+                    for value in [
+                        live_name,
+                        *(source_classes if isinstance(source_classes, list) else []),
+                    ]
+                    if value
+                ]
+                buyer = "/".join(dict.fromkeys(buyer_names)) or str(
+                    deep_get(refusal, "merchant.object_id", "that merchant")
+                )
+                object_id = deep_get(refusal, "merchant.object_id")
+                if object_id is not None:
+                    buyer += f" (merchant {object_id})"
+                rejected_identity = (
+                    f"merchant {object_id}" if object_id is not None else buyer
+                )
+                return (
+                    f"the proposed sale reuses {item!r} with buyer {buyer} in "
+                    f"room {refused_room}; {rejected_identity} already rejected that exact "
+                    "item/buyer placement live. Choose a candidate in a different "
+                    "room or offer a materially different unprotected item"
+                )
         sale_recovery_required = failure_kind in sale_failure_kinds
         if not sale_recovery_required:
             blocked_actions = self.storage.get_runtime("blocked_actions", [])
@@ -6268,27 +6497,6 @@ class BotController:
             )
         if not sale_recovery_required:
             return None
-        blocked_actions = self.storage.get_runtime("blocked_actions", [])
-        blocked_actions = (
-            blocked_actions if isinstance(blocked_actions, list) else []
-        )
-        for entry in blocked_actions:
-            if (
-                not isinstance(entry, dict)
-                or entry.get("goal_id") != goal.get("id")
-                or entry.get("tool") not in {"sell", "sell_all"}
-            ):
-                continue
-            rejected_target = deep_get(entry, "arguments.to")
-            if rejected_target is not None and re.search(
-                rf"\b{re.escape(str(rejected_target))}\b", sale_text
-            ):
-                return (
-                    f"the proposed sale targets merchant {rejected_target}, which already "
-                    "rejected this sale tactic; choose a different candidate returned by "
-                    "buyer discovery"
-                )
-
         prior_discovery = self._recent_buyer_discovery_evidence(
             goal, sale_text=sale_text
         )
@@ -6380,6 +6588,29 @@ class BotController:
                 if isinstance(item, dict)
                 and item.get("room") is not None
                 and item.get("excludes_it") is not True
+            ]
+            refusals = self._merchant_sale_refusals(
+                goal, self.last_observation or {}
+            )
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not any(
+                    query.casefold()
+                    in {
+                        " ".join(str(value).split()).casefold()
+                        for value in refusal.get("item_names", [])
+                    }
+                    and str(candidate.get("room")) == str(refusal.get("room"))
+                    and str(candidate.get("merchant") or "").casefold()
+                    in {
+                        str(value).casefold()
+                        for value in deep_get(
+                            refusal, "merchant.aliases", []
+                        )
+                    }
+                    for refusal in refusals
+                )
             ]
             if candidates:
                 return {
@@ -14595,6 +14826,7 @@ class BotController:
             for key in (
                 "carried_shillings",
                 "known_inventory_item_value",
+                "known_liquidatable_inventory_value",
                 "known_total_carried_value",
                 "valuation_complete",
                 "valuation_note",
@@ -14602,7 +14834,14 @@ class BotController:
             )
             if value.get(key) is not None
         }
-        for key in ("valued_items", "unknown_value_items"):
+        for key in (
+            "valued_items",
+            "unknown_value_items",
+            "protected_sale_items",
+            "rejected_buyer_candidates",
+            "merchant_sale_refusals",
+            "sale_exhausted_items",
+        ):
             items = value.get(key)
             if isinstance(items, list):
                 compact[key] = items[:16]
@@ -14615,6 +14854,19 @@ class BotController:
                     "candidate_count": len(item.get("candidates", []))
                     if isinstance(item.get("candidates"), list)
                     else 0,
+                    "usable_room_ids": sorted(
+                        {
+                            room
+                            for candidate in item.get("candidates", [])
+                            if isinstance(candidate, dict)
+                            for room in (
+                                candidate.get("room_ids", [])
+                                if isinstance(candidate.get("room_ids"), list)
+                                else []
+                            )
+                        },
+                        key=str,
+                    )[:12],
                 }
                 for item in buyers[:16]
                 if isinstance(item, dict)
@@ -14781,6 +15033,8 @@ class BotController:
                         "arguments",
                         "room",
                         "reason",
+                        "offered_item_names",
+                        "merchant_identity",
                         "suppressed_count",
                         "updated_at",
                     )
@@ -19779,6 +20033,18 @@ class BotController:
         npc_transfer_restricted_names = self._intrinsically_unsellable_item_names(
             active_goal, observation
         )
+        protected_sale_ids, protected_sale_names = (
+            self._protected_sale_inventory(observation)
+        )
+        merchant_refusals = self._merchant_sale_refusals(
+            active_goal, observation
+        )
+        sale_exhausted_items = self._sale_exhausted_items(merchant_refusals)
+        sale_exhausted_ids = {
+            str(item.get("item_id") or "").casefold()
+            for item in sale_exhausted_items
+            if item.get("item_id")
+        }
         bank_accounts = self._latest_bank_balance_context()
         signature = canonical_json(
             {
@@ -19789,6 +20055,10 @@ class BotController:
                 "npc_transfer_restricted_names": sorted(
                     npc_transfer_restricted_names
                 ),
+                "protected_sale_ids": sorted(protected_sale_ids),
+                "protected_sale_names": sorted(protected_sale_names),
+                "merchant_refusals": merchant_refusals,
+                "sale_exhausted_items": sale_exhausted_items,
                 "bank_accounts": bank_accounts,
             }
         )
@@ -19804,10 +20074,45 @@ class BotController:
         valued_items: list[dict[str, Any]] = []
         unknown_value_items: list[dict[str, Any]] = []
         npc_transfer_restricted_items: list[dict[str, Any]] = []
+        protected_sale_items: list[dict[str, Any]] = []
+        sale_eligible_items: list[dict[str, Any]] = []
         for item in items:
             name = " ".join(str(item.get("name") or "").split())
             if not name or "shilling" in name.casefold():
                 continue
+            item_id = item.get("id", item.get("object_id"))
+            item_id_key = (
+                str(item_id).strip().casefold()
+                if item_id is not None
+                else None
+            )
+            protected_loadout = (
+                item_id_key in protected_sale_ids
+                if item_id_key is not None
+                else name.casefold() in protected_sale_names
+            )
+            transfer_restricted = (
+                item_id_key in npc_transfer_restricted_ids
+                if item_id_key is not None
+                else name.casefold() in npc_transfer_restricted_names
+            )
+            sale_exhausted = bool(
+                item_id_key and item_id_key in sale_exhausted_ids
+            )
+            if protected_loadout:
+                protected_sale_items.append(
+                    {
+                        "id": item_id,
+                        "name": name,
+                        "reason": "equipped or in-use active loadout",
+                    }
+                )
+            if (
+                not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_items.append(item)
             raw_quantity = item.get("amount", item.get("quantity", item.get("count", 1)))
             quantity = (
                 int(raw_quantity)
@@ -19829,13 +20134,11 @@ class BotController:
             if isinstance(unit_value, (int, float)) and not isinstance(unit_value, bool):
                 subtotal = float(unit_value) * quantity
                 known_inventory_value += subtotal
-                item_id = item.get("id", item.get("object_id"))
-                transfer_restricted = (
-                    item_id is not None
-                    and str(item_id).strip().casefold()
-                    in npc_transfer_restricted_ids
-                )
-                if not transfer_restricted:
+                if (
+                    not transfer_restricted
+                    and not protected_loadout
+                    and not sale_exhausted
+                ):
                     known_liquidatable_inventory_value += subtotal
                 valued_items.append(
                     {
@@ -19847,6 +20150,11 @@ class BotController:
                         "basis": basis,
                         "source_ref": source_ref,
                         "npc_transferable": not transfer_restricted,
+                        "sale_protected": protected_loadout,
+                        "sale_evidence_exhausted": sale_exhausted,
+                        "liquidatable": not transfer_restricted
+                        and not protected_loadout
+                        and not sale_exhausted,
                     }
                 )
                 if transfer_restricted:
@@ -19866,6 +20174,7 @@ class BotController:
                         "name": name,
                         "quantity": quantity,
                         "reason": valuation.get("status", "value_unknown"),
+                        "sale_evidence_exhausted": sale_exhausted,
                     }
                 )
 
@@ -19882,6 +20191,20 @@ class BotController:
         known_total: int | float = carried_shillings + known_inventory_value
         if isinstance(known_total, float) and known_total.is_integer():
             known_total = int(known_total)
+        raw_buyers = (
+            self.knowledge.buyer_candidates(
+                sale_eligible_items,
+                per_item_limit=10,
+            )
+            if hasattr(self.knowledge, "buyer_candidates")
+            else []
+        )
+        buyer_candidates, rejected_buyer_candidates = (
+            self._filter_refused_buyer_candidates(
+                raw_buyers,
+                merchant_refusals,
+            )
+        )
         value = {
             "carried_shillings": carried_shillings,
             "known_inventory_item_value": inventory_total,
@@ -19891,6 +20214,7 @@ class BotController:
             "valued_items": valued_items[:30],
             "unknown_value_items": unknown_value_items[:30],
             "npc_transfer_restricted_items": npc_transfer_restricted_items[:30],
+            "protected_sale_items": protected_sale_items[:30],
             "npc_transfer_rules": [
                 {
                     "source": "Create Weapon",
@@ -19902,25 +20226,18 @@ class BotController:
                 }
             ],
             "bank_accounts": bank_accounts,
-            "buyer_candidates": (
-                self.knowledge.buyer_candidates(
-                    [
-                        item
-                        for item in items
-                        if str(item.get("id", item.get("object_id")))
-                        .strip()
-                        .casefold()
-                        not in npc_transfer_restricted_ids
-                    ]
-                )
-                if hasattr(self.knowledge, "buyer_candidates")
-                else []
-            ),
+            "buyer_candidates": buyer_candidates,
+            "rejected_buyer_candidates": rejected_buyer_candidates,
+            "merchant_sale_refusals": merchant_refusals,
+            "sale_exhausted_items": sale_exhausted_items,
             "valuation_note": (
                 "Best-effort base/live values, not a guaranteed merchant resale quote. "
-                "known_liquidatable_inventory_value excludes exact instances the live "
-                "server proved cannot be given to an NPC. Unknown items mean the true "
-                "total may be higher."
+                "known_liquidatable_inventory_value excludes equipped/in-use loadout "
+                "items and exact instances the live server proved cannot be given to an "
+                "NPC and exact carried items whose source sale hypothesis was disproved "
+                f"by {SALE_BUYER_REFUSAL_LIMIT} independent live buyers. Source buyer "
+                "candidates exclude exact item/merchant/room placements already refused "
+                "live. Unknown items mean the true total may be higher."
             ),
             "banking_policy": {
                 "mode": "planner_discretion",
@@ -20000,6 +20317,351 @@ class BotController:
             if item_id is not None and str(item_id).strip():
                 result.add(str(item_id).strip().casefold())
         return result
+
+    @staticmethod
+    def _merchant_speaker_name(reason: Any) -> str | None:
+        """Recover the live NPC name from an authoritative refusal message."""
+
+        text = " ".join(str(reason or "").split())
+        match = re.match(
+            r'^\s*([^\"]+?)\s+(?:tells\s+you|says)(?:\s*,)?\s*[,:]?\s*[\"]',
+            text,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        name = match.group(1).strip(" ,:'\"")
+        return name or None
+
+    @staticmethod
+    def _protected_sale_inventory(
+        observation: dict[str, Any],
+    ) -> tuple[set[str], set[str]]:
+        """Return exact carried items protected by the active loadout.
+
+        Source value and NPC transferability do not make equipped gear
+        liquidatable. Prefer exact ids so an unequipped duplicate with the same
+        name remains eligible. A name-only equipment record protects the name
+        only when there is one matching carried instance.
+        """
+
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = raw_items if isinstance(raw_items, list) else []
+        equipped = deep_get(observation, "equipment.equipped", [])
+        equipped = equipped if isinstance(equipped, list) else []
+        protected_ids: set[str] = set()
+        unresolved_names: set[str] = set()
+        counts: dict[str, int] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+            if item.get("in_use") is True or item.get("equipped") is True:
+                item_id = item.get("id", item.get("object_id"))
+                if item_id is not None:
+                    protected_ids.add(str(item_id).strip().casefold())
+                elif name:
+                    unresolved_names.add(name)
+        for item in equipped:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id", item.get("object_id"))
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if item_id is not None:
+                protected_ids.add(str(item_id).strip().casefold())
+            elif name:
+                unresolved_names.add(name)
+        protected_names = {
+            name for name in unresolved_names if counts.get(name, 0) == 1
+        }
+        return protected_ids, protected_names
+
+    def _merchant_sale_refusals(
+        self,
+        goal: dict[str, Any] | None,
+        observation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Normalize live buyer refusals across NPC ids and source classes."""
+
+        if not isinstance(goal, dict):
+            return []
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        source_buyers = (
+            self.knowledge.buyer_candidates(items, per_item_limit=10)
+            if hasattr(self.knowledge, "buyer_candidates")
+            else []
+        )
+        buyer_rows = {
+            " ".join(str(row.get("item") or "").split()).casefold(): row
+            for row in source_buyers
+            if isinstance(row, dict) and row.get("item")
+        }
+        result: list[dict[str, Any]] = []
+        entries = self.storage.get_runtime("blocked_actions", [])
+        for entry in entries if isinstance(entries, list) else []:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("goal_id") != goal.get("id")
+                or entry.get("tool") not in {"sell", "sell_all"}
+                or deep_get(
+                    self._failure_context(
+                        str(entry.get("tool") or ""),
+                        str(entry.get("reason") or ""),
+                        observation,
+                    ),
+                    "kind",
+                )
+                != "merchant_rejected_sale"
+            ):
+                continue
+            arguments = entry.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            item_names = {
+                " ".join(str(value).split()).casefold()
+                for value in entry.get("offered_item_names", [])
+                if str(value).strip()
+            } if isinstance(entry.get("offered_item_names"), list) else set()
+            item_names.update(
+                self._sale_selected_item_names(arguments, observation)
+            )
+            room = entry.get("room")
+            identity = entry.get("merchant_identity")
+            identity = identity if isinstance(identity, dict) else {}
+            live_name = str(
+                identity.get("live_name")
+                or self._merchant_speaker_name(entry.get("reason"))
+                or ""
+            ).strip()
+            live_name_key = " ".join(live_name.split()).casefold()
+            target = identity.get("object_id", arguments.get("to"))
+            target_key = (
+                str(target).strip().casefold() if target is not None else ""
+            )
+            source_classes: set[str] = set()
+            resolved_identity = (
+                self.knowledge.merchant_identity(
+                    object_id=target,
+                    name=live_name,
+                )
+                if hasattr(self.knowledge, "merchant_identity")
+                else None
+            )
+            if isinstance(resolved_identity, dict) and resolved_identity.get(
+                "merchant_class"
+            ):
+                source_classes.add(str(resolved_identity["merchant_class"]))
+            for item_name in item_names:
+                row = buyer_rows.get(item_name)
+                candidates = row.get("candidates") if isinstance(row, dict) else []
+                for candidate in candidates if isinstance(candidates, list) else []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    instances = candidate.get("instances")
+                    instances = instances if isinstance(instances, list) else []
+                    identity_match = any(
+                        isinstance(instance, dict)
+                        and (
+                            (
+                                target_key
+                                and str(
+                                    instance.get("seller_id_at_build")
+                                ).strip().casefold()
+                                == target_key
+                            )
+                            or (
+                                live_name_key
+                                and " ".join(
+                                    str(instance.get("name") or "").split()
+                                ).casefold()
+                                == live_name_key
+                            )
+                        )
+                        for instance in instances
+                    )
+                    if not identity_match:
+                        continue
+                    merchant_class = str(candidate.get("merchant") or "").strip()
+                    if merchant_class:
+                        source_classes.add(merchant_class)
+            if isinstance(identity.get("source_classes"), list):
+                source_classes.update(
+                    str(value).strip()
+                    for value in identity["source_classes"]
+                    if str(value).strip()
+                )
+            aliases = {
+                value.casefold()
+                for value in [live_name, *source_classes]
+                if value
+            }
+            if target is not None:
+                aliases.add(str(target).strip().casefold())
+            result.append(
+                {
+                    "tool": entry.get("tool"),
+                    "room": room,
+                    "item_ids": sorted(self._sale_item_ids(arguments)),
+                    "item_names": sorted(item_names),
+                    "merchant": {
+                        "object_id": target,
+                        "live_name": live_name or None,
+                        "source_classes": sorted(source_classes),
+                        "aliases": sorted(aliases),
+                    },
+                    "reason": str(entry.get("reason") or "")[:500],
+                    "updated_at": entry.get("updated_at"),
+                }
+            )
+        return result[-20:]
+
+    @staticmethod
+    def _sale_exhausted_items(
+        refusals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Retire one exact carried item after independent buyer disprovals.
+
+        This is deliberately neither room-wide nor goal-wide. A single refusal
+        removes only that buyer placement. Reaching the bound means enough live
+        buyers have independently disproved the source catalogue's sale
+        hypothesis for this exact object id; a new item id remains eligible.
+        """
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for refusal in refusals:
+            if not isinstance(refusal, dict):
+                continue
+            merchant = refusal.get("merchant")
+            merchant = merchant if isinstance(merchant, dict) else {}
+            identity = str(
+                merchant.get("object_id")
+                or merchant.get("live_name")
+                or ""
+            ).strip().casefold()
+            if not identity:
+                continue
+            for raw_item_id in refusal.get("item_ids", []):
+                item_id = str(raw_item_id).strip().casefold()
+                if not item_id:
+                    continue
+                row = grouped.setdefault(
+                    item_id,
+                    {
+                        "item_id": item_id,
+                        "item_names": set(),
+                        "merchant_identities": set(),
+                        "refusals": [],
+                    },
+                )
+                row["item_names"].update(
+                    " ".join(str(value).split()).casefold()
+                    for value in refusal.get("item_names", [])
+                    if str(value).strip()
+                )
+                row["merchant_identities"].add(identity)
+                row["refusals"].append(refusal)
+        result: list[dict[str, Any]] = []
+        for row in grouped.values():
+            identities = row["merchant_identities"]
+            if len(identities) < SALE_BUYER_REFUSAL_LIMIT:
+                continue
+            result.append(
+                {
+                    "item_id": row["item_id"],
+                    "item_names": sorted(row["item_names"]),
+                    "distinct_refusing_buyers": len(identities),
+                    "threshold": SALE_BUYER_REFUSAL_LIMIT,
+                    "scope": "exact_carried_item_instance",
+                    "reason": (
+                        "multiple independent live buyers rejected this exact "
+                        "item; use a non-sale funding route or materially change "
+                        "inventory before retrying it"
+                    ),
+                }
+            )
+        return sorted(result, key=lambda item: item["item_id"])
+
+    @staticmethod
+    def _filter_refused_buyer_candidates(
+        buyers: list[dict[str, Any]],
+        refusals: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Remove only exact item/merchant/room placements disproved live."""
+
+        usable: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for raw in buyers:
+            if not isinstance(raw, dict):
+                continue
+            item_name = " ".join(str(raw.get("item") or "").split()).casefold()
+            item_refusals = [
+                refusal
+                for refusal in refusals
+                if item_name in set(refusal.get("item_names", []))
+            ]
+            candidates: list[dict[str, Any]] = []
+            for raw_candidate in raw.get("candidates", []):
+                if not isinstance(raw_candidate, dict):
+                    continue
+                candidate = dict(raw_candidate)
+                room_ids = (
+                    list(candidate.get("room_ids", []))
+                    if isinstance(candidate.get("room_ids"), list)
+                    else []
+                )
+                merchant_class = str(
+                    candidate.get("merchant") or ""
+                ).casefold()
+                matching_refusals = [
+                    refusal
+                    for refusal in item_refusals
+                    if merchant_class
+                    and merchant_class
+                    in {
+                        str(value).casefold()
+                        for value in deep_get(
+                            refusal, "merchant.aliases", []
+                        )
+                    }
+                ]
+                refused_rooms = {
+                    str(refusal.get("room"))
+                    for refusal in matching_refusals
+                    if refusal.get("room") is not None
+                }
+                kept_rooms = [
+                    room for room in room_ids if str(room) not in refused_rooms
+                ]
+                removed_rooms = [
+                    room for room in room_ids if str(room) in refused_rooms
+                ]
+                if removed_rooms:
+                    matching = next(
+                        (
+                            refusal
+                            for refusal in matching_refusals
+                            if str(refusal.get("room"))
+                            in {str(room) for room in removed_rooms}
+                        ),
+                        {},
+                    )
+                    rejected.append(
+                        {
+                            "item": raw.get("item"),
+                            "merchant": candidate.get("merchant"),
+                            "room_ids": removed_rooms,
+                            "live_name": deep_get(matching, "merchant.live_name"),
+                            "reason": matching.get("reason"),
+                            "scope": "exact_item_buyer_placement",
+                        }
+                    )
+                if kept_rooms:
+                    candidate["room_ids"] = kept_rooms
+                    candidates.append(candidate)
+            usable.append({**raw, "candidates": candidates[:5]})
+        return usable, rejected[-30:]
 
     def _intrinsically_unsellable_item_ids(
         self,
@@ -20334,6 +20996,24 @@ class BotController:
         arguments: dict[str, Any],
         reason: str,
     ) -> None:
+        failure_kind = str(
+            deep_get(
+                self._failure_context(tool, reason, observation) or {},
+                "kind",
+                "",
+            )
+        )
+        offered_item_names = (
+            sorted(self._sale_selected_item_names(arguments, observation))
+            if tool in {"sell", "sell_all"}
+            else []
+        )
+        merchant_identity = None
+        if failure_kind == "merchant_rejected_sale":
+            merchant_identity = {
+                "object_id": arguments.get("to"),
+                "live_name": self._merchant_speaker_name(reason),
+            }
         self._save_blocked_action(
             {
                 "goal_id": goal["id"],
@@ -20347,6 +21027,16 @@ class BotController:
                 ),
                 "equipment_attempt_hash": self._equipment_attempt_hash(tool, observation),
                 "reason": reason[:500],
+                **(
+                    {"offered_item_names": offered_item_names}
+                    if offered_item_names
+                    else {}
+                ),
+                **(
+                    {"merchant_identity": merchant_identity}
+                    if merchant_identity is not None
+                    else {}
+                ),
                 "suppressed_count": 0,
                 "updated_at": timestamp(),
             }

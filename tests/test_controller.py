@@ -3644,6 +3644,20 @@ class ControllerTests(unittest.TestCase):
                 self.assertIn("6 elderberry @ 28", error or "")
                 self.assertIn("bank room 54", error or "")
 
+                unsupported_stock = [
+                    {
+                        "id": "buy-invented-stock",
+                        "tool": "shop",
+                        "outcome": "Buy 2 apples and 1 herb from seller 711.",
+                        "verification": "Inventory contains apples and herb.",
+                    }
+                ]
+                stock_error = controller._shop_plan_affordability_error(
+                    unsupported_stock, observation
+                )
+                self.assertIn("offers 'apples'", stock_error or "")
+                self.assertIn("absent from that seller's live shop catalogue", stock_error or "")
+
                 funded = [
                     {
                         "id": "reach-bank",
@@ -8437,7 +8451,7 @@ class ControllerTests(unittest.TestCase):
 
                 refused_buyer = copy.deepcopy(ungrounded)
                 refused_buyer["steps"][0]["outcome"] = (
-                    "Sell the rusty sword to D'Franco merchant 736."
+                    "Sell exact rusty sword item id 7525 to D'Franco merchant 736."
                 )
                 with self.assertRaisesRegex(
                     ModelError, "merchant 736.*already rejected"
@@ -8448,6 +8462,296 @@ class ControllerTests(unittest.TestCase):
                         grounding={"valid": True},
                         revision=True,
                     )
+            finally:
+                controller.storage.close()
+
+    def test_sale_refusal_unifies_live_npc_with_source_class_across_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="merchant-alias-refusal")
+                )["goal"]
+                controller.storage.promote()
+                observation = {
+                    "look": {"room": {"num": 103, "name": "The Bhrama & Falcon"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 1, "name": "shillings", "amount": 12},
+                            {"id": 7597, "name": "herb"},
+                            {"id": 8000, "name": "sapphire"},
+                        ]
+                    },
+                }
+                controller.last_observation = observation
+                controller.knowledge.buyer_candidates = (  # type: ignore[method-assign]
+                    lambda items, per_item_limit=5: [
+                        {
+                            "item": item["name"],
+                            "item_kind": "reagent",
+                            "inferred_source_category": "Reagent",
+                            "candidates": [
+                                {
+                                    "merchant": "BarloqueInnkeeper",
+                                    "room_ids": [106],
+                                    "buys_anything": True,
+                                    "instances": [
+                                        {
+                                            "seller_id_at_build": 736,
+                                            "name": "Pritchett",
+                                            "room_id": 106,
+                                        }
+                                    ],
+                                },
+                                {
+                                    "merchant": "Assassin",
+                                    "room_ids": [110],
+                                    "buys_anything": True,
+                                    "instances": [
+                                        {
+                                            "seller_id_at_build": 900,
+                                            "name": "Roq",
+                                            "room_id": 110,
+                                        }
+                                    ],
+                                },
+                                {
+                                    "merchant": "SpareMerchant",
+                                    "room_ids": [106],
+                                    "buys_anything": True,
+                                    "instances": [
+                                        {
+                                            "seller_id_at_build": 999,
+                                            "name": "Other NPC",
+                                            "room_id": 106,
+                                        }
+                                    ],
+                                },
+                            ][:per_item_limit],
+                            "next_evidence": "Get a live quote.",
+                        }
+                        for item in items
+                        if "shilling" not in item["name"].casefold()
+                    ]
+                )
+                # Legacy persisted evidence has neither offered_item_names nor
+                # merchant_identity. The migration must recover both from the
+                # current inventory, refusal prose, and source room placement.
+                controller.storage.set_runtime(
+                    "blocked_actions",
+                    [
+                        {
+                            "goal_id": goal["id"],
+                            "signature": "legacy-sale-signature",
+                            "tool": "sell",
+                            "arguments": {
+                                "to": 736,
+                                "items": [7597],
+                                "confirm": False,
+                            },
+                            "room": 106,
+                            "reason": (
+                                'Pritchett tells you, "Whyfore dost you offer me that?"'
+                            ),
+                            "updated_at": "2000-01-01T00:00:00.000Z",
+                        }
+                    ],
+                )
+
+                finances = controller._financial_context(observation)
+
+                herb_buyers = next(
+                    item
+                    for item in finances["buyer_candidates"]
+                    if item["item"] == "herb"
+                )
+                self.assertEqual(
+                    ["Assassin", "SpareMerchant"],
+                    [item["merchant"] for item in herb_buyers["candidates"]],
+                )
+                rejected = finances["rejected_buyer_candidates"][0]
+                self.assertEqual("BarloqueInnkeeper", rejected["merchant"])
+                self.assertEqual([106], rejected["room_ids"])
+                self.assertEqual("Pritchett", rejected["live_name"])
+                refusal = finances["merchant_sale_refusals"][0]
+                self.assertIn(
+                    "barloqueinnkeeper",
+                    refusal["merchant"]["aliases"],
+                )
+
+                controller.storage.emit_event(
+                    "action.no_progress",
+                    "Buyer lookup returned only the already-refused buyer.",
+                    goal_id=goal["id"],
+                    data={
+                        "tool": "merchants",
+                        "arguments": {"buys": "herb"},
+                        "result": {
+                            "buys_anything": [
+                                {
+                                    "merchant": "BarloqueInnkeeper",
+                                    "room": 106,
+                                }
+                            ],
+                            "rules_mentioning": [],
+                        },
+                    },
+                )
+                self.assertIsNone(
+                    controller._recent_buyer_discovery_evidence(
+                        goal, sale_text="sell herb"
+                    )
+                )
+
+                repeated = [
+                    {
+                        "id": "travel-106",
+                        "tool": "travel",
+                        "outcome": "Travel to Brownestone Inn room 106.",
+                        "verification": "Current room is 106.",
+                    },
+                    {
+                        "id": "sell-herb",
+                        "tool": "sell",
+                        "outcome": (
+                            "Sell herb id 7597 to BarloqueInnkeeper for funds."
+                        ),
+                        "verification": "Carried shillings increase.",
+                    },
+                ]
+                error = controller._sale_recovery_plan_error(goal, repeated)
+                self.assertIn("Pritchett/BarloqueInnkeeper", error or "")
+                self.assertIn("merchant 736 already rejected", error or "")
+
+                different_buyer = [
+                    {
+                        "id": "find-herb-buyer",
+                        "tool": "merchants",
+                        "outcome": "Find merchants that buy herb.",
+                        "verification": "Candidate rooms are returned.",
+                    },
+                    {
+                        "id": "travel-110",
+                        "tool": "travel",
+                        "outcome": "Travel to Assassin in room 110.",
+                        "verification": "Current room is 110.",
+                    },
+                    {
+                        "id": "sell-herb-elsewhere",
+                        "tool": "sell",
+                        "outcome": "Quote herb id 7597 with Assassin.",
+                        "verification": "A positive live quote is returned.",
+                    },
+                ]
+                self.assertIsNone(
+                    controller._sale_recovery_plan_error(goal, different_buyer)
+                )
+
+                same_room_different_buyer = copy.deepcopy(repeated)
+                same_room_different_buyer.insert(
+                    0,
+                    {
+                        "id": "find-other-herb-buyer",
+                        "tool": "merchants",
+                        "outcome": "Find merchants that buy herb.",
+                        "verification": "Candidate rooms are returned.",
+                    },
+                )
+                same_room_different_buyer[-1]["outcome"] = (
+                    "Quote herb id 7597 with SpareMerchant."
+                )
+                same_room_different_buyer[-1]["id"] = "sell-herb-to-spare"
+                self.assertIsNone(
+                    controller._sale_recovery_plan_error(
+                        goal, same_room_different_buyer
+                    )
+                )
+
+                different_item = copy.deepcopy(repeated)
+                different_item.insert(
+                    0,
+                    {
+                        "id": "find-sapphire-buyer",
+                        "tool": "merchants",
+                        "outcome": "Find merchants that buy sapphire.",
+                        "verification": "Candidate rooms are returned.",
+                    },
+                )
+                different_item[-1]["outcome"] = (
+                    "Quote sapphire id 8000 with BarloqueInnkeeper."
+                )
+                different_item[-1]["id"] = "sell-sapphire"
+                self.assertIsNone(
+                    controller._sale_recovery_plan_error(goal, different_item)
+                )
+
+                controller._record_blocked_action(
+                    goal,
+                    {
+                        **observation,
+                        "look": {"room": {"num": 110, "name": "A shadowy corner"}},
+                    },
+                    "sell",
+                    {"to": 900, "items": [7597], "confirm": False},
+                    'Roq tells you, "I simply have no need for that."',
+                )
+                controller._record_blocked_action(
+                    goal,
+                    {
+                        **observation,
+                        "look": {"room": {"num": 106, "name": "Shared market"}},
+                    },
+                    "sell",
+                    {"to": 999, "items": [7597], "confirm": False},
+                    'Other NPC tells you, "I simply have no need for that."',
+                )
+                exhausted_finances = controller._financial_context(observation)
+                self.assertEqual(
+                    [
+                        {
+                            "item_id": "7597",
+                            "item_names": ["herb"],
+                            "distinct_refusing_buyers": 3,
+                            "threshold": 3,
+                            "scope": "exact_carried_item_instance",
+                            "reason": (
+                                "multiple independent live buyers rejected this exact "
+                                "item; use a non-sale funding route or materially change "
+                                "inventory before retrying it"
+                            ),
+                        }
+                    ],
+                    exhausted_finances["sale_exhausted_items"],
+                )
+                self.assertNotIn(
+                    "herb",
+                    {
+                        row["item"]
+                        for row in exhausted_finances["buyer_candidates"]
+                    },
+                )
+                self.assertIn(
+                    "sapphire",
+                    {
+                        row["item"]
+                        for row in exhausted_finances["buyer_candidates"]
+                    },
+                )
+                exhausted_plan = [
+                    {
+                        "id": "sell-herb-to-fourth-buyer",
+                        "tool": "sell",
+                        "outcome": "Sell exact herb id 7597 to a fourth merchant.",
+                        "verification": "Carried shillings increase.",
+                    }
+                ]
+                self.assertIn(
+                    "3 independent live buyers",
+                    controller._sale_recovery_plan_error(
+                        goal, exhausted_plan
+                    )
+                    or "",
+                )
             finally:
                 controller.storage.close()
 

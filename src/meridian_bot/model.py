@@ -252,6 +252,14 @@ financial_context.bank_accounts contains durable last-known balance evidence fro
 When it shows positive funds and selling would consume an item required by the active phase, preserve the item:
 travel to the canonical bank room, live-check/withdraw enough funds, then continue the purchase. A stale balance
 still requires a live bank call before transfer, but it is grounded evidence that this route exists.
+financial_context.known_liquidatable_inventory_value excludes equipped/in-use gear and intrinsically
+non-transferable items; do not count protected_sale_items as funding even when they have a source base value.
+merchant_sale_refusals and rejected_buyer_candidates unify the live NPC name/id with source merchant classes.
+A rejected item/buyer placement remains disproved across phase replacement: do not restore it under the source
+class name, an NPC display name, or a new plan summary. Choose a different remaining room placement or item.
+sale_exhausted_items is narrower than a room or goal block: three independent buyers disproved only that exact
+carried item id while inventory is unchanged. Do not query or visit a fourth merchant for it; choose a non-sale
+funding prerequisite or materially change inventory.
 When a recent shop catalogue gives unit prices and the basket quantity is known, multiply them and compare the
 exact total with financial_context.carried_shillings. Any shortfall requires a funding step before purchase;
 nonzero carried cash alone never proves the basket is affordable.
@@ -463,6 +471,15 @@ For a 10-15 HP outcome, choose local progression milestones and rerank after eac
 recovery, commerce, equipment, supplies, and banking choices. Banking is discretionary; carried cash never blocks
 useful work. Full inventory should normally become a free_inventory_capacity or liquidate_inventory phase supplied
 with item/category/value/buyer facts; decide whether to sell, retain, bank, or drop rather than assuming one answer.
+A source base value is not spendable funding. Use financial_context.known_liquidatable_inventory_value, never
+known_inventory_item_value, when assessing sale capacity; protected_sale_items are equipped/in-use and unavailable
+for liquidation. Treat merchant_sale_refusals and rejected_buyer_candidates as exact live negative evidence even
+when the source class differs from the NPC display name. Never replace a failed support phase with another phase
+whose funding premise is the same rejected item/buyer placement. If no usable buyer room, positive bank balance,
+affordable purchase, or currently castable production route remains, choose a materially different prerequisite
+phase rather than recycling commerce prose.
+sale_exhausted_items means the bounded live buyer search for one exact carried object is finished; it never blocks
+the strategic goal, other carried items, or other merchants for a newly acquired instance.
 A broken or absent wielded weapon may push acquire_item, then resume the parent phase. A keeper withdrawal or death
 may push recover. Reuse a recent successful room/prey tactic while it remains level-eligible; seek a materially
 different grounded tactic only after durable safety, stagnation, or route evidence disproves the prior one.

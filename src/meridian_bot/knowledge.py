@@ -21,7 +21,7 @@ from .utils import canonical_json, deep_get, timestamp
 
 
 KNOWLEDGE_TOOL_NAME = "knowledge_search"
-INDEX_VERSION = 6
+INDEX_VERSION = 7
 ENTITY_KINDS = (
     "location",
     "region",
@@ -824,6 +824,7 @@ class KnowledgeBase:
                 instances.append(
                     {
                         "seller_id_at_build": record.get("id"),
+                        "name": str(record.get("name") or "").strip() or None,
                         "room_id": room_id,
                         "room_name": room_name,
                         "seen": seen,
@@ -1238,6 +1239,18 @@ class KnowledgeBase:
                             "buying_categories": categories,
                             "verification": facts.get("sale_verification"),
                             "entity_id": merchant_row["id"],
+                            "instances": [
+                                {
+                                    "seller_id_at_build": instance.get(
+                                        "seller_id_at_build"
+                                    ),
+                                    "name": instance.get("name"),
+                                    "room_id": instance.get("room_id"),
+                                }
+                                for instance in facts.get("instances", [])
+                                if isinstance(instance, dict)
+                                and instance.get("placed") is True
+                            ],
                         }
                     )
                 values.append(
@@ -1253,6 +1266,66 @@ class KnowledgeBase:
                     }
                 )
             return values
+        finally:
+            connection.close()
+
+    def merchant_identity(
+        self,
+        *,
+        object_id: Any = None,
+        name: Any = None,
+    ) -> dict[str, Any] | None:
+        """Resolve a live merchant identity against every catalogue instance.
+
+        Buyer queries are deliberately bounded, so they cannot also serve as a
+        complete live-name/object-id alias index. This lookup is independent of
+        an item's alleged buying category and therefore still resolves a buyer
+        after live evidence disproves the catalogue's acceptance claim.
+        """
+
+        if not self.available:
+            return None
+        object_key = str(object_id).strip().casefold() if object_id is not None else ""
+        name_key = " ".join(str(name or "").split()).casefold()
+        if not object_key and not name_key:
+            return None
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id,canonical_name,payload_json FROM entities "
+                "WHERE kind='merchant' ORDER BY canonical_name"
+            ).fetchall()
+            for row in rows:
+                facts = json.loads(row["payload_json"])
+                for instance in facts.get("instances", []):
+                    if not isinstance(instance, dict):
+                        continue
+                    instance_id = instance.get("seller_id_at_build")
+                    instance_name = " ".join(
+                        str(instance.get("name") or "").split()
+                    )
+                    id_match = (
+                        object_key
+                        and instance_id is not None
+                        and str(instance_id).strip().casefold() == object_key
+                    )
+                    name_match = (
+                        name_key and instance_name.casefold() == name_key
+                    )
+                    if not id_match and not name_match:
+                        continue
+                    return {
+                        "merchant_class": facts.get("merchant_class")
+                        or row["canonical_name"],
+                        "entity_id": row["id"],
+                        "instance": {
+                            "seller_id_at_build": instance_id,
+                            "name": instance_name or None,
+                            "room_id": instance.get("room_id"),
+                        },
+                        "matched_by": "object_id" if id_match else "name",
+                    }
+            return None
         finally:
             connection.close()
 
