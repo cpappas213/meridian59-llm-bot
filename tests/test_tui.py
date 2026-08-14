@@ -596,6 +596,39 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertIn("MERIDIAN 59 BOT CONSOLE", output.getvalue())
 
+    def test_tui_manual_refresh_repolls_and_displays_acknowledgement(self) -> None:
+        class CountingApi(FakeApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status_requests = 0
+                self.goal_requests = 0
+                self.event_requests = 0
+
+            def status(self) -> dict[str, object]:
+                self.status_requests += 1
+                return super().status()
+
+            def goals(self) -> list[dict[str, object]]:
+                self.goal_requests += 1
+                return super().goals()
+
+            def events(self) -> list[dict[str, object]]:
+                self.event_requests += 1
+                return super().events()
+
+        api = CountingApi()
+        keys = iter(["r", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(api, key_reader=lambda _: next(keys))
+
+        self.assertEqual(0, result)
+        self.assertEqual(2, api.status_requests)
+        self.assertEqual(2, api.goal_requests)
+        self.assertEqual(2, api.event_requests)
+        self.assertIn("Manual refresh complete at", output.getvalue())
+
     def test_tui_submits_only_after_draft_approval(self) -> None:
         api = FakeApi()
         keys = iter(["n", "q"])

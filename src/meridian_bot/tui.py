@@ -1199,25 +1199,36 @@ def run_tui(
     goals: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     message = "Connecting to the controller..."
+    manual_refresh_requested = False
     try:
         while True:
             try:
                 status = api.status()
                 goals = api.goals()
                 events = api.events()
-                if message == "Connecting to the controller..." or message.startswith(
+                if manual_refresh_requested:
+                    message = (
+                        "Manual refresh complete at "
+                        + time.strftime("%H:%M:%S")
+                        + "."
+                    )
+                elif message == "Connecting to the controller..." or message.startswith(
                     "controller unavailable"
                 ):
                     message = "Controller connection restored."
             except ControllerApiError as exc:
                 message = str(exc)
+            manual_refresh_requested = False
             _draw(
                 render_dashboard(
                     status, goals, events, message=message, color=color
                 )
             )
             key = key_reader(refresh_seconds)
-            if key is None or key == "r":
+            if key is None:
+                continue
+            if key == "r":
+                manual_refresh_requested = True
                 continue
             if key == "\x1b":
                 message = "Main console already active."
