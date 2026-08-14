@@ -104,7 +104,7 @@ class FixedModel:
                     "room": int(assigned_match.group(1)),
                     "use_safe_spots": "use_safe_spots=false" not in notes.casefold(),
                     "flee_below": 0.60,
-                    "fight_above_vigor": 100,
+                    "fight_above_vigor": 80,
                 },
                 "rationale": "Use the operator's grounded farm recipe.",
             }
@@ -831,7 +831,7 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_safe_spot: object = False
         self.farm_journal: list[object] = []
         self.farm_flee_below = 0.75
-        self.farm_fight_above_vigor = 100
+        self.farm_fight_above_vigor = 80
         self.farm_use_safe_spots = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
@@ -2570,7 +2570,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 6,
                             "use_safe_spots": False,
                             "flee_below": 0.70,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                     },
                     mode="start",
@@ -2771,7 +2771,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 6,
                             "use_safe_spots": False,
                             "flee_below": 0.70,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                     },
                     mode="start",
@@ -2900,7 +2900,7 @@ class ControllerTests(unittest.TestCase):
                             "target": "ant",
                             "use_safe_spots": False,
                             "flee_below": 0.60,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                         "rationale": "Exercise the safe exhaustion boundary.",
                     },
@@ -3733,7 +3733,7 @@ class ControllerTests(unittest.TestCase):
                         "id": "buy-enough-food",
                         "tool": "shop",
                         "outcome": "Buy enough food from seller 674 using carried shillings.",
-                        "verification": "Inventory contains enough food for 100 vigor.",
+                        "verification": "Inventory contains enough food for optional endurance.",
                     }
                 ]
 
@@ -5422,7 +5422,7 @@ class ControllerTests(unittest.TestCase):
                             },
                             "operator_notes": (
                                 "hunt=groundworm larva; assigned_room=557; "
-                                "use_safe_spots=true; fight_above_vigor=100"
+                                "use_safe_spots=true; fight_above_vigor=80"
                             ),
                         },
                     )
@@ -7139,7 +7139,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("centipede", farm["context"]["target"])
                 self.assertTrue(farm["context"]["use_safe_spots"])
                 self.assertEqual(0.60, farm["context"]["flee_below"])
-                self.assertEqual(100, farm["context"]["fight_above_vigor"])
+                self.assertEqual(80, farm["context"]["fight_above_vigor"])
                 self.assertEqual(28, farm["context"]["next_hp_milestone"])
                 self.assertEqual(
                     farm["id"],
@@ -7347,7 +7347,7 @@ class ControllerTests(unittest.TestCase):
                                 "target": "centipede",
                                 "use_safe_spots": True,
                                 "flee_below": 0.60,
-                                "fight_above_vigor": 100,
+                                "fight_above_vigor": 80,
                             },
                             "rationale": "Use the validated research recipe.",
                         },
@@ -10439,7 +10439,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_background_farm_waits_for_its_numeric_vigor_gate(self) -> None:
+    def test_background_farm_uses_rested_floor_without_food_support(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -10471,24 +10471,6 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="start",
                 )
-                stale_lesson = controller.learning.defer_goal(
-                    goal,
-                    broker.observe(),
-                    tool="autopilot",
-                    arguments={
-                        "action": "start",
-                        "mode": "farm",
-                        "hunt": "giant rat",
-                        "assigned_room": 575,
-                    },
-                    reason=(
-                        "Repeated deterministic safety suppression exhausted the "
-                        "controller wait budget: recover combat vigor before launch"
-                    ),
-                    classification="ineffective_tactic",
-                    scope="tactic",
-                )["lesson"]
-
                 result = controller._execute(
                     goal,
                     broker.observe(),
@@ -10505,33 +10487,99 @@ class ControllerTests(unittest.TestCase):
                     },
                 )
 
-                self.assertTrue(result["safety_suppressed"])
-                self.assertTrue(result["campaign_support_phase_started"])
-                self.assertIn("recover_combat_vigor", {item["kind"] for item in result["blockers"]})
-                blocker = next(item for item in result["blockers"] if item["kind"] == "recover_combat_vigor")
-                self.assertIn("resting stops at 80 vigor", blocker["guidance"])
-                support = controller.storage.active_campaign_phase(run["id"])
-                self.assertEqual("prepare_combat", support["kind"])
-                self.assertEqual(farm["id"], support["parent_phase_id"])
-                self.assertEqual(
-                    {
-                        "id": "combat-vigor-100",
-                        "kind": "numeric_threshold",
-                        "metric": "status.vitals.vigor.value",
-                        "operator": ">=",
-                        "value": 100,
-                    },
-                    support["success_criteria"][0],
+                self.assertEqual("autopilot", result["action"])
+                self.assertNotIn(
+                    "recover_combat_vigor",
+                    {item["kind"] for item in result.get("blockers", [])},
                 )
+                call = next(
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                )
+                self.assertEqual(80, call["fight_above_vigor"])
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(farm["id"], active["id"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
-                self.assertIsNone(
-                    controller.storage.get_runtime("safety_suppression_v1")
+            finally:
+                controller.storage.close()
+
+    def test_obsolete_above_rest_vigor_phase_resumes_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="retire-obsolete-vigor-gate")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                farm = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats in room 575.",
+                        "success_criteria": [
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "context": {
+                            "room": 575,
+                            "target": "giant rat",
+                            "fight_above_vigor": 100,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
                 )
+                support = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Raise vigor to the former 100-vigor floor.",
+                        "success_criteria": [
+                            {
+                                "id": "legacy-combat-vigor-100",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.vigor.value",
+                                "operator": ">=",
+                                "value": 100,
+                            }
+                        ],
+                        "context": {
+                            "reason": "recover_combat_vigor",
+                            "required_vigor": 100,
+                            "resume_combat_phase_id": farm["id"],
+                        },
+                    },
+                    mode="push",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(
+                    goal,
+                    {
+                        "status": {
+                            "vitals": {
+                                "vigor": {
+                                    "value": 48,
+                                    "scale_max": 200,
+                                    "rested": False,
+                                }
+                            }
+                        }
+                    },
+                )
+
+                self.assertTrue(result["campaign_phase_policy_migrated"])
+                self.assertEqual("succeeded", controller.storage.campaign_phase(support["id"])["status"])
                 self.assertEqual(
-                    "resolved",
-                    controller.storage.goal_lesson(stale_lesson["id"])["status"],
+                    farm["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
                 )
-                self.assertFalse(any(name == "autopilot" for name, _ in broker.calls))
+                self.assertIsNone(controller._execution_plan(goal))
             finally:
                 controller.storage.close()
 
@@ -10598,7 +10646,7 @@ class ControllerTests(unittest.TestCase):
                 call = next(arguments for name, arguments in broker.calls if name == "autopilot")
                 self.assertEqual(0.7, call["rest_below"])
                 self.assertEqual(0.60, call["flee_below"])
-                self.assertEqual(100, call["fight_above_vigor"])
+                self.assertEqual(80, call["fight_above_vigor"])
                 self.assertTrue(call["use_safe_spots"])
                 self.assertEqual(0.9, call["hold_resume_above"])
                 self.assertFalse(call["break_out_via_logoff"])
@@ -12087,7 +12135,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 1016,
                             "target": "mummy",
                             "use_safe_spots": True,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                         "rationale": "Use the regional sanctuary and nearby farm.",
                     },
@@ -12121,7 +12169,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_structured_farm_preparation_resolves_zero_cash_food_deadlock(self) -> None:
+    def test_structured_farm_preparation_rests_without_food_funding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -12230,18 +12278,11 @@ class ControllerTests(unittest.TestCase):
                 provisioning_ids = [
                     step["id"] for step in provisioning_plan["steps"]
                 ]
-                self.assertLess(
-                    provisioning_ids.index("farm-bank-transit"),
-                    provisioning_ids.index("withdraw-provision-funds"),
-                )
-                self.assertLess(
-                    provisioning_ids.index("withdraw-provision-funds"),
-                    provisioning_ids.index("farm-provision-transit"),
-                )
-                self.assertLess(
-                    provisioning_ids.index("farm-provision-transit"),
-                    provisioning_ids.index("buy-farm-food"),
-                )
+                self.assertNotIn("farm-bank-transit", provisioning_ids)
+                self.assertNotIn("withdraw-provision-funds", provisioning_ids)
+                self.assertNotIn("farm-provision-transit", provisioning_ids)
+                self.assertNotIn("buy-farm-food", provisioning_ids)
+                self.assertIn("rest-for-farm", provisioning_ids)
                 stored_provisioning = controller._store_execution_plan(
                     goal,
                     provisioning_plan,
@@ -12251,60 +12292,13 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     "verified", stored_provisioning["verification"]["status"]
                 )
-                to_bank = controller._structured_farm_preparation_action(
-                    goal, observation(52), completion
-                )
-                self.assertEqual("travel", to_bank["tool"])
-                self.assertEqual({"to": 54}, to_bank["arguments"])
-
-                withdraw = controller._structured_farm_preparation_action(
-                    goal, observation(54), completion
-                )
-                self.assertEqual("bank", withdraw["tool"])
-                self.assertEqual(
-                    {"action": "withdraw", "amount": 112},
-                    withdraw["arguments"],
-                )
-
-                back_to_inn = controller._structured_farm_preparation_action(
-                    goal, observation(54, currency=112), completion
-                )
-                self.assertEqual("travel", back_to_inn["tool"])
-                self.assertEqual({"to": 52}, back_to_inn["arguments"])
-
-                controller._set_planner_feedback(
-                    goal,
-                    "The default route made no progress.",
-                    blocked_action={
-                        "tool": "travel",
-                        "arguments": {"agent": "primary", "to": 52},
-                        "room": 54,
-                    },
-                )
-                explicit_route_retry = controller._structured_farm_preparation_action(
-                    goal, observation(54, currency=112), completion
-                )
-                self.assertEqual(
-                    {"to": 52, "max_hops": 25},
-                    explicit_route_retry["arguments"],
-                )
-                controller._clear_planner_feedback()
-
-                buy_food = controller._structured_farm_preparation_action(
-                    goal,
-                    observation(52, currency=112),
-                    completion,
-                )
-                self.assertEqual("shop", buy_food["tool"])
-                self.assertEqual([98], buy_food["arguments"]["buy_ids"])
-
                 rest = controller._structured_farm_preparation_action(
-                    goal, observation(52, cheese=1), completion
+                    goal, observation(52), completion
                 )
                 self.assertEqual("rest_up", rest["tool"])
                 self.assertEqual(0.4, rest["arguments"]["to"])
 
-                ready = observation(52, cheese=1, vigor=80, rested=True)
+                ready = observation(52, vigor=80, rested=True)
                 self.assertIsNone(
                     controller._structured_farm_preparation_action(
                         goal, ready, completion
@@ -12338,7 +12332,7 @@ class ControllerTests(unittest.TestCase):
                             "bank_before_hazard": False,
                             "operator_notes": (
                                 "hunt=groundworm larva; assigned_room=557; "
-                                "use_safe_spots=true; fight_above_vigor=100"
+                                "use_safe_spots=true; fight_above_vigor=80"
                             ),
                         },
                     )
@@ -12541,7 +12535,7 @@ class ControllerTests(unittest.TestCase):
                             "bank_before_hazard": False,
                             "operator_notes": (
                                 "hunt=groundworm larva; assigned_room=557; "
-                                "use_safe_spots=true; fight_above_vigor=100"
+                                "use_safe_spots=true; fight_above_vigor=80"
                             ),
                         },
                     )
@@ -12633,7 +12627,7 @@ class ControllerTests(unittest.TestCase):
                             "bank_before_hazard": True,
                             "operator_notes": (
                                 "hunt=groundworm larva; assigned_room=557; "
-                                "use_safe_spots=true; fight_above_vigor=100"
+                                "use_safe_spots=true; fight_above_vigor=80"
                             ),
                         },
                     )
@@ -13426,7 +13420,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 563,
                             "target": "ant",
                             "use_safe_spots": True,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                         "rationale": "Use a bounded safe-wall farm.",
                     },
@@ -13550,7 +13544,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 566,
                             "target": "groundworm larva",
                             "use_safe_spots": True,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                         "rationale": "Use a bounded safe-wall farm.",
                     },
@@ -13999,7 +13993,7 @@ class ControllerTests(unittest.TestCase):
                         constraints={
                             "operator_notes": (
                                 "hunt=groundworm larva; assigned_room=557; "
-                                "use_safe_spots=true; fight_above_vigor=100"
+                                "use_safe_spots=true; fight_above_vigor=80"
                             )
                         },
                     )
@@ -14658,7 +14652,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 535,
                             "use_safe_spots": True,
                             "flee_below": 0.75,
-                            "fight_above_vigor": 100,
+                            "fight_above_vigor": 80,
                         },
                     },
                     mode="start",

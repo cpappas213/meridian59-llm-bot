@@ -98,9 +98,10 @@ COMBAT_FOOD_VIGOR_VALUES = (
     ("drumstick", 9),
     ("goblet", 3),
 )
-# One cheese after ordinary rest reaches 110. This retains a useful combat
-# buffer without forcing multi-minute stomach-drain waits between phases.
-FARM_FIGHT_VIGOR = 100
+# Ordinary keeper farms may start at the game's natural rested floor. Combat
+# safety comes from the health/flee envelope; food is optional endurance, not a
+# prerequisite that can deadlock a character with no money or provisions.
+FARM_FIGHT_VIGOR = RESTED_VIGOR_FLOOR
 # The keeper reports a stall after five unsuccessful internal passes.  That is
 # useful telemetry, but the first report can be only a couple of seconds old
 # and a wandering monster or a break-off can still resolve it.  Give the live
@@ -7680,12 +7681,9 @@ class BotController:
                     # preference. Normalize old queued recipes that still say
                     # 75-80% as well as overly aggressive lower proposals.
                     "flee_below": FARM_FLEE_THRESHOLD,
-                    # Historical 140-vigor recipes made a fed character wait
-                    # several minutes for stomach room before combat. Ordinary
-                    # farms use the controller-owned 100-vigor reserve. The
-                    # only exception is a typed economic-bootstrap child phase:
-                    # its health-aware keeper may work from the game's verified
-                    # rested floor until it earns the exact food budget.
+                    # The keeper may work from the game's verified rested floor.
+                    # Higher model- or goal-authored values are normalized away:
+                    # food is useful endurance but is not a launch prerequisite.
                     "fight_above_vigor": (
                         RESTED_VIGOR_FLOOR
                         if allow_rested_vigor
@@ -8106,7 +8104,11 @@ class BotController:
                 arguments.get("fight_above_vigor", FARM_FIGHT_VIGOR)
                 or FARM_FIGHT_VIGOR
             )
-            if isinstance(vigor, (int, float)) and vigor < fight_vigor:
+            if (
+                isinstance(vigor, (int, float))
+                and vigor < fight_vigor
+                and fight_vigor > RESTED_VIGOR_FLOOR
+            ):
                 supply = self._combat_vigor_supply(observation)
                 verified_food_shortfall = (
                     int(supply.get("vigor_points", 0) or 0)
@@ -8122,7 +8124,7 @@ class BotController:
                             "supply": supply,
                             "guidance": (
                                 f"acquire enough edible food before launching the keeper so verified nutrition can raise vigor to at least {fight_vigor}; "
-                                "sitting cannot do this because resting stops at 80 vigor. Carried herbs and elderberries "
+                                "this explicit above-rest threshold cannot be reached by sitting. Carried herbs and elderberries "
                                 "count only when the verified spell list contains Create Food"
                             ),
                         }
@@ -10213,10 +10215,8 @@ class BotController:
             phase.get("context") if isinstance(phase.get("context"), dict) else {}
         )
         if phase_context.get("reason") == "bootstrap_combat_funding":
-            # This child phase exists precisely because the ordinary 100-vigor
-            # gate is unaffordable. Its keeper is separately restricted to the
-            # game's rested floor and the exact provision budget, so wrapping it
-            # in another food-support phase would recreate the deadlock.
+            # Legacy child phases may still be present while persisted campaign
+            # state is reconciled. Never wrap one in another food-support phase.
             return None
 
         vigor_blocker = next(
@@ -10446,8 +10446,8 @@ class BotController:
                         "The live menu proves the food cost, while carried cash, "
                         "verified bank funds, and every grounded sale route cannot "
                         "cover it. A health-aware keeper can safely work from the "
-                        "game's rested floor without weakening the ordinary 100-vigor "
-                        "farm policy."
+                        "game's rested floor while preserving the ordinary combat "
+                        "health policy."
                     ),
                 },
                 "rationale": "Earn only the exact missing provision budget.",
@@ -15451,6 +15451,53 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
+        context = phase.get("context") if isinstance(phase.get("context"), dict) else {}
+        if (
+            phase.get("kind") == "prepare_combat"
+            and context.get("reason") == "recover_combat_vigor"
+        ):
+            try:
+                required_vigor = int(context.get("required_vigor") or 0)
+            except (TypeError, ValueError):
+                required_vigor = 0
+            if required_vigor > FARM_FIGHT_VIGOR:
+                reason = (
+                    f"retired obsolete {required_vigor}-vigor provisioning gate; "
+                    f"ordinary farms now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                )
+                result_phase = self.storage.transition_campaign_phase(
+                    phase["id"], "succeeded", reason=reason, resume_parent=True
+                )
+                next_phase = self.storage.active_campaign_phase(run["id"])
+                self._invalidate_execution_plan(goal, reason)
+                self._clear_safety_suppression(str(goal.get("id") or ""))
+                self._clear_planner_feedback()
+                self.storage.emit_event(
+                    "campaign.combat_vigor_policy_migrated",
+                    "Removed an obsolete above-rest vigor support phase",
+                    severity="notice",
+                    interesting=False,
+                    goal_id=goal.get("id"),
+                    data={
+                        "retired_phase_id": phase.get("id"),
+                        "old_required_vigor": required_vigor,
+                        "new_required_vigor": FARM_FIGHT_VIGOR,
+                        "resumed_parent_phase_id": (
+                            next_phase.get("id") if isinstance(next_phase, dict) else None
+                        ),
+                        "strategic_goal_preserved": True,
+                    },
+                )
+                return {
+                    "campaign_phase_completed": True,
+                    "campaign_phase_policy_migrated": True,
+                    "phase": result_phase,
+                    "next_phase": next_phase,
+                    "goal_blocked": False,
+                    "goal": self.storage.goal(goal["id"]),
+                    "keeper_released": True,
+                    "strategic_goal_preserved": True,
+                }
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if (

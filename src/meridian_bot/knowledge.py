@@ -2608,7 +2608,7 @@ class KnowledgeBase:
                             "Farm execution fields in operator_notes must use exact key=value syntax. "
                             "Example: hunt=groundworm larva; assigned_room=567; "
                             "use_safe_spots=true; flee_below=0.60; hold_resume_above=0.90; "
-                            "fight_above_vigor=100; bank_above=0; "
+                            "fight_above_vigor=80; bank_above=0; "
                             "break_out_via_logoff=false."
                         ),
                     }

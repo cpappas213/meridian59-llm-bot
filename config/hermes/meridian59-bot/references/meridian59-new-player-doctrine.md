@@ -34,10 +34,9 @@ retry until a materially different tactic is chosen.
 - Death drops the knapsack; banked or stored property survives. Bank carried
   currency before danger and treat a death as a capability failure, not a cue
   to retry the same fight.
-- Vigor ranges from 1 to 200, but sitting restores it only to 80. The
-  `vigor.rested` boolean reports that low resting threshold, not readiness for the
-  100-vigor keeper policy. One 30-nutrition cheese after rest supplies that modest
-  buffer without a long stomach-drain wait. Reagents are
+- Vigor ranges from 1 to 200, and sitting restores it to 80. That natural rested
+  threshold is sufficient for the ordinary keeper launch policy; food is optional
+  endurance and must not become a financial prerequisite for combat. Reagents are
   a usable provisioning path only when live spell evidence confirms that the character
   knows `create food`; carrying elderberries and herbs does not prove that.
 - Carrying a weapon or armor is not evidence it is worn or wielded. When

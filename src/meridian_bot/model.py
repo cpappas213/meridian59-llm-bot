@@ -344,7 +344,7 @@ nutrition before launching. Do not retry a knowingly unaffordable shop call.
 Honor the durable goal's explicit use_safe_spots value, or the active internal farm phase's explicit
 use_safe_spots value: true requests wall trials; false requests bounded open-field
 combat and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.60
-for ordinary bounded farms, hold_resume_above at least 0.90, fight_above_vigor exactly 100, and
+for ordinary bounded farms, hold_resume_above at least 0.90, fight_above_vigor exactly 80, and
 break_out_via_logoff=false until stable room saving is verified. A safe_spot.works label alone is not proof.
 Keeper banking is optional: use bank_above=0 unless the current financial_context and plan deliberately
 select special farm banking trips. If selected, use bank_above=400 or higher. Never request a positive
@@ -369,11 +369,10 @@ omits or contradicts these facts before any action is permitted.
 If the HP/progression criterion is already met, omit every farm/autopilot launch step and plan only the
 remaining recovery and explicit finish criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
-Before starting, compare live numeric vigor with fight_above_vigor. Resting stops at 80 vigor and cannot
-by itself satisfy the 100-vigor gate. If verified edible food is carried, start the keeper from the sanctuary
-and let its provisioning phase eat to the configured floor before travel or combat. Carried herbs and
-elderberries are usable only when the verified spell list says the character knows Create Food; otherwise buy
-food or pursue a supply goal. The game's rested boolean is only a lower cutoff and is not enough. If a retreat
+Before starting, compare live numeric vigor with fight_above_vigor. Resting reaches the ordinary 80-vigor
+keeper floor, so do not require food or spending solely to launch combat. Verified edible food remains useful
+optional endurance, and carried herbs and elderberries are usable only when the verified spell list says the
+character knows Create Food. If a retreat
 happens before the assigned room is reached, treat it as hazardous-route evidence and do not condemn
 the destination room.
 Once it is running, do not issue travel, bank, equipment,
@@ -503,7 +502,7 @@ other negative evidence narrows the available tactics and never authorizes anoth
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
-and fight_above_vigor (100). The controller persists and enforces these fields across planning turns. If choosing
+and fight_above_vigor (80). The controller persists and enforces these fields across planning turns. If choosing
 open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
 it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey
