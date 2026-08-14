@@ -342,9 +342,11 @@ Keeper banking is optional: use bank_above=0 unless the current financial_contex
 select special farm banking trips. If selected, use bank_above=400 or higher. Never request a positive
 threshold below 400; it cannot deposit and would loop.
 Observed rest damage disproves that square, not the entire room or all farming: one failed square is a tactic
-warning; health reaching the flee threshold, withdrawal, death, or repeated failures exhausting healing
-margin are survivability evidence. Do not mistake safe nuisance kills for failure, but count only the named
-eligible prey as direct HP-progression work.
+warning. Health or vigor dips, safe breakoffs, rests, and successful withdrawals are ordinary recovery
+telemetry, even when they repeat many times. A kill/rest/resume cycle is productive evidence and never a
+reason to condemn the room. Death, inability to reach safety or resume, persistent zero-kill operation, or a
+precise live hazard are survivability failures. Do not mistake safe nuisance kills for failure, but count only
+the named eligible prey as direct HP-progression work.
 Each progression lookup is evidence, not work: call prey at most once for an unchanged state, then
 hunting_grounds at most once for the selected prey. After both results are grounded, launch the bounded
 keeper or choose a materially different tactic; never loop on either read.
@@ -373,8 +375,10 @@ happens before the assigned room is reached, treat it as hazardous-route evidenc
 the destination room.
 Once it is running, do not issue travel, bank, equipment,
 combat, or another start call: the controller monitors it exclusively until the bounded HP target is
-reached, its flee threshold is reached, or the keeper reports a stall/error. The controller then pauses
-the phase; do not restart it until the disclosed retry predicate is met. Rerank prey whenever max HP reaches the prey's level
+reached or the keeper reports a persistent stall/error or precise structural safety failure. Flee-threshold
+recovery remains inside the same farm phase and does not authorize replanning. Verified keeper kills renew
+the farm phase's elapsed-time lease, so a productive long grind remains active across any number of safe
+recovery cycles. Rerank prey whenever max HP reaches the prey's level
 and satisfy only the remaining explicit completion criteria.
 For PvE fight, never rely on the broker defaults. On an unproven or not-yet-safe encounter explicitly use
 rounds=1, swings_per_round=1, disengage_at at least 0.70, equip=true, and loot=true, then reobserve before
@@ -456,7 +460,8 @@ When the intended supply is any edible product of Create Food, use item_count_at
 the controller's semantic edible category. Never use item="Snack" or claim food heals health: Create Food yields
 concrete items such as apples and those restore vigor. Preserve the exact desired quantity in the target.
 Phase budgets are normalized to at least 8 actions and 30 minutes; repeated equivalent semantic failure can end
-a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot.
+a phase earlier because it is verified evidence, but mere elapsed time or one refusal cannot. For a running
+farm, max_minutes is a no-progress lease renewed by every verified keeper kill, not a wall-clock lifetime.
 Each abandon_predicates entry is an OR trigger: if any one becomes deterministically true, the controller ends only
 that phase and asks for a different approach. Use them sparingly for concrete invalidation such as an incompatible
 room, a lost prerequisite, or health below an explicit emergency threshold; never encode model doubt, elapsed time,
@@ -479,9 +484,10 @@ affordable purchase, or currently castable production route remains, choose a ma
 phase rather than recycling commerce prose.
 sale_exhausted_items means the bounded live buyer search for one exact carried object is finished; it never blocks
 the strategic goal, other carried items, or other merchants for a newly acquired instance.
-A broken or absent wielded weapon may push acquire_item, then resume the parent phase. A keeper withdrawal or death
-may push recover. Reuse a recent successful room/prey tactic while it remains level-eligible; seek a materially
-different grounded tactic only after durable safety, stagnation, or route evidence disproves the prior one.
+A broken or absent wielded weapon may push acquire_item, then resume the parent phase. The keeper owns ordinary
+withdraw/rest/resume cycles; only failed recovery or death may push recover. Reuse a recent successful room/prey
+tactic while it remains level-eligible; seek a materially different grounded tactic only after durable safety,
+stagnation, or route evidence disproves the prior one.
 Room and target exclusions are controller-owned evidence. Never emit phase.context.avoid_rooms or
 phase.context.avoid_targets, never infer them from a phase's failed status, and never treat an exact
 safe-return or origin/destination route failure as evidence against that phase's researched or farm room.

@@ -11,6 +11,7 @@ from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 
 CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
+CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY = "campaign_phase_progress_lease_v1"
 
 
 PHASE_KINDS = {
@@ -1182,6 +1183,9 @@ class CampaignCoordinator:
         activated_at = str(phase.get("activated_at") or phase.get("created_at") or "")
         elapsed_minutes = 0.0
         downtime_seconds = 0.0
+        downtime_at_lease_seconds = 0.0
+        elapsed_basis = "phase_activation"
+        last_verified_progress_at: str | None = None
         downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
         if (
             isinstance(downtime, dict)
@@ -1191,8 +1195,41 @@ class CampaignCoordinator:
                 downtime_seconds = max(0.0, float(downtime.get("seconds", 0.0) or 0.0))
             except (TypeError, ValueError):
                 downtime_seconds = 0.0
+        reference_at = activated_at
+        if str(phase.get("kind") or "") == "farm":
+            leases = self.storage.get_runtime(
+                CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+            )
+            lease = (
+                leases.get(str(phase.get("id") or ""))
+                if isinstance(leases, dict)
+                else None
+            )
+            if isinstance(lease, dict):
+                renewed_at = str(lease.get("renewed_at") or "")
+                try:
+                    activated_value = datetime.fromisoformat(
+                        activated_at.replace("Z", "+00:00")
+                    )
+                    renewed_value = datetime.fromisoformat(
+                        renewed_at.replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if renewed_value >= activated_value:
+                        reference_at = renewed_at
+                        elapsed_basis = "last_verified_keeper_progress"
+                        last_verified_progress_at = renewed_at
+                        try:
+                            downtime_at_lease_seconds = max(
+                                0.0,
+                                float(lease.get("downtime_seconds", 0.0) or 0.0),
+                            )
+                        except (TypeError, ValueError):
+                            downtime_at_lease_seconds = 0.0
         try:
-            activated = datetime.fromisoformat(activated_at.replace("Z", "+00:00"))
+            activated = datetime.fromisoformat(reference_at.replace("Z", "+00:00"))
             elapsed_minutes = max(
                 0.0,
                 (
@@ -1200,7 +1237,7 @@ class CampaignCoordinator:
                         datetime.now(timezone.utc)
                         - activated.astimezone(timezone.utc)
                     ).total_seconds()
-                    - downtime_seconds
+                    - max(0.0, downtime_seconds - downtime_at_lease_seconds)
                 )
                 / 60.0,
             )
@@ -1213,6 +1250,8 @@ class CampaignCoordinator:
                 "limit": max_actions,
                 "elapsed_minutes": round(elapsed_minutes, 1),
                 "downtime_minutes": round(downtime_seconds / 60.0, 1),
+                "elapsed_basis": elapsed_basis,
+                "last_verified_progress_at": last_verified_progress_at,
             }
         if elapsed_minutes >= max_minutes:
             return {
@@ -1221,6 +1260,8 @@ class CampaignCoordinator:
                 "limit": max_minutes,
                 "attempts": attempts,
                 "downtime_minutes": round(downtime_seconds / 60.0, 1),
+                "elapsed_basis": elapsed_basis,
+                "last_verified_progress_at": last_verified_progress_at,
             }
         return None
 

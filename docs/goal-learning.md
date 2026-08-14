@@ -82,25 +82,31 @@ migrations are checked against those stored failed-state components so a
 controller upgrade cannot manufacture an improvement.
 
 Farm quarantine is the corresponding fast runtime gate. Crossing the configured
-flee boundary once is an ordinary recovery event: the keeper retains control,
-the phase remains active, and no lesson or quarantine is created. Two distinct
-retreat/withdrawal episodes for the exact room, prey, and safe-spot strategy
-inside 30 minutes quarantine that tactic. A death, lethal safe-spot failure,
-depleted healing margin, or verified live over-level hazard still quarantines
-immediately. An over-level hazard uses a specific retry predicate: max HP must
-reach the level required by the configured danger margin, or the pinned source
-corpus must change. It cannot unlock from a generic cooldown or unrelated
-equipment-id churn. The same no-timeout rule applies once repeated retreats,
-safe-spot failures, or depleted healing margin establish an exact farm
-survivability failure. Other room/prey tactics remain available while that one
-stays quarantined until readiness measurably improves.
+flee boundary, withdrawing, resting, and resuming are ordinary recovery events:
+the keeper retains control, the phase remains active, and no lesson or quarantine
+is created however often that productive cycle repeats. A death, lethal
+safe-spot failure, or verified live over-level hazard still quarantines the exact
+room/prey tactic immediately. Rest damage or another verified safe-spot failure
+retires that coordinate without condemning the room. Two recoveries before ever
+reaching the assignment invalidate only that exact launch route. An over-level
+hazard uses a specific retry predicate: max HP must reach the level required by
+the configured danger margin, or the pinned source corpus must change. It cannot
+unlock from a generic cooldown or unrelated equipment-id churn. Other room/prey
+tactics remain available while a precisely disproved one stays quarantined until
+readiness measurably improves.
 
-Startup removes legacy quarantines whose sole evidence was an ordinary
-flee-threshold crossing. Other survivability quarantines may be released after a
-verified max-HP or equipment improvement. When the deterministic retry predicate
-of an exact farm lesson unlocks, its matching runtime quarantine and retreat
-counter are released in the same reconciliation step so the two gates cannot
-contradict one another.
+Startup removes legacy quarantines and assigned-room tactic lessons whose sole
+evidence was an ordinary flee/withdraw/rest/resume cycle. Other survivability
+quarantines may be released after a verified max-HP or equipment improvement.
+When the deterministic retry predicate of an exact farm lesson unlocks, its
+matching runtime quarantine and retreat counter are released in the same
+reconciliation step so the two gates cannot contradict one another.
+
+Farm `max_minutes` is a no-progress lease rather than a wall-clock lifetime.
+Every verified keeper kill renews it, while keeper passes, fights, withdrawals,
+rests, and resumes do not consume campaign action attempts. A productive grind
+can therefore run through any number of bounded recovery sessions; a persistent
+zero-kill stall still ends the phase through its separate stagnation policy.
 
 Progression research keeps `avoid_rooms` only as a diversity preference. It
 prefers an exact room/prey tactic that recently completed a milestone, then an
@@ -134,7 +140,7 @@ failures cannot accumulate forever:
 - repeated semantic no-progress or broker action failure;
 - repeating an exact known-failed action;
 - ten consecutive planner waits by default;
-- repeated retreat or death evidence for one exact combat/farm tactic; or
+- death or another precise structural safety failure for one exact combat/farm tactic; or
 - an active legacy goal contains an invalid static reference.
 
 Banking, routing, shopping, equipment, and evidence lookup are preparation

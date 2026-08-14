@@ -11,6 +11,7 @@ from typing import Any
 from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
 from .campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
     PhaseOutcome,
 )
@@ -20,10 +21,12 @@ from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationEr
 from .contracts import parse_ability_metric
 from .learning import (
     ARMOR_WORDS,
+    FARM_RECOVERY_REASON_MARKERS,
     HEALING_SUPPLY_WORDS,
     WEAPON_WORDS,
     GoalDeferredError,
     GoalLearning,
+    is_obsolete_farm_recovery_failure,
     is_inventory_capacity_refusal,
 )
 from .model import ModelError, VllmClient
@@ -93,11 +96,9 @@ FARM_TRANSIT_CYCLE_MAX_ROOMS = 3
 # old keeper run ended in a transient stall.  After a bounded cooldown it may
 # be retried; a fresh persistent stall records a new cooldown immediately.
 FARM_STAGNATION_RETRY_SECONDS = 15 * 60
-# A keeper crossing its configured retreat boundary is evidence that recovery
-# policy engaged, not proof that the farm is unusable. Only a second distinct
-# retreat inside this window escalates the exact tactic to quarantine.
+# Keep a bounded audit trail of recovery episodes. These are ordinary work
+# cycles and never escalate to quarantine merely because they repeat.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
-FARM_RETREAT_QUARANTINE_COUNT = 2
 # A source-listed monster is provisionally too dangerous for autonomous
 # farming while its level exceeds max HP by more than this bounded
 # survivability margin.  Monster difficulty dominates attack accuracy in the
@@ -907,16 +908,14 @@ class BotController:
             self.storage.set_runtime("farm_tactic_retreat_incidents_v1", filtered)
 
     def _repair_policy_obsolete_farm_quarantines(self) -> list[dict[str, Any]]:
-        """Release records caused only by crossing a farm flee boundary.
+        """Release records caused only by ordinary farm recovery cycles.
 
-        A threshold crossing proves the keeper's recovery policy engaged. It
-        does not prove the room/prey tactic unsafe, regardless of whether the
-        stored boundary came from an older policy or the current one.
+        Threshold crossings, safe breakoffs, and successful withdrawals prove
+        that recovery policy engaged. Repetition does not turn them into room
+        failure. Deaths and independently verified hazards remain retained.
         """
         raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
-        if not isinstance(raw, dict):
-            return []
-        quarantines = dict(raw)
+        quarantines = dict(raw) if isinstance(raw, dict) else {}
         released: list[dict[str, Any]] = []
         for key, record in list(quarantines.items()):
             if not isinstance(record, dict):
@@ -930,37 +929,86 @@ class BotController:
                 for reason in record.get("reasons", [])
                 if str(reason).strip()
             ]
-            deltas = record.get("deltas") if isinstance(record.get("deltas"), dict) else {}
-            threshold_only = bool(reasons) and all(
-                reason == "health reached the keeper flee threshold"
+            deltas = (
+                record.get("deltas")
+                if isinstance(record.get("deltas"), dict)
+                else {}
+            )
+            recovery_only = bool(reasons) and all(
+                any(marker in reason for marker in FARM_RECOVERY_REASON_MARKERS)
                 for reason in reasons
             )
-            consequential_failure = any(
+            fatal_failure = any(
                 int(deltas.get(name, 0) or 0) > 0
-                for name in ("deaths", "withdrawals")
+                for name in (
+                    "deaths",
+                    "deaths_in_safe_spot",
+                    "deaths_in_proven_safe_spot",
+                )
             )
-            if (
-                not threshold_only
-                or consequential_failure
-            ):
+            if not recovery_only or fatal_failure:
                 continue
             released.append(
                 {
                     **record,
                     "released_at": timestamp(),
                     "release_reason": (
-                        "a flee-threshold crossing is recovery evidence, not "
-                        "standalone quarantine evidence"
+                        "repeated successful farm recovery is work-cycle telemetry, "
+                        "not quarantine evidence"
                     ),
                     "prior_flee_threshold": prior_threshold,
                     "current_flee_threshold": FARM_FLEE_THRESHOLD,
                 }
             )
             quarantines.pop(key, None)
-        if not released:
+        if released:
+            self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+            self._clear_released_farm_retreat_incidents(released)
+        affected_goal_ids = {
+            str(item.get("goal_id") or "")
+            for item in released
+            if item.get("goal_id")
+        }
+
+        repaired_lessons = [
+            self.storage.update_goal_lesson(
+                lesson["id"],
+                "resolved",
+                resolution_goal_id=lesson.get("goal_id"),
+                evidence={
+                    "repair": (
+                        "ordinary threshold/rest/withdraw/resume cycles cannot "
+                        "invalidate a productive farm tactic"
+                    ),
+                    "at": timestamp(),
+                },
+            )
+            for lesson in self.storage.goal_lessons(
+                statuses=["deferred", "unlocked"], limit=200
+            )
+            if lesson.get("scope") == "tactic"
+            and lesson.get("classification") == "ineffective_tactic"
+            and is_obsolete_farm_recovery_failure(lesson.get("summary"))
+        ]
+        affected_goal_ids.update(
+            str(lesson.get("goal_id") or "")
+            for lesson in repaired_lessons
+            if lesson.get("goal_id")
+        )
+        if not released and not repaired_lessons:
             return []
-        self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
-        self._clear_released_farm_retreat_incidents(released)
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            self.storage.set_runtime(
+                f"background_farm_failure_handled_v1:{goal_id}", False
+            )
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
         suppression = self.storage.get_runtime("safety_suppression_v1")
         if isinstance(suppression, dict) and "quarantined_farm_tactic" in suppression.get(
             "blocker_kinds", []
@@ -969,7 +1017,7 @@ class BotController:
             self._clear_planner_feedback()
         self.storage.emit_event(
             "background_farm.quarantine_released",
-            "Released quarantines supported only by an ordinary flee-threshold crossing",
+            "Released quarantines created from ordinary farm recovery cycles",
             severity="notice",
             interesting=False,
             data={
@@ -978,6 +1026,8 @@ class BotController:
                     item.get("prior_flee_threshold") for item in released
                 ],
                 "current_threshold": FARM_FLEE_THRESHOLD,
+                "lesson_ids": [item.get("id") for item in repaired_lessons],
+                "research_retry_reopened": bool(affected_goal_ids),
             },
         )
         return released
@@ -11390,6 +11440,52 @@ class BotController:
         self.storage.set_runtime("farm_tactic_retreat_incidents_v1", records)
         return record
 
+    def _renew_farm_progress_lease(
+        self,
+        goal: dict[str, Any],
+        *,
+        kill_delta: int,
+        cumulative_kills: int,
+    ) -> dict[str, Any] | None:
+        """Renew a long farm phase whenever the keeper verifies another kill."""
+
+        if kill_delta <= 0:
+            return None
+        phase = self._active_keeper_combat_phase(goal)
+        if not isinstance(phase, dict) or phase.get("kind") != "farm":
+            return None
+        leases = self.storage.get_runtime(
+            CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+        )
+        leases = dict(leases) if isinstance(leases, dict) else {}
+        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
+        downtime_seconds = 0.0
+        if (
+            isinstance(downtime, dict)
+            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
+        ):
+            try:
+                downtime_seconds = max(
+                    0.0, float(downtime.get("seconds", 0.0) or 0.0)
+                )
+            except (TypeError, ValueError):
+                downtime_seconds = 0.0
+        value = {
+            "goal_id": goal.get("id"),
+            "phase_id": phase.get("id"),
+            "renewed_at": timestamp(),
+            "progress_kind": "verified_keeper_kill",
+            "kill_delta": int(kill_delta),
+            "cumulative_kills": int(cumulative_kills),
+            "downtime_seconds": downtime_seconds,
+        }
+        leases[str(phase["id"])] = value
+        self.storage.set_runtime(
+            CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+            dict(list(leases.items())[-100:]),
+        )
+        return value
+
     @staticmethod
     def _farm_kill_records(
         status: dict[str, Any],
@@ -11514,6 +11610,11 @@ class BotController:
                 result={"disengaged": True, "target": target, "source": "keeper_status_delta"},
                 after=observation,
             )
+        progress_lease = self._renew_farm_progress_lease(
+            goal,
+            kill_delta=deltas["kills"],
+            cumulative_kills=counters["kills"],
+        )
 
         observed_safe_spot_failures = self._farm_safe_spot_failure_ids(
             status, minimum_pass=pass_floor
@@ -11590,10 +11691,6 @@ class BotController:
                       else ()),
                 ],
             )
-            if int(retreat_record.get("count", 0) or 0) >= FARM_RETREAT_QUARANTINE_COUNT:
-                quarantine_reasons.append(
-                    "repeated retreat episodes reached the farm tactic safety limit"
-                )
         last_death = status.get("last_death") if isinstance(status.get("last_death"), dict) else None
         death_at = str(last_death.get("at")) if last_death and last_death.get("at") is not None else None
         death_is_new = bool(
@@ -11608,8 +11705,9 @@ class BotController:
         # A wall being disproved is useful coordinate-local learning. The
         # keeper already retires that exact square and selects another one;
         # neither three failed squares nor low carried supplies prove the rest
-        # of the room unsafe. Health, repeated retreat, withdrawal, death, and
-        # live over-level-hostile boundaries above remain fail-closed signals.
+        # of the room unsafe. Routine health recovery and withdrawal cycles are
+        # likewise telemetry; death and live over-level-hostile boundaries are
+        # the fail-closed signals.
         if safe_spot_disproved and safe_spot_failure_count >= 3:
             tactic_warnings.append(
                 "multiple safe-spot coordinates were retired; the room remains eligible"
@@ -11618,7 +11716,22 @@ class BotController:
             tactic_warnings.append(
                 "the last healing supply was consumed; replenish before a later hazardous launch"
             )
-        risk_reasons.extend(recovery_reasons)
+        if at_assigned_room is False:
+            # Recovery before arrival is useful route evidence. Once at the
+            # assignment, the same rest/withdraw/resume cycle is ordinary work.
+            risk_reasons.extend(recovery_reasons)
+            if (
+                recovery_reasons
+                and isinstance(retreat_record, dict)
+                and int(retreat_record.get("count", 0) or 0) >= 2
+            ):
+                # Reaching safety twice without ever reaching the assignment
+                # disproves only this launch route. It does not condemn the
+                # destination room, quarry, strategic goal, or future combat
+                # sessions that successfully arrive there.
+                quarantine_reasons.append(
+                    "repeated pre-arrival recovery could not reach the assigned room by the current route"
+                )
         risk_reasons.extend(quarantine_reasons)
 
         snapshot = {
@@ -11656,6 +11769,7 @@ class BotController:
             ),
             "recovery_reasons": list(dict.fromkeys(recovery_reasons)),
             "quarantine_reasons": list(dict.fromkeys(quarantine_reasons)),
+            "progress_lease": redact(progress_lease),
         }
         self.storage.set_runtime(key, snapshot)
         if any(deltas.values()) or supplies_used or safe_spot_disproved or tactic_warnings:
@@ -11713,6 +11827,7 @@ class BotController:
                 if isinstance(retreat_record, dict)
                 else 0
             ),
+            "progress_lease": redact(progress_lease),
         }
 
     def _quarantine_farm_tactic(
@@ -11989,8 +12104,9 @@ class BotController:
                         "retreat_incident_count": evidence.get(
                             "retreat_incident_count"
                         ),
-                        "quarantine_after": FARM_RETREAT_QUARANTINE_COUNT,
                         "window_seconds": FARM_RETREAT_INCIDENT_WINDOW_SECONDS,
+                        "classification": "ordinary_recovery_telemetry",
+                        "quarantine_from_repetition": False,
                     },
                 )
             return {
@@ -12196,8 +12312,8 @@ class BotController:
             # one turn earlier than the farm supervisor, but that timing does
             # not turn a first recoverable incident into proof that the room
             # or phase failed. Keep the bounded phase and keeper recipe intact;
-            # repeated retreats, a death, or another precise quarantine reason
-            # will still take the terminal handoff below.
+            # a death or another precise structural quarantine reason will
+            # still take the terminal handoff below.
             self.storage.emit_event(
                 "background_farm.critical_recovery_monitored",
                 "Critical health remained under the active farm keeper's recovery control",

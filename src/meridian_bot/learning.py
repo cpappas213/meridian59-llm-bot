@@ -58,11 +58,36 @@ INVENTORY_CAPACITY_REFUSAL_MARKERS = (
     "inventory is full",
     "inventory full",
 )
+FARM_RECOVERY_REASON_MARKERS = (
+    "health reached the keeper flee threshold",
+    "health crossed the keeper flee threshold",
+    "the keeper had to withdraw",
+    "repeated retreat episodes reached",
+)
 
 
 def is_inventory_capacity_refusal(reason: Any) -> bool:
     text = str(reason or "").casefold()
     return any(marker in text for marker in INVENTORY_CAPACITY_REFUSAL_MARKERS)
+
+
+def is_obsolete_farm_recovery_failure(reason: Any) -> bool:
+    """Whether old evidence mislabeled a recoverable farm cycle as failure."""
+
+    text = " ".join(str(reason or "").casefold().split())
+    if not any(marker in text for marker in FARM_RECOVERY_REASON_MARKERS):
+        return False
+    return not any(
+        marker in text
+        for marker in (
+            "death",
+            "died",
+            "overlevel hostile",
+            "safe spot failed",
+            "disproved the safe spot",
+            "could not reach safety",
+        )
+    )
 
 
 class GoalDeferredError(ValueError):
@@ -479,6 +504,7 @@ class GoalLearning:
                     "deaths": 0,
                     "healing_supplies_used": 0,
                     "risk_samples": 0,
+                    "recovery_samples": 0,
                     "safe_spot_failure_count": 0,
                     "last_observed_at": None,
                 },
@@ -520,7 +546,23 @@ class GoalLearning:
                     for warning in warnings
                 ):
                     row["route_damage_samples"] += 1
-            if sample.get("risk_reasons"):
+            recovery_reasons = sample.get("recovery_reasons")
+            recovery_reasons = (
+                recovery_reasons if isinstance(recovery_reasons, list) else []
+            )
+            if recovery_reasons:
+                row["recovery_samples"] += 1
+            risk_reasons = sample.get("risk_reasons")
+            risk_reasons = risk_reasons if isinstance(risk_reasons, list) else []
+            material_risks = [
+                reason
+                for reason in risk_reasons
+                if not (
+                    sample.get("at_assigned_room") is True
+                    and is_obsolete_farm_recovery_failure(reason)
+                )
+            ]
+            if material_risks:
                 row["risk_samples"] += 1
             row["safe_spot_failure_count"] = max(
                 row["safe_spot_failure_count"],
@@ -546,7 +588,7 @@ class GoalLearning:
                 for item in quarantine_values
             )
             row["interpretation"] = (
-                "Empirical controller evidence; compare target_kill_share with the static spawn table and keep route failures separate from room combat."
+                "Empirical controller evidence; productive kill/rest/withdraw/resume cycles are recovery telemetry, not room failure. Compare target_kill_share with the static spawn table and keep route failures separate from room combat."
             )
         values.sort(
             key=lambda row: str(row.get("last_observed_at") or ""), reverse=True
@@ -1146,6 +1188,30 @@ class GoalLearning:
         )
         quarantines_changed = False
         for lesson in self.storage.goal_lessons(statuses=["unlocked"], limit=200):
+            failed_state = lesson.get("failed_state")
+            failed_state = failed_state if isinstance(failed_state, dict) else {}
+            failed_tactic = failed_state.get("failed_tactic")
+            failed_tactic = failed_tactic if isinstance(failed_tactic, dict) else {}
+            if (
+                lesson.get("classification") == "ineffective_tactic"
+                and lesson.get("scope") == "tactic"
+                and is_obsolete_farm_recovery_failure(lesson.get("summary"))
+                and not self._farm_tactic_has_later_death(
+                    lesson, failed_state, failed_tactic
+                )
+            ):
+                self.storage.update_goal_lesson(
+                    lesson["id"],
+                    "resolved",
+                    evidence={
+                        "repair": (
+                            "ordinary farm recovery is not a capability failure "
+                            "and cannot re-quarantine the tactic"
+                        ),
+                        "at": timestamp(),
+                    },
+                )
+                continue
             predicate = lesson.get("retry_when")
             conditions = (
                 predicate.get("conditions", []) if isinstance(predicate, dict) else []

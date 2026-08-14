@@ -9,6 +9,7 @@ from pathlib import Path
 
 from meridian_bot.campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
 )
 from meridian_bot.criteria import CriteriaEvaluator
@@ -1115,6 +1116,64 @@ class StorageTests(unittest.TestCase):
                 exhausted = coordinator.budget_exhausted(phase)
                 self.assertIsNotNone(exhausted)
                 self.assertEqual("time_budget", exhausted["kind"])
+
+    def test_productive_farm_kill_renews_elapsed_time_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                phase = {
+                    "id": "long-productive-farm",
+                    "kind": "farm",
+                    "budget": {"max_actions": 120, "max_minutes": 180},
+                    "attempt_count": 1,
+                    "activated_at": (
+                        datetime.now(timezone.utc) - timedelta(hours=12)
+                    ).isoformat(),
+                }
+
+                stale = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(stale)
+                self.assertEqual("time_budget", stale["kind"])
+                self.assertEqual("phase_activation", stale["elapsed_basis"])
+
+                renewed_at = (
+                    datetime.now(timezone.utc) - timedelta(minutes=2)
+                ).isoformat()
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "renewed_at": renewed_at,
+                            "progress_kind": "verified_keeper_kill",
+                            "cumulative_kills": 150,
+                            "downtime_seconds": 0,
+                        }
+                    },
+                )
+
+                self.assertIsNone(coordinator.budget_exhausted(phase))
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "renewed_at": (
+                                datetime.now(timezone.utc) - timedelta(minutes=181)
+                            ).isoformat(),
+                            "progress_kind": "verified_keeper_kill",
+                            "cumulative_kills": 150,
+                            "downtime_seconds": 0,
+                        }
+                    },
+                )
+                idle = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(idle)
+                self.assertEqual("time_budget", idle["kind"])
+                self.assertEqual(
+                    "last_verified_keeper_progress", idle["elapsed_basis"]
+                )
 
     def test_campaign_manager_compiles_typed_currency_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

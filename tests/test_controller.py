@@ -10,7 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from meridian_bot.broker import Tool, ToolCallError
-from meridian_bot.campaign import CampaignCoordinator
+from meridian_bot.campaign import (
+    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+    CampaignCoordinator,
+)
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
     PLANNED_CONTROLLER_STOP_RUNTIME_KEY,
@@ -11883,10 +11886,34 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_threshold_only_quarantine_releases_at_old_or_current_policy(self) -> None:
+    def test_recovery_only_quarantines_and_lessons_are_released(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="obsolete-recovery-quarantine")
+                )["goal"]
+                lesson = controller.learning.defer_goal(
+                    goal,
+                    SimulatedBroker().observe(),
+                    tool="autopilot",
+                    arguments={
+                        "action": "start",
+                        "mode": "farm",
+                        "hunt": "giant rat",
+                        "assigned_room": 535,
+                        "use_safe_spots": True,
+                    },
+                    reason=(
+                        "Background farming exceeded verified survivability in "
+                        "the assigned room: health reached the keeper flee threshold; "
+                        "the keeper had to withdraw; repeated retreat episodes reached "
+                        "the farm tactic safety limit"
+                    ),
+                    classification="ineffective_tactic",
+                    scope="tactic",
+                    block=False,
+                )["lesson"]
                 controller.storage.set_runtime(
                     "farm_tactic_quarantine_v1",
                     {
@@ -11906,9 +11933,14 @@ class ControllerTests(unittest.TestCase):
                         },
                         "535": {
                             "room": 535,
+                            "assigned_room": 535,
                             "target": "giant rat",
+                            "use_safe_spots": True,
+                            "goal_id": goal["id"],
                             "flee_threshold": 0.8,
-                            "reasons": ["health reached the keeper flee threshold"],
+                            "reasons": [
+                                "repeated retreat episodes reached the farm tactic safety limit"
+                            ],
                             "deltas": {"deaths": 0, "withdrawals": 1},
                         },
                         "575": {
@@ -11923,14 +11955,20 @@ class ControllerTests(unittest.TestCase):
 
                 released = controller._repair_policy_obsolete_farm_quarantines()
 
-                self.assertCountEqual([557, 554], [item["room"] for item in released])
+                self.assertCountEqual(
+                    [557, 554, 535], [item["room"] for item in released]
+                )
                 remaining = controller.storage.get_runtime(
                     "farm_tactic_quarantine_v1", {}
                 )
                 self.assertNotIn("557", remaining)
                 self.assertNotIn("554", remaining)
-                self.assertIn("535", remaining)
+                self.assertNotIn("535", remaining)
                 self.assertIn("575", remaining)
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(lesson["id"])["status"],
+                )
                 former_policy = next(
                     item for item in released if item["room"] == 557
                 )
@@ -15098,7 +15136,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_repeated_farm_retreats_quarantine_exact_tactic(self) -> None:
+    def test_fifty_productive_recovery_cycles_never_quarantine_or_consume_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -15108,7 +15146,7 @@ class ControllerTests(unittest.TestCase):
                     "num": 535,
                     "name": "West Merchant Way through Ilerian Woods",
                 }
-                broker.vitals["health"] = {"current": 19, "max": 26}
+                broker.farm_flee_below = 0.6
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
                     goal_payload(
@@ -15125,30 +15163,88 @@ class ControllerTests(unittest.TestCase):
                         ],
                     )
                 )["goal"]
-
-                first = controller.turn()
-                broker.vitals["health"] = {"current": 26, "max": 26}
-                controller.turn()
-                broker.vitals["health"] = {"current": 19, "max": 26}
-                broker.farm_did["withdrawals"] = 1
-                repeated = controller.turn()
-
-                self.assertTrue(first["background_farm_recovering"])
-                self.assertTrue(repeated["switched_to_survival"])
-                self.assertEqual("survive", broker.farm_mode)
-                quarantine = controller.storage.get_runtime(
-                    "farm_tactic_quarantine_v1", {}
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm giant rats until max HP reaches 27.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-max-hp-27",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "target": "giant rat",
+                            "room": 535,
+                            "use_safe_spots": True,
+                            "flee_below": 0.6,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
                 )
-                self.assertIn("535", quarantine)
-                self.assertIn(
-                    "repeated retreat episodes",
-                    quarantine["535"]["reasons"][0],
+
+                completion = controller.criteria.evaluate(goal, broker.observe())
+                journal: list[dict[str, object]] = []
+                for cycle in range(50):
+                    for offset in range(5):
+                        kill_number = cycle * 5 + offset + 1
+                        journal.append(
+                            {
+                                "at": 1000 + kill_number,
+                                "pass": kill_number,
+                                "what": "killed",
+                                "target": "giant rat",
+                            }
+                        )
+                    broker.farm_journal = list(journal)
+                    broker.farm_did["kills"] = (cycle + 1) * 5
+                    broker.farm_did["withdrawals"] = cycle + 1
+                    broker.vitals["health"] = {"current": 15, "max": 26}
+                    recovering = controller._manage_background_farm(
+                        goal, broker.observe(), completion
+                    )
+                    self.assertTrue(recovering["background_farm_recovering"])
+
+                    broker.vitals["health"] = {"current": 26, "max": 26}
+                    resumed = controller._manage_background_farm(
+                        goal, broker.observe(), completion
+                    )
+                    self.assertTrue(resumed["background_farm_monitoring"])
+
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active["id"])
+                self.assertEqual("active", active["status"])
+                self.assertEqual(0, active["attempt_count"])
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
                 )
-                lesson = controller.storage.goal_lessons(
-                    statuses=["deferred"], goal_id=goal["id"]
-                )[0]
-                self.assertEqual("ineffective_tactic", lesson["classification"])
-                self.assertEqual("tactic", lesson["scope"])
+                self.assertEqual(
+                    [],
+                    controller.storage.goal_lessons(
+                        statuses=["deferred"], goal_id=goal["id"]
+                    ),
+                )
+                lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+                self.assertEqual(250, lease["cumulative_kills"])
+                self.assertIsNone(controller.campaign.budget_exhausted(active))
+                self.assertTrue(broker.farm_running)
+                self.assertFalse(
+                    any(
+                        name == "autopilot" and arguments.get("action") == "stop"
+                        for name, arguments in broker.calls
+                    )
+                )
             finally:
                 controller.storage.close()
 
@@ -15248,6 +15344,11 @@ class ControllerTests(unittest.TestCase):
                 )[0]
                 self.assertEqual("route_unavailable", lesson["classification"])
                 self.assertEqual("tactic", lesson["scope"])
+                controller._repair_policy_obsolete_farm_quarantines()
+                self.assertEqual(
+                    "deferred",
+                    controller.storage.goal_lesson(lesson["id"])["status"],
+                )
                 self.assertFalse(result["quarantine"]["quarantined"])
                 self.assertNotIn(
                     "586", controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
