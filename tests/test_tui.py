@@ -516,6 +516,37 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(4, confirm["expected_version"])
         self.assertIn("only after every observable criterion passes", output.getvalue())
 
+    def test_goal_management_colorizes_queue_selection_and_actions(self) -> None:
+        answers = iter(["1", "p"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = prompt_goal_command(
+                FakeApi().goals(),
+                input_fn=lambda _: next(answers),
+                color=True,
+            )
+
+        rendered = output.getvalue()
+        self.assertIsNotNone(result)
+        self.assertIn("\x1b[1;36mGOAL QUEUE MANAGEMENT\x1b[0m", rendered)
+        self.assertIn("\x1b[32m[active]", rendered)
+        self.assertIn("\x1b[33m[queued]", rendered)
+        self.assertIn("\x1b[35m P50\x1b[0m", rendered)
+        self.assertIn("\x1b[31m[C]ancel\x1b[0m", rendered)
+        self.assertIn("\x1b[36mSelected:\x1b[0m", rendered)
+
+    def test_goal_management_default_output_remains_plain_text(self) -> None:
+        answers = iter(["1", "p"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            prompt_goal_command(
+                FakeApi().goals(), input_fn=lambda _: next(answers)
+            )
+
+        self.assertNotIn("\x1b[", output.getvalue())
+
     def test_escape_cancels_goal_creation_from_each_prompt_stage(self) -> None:
         initial = FakeApi()
         with contextlib.redirect_stdout(io.StringIO()):

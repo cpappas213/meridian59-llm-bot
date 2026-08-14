@@ -985,6 +985,7 @@ def prompt_goal_command(
     goals: list[dict[str, Any]],
     *,
     input_fn: Callable[[str], str] = input,
+    color: bool = False,
 ) -> tuple[str, dict[str, Any]] | None:
     open_goals = [
         goal
@@ -992,17 +993,29 @@ def prompt_goal_command(
         if goal.get("status") in {"active", "queued", "paused", "blocked"}
     ]
     if not open_goals:
-        print("There are no open goals to manage.")
+        print(_paint("There are no open goals to manage.", "dim", color))
         return None
-    print("\nManage a goal")
-    print("Press Esc at any prompt to cancel and return to the live console.")
+    print()
+    print(_paint("GOAL QUEUE MANAGEMENT", "bright_cyan", color))
+    print(_paint("-" * 76, "blue", color))
+    print(_paint(" #  STATUS       PRI  GOAL", "dim", color))
     for index, goal in enumerate(open_goals, 1):
+        status = str(goal.get("status", "-"))
+        status_label = f"[{status}]".ljust(12)
+        priority_label = f"P{goal.get('priority', '-')}".rjust(4)
         print(
-            f"{index:>2}. [{goal.get('status', '-')}] P{goal.get('priority', '-')} "
-            f"{goal.get('title', '?')}"
+            f"{_paint(f'{index:>2}.', 'bright_white', color)} "
+            f"{_paint(status_label, _state_style(status), color)} "
+            f"{_paint(priority_label, 'magenta', color)}  "
+            f"{_paint(goal.get('title', '?'), 'bright_white', color)}"
         )
+    print(_paint("-" * 76, "blue", color))
+    print(
+        _paint("Tip:", "cyan", color)
+        + " higher priority numbers run first; Esc returns without changing anything."
+    )
     selected = _prompt_integer(
-        "Goal number ([Esc] back): ",
+        f"{_paint('Goal number', 'bright_cyan', color)} ([Esc] back): ",
         input_fn,
         default=1,
         minimum=1,
@@ -1012,6 +1025,16 @@ def prompt_goal_command(
         return None
     goal = open_goals[selected - 1]
     status = str(goal.get("status"))
+    print(
+        "\n"
+        + _paint("Selected:", "cyan", color)
+        + " "
+        + _paint(goal.get("title", "?"), "bright_white", color)
+        + " "
+        + _paint(f"[{status}]", _state_style(status), color)
+        + " "
+        + _paint(f"P{goal.get('priority', '-')}", "magenta", color)
+    )
     choices = ["reprioritize", "cancel"]
     if status in {"active", "queued"}:
         choices.insert(0, "pause")
@@ -1025,7 +1048,11 @@ def prompt_goal_command(
     ):
         choices.append("confirm_complete")
         print(
-            "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes."
+            _paint(
+                "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes.",
+                "yellow",
+                color,
+            )
         )
     action_keys = {
         "pause": "p",
@@ -1041,11 +1068,24 @@ def prompt_goal_command(
         "cancel": "[C]ancel",
         "confirm_complete": "Con[F]irm manual criterion",
     }
+    action_styles = {
+        "pause": "yellow",
+        "resume": "green",
+        "reprioritize": "magenta",
+        "cancel": "red",
+        "confirm_complete": "green",
+    }
     print(
-        "Actions: "
-        + ", ".join(action_labels[choice] for choice in choices)
+        _paint("Actions:", "cyan", color)
+        + " "
+        + ", ".join(
+            _paint(action_labels[choice], action_styles[choice], color)
+            for choice in choices
+        )
     )
-    raw_action = _prompt_required("Action ([Esc] back): ", input_fn)
+    raw_action = _prompt_required(
+        f"{_paint('Action', 'bright_cyan', color)} ([Esc] back): ", input_fn
+    )
     if raw_action is None:
         return None
     raw_action = raw_action.casefold()
@@ -1058,7 +1098,7 @@ def prompt_goal_command(
         None,
     )
     if action is None:
-        print("Unknown action.")
+        print(_paint("Unknown action.", "red", color))
         return None
     payload: dict[str, Any] = {
         "request_id": f"tui-goal-command-{uuid7()}",
@@ -1068,7 +1108,8 @@ def prompt_goal_command(
     }
     if action == "reprioritize":
         priority = _prompt_integer(
-            "New priority (0 lowest, 100 highest) [50; Esc to go back]: ",
+            f"{_paint('New priority', 'bright_cyan', color)} "
+            "(0 lowest, 100 highest) [50; Esc to go back]: ",
             input_fn,
             default=50,
             minimum=0,
@@ -1085,7 +1126,7 @@ def prompt_goal_command(
         if confirmation is None:
             return None
         if confirmation.strip() != "CANCEL":
-            print("Cancellation aborted.")
+            print(_paint("Cancellation aborted.", "yellow", color))
             return None
         payload["cause"] = "operator_requested"
     if action == "confirm_complete":
@@ -1096,7 +1137,7 @@ def prompt_goal_command(
         if confirmation is None:
             return None
         if confirmation.strip() != "CONFIRM":
-            print("Confirmation aborted.")
+            print(_paint("Confirmation aborted.", "yellow", color))
             return None
     return str(goal.get("id")), payload
 
@@ -1217,7 +1258,9 @@ def run_tui(
             if key == "m":
                 _form_screen()
                 try:
-                    command = prompt_goal_command(goals, input_fn=input_fn)
+                    command = prompt_goal_command(
+                        goals, input_fn=input_fn, color=color
+                    )
                     if command is None:
                         message = "No goal change was made."
                     else:
