@@ -100,6 +100,27 @@ class ApiTests(unittest.TestCase):
                     self.assertIn("abilities", character_status)
                     self.assertIn("inventory", character_status)
                     self.assertIn("equipment", character_status)
+                controller._remember_conversation(
+                    "name:bunsen", "speaker", "Good morning.", speaker_kind="npc"
+                )
+                controller._remember_conversation(
+                    "name:bunsen", "assistant", "Good morning!", speaker_kind="npc"
+                )
+                conversation_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/conversations?limit=1",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(conversation_request, timeout=2) as response:
+                    conversations = json.load(response)
+                    self.assertEqual(200, response.status)
+                self.assertEqual(1, len(conversations["messages"]))
+                self.assertEqual("assistant", conversations["messages"][0]["role"])
+                self.assertEqual("Good morning!", conversations["messages"][0]["content"])
+                self.assertEqual("bunsen", conversations["messages"][0]["speaker"])
+                self.assertEqual(
+                    controller.config.deployment.timezone,
+                    conversations["timezone"],
+                )
                 draft_status, draft = self.request_json(
                     f"http://127.0.0.1:{control_port}/v1/goals/draft",
                     body={"prompt": "Do something useful."},

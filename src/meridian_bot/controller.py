@@ -20030,12 +20030,28 @@ class BotController:
             return []
         return entries[-(self.config.controller.conversation_history_turns * 2) :]
 
-    def _remember_conversation(self, key: str, role: str, content: str, *, speaker_kind: str) -> None:
+    def _remember_conversation(
+        self,
+        key: str,
+        role: str,
+        content: str,
+        *,
+        speaker_kind: str,
+        speaker: Any = None,
+    ) -> None:
         clean = " ".join(str(content).split())[:600]
         if not clean:
             return
         entries = self._conversation_history.setdefault(key, [])
-        entries.append({"role": role, "content": clean, "speaker_kind": speaker_kind, "at": timestamp()})
+        entry = {
+            "role": role,
+            "content": clean,
+            "speaker_kind": speaker_kind,
+            "at": timestamp(),
+        }
+        if speaker:
+            entry["speaker"] = " ".join(str(speaker).split())[:100]
+        entries.append(entry)
         del entries[: -self.config.controller.conversation_history_turns * 2]
         if len(self._conversation_history) > 100:
             oldest = min(
@@ -20173,7 +20189,13 @@ class BotController:
         self._greeted_at[key] = now
         self._greeting_times.append(now)
         self._save_social_presence()
-        self._remember_conversation(key, "assistant", result["reply"], speaker_kind="player")
+        self._remember_conversation(
+            key,
+            "assistant",
+            result["reply"],
+            speaker_kind="player",
+            speaker=encounter["name"],
+        )
         self.storage.emit_event(
             "conversation.greeted",
             f"Greeted visible player {encounter['name']}",
@@ -20228,7 +20250,13 @@ class BotController:
                         interesting=True,
                         data={"inbox_item_id": message_id, "speaker_kind": speaker_kind},
                     )
-                self._remember_conversation(speaker_key, "speaker", incoming, speaker_kind=speaker_kind)
+                self._remember_conversation(
+                    speaker_key,
+                    "speaker",
+                    incoming,
+                    speaker_kind=speaker_kind,
+                    speaker=source.get("name"),
+                )
                 if result["ignore"] or not result["reply"]:
                     self.broker.call_tool(
                         "inbox",
@@ -20256,6 +20284,7 @@ class BotController:
                 pending = {
                     "reply": result["reply"],
                     "speaker_key": speaker_key,
+                    "speaker": source.get("name"),
                     "speaker_kind": speaker_kind,
                     "persona_version": persona["version"],
                     "attempts": 0,
@@ -20312,6 +20341,7 @@ class BotController:
                     "assistant",
                     str(pending["reply"]),
                     speaker_kind=str(pending["speaker_kind"]),
+                    speaker=pending.get("speaker"),
                 )
             else:
                 self.broker.call_tool(
@@ -22658,6 +22688,53 @@ class BotController:
                 },
             }
         )
+
+    def conversation_history(self, *, limit: int = 60) -> dict[str, Any]:
+        """Return recent persisted in-game dialogue for authenticated local clients."""
+
+        limit = max(1, min(int(limit), 200))
+        saved = self.storage.get_runtime("conversation_history_v1", {})
+        history = saved if isinstance(saved, dict) else self._conversation_history
+        messages: list[dict[str, Any]] = []
+        for speaker_key, entries in history.items():
+            if not isinstance(entries, list):
+                continue
+            key = str(speaker_key)
+            key_kind, separator, key_value = key.partition(":")
+            if separator and key_kind == "name":
+                speaker = key_value or "unknown speaker"
+            elif separator and key_kind == "object":
+                speaker = f"object {key_value}" if key_value else "unknown speaker"
+            else:
+                speaker = key or "unknown speaker"
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                content = " ".join(str(entry.get("content") or "").split())
+                if not content:
+                    continue
+                messages.append(
+                    {
+                        "speaker_key": key,
+                        "speaker": " ".join(
+                            str(entry.get("speaker") or speaker).split()
+                        ),
+                        "role": str(entry.get("role") or "speaker"),
+                        "speaker_kind": str(
+                            entry.get("speaker_kind") or "unknown_in_game_speaker"
+                        ),
+                        "content": content,
+                        "occurred_at": str(entry.get("at") or ""),
+                    }
+                )
+        messages.sort(key=lambda item: item["occurred_at"])
+        observation = self.last_observation or {}
+        return {
+            "messages": messages[-limit:],
+            "timezone": self.config.deployment.timezone,
+            "character_name": self._character_name(observation)
+            or self.config.game.agent,
+        }
 
     def status(self, *, detail: str = "summary", include_recent_events: int = 3) -> dict[str, Any]:
         if detail not in {"supervision", "summary", "goal", "diagnostic"}:

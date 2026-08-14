@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import shutil
 import sys
@@ -119,6 +120,22 @@ class ControllerApi:
 
     def character_status(self) -> dict[str, Any]:
         return self.request("GET", "/v1/character")
+
+    def conversations(self, *, limit: int = 60) -> dict[str, Any]:
+        limit = max(1, min(limit, 200))
+        value = self.request("GET", f"/v1/conversations?limit={limit}")
+        timezone_name = str(value.get("timezone") or "UTC")
+        messages = value.get("messages")
+        result: list[dict[str, Any]] = []
+        for item in messages if isinstance(messages, list) else []:
+            if not isinstance(item, dict):
+                continue
+            message = dict(item)
+            message["display_occurred_at"] = _event_display_timestamp(
+                message.get("occurred_at"), timezone_name
+            )
+            result.append(message)
+        return {**value, "messages": result, "timezone": timezone_name}
 
     def goals(self) -> list[dict[str, Any]]:
         value = self.request("GET", "/v1/goals")
@@ -550,6 +567,7 @@ def render_dashboard(
                 f"{_paint('[N]', 'bright_cyan', color)} New goal   "
                 f"{_paint('[M]', 'bright_cyan', color)} Manage goal/queue   "
                 f"{_paint('[S]', 'bright_cyan', color)} Character status   "
+                f"{_paint('[C]', 'bright_cyan', color)} Recent chat   "
                 f"{_paint('[R]', 'bright_cyan', color)} Refresh   "
                 f"{_paint('[H]', 'bright_cyan', color)} Help   "
                 f"{_paint('[Q]', 'bright_cyan', color)} Quit"
@@ -753,6 +771,80 @@ def render_character_status(
 
     append_abilities("skills", "SKILLS")
     append_abilities("spells", "SPELLS")
+    lines.extend(
+        [
+            heavy_rule,
+            _paint("Press Esc or Enter to return to the live console.", "dim", color),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _safe_chat_text(value: Any) -> str:
+    """Normalize chat text and strip terminal control characters."""
+
+    without_terminal_sequences = re.sub(
+        r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value or "")
+    )
+    collapsed = " ".join(without_terminal_sequences.split())
+    return "".join(character for character in collapsed if character.isprintable())
+
+
+def render_conversations(
+    history: dict[str, Any], *, width: int | None = None, color: bool = False
+) -> str:
+    """Render recent incoming and outgoing in-game dialogue."""
+
+    width = max(72, width or shutil.get_terminal_size((110, 32)).columns)
+    character_name = _safe_chat_text(history.get("character_name")) or "Character"
+    timezone_name = _safe_chat_text(history.get("timezone")) or "UTC"
+    messages = history.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    rule = _paint("-" * width, "blue", color)
+    heavy_rule = _paint("=" * width, "blue", color)
+    lines = [
+        _paint("RECENT CHAT".center(width), "bright_cyan", color),
+        heavy_rule,
+        (
+            f"Character {_paint(character_name, 'bright_white', color)} | "
+            f"Times shown in {_paint(timezone_name, 'cyan', color)} | "
+            f"{len(messages)} message{'s' if len(messages) != 1 else ''}"
+        ),
+        rule,
+    ]
+    if not messages:
+        lines.append(_paint("No recent in-game chat is stored.", "dim", color))
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "speaker").casefold()
+        speaker = _safe_chat_text(message.get("speaker")) or "unknown speaker"
+        speaker_kind = _safe_chat_text(message.get("speaker_kind"))
+        when = _safe_chat_text(
+            message.get("display_occurred_at") or message.get("occurred_at")
+        )
+        if role == "assistant":
+            direction = f"{character_name} -> {speaker}"
+            style = "green"
+        else:
+            direction = f"{speaker} -> {character_name}"
+            style = "yellow"
+        metadata = f" ({speaker_kind})" if speaker_kind else ""
+        lines.append(
+            f"{_paint(when or '-', 'dim', color)}  "
+            f"{_paint(direction, style, color)}{_paint(metadata, 'dim', color)}"
+        )
+        content = _safe_chat_text(message.get("content")) or "-"
+        wrapped = textwrap.wrap(
+            content,
+            width=max(20, width - 4),
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or ["-"]
+        lines.extend(f"  {_paint(line, style, color)}" for line in wrapped)
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
     lines.extend(
         [
             heavy_rule,
@@ -1255,8 +1347,19 @@ def run_tui(
                     "N turns a plain-language request into a model-authored goal for your approval; "
                     "M manages goals (use F there to confirm a pending manual criterion); "
                     "S shows complete skills, spells, inventory, and equipment; "
+                    "C shows recent incoming and outgoing in-game chat; "
                     "Esc cancels any subpage and returns here."
                 )
+                continue
+            if key == "c":
+                _form_screen()
+                try:
+                    history = api.conversations()
+                    print(render_conversations(history, color=color))
+                    _form_input("", input_fn)
+                    message = "Returned from recent chat."
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Recent chat failed: {exc}"
                 continue
             if key == "s":
                 _form_screen()

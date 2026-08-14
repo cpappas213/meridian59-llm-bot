@@ -10,6 +10,7 @@ from meridian_bot.tui import (
     prompt_goal_command,
     prompt_new_goal,
     render_character_status,
+    render_conversations,
     render_dashboard,
     run_tui,
 )
@@ -20,6 +21,7 @@ class FakeApi:
         self.draft_requests: list[dict[str, object]] = []
         self.submissions: list[dict[str, object]] = []
         self.character_status_requests = 0
+        self.conversation_requests = 0
         self.drafts: list[dict[str, object]] = [
             {
                 "title": "Reach the bank",
@@ -198,6 +200,31 @@ class FakeApi:
             },
         }
 
+    def conversations(self) -> dict[str, object]:
+        self.conversation_requests += 1
+        return {
+            "character_name": "Sable",
+            "timezone": "America/Los_Angeles",
+            "messages": [
+                {
+                    "occurred_at": "2026-08-14T13:35:00Z",
+                    "display_occurred_at": "2026-08-14 06:35 PDT",
+                    "speaker": "bunsen",
+                    "speaker_kind": "npc",
+                    "role": "speaker",
+                    "content": "Can you help me with this particularly long request?",
+                },
+                {
+                    "occurred_at": "2026-08-14T13:35:02Z",
+                    "display_occurred_at": "2026-08-14 06:35 PDT",
+                    "speaker": "bunsen",
+                    "speaker_kind": "npc",
+                    "role": "assistant",
+                    "content": "Yes, I can help.",
+                },
+            ],
+        }
+
     def draft_goal(
         self,
         prompt: str,
@@ -253,6 +280,35 @@ class TuiTests(unittest.TestCase):
             requests,
         )
 
+    def test_controller_api_conversations_localizes_message_times(self) -> None:
+        api = object.__new__(ControllerApi)
+        requests: list[tuple[str, str]] = []
+
+        def request(method: str, path: str) -> dict[str, object]:
+            requests.append((method, path))
+            return {
+                "character_name": "Sable",
+                "timezone": "America/Los_Angeles",
+                "messages": [
+                    {
+                        "occurred_at": "2026-08-14T13:35:02Z",
+                        "speaker": "bunsen",
+                        "role": "assistant",
+                        "content": "Hello.",
+                    }
+                ],
+            }
+
+        api.request = request
+
+        result = api.conversations(limit=25)
+
+        self.assertEqual(
+            "2026-08-14 06:35 PDT",
+            result["messages"][0]["display_occurred_at"],
+        )
+        self.assertEqual([("GET", "/v1/conversations?limit=25")], requests)
+
     def test_dashboard_renders_goal_queue_vitals_and_abilities(self) -> None:
         api = FakeApi()
 
@@ -267,6 +323,7 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Controller started", rendered)
         self.assertIn("2026-08-08 12:34 UTC", rendered)
         self.assertIn("[S] Character status", rendered)
+        self.assertIn("[C] Recent chat", rendered)
         self.assertIn("CURRENT PHASE", rendered)
         self.assertIn("#4 Return Home [active]", rendered)
         self.assertIn("Attempts 2", rendered)
@@ -329,6 +386,23 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Vigor: 100 / 200 (50%; rested; rest threshold 80)", rendered)
         self.assertIn("Might: 25 (display scale 50; hard cap 70)", rendered)
         self.assertNotIn("{'value':", rendered)
+
+    def test_recent_chat_renders_directions_wraps_and_strips_controls(self) -> None:
+        api = FakeApi()
+        history = api.conversations()
+        history["messages"][0]["content"] = (
+            "Can you help me with this particularly long \x1b[31mrequest?"
+        )
+
+        rendered = render_conversations(history, width=72, color=True)
+
+        self.assertIn("RECENT CHAT", rendered)
+        self.assertIn("bunsen -> Sable", rendered)
+        self.assertIn("Sable -> bunsen", rendered)
+        self.assertIn("2026-08-14 06:35 PDT", rendered)
+        self.assertNotIn("\x1b[31mrequest", rendered)
+        self.assertNotIn("[31mrequest", rendered)
+        self.assertIn("\x1b[", rendered)
 
     def test_new_goal_flow_drafts_plain_language_and_approves(self) -> None:
         api = FakeApi()
@@ -683,6 +757,22 @@ class TuiTests(unittest.TestCase):
 
         self.assertEqual(0, result)
         self.assertEqual(1, api.character_status_requests)
+
+    def test_tui_c_opens_recent_chat_and_returns_to_dashboard(self) -> None:
+        api = FakeApi()
+        keys = iter(["c", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "\x1b",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, api.conversation_requests)
+        self.assertIn("RECENT CHAT", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -90,6 +90,13 @@ class ApiServers:
                         return self.send_json(200, controller.status(detail=_first(query, "detail", "summary"), include_recent_events=int(_first(query, "include_recent_events", "3"))))
                     if parsed.path == "/v1/character":
                         return self.send_json(200, controller.character_status())
+                    if parsed.path == "/v1/conversations":
+                        return self.send_json(
+                            200,
+                            controller.conversation_history(
+                                limit=int(_first(query, "limit", "60"))
+                            ),
+                        )
                     if parsed.path == "/v1/goals":
                         statuses = [
                             part
