@@ -208,6 +208,7 @@ def _state_style(value: Any) -> str:
         "ready",
         "active",
         "succeeded",
+        "complete",
         "low",
         "known",
     }:
@@ -216,6 +217,12 @@ def _state_style(value: Any) -> str:
         "starting",
         "reconciling",
         "degraded",
+        "shutdown_requested",
+        "draining",
+        "requested",
+        "pausing",
+        "securing",
+        "logging_out",
         "queued",
         "paused",
         "elevated",
@@ -493,6 +500,11 @@ def render_dashboard(
     width = width or shutil.get_terminal_size((110, 32)).columns
     width = max(72, width)
     controller = status.get("controller") if isinstance(status.get("controller"), dict) else {}
+    shutdown = (
+        controller.get("shutdown")
+        if isinstance(controller.get("shutdown"), dict)
+        else None
+    )
     game = status.get("game") if isinstance(status.get("game"), dict) else {}
     onboarding = status.get("onboarding") if isinstance(status.get("onboarding"), dict) else {}
     campaign = status.get("campaign") if isinstance(status.get("campaign"), dict) else {}
@@ -537,9 +549,36 @@ def render_dashboard(
             f"Control {controller.get('control_owner', '-')} | "
             f"Observation age {game.get('observation_age_seconds', '-')}s"
         ),
-        rule,
-        _paint("CURRENT GOAL", "bright_cyan", color),
     ]
+    if shutdown and shutdown.get("stage"):
+        shutdown_stage = str(shutdown.get("stage"))
+        shutdown_details: list[str] = []
+        paused_goal_ids = shutdown.get("paused_goal_ids")
+        if isinstance(paused_goal_ids, list) and paused_goal_ids:
+            shutdown_details.append(f"{len(paused_goal_ids)} goal(s) paused")
+        safe_room = shutdown.get("safe_room")
+        if isinstance(safe_room, dict):
+            safe_name = safe_room.get("name") or safe_room.get("canonical_name")
+            safe_id = safe_room.get("room_id")
+            if safe_name or safe_id is not None:
+                shutdown_details.append(
+                    "safe room "
+                    + str(safe_name or "verified")
+                    + (f" ({safe_id})" if safe_id is not None else "")
+                )
+        if shutdown.get("logged_out") is True:
+            shutdown_details.append("logged out")
+        if shutdown.get("error"):
+            shutdown_details.append(
+                "error " + _one_line(shutdown.get("error"), limit=width // 2)
+            )
+        lines.append(
+            (
+                f"Safe shutdown {_paint('[' + shutdown_stage + ']', _state_style(shutdown_stage), color)}"
+                + (f" | {' | '.join(shutdown_details)}" if shutdown_details else "")
+            )
+        )
+    lines.extend([rule, _paint("CURRENT GOAL", "bright_cyan", color)])
     if displayed_goal:
         lines.extend(
             [
@@ -675,10 +714,13 @@ def render_dashboard(
                 f"{_paint('[N]', 'bright_cyan', color)} New goal   "
                 f"{_paint('[M]', 'bright_cyan', color)} Manage goal/queue   "
                 f"{_paint('[S]', 'bright_cyan', color)} Character status   "
-                f"{_paint('[C]', 'bright_cyan', color)} Recent chat   "
+                f"{_paint('[C]', 'bright_cyan', color)} Recent chat"
+            ),
+            (
                 f"{_paint('[R]', 'bright_cyan', color)} Refresh   "
                 f"{_paint('[H]', 'bright_cyan', color)} Help   "
-                f"{_paint('[Q]', 'bright_cyan', color)} Quit"
+                f"{_paint('[X]', 'yellow', color)} Safe shutdown   "
+                f"{_paint('[Q]', 'bright_cyan', color)} Detach TUI"
             ),
         ]
     )
@@ -1400,6 +1442,26 @@ def _form_screen() -> None:
     sys.stdout.flush()
 
 
+def prompt_safe_shutdown(
+    *, input_fn: Callable[[str], str] = input, color: bool = False
+) -> bool:
+    """Require an explicit operator confirmation for coordinated shutdown."""
+
+    print(_paint("COORDINATED SAFE SHUTDOWN", "bright_cyan", color))
+    print(
+        "This pauses every runnable goal, waits for foreground/keeper ownership, "
+        "routes the character to a source-verified safe room, logs out without "
+        "forgetting credentials, then stops the controller and owned broker."
+    )
+    confirmation = _form_input(
+        "Type SHUTDOWN to proceed ([Esc] back): ", input_fn
+    )
+    return bool(
+        confirmation is not None
+        and confirmation.strip().casefold() == "shutdown"
+    )
+
+
 def run_tui(
     api: ControllerApi,
     *,
@@ -1449,12 +1511,34 @@ def run_tui(
                 continue
             if key == "q":
                 return 0
+            if key == "x":
+                _form_screen()
+                try:
+                    if not prompt_safe_shutdown(input_fn=input_fn, color=color):
+                        message = "Safe shutdown cancelled; the bot is still running."
+                    else:
+                        result = api.safe_stop()
+                        shutdown = (
+                            result.get("shutdown")
+                            if isinstance(result.get("shutdown"), dict)
+                            else {}
+                        )
+                        stage = shutdown.get("stage") or "requested"
+                        message = (
+                            f"Safe shutdown accepted [{stage}]. Keep this console "
+                            "open to watch progress, or press Q to detach the TUI."
+                        )
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Safe shutdown failed: {exc}"
+                continue
             if key == "h":
                 message = (
                     "N turns a plain-language request into a model-authored goal for your approval; "
                     "M manages goals (use F there to confirm a pending manual criterion); "
                     "S shows complete skills, spells, inventory, and equipment; "
                     "C shows recent incoming and outgoing in-game chat; "
+                    "X requests coordinated pause, safe return, logout, and process shutdown; "
+                    "Q only detaches this TUI and leaves the bot running; "
                     "Esc cancels any subpage and returns here."
                 )
                 continue

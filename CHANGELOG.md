@@ -7,6 +7,9 @@ and intends to use semantic versioning after its first public release.
 
 ### Added
 
+- An explicitly confirmed `X` safe-shutdown action on the TUI main screen,
+  including live drain-stage, paused-goal, verified-safe-room, logout, and
+  failure reporting while `Q` remains a detach-only operation.
 - A coordinated runtime shutdown sequence that pauses all runnable goals,
   recovers and routes to fresh source-verified safety, releases the keeper, logs
   out without forgetting the character, and fails safe without terminating when

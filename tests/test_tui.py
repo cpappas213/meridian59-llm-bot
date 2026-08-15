@@ -9,6 +9,7 @@ from meridian_bot.tui import (
     ControllerApiError,
     prompt_goal_command,
     prompt_new_goal,
+    prompt_safe_shutdown,
     render_character_status,
     render_conversations,
     render_dashboard,
@@ -22,6 +23,7 @@ class FakeApi:
         self.submissions: list[dict[str, object]] = []
         self.character_status_requests = 0
         self.conversation_requests = 0
+        self.safe_stop_requests = 0
         self.drafts: list[dict[str, object]] = [
             {
                 "title": "Reach the bank",
@@ -244,6 +246,19 @@ class FakeApi:
             ],
         }
 
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, object]:
+        self.safe_stop_requests += 1
+        return {
+            "stopping": True,
+            "shutdown": {
+                "request_id": "shutdown-1",
+                "stage": "requested",
+                "requested_destination_room_id": destination_room_id,
+            },
+        }
+
     def draft_goal(
         self,
         prompt: str,
@@ -352,6 +367,27 @@ class TuiTests(unittest.TestCase):
             "Location Tos (room 50) [guild PvP only, city, region: Tos]",
             rendered,
         )
+        self.assertIn("[X] Safe shutdown", rendered)
+        self.assertIn("[Q] Detach TUI", rendered)
+
+    def test_dashboard_renders_safe_shutdown_progress(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["controller"]["state"] = "draining"
+        status["controller"]["shutdown"] = {
+            "stage": "securing",
+            "paused_goal_ids": ["goal-1", "goal-2"],
+            "safe_room": {"room_id": 52, "name": "Familiars"},
+            "logged_out": False,
+        }
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Safe shutdown [securing]", rendered)
+        self.assertIn("2 goal(s) paused", rendered)
+        self.assertIn("safe room Familiars (52)", rendered)
 
     def test_dashboard_explains_when_campaign_is_between_phases(self) -> None:
         api = FakeApi()
@@ -702,12 +738,53 @@ class TuiTests(unittest.TestCase):
                     )
 
     def test_tui_can_attach_and_quit_without_stopping_controller(self) -> None:
+        api = FakeApi()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = run_tui(FakeApi(), key_reader=lambda _: "q")
+            result = run_tui(api, key_reader=lambda _: "q")
 
         self.assertEqual(0, result)
+        self.assertEqual(0, api.safe_stop_requests)
         self.assertIn("MERIDIAN 59 BOT CONSOLE", output.getvalue())
+
+    def test_tui_safe_shutdown_requires_confirmation_and_calls_controller(self) -> None:
+        api = FakeApi()
+        keys = iter(["x", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "SHUTDOWN",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, api.safe_stop_requests)
+        self.assertIn("Safe shutdown accepted [requested]", output.getvalue())
+
+    def test_tui_safe_shutdown_escape_cancels_without_api_call(self) -> None:
+        api = FakeApi()
+        keys = iter(["x", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "\x1b",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(0, api.safe_stop_requests)
+        self.assertIn("Safe shutdown cancelled", output.getvalue())
+
+    def test_safe_shutdown_confirmation_requires_exact_keyword(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                prompt_safe_shutdown(input_fn=lambda _: "  shutdown  ")
+            )
+            self.assertFalse(prompt_safe_shutdown(input_fn=lambda _: "yes"))
 
     def test_tui_manual_refresh_repolls_and_displays_acknowledgement(self) -> None:
         class CountingApi(FakeApi):
