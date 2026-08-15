@@ -36,6 +36,10 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Imported structured compendium item values into financial planning and split
+  source-estimated liquidation value from exact live merchant quotes. A zero
+  confirmed quote now means sale-eligible loot still needs quoting rather than
+  incorrectly implying that the inventory is worthless.
 - Made exhausted progression-research support phases complete only after a
   material equipment, ability, inventory, route, quarantine, max-health, or
   knowledge change. Read-only equipment/ability calls no longer manufacture

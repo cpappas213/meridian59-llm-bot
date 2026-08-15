@@ -301,8 +301,12 @@ financial_context.bank_accounts contains durable last-known balance evidence fro
 When it shows positive funds and selling would consume an item required by the active phase, preserve the item:
 travel to the canonical bank room, live-check/withdraw enough funds, then continue the purchase. A stale balance
 still requires a live bank call before transfer, but it is grounded evidence that this route exists.
-financial_context.known_liquidatable_inventory_value excludes equipped/in-use gear and intrinsically
-non-transferable items; do not count protected_sale_items as funding even when they have a source base value.
+financial_context.source_estimated_liquidatable_inventory_value is a source/base estimate that excludes
+equipped/in-use gear and intrinsically non-transferable items; use it to prioritize what to quote, never as
+spendable cash. confirmed_live_quote_liquidatable_value is stronger live evidence but still requires an
+immediate confirm=false re-quote before mutation. When that confirmed field is zero but liquidation_status
+is quote_required, interpret it as unquoted sale-eligible loot, not worthless inventory or a failed route.
+Do not count protected_sale_items as funding even when they have a source base value.
 merchant_sale_refusals and rejected_buyer_candidates unify the live NPC name/id with source merchant classes.
 A rejected item/buyer placement remains disproved across phase replacement: do not restore it under the source
 class name, an NPC display name, or a new plan summary. Choose a different remaining room placement or item.
@@ -540,9 +544,13 @@ For a 10-15 HP outcome, choose local progression milestones and rerank after eac
 recovery, commerce, equipment, supplies, and banking choices. Banking is discretionary; carried cash never blocks
 useful work. Full inventory should normally become a free_inventory_capacity or liquidate_inventory phase supplied
 with item/category/value/buyer facts; decide whether to sell, retain, bank, or drop rather than assuming one answer.
-A source base value is not spendable funding. Use financial_context.known_liquidatable_inventory_value, never
-known_inventory_item_value, when assessing sale capacity; protected_sale_items are equipped/in-use and unavailable
-for liquidation. Treat merchant_sale_refusals and rejected_buyer_candidates as exact live negative evidence even
+A source base value is not spendable funding. Use
+financial_context.source_estimated_liquidatable_inventory_value, never source_estimated_inventory_value, to
+prioritize sale candidates; protected_sale_items are equipped/in-use and unavailable for liquidation. Only
+carried_shillings is already spendable. confirmed_live_quote_liquidatable_value is grounded sale evidence, but
+the action agent must still obtain an immediate confirm=false quote before confirming the mutation. A zero
+confirmed quote with liquidation_status.state=quote_required means quote the disclosed items at a grounded buyer;
+it does not mean the inventory is worthless. Treat merchant_sale_refusals and rejected_buyer_candidates as exact live negative evidence even
 when the source class differs from the NPC display name. Never replace a failed support phase with another phase
 whose funding premise is the same rejected item/buyer placement. If no usable buyer room, positive bank balance,
 affordable purchase, or currently castable production route remains, choose a materially different prerequisite

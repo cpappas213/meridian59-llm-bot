@@ -21,7 +21,7 @@ from .utils import canonical_json, deep_get, timestamp
 
 
 KNOWLEDGE_TOOL_NAME = "knowledge_search"
-INDEX_VERSION = 7
+INDEX_VERSION = 8
 ENTITY_KINDS = (
     "location",
     "region",
@@ -146,12 +146,16 @@ class _PageText(HTMLParser):
         self.description = ""
         self.text: list[str] = []
         self.citations: list[str] = []
+        self.facts: dict[str, str] = {}
         self._main = 0
         self._ignored = 0
         self._capture_title = False
         self._capture_h1 = False
         self._capture_cite = False
         self._buffer: list[str] = []
+        self._fact_capture: str | None = None
+        self._fact_buffer: list[str] = []
+        self._pending_fact_label: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -171,8 +175,24 @@ class _PageText(HTMLParser):
         if "cite" in classes and self._main and not self._ignored:
             self._capture_cite = True
             self._buffer = []
+        if tag == "div" and self._main and not self._ignored:
+            if "lbl" in classes:
+                self._fact_capture = "label"
+                self._fact_buffer = []
+            elif "val" in classes:
+                self._fact_capture = "value"
+                self._fact_buffer = []
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self._fact_capture:
+            value = " ".join("".join(self._fact_buffer).split())
+            if self._fact_capture == "label":
+                self._pending_fact_label = value or None
+            elif value and self._pending_fact_label:
+                self.facts[normalize(self._pending_fact_label)] = value
+                self._pending_fact_label = None
+            self._fact_capture = None
+            self._fact_buffer = []
         if tag == "title" and self._capture_title:
             self.title = " ".join("".join(self._buffer).split())
             self._capture_title = False
@@ -192,6 +212,8 @@ class _PageText(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._capture_title or self._capture_h1 or self._capture_cite:
             self._buffer.append(data)
+        if self._fact_capture:
+            self._fact_buffer.append(data)
         if self._main and not self._ignored:
             clean = " ".join(data.split())
             if clean:
@@ -766,6 +788,26 @@ class KnowledgeBase:
         source_ref = str(path.relative_to(self.root)).replace("\\", "/")
         if parser.citations:
             source_ref += " | " + " | ".join(parser.citations[:8])
+        payload: dict[str, Any] = {
+            "slug": slug,
+            "page": str(path.relative_to(self.root)).replace("\\", "/"),
+        }
+        raw_value = parser.facts.get("value")
+        if kind in {"item", "weapon", "armor", "reagent"} and raw_value:
+            match = re.fullmatch(
+                r"\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:sh|shillings?)\s*",
+                raw_value,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                numeric_value = float(match.group(1).replace(",", ""))
+                payload["value"] = (
+                    int(numeric_value) if numeric_value.is_integer() else numeric_value
+                )
+                payload["value_basis"] = (
+                    "source-derived base item value from the compendium Value fact; "
+                    "live merchant resale value may differ"
+                )
         self._upsert_entity(
             connection,
             entity_id=entity_id,
@@ -774,7 +816,7 @@ class KnowledgeBase:
             aliases=aliases,
             summary=summary,
             content=content,
-            payload={"slug": slug, "page": str(path.relative_to(self.root)).replace("\\", "/")},
+            payload=payload,
             source_ref=source_ref,
             source_hash=hashlib.sha256(raw).hexdigest(),
         )
@@ -1181,7 +1223,8 @@ class KnowledgeBase:
                 "canonical_name": row["canonical_name"],
                 "unit_value": value,
                 "source_ref": row["source_ref"],
-                "basis": "source-derived base item value; live resale value may differ",
+                "basis": payload.get("value_basis")
+                or "source-derived base item value; live resale value may differ",
             }
         finally:
             connection.close()

@@ -14972,11 +14972,15 @@ class BotController:
             key: value.get(key)
             for key in (
                 "carried_shillings",
+                "source_estimated_inventory_value",
+                "source_estimated_liquidatable_inventory_value",
+                "confirmed_live_quote_liquidatable_value",
                 "known_inventory_item_value",
                 "known_liquidatable_inventory_value",
                 "known_total_carried_value",
                 "valuation_complete",
                 "valuation_note",
+                "liquidation_status",
                 "banking_policy",
             )
             if value.get(key) is not None
@@ -14984,6 +14988,8 @@ class BotController:
         for key in (
             "valued_items",
             "unknown_value_items",
+            "unquoted_liquidatable_items",
+            "valid_live_sell_quotes",
             "protected_sale_items",
             "rejected_buyer_candidates",
             "merchant_sale_refusals",
@@ -17076,6 +17082,74 @@ class BotController:
             }
         )
 
+    @staticmethod
+    def _selected_sale_inventory(
+        arguments: dict[str, Any], observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Resolve a sell request to exact current inventory evidence."""
+
+        raw_selected = arguments.get("items")
+        selected = raw_selected if isinstance(raw_selected, list) else [raw_selected]
+        selected_ids: set[str] = set()
+        selected_names: set[str] = set()
+        requested_amounts: dict[str, int] = {}
+        for value in selected:
+            if isinstance(value, dict):
+                item_id = value.get("id", value.get("object_id"))
+                name = value.get("name")
+                if item_id is not None and str(item_id).strip():
+                    item_id_key = str(item_id).strip().casefold()
+                    selected_ids.add(item_id_key)
+                    amount = value.get("amount")
+                    if (
+                        isinstance(amount, (int, float))
+                        and not isinstance(amount, bool)
+                        and amount > 0
+                    ):
+                        requested_amounts[item_id_key] = int(amount)
+                if name is not None and str(name).strip():
+                    selected_names.add(str(name).strip().casefold())
+            elif value is not None and str(value).strip():
+                clean = str(value).strip().casefold()
+                selected_ids.add(clean)
+                selected_names.add(clean)
+
+        inventory = deep_get(observation, "inventory.items", [])
+        resolved: list[dict[str, Any]] = []
+        for item in inventory if isinstance(inventory, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id", item.get("object_id"))
+            item_id_key = (
+                str(item_id).strip().casefold() if item_id is not None else ""
+            )
+            name = " ".join(str(item.get("name") or "").split())
+            if not (
+                (item_id_key and item_id_key in selected_ids)
+                or name.casefold() in selected_names
+            ):
+                continue
+            raw_quantity = item.get(
+                "amount", item.get("quantity", item.get("count", 1))
+            )
+            quantity = (
+                int(raw_quantity)
+                if isinstance(raw_quantity, (int, float))
+                and not isinstance(raw_quantity, bool)
+                and raw_quantity > 0
+                else 1
+            )
+            offered_quantity = requested_amounts.get(item_id_key, quantity)
+            resolved.append(
+                {
+                    "id": item_id,
+                    "name": name,
+                    "quantity": offered_quantity,
+                    "inventory_quantity": quantity,
+                }
+            )
+        return resolved
+
     def _guard_prepare_combat_sale(
         self,
         goal: dict[str, Any],
@@ -17320,6 +17394,11 @@ class BotController:
                 "signature": signature,
                 "offered_price": result.get("offered_price"),
                 "quoted_at": timestamp(),
+                "goal_id": goal.get("id"),
+                "phase_id": (phase or {}).get("id"),
+                "merchant_id": arguments.get("to", arguments.get("merchant")),
+                "room_id": self._observation_room(observation),
+                "items": self._selected_sale_inventory(arguments, observation),
             }
         )
         self.storage.set_runtime("prepare_combat_sell_quotes_v1", values[-30:])
@@ -20661,6 +20740,14 @@ class BotController:
             if item.get("item_id")
         }
         bank_accounts = self._latest_bank_balance_context()
+        raw_sell_quotes = self.storage.get_runtime(
+            "prepare_combat_sell_quotes_v1", []
+        )
+        sell_quotes = (
+            [item for item in raw_sell_quotes if isinstance(item, dict)]
+            if isinstance(raw_sell_quotes, list)
+            else []
+        )
         signature = canonical_json(
             {
                 "items": items,
@@ -20675,6 +20762,7 @@ class BotController:
                 "merchant_refusals": merchant_refusals,
                 "sale_exhausted_items": sale_exhausted_items,
                 "bank_accounts": bank_accounts,
+                "sell_quotes": sell_quotes,
             }
         )
         if (
@@ -20691,6 +20779,8 @@ class BotController:
         npc_transfer_restricted_items: list[dict[str, Any]] = []
         protected_sale_items: list[dict[str, Any]] = []
         sale_eligible_items: list[dict[str, Any]] = []
+        sale_eligible_details: list[dict[str, Any]] = []
+        sale_eligible_by_id: dict[str, dict[str, Any]] = {}
         for item in items:
             name = " ".join(str(item.get("name") or "").split())
             if not name or "shilling" in name.casefold():
@@ -20736,6 +20826,25 @@ class BotController:
                 and raw_quantity > 0
                 else 1
             )
+            if (
+                not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_details.append(
+                    {"id": item_id, "name": name, "quantity": quantity}
+                )
+            if (
+                item_id_key
+                and not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_by_id[item_id_key] = {
+                    "id": item_id,
+                    "name": name,
+                    "quantity": quantity,
+                }
             valuation = self.knowledge.item_valuation(name)
             unit_value = valuation.get("unit_value")
             basis = valuation.get("basis")
@@ -20820,14 +20929,155 @@ class BotController:
                 merchant_refusals,
             )
         )
+        valid_live_sell_quotes: list[dict[str, Any]] = []
+        quoted_item_ids: set[str] = set()
+        for quote in sell_quotes:
+            offered_price = quote.get("offered_price")
+            quote_items = quote.get("items")
+            if (
+                not isinstance(offered_price, (int, float))
+                or isinstance(offered_price, bool)
+                or offered_price <= 0
+                or not isinstance(quote_items, list)
+                or not quote_items
+            ):
+                continue
+            item_ids: set[str] = set()
+            normalized_items: list[dict[str, Any]] = []
+            valid = True
+            for quoted_item in quote_items:
+                if not isinstance(quoted_item, dict):
+                    valid = False
+                    break
+                quoted_id = quoted_item.get("id", quoted_item.get("object_id"))
+                quoted_id_key = (
+                    str(quoted_id).strip().casefold()
+                    if quoted_id is not None
+                    else ""
+                )
+                current = sale_eligible_by_id.get(quoted_id_key)
+                inventory_quantity_at_quote = quoted_item.get(
+                    "inventory_quantity", quoted_item.get("quantity")
+                )
+                offered_quantity = quoted_item.get("quantity")
+                if (
+                    not quoted_id_key
+                    or current is None
+                    or str(current.get("name") or "").casefold()
+                    != str(quoted_item.get("name") or "").casefold()
+                    or current.get("quantity") != inventory_quantity_at_quote
+                    or not isinstance(offered_quantity, int)
+                    or isinstance(offered_quantity, bool)
+                    or offered_quantity <= 0
+                    or offered_quantity > current.get("quantity", 0)
+                ):
+                    valid = False
+                    break
+                item_ids.add(quoted_id_key)
+                normalized_items.append(
+                    {
+                        **current,
+                        "quantity": offered_quantity,
+                        "inventory_quantity": current.get("quantity"),
+                    }
+                )
+            if not valid or not item_ids:
+                continue
+            valid_live_sell_quotes.append(
+                {
+                    "offered_price": offered_price,
+                    "quoted_at": quote.get("quoted_at"),
+                    "merchant_id": quote.get("merchant_id"),
+                    "room_id": quote.get("room_id"),
+                    "items": normalized_items,
+                    "_item_ids": item_ids,
+                }
+            )
+
+        # Quotes can overlap. Count a conservative disjoint subset so one
+        # carried object is never represented twice in the confirmed total.
+        confirmed_live_quote_value = 0.0
+        counted_item_ids: set[str] = set()
+        for quote in sorted(
+            valid_live_sell_quotes,
+            key=lambda item: float(item.get("offered_price", 0)),
+            reverse=True,
+        ):
+            quote_ids = quote.pop("_item_ids")
+            counted = not bool(quote_ids & counted_item_ids)
+            quote["counted_in_confirmed_total"] = counted
+            if counted:
+                counted_item_ids.update(quote_ids)
+                confirmed_live_quote_value += float(quote["offered_price"])
+            for quoted_item in quote.get("items", []):
+                if (
+                    quoted_item.get("quantity")
+                    == quoted_item.get("inventory_quantity")
+                    and quoted_item.get("id") is not None
+                ):
+                    quoted_item_ids.add(
+                        str(quoted_item["id"]).strip().casefold()
+                    )
+
+        confirmed_quote_total: int | float = (
+            int(confirmed_live_quote_value)
+            if confirmed_live_quote_value.is_integer()
+            else confirmed_live_quote_value
+        )
+        unquoted_liquidatable_items = [
+            item
+            for item in sale_eligible_details
+            if item.get("id") is None
+            or str(item["id"]).strip().casefold() not in quoted_item_ids
+        ]
+        has_grounded_buyer = any(
+            isinstance(item, dict)
+            and isinstance(item.get("candidates"), list)
+            and bool(item["candidates"])
+            for item in buyer_candidates
+        )
+        if confirmed_quote_total:
+            liquidation_state = "live_quotes_available"
+            liquidation_interpretation = (
+                "At least one exact current inventory selection has a positive live "
+                "merchant quote. Re-quote immediately before a mutating sale."
+            )
+        elif sale_eligible_items and has_grounded_buyer:
+            liquidation_state = "quote_required"
+            liquidation_interpretation = (
+                "Sale-eligible inventory and grounded buyer candidates exist, but no "
+                "positive live quote is recorded for the unchanged exact items. Zero "
+                "confirmed quote value means unquoted, not worthless."
+            )
+        elif sale_eligible_items:
+            liquidation_state = "buyer_discovery_required"
+            liquidation_interpretation = (
+                "Sale-eligible inventory exists, but no currently usable grounded buyer "
+                "placement is known. Seek new buyer evidence or use another funding route."
+            )
+        else:
+            liquidation_state = "no_sale_eligible_inventory"
+            liquidation_interpretation = (
+                "No current inventory instance is eligible for sale after loadout and "
+                "live negative-evidence protections."
+            )
         value = {
             "carried_shillings": carried_shillings,
+            "source_estimated_inventory_value": inventory_total,
+            "source_estimated_liquidatable_inventory_value": liquidatable_total,
+            "confirmed_live_quote_liquidatable_value": confirmed_quote_total,
             "known_inventory_item_value": inventory_total,
             "known_liquidatable_inventory_value": liquidatable_total,
             "known_total_carried_value": known_total,
             "valuation_complete": not unknown_value_items,
             "valued_items": valued_items[:30],
             "unknown_value_items": unknown_value_items[:30],
+            "unquoted_liquidatable_items": unquoted_liquidatable_items[:30],
+            "valid_live_sell_quotes": valid_live_sell_quotes[:30],
+            "liquidation_status": {
+                "state": liquidation_state,
+                "interpretation": liquidation_interpretation,
+            },
             "npc_transfer_restricted_items": npc_transfer_restricted_items[:30],
             "protected_sale_items": protected_sale_items[:30],
             "npc_transfer_rules": [
@@ -20846,13 +21096,17 @@ class BotController:
             "merchant_sale_refusals": merchant_refusals,
             "sale_exhausted_items": sale_exhausted_items,
             "valuation_note": (
-                "Best-effort base/live values, not a guaranteed merchant resale quote. "
-                "known_liquidatable_inventory_value excludes equipped/in-use loadout "
+                "source_estimated_* and the legacy known_* value fields are best-effort "
+                "base/live inventory estimates, not spendable cash or guaranteed resale. "
+                "source_estimated_liquidatable_inventory_value excludes equipped/in-use loadout "
                 "items and exact instances the live server proved cannot be given to an "
                 "NPC and exact carried items whose source sale hypothesis was disproved "
                 f"by {SALE_BUYER_REFUSAL_LIMIT} independent live buyers. Source buyer "
                 "candidates exclude exact item/merchant/room placements already refused "
-                "live. Unknown items mean the true total may be higher."
+                "live. confirmed_live_quote_liquidatable_value contains only positive live "
+                "quotes whose exact item ids, names, and quantities still match inventory; "
+                "zero means no current quote evidence, not zero market value. Unknown items "
+                "mean the source estimate may be higher."
             ),
             "banking_policy": {
                 "mode": "planner_discretion",
