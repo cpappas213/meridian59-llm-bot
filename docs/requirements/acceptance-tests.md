@@ -189,6 +189,8 @@ real vault.
 | AT-HARN-005 | P1 | Verify controller never calls `leave(forget=true)` in ordinary, restart, error, or graceful-stop paths. | FR-CHAR-006 |
 | AT-HARN-006 | P0 | Instrument concurrent broker mutations. Maximum in-flight mutations per character is exactly one. | FR-PLAY-003 |
 | AT-HARN-007 | P1 | Update to a candidate upstream commit. Contract suite detects compatible changes or reports exact incompatible schemas before live play. | NFR-MAINT-003 |
+| AT-HARN-008 | P0 | Request shutdown with active and queued goals while exposed. The controller pauses every runnable goal, serializes behind the current mutation, recovers and travels to fresh source-verified safety, releases the keeper, calls `leave(forget=false)`, verifies the session absent, then exits. Repeat from an already-safe room and verify travel is skipped. | FR-CHAR-006, FR-CHAR-015; FR-PLAY-003 |
+| AT-HARN-009 | P0 | Inject route and logout failures during shutdown. The controller does not exit or forget the character; all goals remain paused and survival protection is active while the character remains joined. A repeated request does not create a second shutdown workflow. | FR-CHAR-015; NFR-REL-002 |
 
 ## 10. Observability tests
 

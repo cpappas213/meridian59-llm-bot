@@ -680,7 +680,7 @@ The MCP facade maps to a versioned local API. Recommended routes:
 | `GET /v1/consequences` | Read-only consequential-action assessments and outcomes. |
 | `GET /v1/persona` / `PUT /v1/persona` | Persona versioning. |
 | `GET /v1/events` | Cursor-based event retrieval. |
-| `POST /v1/runtime/safe-stop` | Graceful operations stop; not exposed as Hermes MCP in MVP. |
+| `POST /v1/runtime/safe-stop` | Begin coordinated pause, safe return, logout, and process stop; accepts optional `destination_room_id`; not exposed as Hermes MCP in MVP. |
 | `GET /v1/knowledge/metadata` | Corpus version, build timestamp, source count, entity count, index version, and harness revision. |
 | `GET /v1/knowledge/search` | Read-only full-text/entity search. |
 | `GET /v1/knowledge/resolve` | Exact name, alias, class, slug, or numeric room-id resolution. |
@@ -691,6 +691,19 @@ The MCP facade maps to a versioned local API. Recommended routes:
 All non-health routes require a random local bearer secret even though the
 listener binds to loopback. The MCP facade reads it from its private environment.
 State changes use the same `request_id` semantics as MCP.
+
+`POST /v1/runtime/safe-stop` returns `202` after recording the shutdown request;
+the controller loop remains the sole gameplay-mutation owner and performs the
+sequence asynchronously. It pauses every active or queued goal, lets any current
+foreground mutation settle, recovers while exposed, and either remains in the
+freshly observed current safe room or routes to the optional exact destination
+or another source-verified safe candidate. Only after a fresh room observation,
+keeper release, `leave(forget=false)`, and confirmation that the broker session
+is absent does it terminate the controller and owned broker. A failed recovery,
+route, safety check, keeper stop, or logout leaves the controller running with
+goals paused and survival mode retained. Repeated requests are idempotent. The
+`controller.shutdown` status object exposes the requested target, stage, result,
+and error while the API remains available.
 
 ### 9.1 Goal drafting
 

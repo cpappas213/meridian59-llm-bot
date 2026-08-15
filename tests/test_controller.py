@@ -971,6 +971,75 @@ class BackgroundFarmBroker(SimulatedBroker):
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
 
+class ShutdownBroker(SimulatedBroker):
+    def __init__(
+        self,
+        *,
+        fail_travel: bool = False,
+        fail_leave: bool = False,
+        asynchronous_stop_polls: int = 0,
+    ) -> None:
+        super().__init__()
+        self.keeper_running = True
+        self.keeper_mode = "farm"
+        self.fail_travel = fail_travel
+        self.fail_leave = fail_leave
+        self.asynchronous_stop_polls = asynchronous_stop_polls
+        self.keeper_stopping = False
+
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        *,
+        timeout: float = 180,
+        mutation: bool = False,
+    ) -> object:
+        if name == "autopilot" and arguments.get("action") == "status":
+            self.calls.append((name, copy.deepcopy(arguments)))
+            if self.keeper_stopping:
+                if self.asynchronous_stop_polls > 0:
+                    self.asynchronous_stop_polls -= 1
+                else:
+                    self.keeper_running = False
+                    self.keeper_stopping = False
+            return {
+                "running": self.keeper_running,
+                "mode": self.keeper_mode,
+                "activity": "hunting" if self.keeper_running else "stopped",
+                "threat": {
+                    "could_reach_us": 0,
+                    "camped_on_us": 0,
+                    "in_swing_range": 0,
+                    "landing_damage": 0,
+                },
+            }
+        if name == "autopilot" and arguments.get("action") == "stop":
+            self.calls.append((name, copy.deepcopy(arguments)))
+            if self.asynchronous_stop_polls > 0:
+                self.keeper_stopping = True
+                return {"running": True, "stopping": True}
+            self.keeper_running = False
+            return {"running": False, "stopped": True}
+        if name == "autopilot" and arguments.get("action") == "start":
+            self.calls.append((name, copy.deepcopy(arguments)))
+            self.keeper_running = True
+            self.keeper_mode = str(arguments.get("mode") or "survive")
+            return {"running": True, "mode": self.keeper_mode}
+        if name == "travel" and self.fail_travel:
+            self.calls.append((name, copy.deepcopy(arguments)))
+            return {"arrived": False, "reason": "test route failure"}
+        if name == "leave":
+            self.calls.append((name, copy.deepcopy(arguments)))
+            if self.fail_leave:
+                return {"left": False, "forgotten": False}
+            self.joined = False
+            return {"left": True, "forgotten": False}
+        return super().call_tool(
+            name, arguments, timeout=timeout, mutation=mutation
+        )
+
+
 class DeathReconciliationBroker(CombatBroker):
     def __init__(self) -> None:
         super().__init__()
@@ -13587,6 +13656,206 @@ class ControllerTests(unittest.TestCase):
                     "events"
                 ]
                 self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_pauses_every_runnable_goal_then_travels_and_logs_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker()
+                broker.room = {"num": 575, "name": "The King's Way"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                first = controller.storage.submit_goal(
+                    goal_payload(request_id="shutdown-active")
+                )["goal"]
+                second = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="shutdown-queued",
+                        objective="Train mace fighting.",
+                    )
+                )["goal"]
+
+                requested = controller.safe_stop(destination_room_id=52)
+                repeated = controller.safe_stop(destination_room_id=52)
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual(requested["request_id"], repeated["request_id"])
+                self.assertEqual("complete", result["stage"])
+                self.assertTrue(result["logged_out"])
+                self.assertEqual(52, result["safe_room"]["room_id"])
+                self.assertTrue(controller.stop_event.is_set())
+                self.assertFalse(broker.joined)
+                self.assertEqual(
+                    "paused", controller.storage.goal(first["id"])["status"]
+                )
+                self.assertEqual(
+                    "paused", controller.storage.goal(second["id"])["status"]
+                )
+                self.assertEqual([], controller.storage.goals(["active", "queued"]))
+                travel_index = next(
+                    index
+                    for index, (name, _) in enumerate(broker.calls)
+                    if name == "travel"
+                )
+                leave_index = next(
+                    index
+                    for index, (name, _) in enumerate(broker.calls)
+                    if name == "leave"
+                )
+                self.assertLess(travel_index, leave_index)
+                leave_arguments = broker.calls[leave_index][1]
+                self.assertIs(leave_arguments["forget"], False)
+                self.assertEqual(52, broker.room["num"])
+                events = controller.storage.latest_events(
+                    kinds=["runtime.shutdown_complete"]
+                )
+                self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_in_verified_room_skips_travel_before_logout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker()
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop()
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("complete", result["stage"])
+                self.assertEqual(52, result["safe_room"]["room_id"])
+                self.assertNotIn("travel", [name for name, _ in broker.calls])
+                self.assertIn("leave", [name for name, _ in broker.calls])
+                self.assertFalse(broker.joined)
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_waits_for_asynchronous_keeper_hard_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker(asynchronous_stop_polls=2)
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop()
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("complete", result["stage"])
+                self.assertFalse(broker.joined)
+                statuses = [
+                    args
+                    for name, args in broker.calls
+                    if name == "autopilot" and args.get("action") == "status"
+                ]
+                self.assertGreaterEqual(len(statuses), 3)
+                leave_index = next(
+                    index
+                    for index, (name, _) in enumerate(broker.calls)
+                    if name == "leave"
+                )
+                last_status_index = max(
+                    index
+                    for index, (name, args) in enumerate(broker.calls)
+                    if name == "autopilot" and args.get("action") == "status"
+                )
+                self.assertLess(last_status_index, leave_index)
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_request_is_drained_by_controller_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker()
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop()
+                controller.run_forever()
+
+                self.assertEqual("stopped", controller.state)
+                self.assertEqual(
+                    "complete", controller._shutdown_status_snapshot()["stage"]
+                )
+                self.assertFalse(broker.joined)
+            finally:
+                controller.stop_event.set()
+                controller.storage.close()
+
+    def test_safe_shutdown_request_suspends_background_social_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = ShutdownBroker()
+                controller.broker = broker
+
+                controller.safe_stop()
+                controller._social_tick()
+
+                self.assertEqual([], broker.calls)
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_route_failure_retains_controller_and_survival_keeper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker(fail_travel=True)
+                broker.room = {"num": 575, "name": "The King's Way"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="shutdown-route-failure")
+                )["goal"]
+
+                controller.safe_stop(destination_room_id=52)
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("failed", result["stage"])
+                self.assertFalse(controller.stop_event.is_set())
+                self.assertTrue(broker.joined)
+                self.assertTrue(broker.keeper_running)
+                self.assertEqual("survive", broker.keeper_mode)
+                self.assertNotIn("leave", [name for name, _ in broker.calls])
+                self.assertEqual(
+                    "paused", controller.storage.goal(goal["id"])["status"]
+                )
+            finally:
+                controller.storage.close()
+
+    def test_safe_shutdown_logout_failure_never_stops_or_forgets_character(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = ShutdownBroker(fail_leave=True)
+                broker.room = {"num": 52, "name": "Familiars"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop()
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("failed", result["stage"])
+                self.assertFalse(controller.stop_event.is_set())
+                self.assertTrue(broker.joined)
+                self.assertTrue(broker.keeper_running)
+                leaves = [args for name, args in broker.calls if name == "leave"]
+                self.assertEqual(1, len(leaves))
+                self.assertIs(leaves[0]["forget"], False)
             finally:
                 controller.storage.close()
 

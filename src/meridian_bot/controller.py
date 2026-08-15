@@ -70,7 +70,8 @@ TRANSIENT_MOVEMENT_FAILURE_MARKERS = (
 )
 
 TOS_BANK_ROOM_ID = 54
-RAZA_EXIT_SAFE_ROOM_ID = 52
+FAMILIARS_ROOM_ID = 52
+RAZA_EXIT_SAFE_ROOM_ID = FAMILIARS_ROOM_ID
 SALE_BUYER_REFUSAL_LIMIT = 3
 RESTED_VIGOR_FLOOR = 80
 # Ordinary keeper farms may start at the game's natural rested floor. Combat
@@ -196,6 +197,15 @@ ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 PLANNED_CONTROLLER_STOP_RUNTIME_KEY = "planned_controller_stop_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
+# A shutdown is deliberately much slower than a process stop. The keeper first
+# gets a bounded opportunity to recover or withdraw, and long ordinary-client
+# routes can take minutes. Failure never advances to logout/process termination.
+SHUTDOWN_RECOVERY_TIMEOUT_SECONDS = 3 * 60
+SHUTDOWN_TRAVEL_TIMEOUT_SECONDS = 10 * 60
+SHUTDOWN_KEEPER_STOP_TIMEOUT_SECONDS = 2 * 60
+SHUTDOWN_SESSION_EXIT_TIMEOUT_SECONDS = 15
+SHUTDOWN_MAX_SAFE_CANDIDATES = 4
+
 
 class OnboardingRequired(ValueError):
     """A gameplay goal cannot become durable before character setup finishes."""
@@ -236,6 +246,10 @@ class BotController:
         }
         self.warnings: list[str] = []
         self.stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_status: dict[str, Any] | None = None
         self._turn_lock = threading.Lock()
         # Ambient conversation remains responsive, but must not inject broker
         # traffic into an in-flight navigation or combat transaction.
@@ -8824,6 +8838,10 @@ class BotController:
         raise KnowledgeValidationError(validation)
 
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._shutdown_requested.is_set():
+            raise InvalidTransition(
+                "controller shutdown is draining; new gameplay goals are not accepted"
+            )
         onboarding = self._onboarding_status(self.last_observation or {})
         if not onboarding.get("ready_for_goals"):
             raise OnboardingRequired(
@@ -9213,6 +9231,13 @@ class BotController:
             raise
 
     def manage_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if (
+            self._shutdown_requested.is_set()
+            and payload.get("action") == "resume"
+        ):
+            raise InvalidTransition(
+                "controller shutdown is draining; goals cannot be resumed"
+            )
         goal = self.storage.goal(str(payload.get("goal_id", "")))
         if goal is None:
             # Preserve the storage layer's stable NOT_FOUND response.
@@ -9689,6 +9714,9 @@ class BotController:
         backoff = 1.0
         while not self.stop_event.is_set():
             self.last_heartbeat_at = timestamp()
+            if self._shutdown_requested.is_set():
+                self._perform_safe_shutdown()
+                continue
             try:
                 self.turn()
                 backoff = 1.0
@@ -9726,11 +9754,16 @@ class BotController:
                 cadence = backoff
                 backoff = min(backoff * 2, self.config.controller.error_backoff_max_seconds)
             else:
-                if self.dependencies.get("broker") == "healthy" and self.dependencies.get("model") != "unhealthy":
+                if (
+                    not self._shutdown_requested.is_set()
+                    and self.dependencies.get("broker") == "healthy"
+                    and self.dependencies.get("model") != "unhealthy"
+                ):
                     self.state = "running"
                     self.warnings = []
                     self._active_degradations.clear()
-            self.stop_event.wait(cadence)
+            self._wake_event.wait(cadence)
+            self._wake_event.clear()
         self.state = "stopped"
 
     @staticmethod
@@ -19915,10 +19948,10 @@ class BotController:
     def _social_tick(self) -> None:
         if self.offline_diagnostics or not self.config.controller.conversation_enabled:
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         self._reconcile_conversation_listener()
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         look = self.broker.call_tool(
             "look",
@@ -20158,7 +20191,7 @@ class BotController:
             self._greeted_at[key] = now
             self._save_social_presence()
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             # Keep the pending greeting for the next quiet social tick.
             return
         if contains_secret(result["reply"], self.config.secrets):
@@ -20207,7 +20240,7 @@ class BotController:
         persona = self.storage.persona()
         if self.offline_diagnostics or not self.config.controller.conversation_enabled or persona.get("version", 0) == 0:
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         look = look if isinstance(look, dict) else {}
         inbox = self.broker.call_tool(
@@ -20324,7 +20357,7 @@ class BotController:
                     "retry_after": 0.0,
                 }
 
-            if self._game_action_active.is_set():
+            if self._shutdown_requested.is_set() or self._game_action_active.is_set():
                 self._pending_conversation_replies[str(message_id)] = pending
                 continue
             if not self._conversation_window_allows(
@@ -22390,6 +22423,7 @@ class BotController:
                 "version": self.VERSION,
                 "last_heartbeat_at": self.last_heartbeat_at,
                 "heartbeat_age_seconds": self._age_seconds(self.last_heartbeat_at),
+                "shutdown": self._shutdown_status_snapshot(),
                 "control_owner": (
                     "foreground_action"
                     if foreground_action is not None
@@ -22893,6 +22927,7 @@ class BotController:
                 "since": self.started_at,
                 "version": self.VERSION,
                 "last_heartbeat_at": self.last_heartbeat_at,
+                "shutdown": self._shutdown_status_snapshot(),
                 "control_owner": "foreground_action" if foreground_action else "controller",
                 "foreground_action": foreground_action,
             },
@@ -22955,14 +22990,561 @@ class BotController:
             return "critical" if ratio < 0.4 else "elevated" if ratio < 0.7 else "low"
         return "unknown"
 
-    def safe_stop(self) -> None:
-        self._mark_planned_phase_stop()
-        self.state = "stopping"
-        self.stop_event.set()
+    def _shutdown_status_snapshot(self) -> dict[str, Any] | None:
+        with self._shutdown_lock:
+            return (
+                dict(self._shutdown_status)
+                if isinstance(self._shutdown_status, dict)
+                else None
+            )
+
+    def _set_shutdown_stage(self, stage: str, **updates: Any) -> dict[str, Any]:
+        with self._shutdown_lock:
+            value = dict(self._shutdown_status or {})
+            value.update(updates)
+            value["stage"] = stage
+            value["updated_at"] = timestamp()
+            self._shutdown_status = value
+            return dict(value)
+
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, Any]:
+        """Request a controller-owned pause, safe return, logout, and stop.
+
+        The API thread only records intent and wakes the controller loop. The
+        loop itself drains the request after any in-flight game action returns,
+        preserving the single broker-mutation owner. Repeated requests are
+        idempotent while a drain is active.
+        """
+
+        if destination_room_id is not None:
+            if (
+                not isinstance(destination_room_id, int)
+                or isinstance(destination_room_id, bool)
+                or destination_room_id <= 0
+            ):
+                raise ValueError(
+                    "shutdown destination_room_id must be a positive integer"
+                )
+            if self._verified_safe_staging(destination_room_id) is None:
+                raise ValueError(
+                    f"shutdown destination room {destination_room_id} is not "
+                    "source-verified as a sanctuary or no-combat room"
+                )
+
+        with self._shutdown_lock:
+            existing = self._shutdown_status
+            if (
+                isinstance(existing, dict)
+                and existing.get("stage")
+                not in {"failed", "complete"}
+            ):
+                return dict(existing)
+            requested = {
+                "request_id": uuid7(),
+                "stage": "requested",
+                "requested_at": timestamp(),
+                "updated_at": timestamp(),
+                "requested_destination_room_id": destination_room_id,
+                "paused_goal_ids": [],
+                "safe_room": None,
+                "logged_out": False,
+                "error": None,
+            }
+            self._shutdown_status = requested
+
+        self.state = "shutdown_requested"
+        self._shutdown_requested.set()
+        self._wake_event.set()
+        self.storage.emit_event(
+            "runtime.shutdown_requested",
+            "Coordinated pause, safe return, logout, and shutdown requested",
+            severity="notice",
+            interesting=True,
+            data={
+                "request_id": requested["request_id"],
+                "requested_destination_room_id": destination_room_id,
+            },
+        )
+        return dict(requested)
+
+    @staticmethod
+    def _shutdown_full_health(observation: dict[str, Any]) -> bool:
+        health = deep_get(
+            observation,
+            "status.vitals.health",
+            deep_get(observation, "look.vitals.health"),
+        )
+        if not isinstance(health, dict):
+            return False
+        current = health.get("current", health.get("value"))
+        maximum = health.get("max")
         try:
-            self._set_fallback()
+            return float(current) > 0 and float(current) >= float(maximum)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _shutdown_keeper_threat_clear(status: Any) -> bool:
+        if not isinstance(status, dict):
+            return True
+        threat = status.get("threat")
+        if not isinstance(threat, dict):
+            return True
+        for key in ("could_reach_us", "camped_on_us", "in_swing_range"):
+            try:
+                if float(threat.get(key, 0) or 0) > 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        try:
+            return float(threat.get("landing_damage", 0) or 0) <= 0
+        except (TypeError, ValueError):
+            return False
+
+    def _refresh_shutdown_observation(self) -> dict[str, Any]:
+        observation = self._reconcile_recent_inventory_creation(
+            self._reconcile_recent_room_transition(self.broker.observe())
+        )
+        self.last_observation = observation
+        self._remember_safe_staging(observation)
+        self.storage.record_snapshot(redact(observation))
+        self.last_heartbeat_at = timestamp()
+        return observation
+
+    def _pause_all_runnable_goals_for_shutdown(self) -> list[str]:
+        paused: list[str] = []
+        # Storage promotes the next queued goal whenever an active goal is
+        # paused. Looping therefore atomically drains every runnable goal into
+        # the durable paused state before broker ownership changes.
+        for _ in range(200):
+            active = self.storage.active_goal()
+            if active is None:
+                return paused
+            result = self.manage_goal(
+                {
+                    "request_id": f"shutdown-pause-{uuid7()}",
+                    "goal_id": active["id"],
+                    "expected_version": active.get("version"),
+                    "action": "pause",
+                    "reason": (
+                        "Coordinated shutdown paused all runnable work before "
+                        "safe return and logout"
+                    ),
+                }
+            )
+            goal = result.get("goal") if isinstance(result, dict) else None
+            if not isinstance(goal, dict) or goal.get("status") != "paused":
+                raise RuntimeError(
+                    f"shutdown could not verify paused goal {active['id']}"
+                )
+            paused.append(str(goal["id"]))
+        raise RuntimeError("shutdown refused to drain more than 200 runnable goals")
+
+    def _shutdown_safe_candidates(
+        self,
+        observation: dict[str, Any],
+        requested_room_id: int | None,
+    ) -> list[dict[str, Any]]:
+        current_room = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        current = self._verified_safe_staging(current_room)
+        if current is not None and requested_room_id is None:
+            return [{**current, "basis": "already_in_verified_safe_room"}]
+
+        candidates: list[dict[str, Any]] = []
+        if requested_room_id is not None:
+            requested = self._verified_safe_staging(requested_room_id)
+            if requested is not None:
+                candidates.append(
+                    {**requested, "basis": "operator_requested_safe_room"}
+                )
+
+        finder = getattr(self.knowledge, "safe_location_candidates", None)
+        if callable(finder) and current_room is not None:
+            try:
+                found = finder(
+                    int(current_room),
+                    preferred_room_id=(
+                        requested_room_id
+                        if requested_room_id is not None
+                        else FAMILIARS_ROOM_ID
+                    ),
+                    limit=12,
+                )
+            except (TypeError, ValueError):
+                found = None
+            raw = found.get("candidates") if isinstance(found, dict) else None
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                verified = self._verified_safe_staging(item.get("room_id"))
+                if verified is not None:
+                    candidates.append(
+                        {
+                            **verified,
+                            "distance": item.get("distance"),
+                            "basis": item.get("basis") or "source_safe_candidate",
+                        }
+                    )
+
+        remembered = self.storage.get_runtime(SAFE_STAGING_RUNTIME_KEY, {})
+        if isinstance(remembered, dict):
+            verified = self._verified_safe_staging(remembered.get("room_id"))
+            if verified is not None:
+                candidates.append(
+                    {
+                        **verified,
+                        "basis": "source_revalidated_last_observed_safe_room",
+                    }
+                )
+
+        unique: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for item in candidates:
+            room_id = int(item["room_id"])
+            if room_id in seen:
+                continue
+            seen.add(room_id)
+            unique.append(item)
+        return unique[:SHUTDOWN_MAX_SAFE_CANDIDATES]
+
+    def _stop_keeper_for_shutdown(self) -> dict[str, Any]:
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if not self._keeper_is_driving(status):
+            return status if isinstance(status, dict) else {"running": False}
+        result = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                "hard": True,
+                "why": (
+                    "coordinated shutdown is transferring movement ownership "
+                    "to verified safe return"
+                ),
+            },
+            timeout=30,
+            mutation=True,
+        )
+        # Upstream hard-stop is intentionally asynchronous: it marks the keeper
+        # as stopping and returns its current status, which can still have
+        # running=true until the in-flight pass reaches its cancellation
+        # boundary. Poll the authoritative state instead of mistaking that
+        # acknowledgement for a refusal and immediately reviving the keeper.
+        deadline = time.monotonic() + SHUTDOWN_KEEPER_STOP_TIMEOUT_SECONDS
+        status = result
+        while self._keeper_is_driving(status) and time.monotonic() < deadline:
+            time.sleep(0.25)
+            status = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+        if self._keeper_is_driving(status):
+            raise RuntimeError(
+                "keeper did not release control before the shutdown timeout"
+            )
+        return status if isinstance(status, dict) else {"running": False}
+
+    def _recover_for_shutdown(
+        self, observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        current_room = deep_get(observation, "look.room.num")
+        if self._verified_safe_staging(current_room) is not None:
+            return observation
+        keeper = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if self._shutdown_full_health(observation) and self._shutdown_keeper_threat_clear(
+            keeper
+        ):
+            return observation
+
+        self._set_shutdown_stage(
+            "recovering",
+            detail="survival keeper is recovering or withdrawing before safe travel",
+        )
+        self._ensure_survival_keeper()
+        deadline = time.monotonic() + SHUTDOWN_RECOVERY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(2.0)
+            observation = self._refresh_shutdown_observation()
+            current_room = deep_get(observation, "look.room.num")
+            if self._verified_safe_staging(current_room) is not None:
+                return observation
+            keeper = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+            if self._shutdown_full_health(
+                observation
+            ) and self._shutdown_keeper_threat_clear(keeper):
+                return observation
+        raise RuntimeError(
+            "survival keeper did not establish full-health, threat-clear travel "
+            "readiness before the shutdown recovery timeout"
+        )
+
+    def _travel_to_shutdown_safety(
+        self,
+        observation: dict[str, Any],
+        requested_room_id: int | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        current_room = deep_get(observation, "look.room.num")
+        current_safe = self._verified_safe_staging(current_room)
+        if current_safe is not None and (
+            requested_room_id is None
+            or str(current_room) == str(requested_room_id)
+        ):
+            return observation, {
+                **current_safe,
+                "basis": "already_in_verified_safe_room",
+            }
+
+        candidates = self._shutdown_safe_candidates(
+            observation, requested_room_id
+        )
+        if not candidates:
+            raise RuntimeError(
+                f"no source-verified shutdown sanctuary is available from room {current_room}"
+            )
+
+        capabilities = self.broker.capabilities()
+        self._stop_keeper_for_shutdown()
+        failures: list[dict[str, Any]] = []
+        for candidate in candidates:
+            destination = int(candidate["room_id"])
+            self._set_shutdown_stage(
+                "travelling",
+                destination_room_id=destination,
+                destination_name=candidate.get("name"),
+                route_failures=failures,
+            )
+            self._begin_foreground_action("shutdown_safe_return")
+            try:
+                if "rest" in capabilities:
+                    self.broker.call_tool(
+                        "rest",
+                        {"agent": self.config.game.agent, "stand": True},
+                        timeout=10,
+                        mutation=True,
+                    )
+                if "look" in capabilities:
+                    self.broker.call_tool(
+                        "look",
+                        {"agent": self.config.game.agent},
+                        timeout=20,
+                        mutation=False,
+                    )
+                arguments: dict[str, Any] = {
+                    "agent": self.config.game.agent,
+                    "to": destination,
+                }
+                travel_tool = capabilities.get("travel")
+                if travel_tool is not None and travel_tool.accepts("max_hops"):
+                    arguments["max_hops"] = 50
+                result = self.broker.call_tool(
+                    "travel",
+                    arguments,
+                    timeout=SHUTDOWN_TRAVEL_TIMEOUT_SECONDS,
+                    mutation=True,
+                )
+            except (BrokerError, ValueError) as exc:
+                result = {"error": str(exc)[:500]}
+            finally:
+                self._end_foreground_action()
+
+            observation = self._refresh_shutdown_observation()
+            arrived_room = deep_get(observation, "look.room.num")
+            verified = self._verified_safe_staging(arrived_room)
+            if verified is not None and str(arrived_room) == str(destination):
+                return observation, {
+                    **verified,
+                    "basis": candidate.get("basis"),
+                }
+            failures.append(
+                {
+                    "destination_room_id": destination,
+                    "result": redact(result),
+                    "observed_room_id": arrived_room,
+                }
+            )
+            observation = self._recover_for_shutdown(observation)
+            self._stop_keeper_for_shutdown()
+
+        raise RuntimeError(
+            "every source-verified shutdown sanctuary route failed: "
+            + "; ".join(
+                f"room {item['destination_room_id']} left us in "
+                f"{item.get('observed_room_id')}"
+                for item in failures
+            )
+        )
+
+    def _logout_for_shutdown(self) -> dict[str, Any]:
+        capabilities = self.broker.capabilities()
+        leave = capabilities.get("leave")
+        if leave is None:
+            raise RuntimeError("broker does not expose the controller-owned leave tool")
+        arguments: dict[str, Any] = {"agent": self.config.game.agent}
+        if leave.accepts("forget"):
+            # FR-CHAR-006: ordinary shutdown must preserve the credential roster.
+            arguments["forget"] = False
+        result = self.broker.call_tool(
+            "leave", arguments, timeout=30, mutation=True
+        )
+        if not isinstance(result, dict) or result.get("left") is not True:
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError:
+                health = None
+            sessions = health.get("sessions") if isinstance(health, dict) else None
+            if not isinstance(sessions, list) or self.config.game.agent in sessions:
+                raise RuntimeError(
+                    "broker did not affirm that the character logged out"
+                )
+        if not isinstance(result, dict):
+            result = {"left": True}
+        if result.get("forgotten") is True:
+            raise RuntimeError(
+                "broker unexpectedly removed the character from its credential roster"
+            )
+
+        deadline = time.monotonic() + SHUTDOWN_SESSION_EXIT_TIMEOUT_SECONDS
+        session_absent = False
+        while time.monotonic() < deadline:
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError:
+                # The affirmative leave receipt is enough if the broker begins
+                # shutting down before its next health response.
+                session_absent = True
+                break
+            sessions = health.get("sessions")
+            if isinstance(sessions, list) and self.config.game.agent not in sessions:
+                session_absent = True
+                break
+            time.sleep(0.25)
+        if not session_absent:
+            raise RuntimeError(
+                "character remained in the broker session list after logout"
+            )
+        return result
+
+    def _fail_safe_shutdown(self, exc: Exception) -> None:
+        message = str(exc)[:1000]
+        try:
+            health = self.broker.health(timeout=3)
+            joined = self.config.game.agent in health.get("sessions", [])
         except BrokerError:
-            pass
+            joined = False
+        if joined:
+            try:
+                self._ensure_survival_keeper()
+            except (BrokerError, ValueError):
+                pass
+        self._shutdown_requested.clear()
+        self.state = "shutdown_failed"
+        self.warnings = [*self.warnings[-9:], f"shutdown: {message}"]
+        self._set_shutdown_stage(
+            "failed",
+            error=message,
+            logged_out=not joined,
+            fail_safe=(
+                "controller remains running with goals paused; survival keeper "
+                "was retained or restarted when the session was still joined"
+            ),
+        )
+        self.storage.emit_event(
+            "runtime.shutdown_failed",
+            "Coordinated shutdown failed safe; controller remains running",
+            severity="error",
+            interesting=True,
+            data={"error": message, "joined": joined},
+        )
+
+    def _perform_safe_shutdown(self) -> dict[str, Any]:
+        request = self._shutdown_status_snapshot() or {}
+        requested_room_id = request.get("requested_destination_room_id")
+        self._mark_planned_phase_stop()
+        self.state = "draining"
+        self._set_shutdown_stage("pausing", error=None)
+        try:
+            paused_goal_ids = self._pause_all_runnable_goals_for_shutdown()
+            self._set_shutdown_stage(
+                "securing", paused_goal_ids=paused_goal_ids
+            )
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError as exc:
+                raise RuntimeError(
+                    "cannot verify the broker session before shutdown"
+                ) from exc
+            if self.config.game.agent not in health.get("sessions", []):
+                final = self._set_shutdown_stage(
+                    "complete",
+                    paused_goal_ids=paused_goal_ids,
+                    logged_out=True,
+                    safe_room=None,
+                    detail="character was already absent from the broker session list",
+                )
+            else:
+                observation = self._refresh_shutdown_observation()
+                observation = self._recover_for_shutdown(observation)
+                observation, safe_room = self._travel_to_shutdown_safety(
+                    observation,
+                    int(requested_room_id)
+                    if requested_room_id is not None
+                    else None,
+                )
+                current_room = deep_get(observation, "look.room.num")
+                if self._verified_safe_staging(current_room) is None:
+                    raise RuntimeError(
+                        "shutdown safe-room verification was lost before logout"
+                    )
+                self._set_shutdown_stage(
+                    "logging_out", safe_room=redact(safe_room)
+                )
+                self._stop_keeper_for_shutdown()
+                leave_result = self._logout_for_shutdown()
+                final = self._set_shutdown_stage(
+                    "complete",
+                    paused_goal_ids=paused_goal_ids,
+                    safe_room=redact(safe_room),
+                    logged_out=True,
+                    leave_result=redact(leave_result),
+                )
+            self.storage.emit_event(
+                "runtime.shutdown_complete",
+                "Paused runnable work, verified safety, logged out, and completed shutdown",
+                severity="notice",
+                interesting=True,
+                data=redact(final),
+            )
+            self.state = "stopping"
+            self._shutdown_requested.clear()
+            self.stop_event.set()
+            self._wake_event.set()
+            return final
+        except Exception as exc:
+            self._fail_safe_shutdown(exc)
+            return self._shutdown_status_snapshot() or {"stage": "failed"}
 
     def _active_campaign_phase_identity(self) -> tuple[str, str, str] | None:
         goal = self.storage.active_goal()

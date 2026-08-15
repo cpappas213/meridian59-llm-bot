@@ -129,6 +129,13 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(
                     "Meet the operator's request", draft["goal"]["title"]
                 )
+                shutdown_status, shutdown = self.request_json(
+                    f"http://127.0.0.1:{control_port}/v1/runtime/safe-stop",
+                    body={},
+                )
+                self.assertEqual(202, shutdown_status)
+                self.assertTrue(shutdown["stopping"])
+                self.assertEqual("requested", shutdown["shutdown"]["stage"])
                 mutation = urllib.request.Request(
                     f"http://127.0.0.1:{dashboard_port}/goals",
                     data=b"{}",

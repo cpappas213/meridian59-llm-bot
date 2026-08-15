@@ -142,20 +142,24 @@ ambiguity.
 
 ## 7. Backup and restore
 
-Use `scripts/restart-controller.ps1` for routine maintenance; it waits for a
-full-health, low-risk boundary with no foreground action, then asks the
-controller to stop itself and its owned broker before starting the scheduled
-task again. A raw `Stop-ScheduledTask` can terminate only the PowerShell wrapper
-and leave its Python and Node children holding the instance lock and ports.
+Use `scripts/restart-controller.ps1` for routine maintenance. It immediately
+asks the controller to begin its coordinated shutdown: pause all runnable goals,
+let an in-flight mutation settle, recover and route to source-verified safety,
+stop the keeper, log out with `forget=false`, and stop itself and its owned
+broker. The script waits for completion before starting the scheduled task
+again. Paused goals are deliberately not resumed by the restart. A raw
+`Stop-ScheduledTask` can terminate only the PowerShell wrapper and leave its
+Python and Node children holding the instance lock and ports—or strand the
+character in game.
 
 Gracefully stop the controller before copying runtime state. Back up `bot.toml`,
 `secrets.env`, `data/controller.sqlite3`, its WAL/SHM files when present, and
 the harness fleet-state file to an encrypted private location. Restore them only
 to a trusted machine, verify ACLs, then run `doctor` before starting the task.
 
-To leave the controller stopped for a backup, first use `status` to confirm a
-safe boundary, run the authenticated stop command, and wait for the task state
-to become `Ready`:
+To leave the controller stopped for a backup, run the authenticated stop command
+and wait for the task state to become `Ready`. The controller itself establishes
+and verifies the safe boundary before logging out:
 
 ```powershell
 python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" status
@@ -163,13 +167,22 @@ python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" sto
 Get-ScheduledTask -TaskName "Meridian59 LLM Bot"
 ```
 
+Use `stop --safe-room <room-id>` only to require an exact destination whose
+source knowledge has sanctuary or no-combat flags. Without it, an already-safe
+current room is retained; otherwise the controller tries bounded verified safe
+candidates. If the task does not become `Ready`, inspect
+`controller.shutdown`: shutdown intentionally fails open at the process level
+but safe at the gameplay level, keeping the controller alive, every goal paused,
+and survival mode running when the character remains joined. Resolve that error
+before retrying; never force-stop an exposed character.
+
 Never publish runtime state or diagnostics; both may identify accounts, private
 servers, players, inventory, or tokens.
 
 ## 8. Updating
 
-1. At a full-health, low-risk boundary, run
-   `m59-bot --config <path> stop` and wait for the scheduled task to become
+1. Run `m59-bot --config <path> stop`; the coordinated shutdown establishes a
+   verified safe boundary and logs out before the scheduled task becomes
    `Ready`. Do not use `Stop-ScheduledTask`.
 2. Back up private state.
 3. Pull the root repository and update submodules to the committed gitlink.

@@ -4,8 +4,8 @@ param(
     [string]$InstallRoot = "$env:LOCALAPPDATA\m59-llm-bot",
     [string]$ConfigPath = "",
     [string]$TaskName = "Meridian59 LLM Bot",
-    [ValidateRange(10, 600)]
-    [int]$ShutdownTimeoutSeconds = 60,
+    [ValidateRange(10, 1800)]
+    [int]$ShutdownTimeoutSeconds = 900,
     [ValidateRange(10, 1800)]
     [int]$SafeBoundaryTimeoutSeconds = 180,
     [ValidateRange(10, 600)]
@@ -61,31 +61,13 @@ function Invoke-ControllerCli {
 
 $before = Invoke-ControllerCli @("status")
 if ($before.ExitCode -eq 0) {
-    $safeDeadline = (Get-Date).AddSeconds($SafeBoundaryTimeoutSeconds)
-    do {
-        try {
-            $snapshot = ($before.Output -join [Environment]::NewLine) | ConvertFrom-Json
-        } catch {
-            throw "Controller status was not valid JSON: $($before.Output -join [Environment]::NewLine)"
-        }
-        $health = $snapshot.game.vitals.health
-        $safeBoundary = (
-            $snapshot.controller.foreground_action -eq $null -and
-            $snapshot.game.risk -eq "low" -and
-            $health.value -gt 0 -and
-            $health.value -eq $health.max
-        )
-        if ($safeBoundary) { break }
-        if ((Get-Date) -ge $safeDeadline) {
-            throw "No full-health, low-risk maintenance boundary appeared within $SafeBoundaryTimeoutSeconds seconds; the running controller was left untouched."
-        }
-        Start-Sleep -Seconds 1
-        $before = Invoke-ControllerCli @("status")
-        if ($before.ExitCode -ne 0) {
-            throw "The controller became unavailable while waiting for a safe maintenance boundary."
-        }
-    } while ($true)
-    Write-Host "Requesting graceful controller and broker shutdown..."
+    # The controller owns the drain. Request it immediately so active work is
+    # paused before waiting: it recovers/withdraws as needed, travels to a
+    # source-verified sanctuary, logs out with forget=false, and only then
+    # exits with its owned broker. SafeBoundaryTimeoutSeconds is retained as a
+    # backwards-compatible parameter for existing maintenance commands; the
+    # coordinated controller timeout is governed by ShutdownTimeoutSeconds.
+    Write-Host "Requesting coordinated pause, safe return, logout, and shutdown..."
     $stop = Invoke-ControllerCli @("stop")
     if ($stop.ExitCode -ne 0) {
         throw "Graceful controller stop failed: $($stop.Output -join [Environment]::NewLine)"

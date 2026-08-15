@@ -36,7 +36,21 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="return failure unless the controller is running and the game is joined",
     )
-    sub.add_parser("stop", help="ask the running controller and owned broker to stop gracefully")
+    stop = sub.add_parser(
+        "stop",
+        help=(
+            "pause runnable goals, reach verified safety, log out without "
+            "forgetting credentials, then stop the controller and owned broker"
+        ),
+    )
+    stop.add_argument(
+        "--safe-room",
+        type=int,
+        help=(
+            "optional exact source-verified sanctuary/no-combat room; otherwise "
+            "use the current safe room or nearest verified candidate"
+        ),
+    )
     sub.add_parser("once", help="run startup and one planning turn")
     persona = sub.add_parser(
         "setup-persona",
@@ -319,10 +333,20 @@ def run_controller(config: BotConfig, *, no_connect: bool = False, once: bool = 
     return 0
 
 
-def runtime_command(config: BotConfig, command: str, *, require_joined: bool = False) -> int:
+def runtime_command(
+    config: BotConfig,
+    command: str,
+    *,
+    require_joined: bool = False,
+    safe_room: int | None = None,
+) -> int:
     api = ControllerApi(config)
     try:
-        value = api.status() if command == "status" else api.safe_stop()
+        value = (
+            api.status()
+            if command == "status"
+            else api.safe_stop(destination_room_id=safe_room)
+        )
     except ControllerApiError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -420,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         return runtime_command(config, "status", require_joined=args.require_joined)
     if args.command == "stop":
-        return runtime_command(config, "stop")
+        return runtime_command(config, "stop", safe_room=args.safe_room)
     if args.command == "once":
         return run_controller(config, once=True)
     if args.command == "run":

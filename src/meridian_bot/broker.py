@@ -222,7 +222,15 @@ class BrokerClient:
                 schema=raw.get("inputSchema") if isinstance(raw.get("inputSchema"), dict) else {},
             )
             manifest[tool.name] = tool
-        required = {"join", "look", "status", "inventory", "autopilot", "wait_for_event"}
+        required = {
+            "join",
+            "leave",
+            "look",
+            "status",
+            "inventory",
+            "autopilot",
+            "wait_for_event",
+        }
         missing = required - set(manifest)
         if missing:
             raise HarnessIncompatible(f"broker is missing required tools: {', '.join(sorted(missing))}")

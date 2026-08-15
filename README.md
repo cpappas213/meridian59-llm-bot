@@ -177,12 +177,26 @@ Use the supported restart command for upgrades or routine maintenance:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-controller.ps1
 ```
 
-It waits for a full-health, low-risk maintenance boundary with no foreground
-action, authenticates to the running controller, lets the controller stop its
-owned broker, waits for the scheduled action to exit, starts it again, and
-verifies a joined game session. Do not substitute a raw `Stop-ScheduledTask`;
-Windows can stop only the PowerShell wrapper and leave Python and Node holding
-the instance lock and network ports.
+It authenticates to the running controller and immediately starts its coordinated
+shutdown sequence: pause every runnable goal, let any in-flight mutation settle,
+recover and route to a source-verified safe room when needed, stop the keeper,
+log the character out without forgetting it, and only then stop the controller
+and its owned broker. The script waits for that sequence to finish, starts the
+scheduled action again, and verifies a joined game session. Paused goals remain
+paused after restart until an operator explicitly resumes one. Do not substitute
+a raw `Stop-ScheduledTask`; Windows can stop only the PowerShell wrapper and
+leave Python and Node holding the instance lock and network ports.
+
+To shut down and leave the character logged out, use the authenticated command:
+
+```powershell
+python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" stop
+```
+
+Add `--safe-room 52` only when you want an exact source-verified safe
+destination. If recovery, travel, safety verification, keeper release, or logout
+fails, the controller stays alive with goals paused and survival mode retained
+instead of terminating while the character may still be exposed.
 
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional

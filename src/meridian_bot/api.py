@@ -198,8 +198,17 @@ class ApiServers:
                     if parsed.path == "/v1/knowledge/progression-context":
                         return self.send_json(200, controller.progression_context(body))
                     if parsed.path == "/v1/runtime/safe-stop":
-                        controller.safe_stop()
-                        return self.send_json(202, {"stopping": True})
+                        destination = body.get("destination_room_id")
+                        shutdown = controller.safe_stop(
+                            destination_room_id=destination
+                        )
+                        return self.send_json(
+                            202,
+                            {
+                                "stopping": True,
+                                "shutdown": shutdown,
+                            },
+                        )
                     return self.send_json(404, {"code": "NOT_FOUND", "message": "route not found"})
                 except Exception as exc:
                     status, response = _error(exc)

@@ -115,8 +115,15 @@ class ControllerApi:
             "GET", "/v1/status?detail=supervision&include_recent_events=0"
         )
 
-    def safe_stop(self) -> dict[str, Any]:
-        return self.request("POST", "/v1/runtime/safe-stop", {})
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, Any]:
+        payload = (
+            {}
+            if destination_room_id is None
+            else {"destination_room_id": destination_room_id}
+        )
+        return self.request("POST", "/v1/runtime/safe-stop", payload)
 
     def character_status(self) -> dict[str, Any]:
         return self.request("GET", "/v1/character")

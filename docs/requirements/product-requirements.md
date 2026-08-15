@@ -93,6 +93,13 @@ revising tactics in service of the active goal.
 - **FR-CHAR-014**: Interactive setup shall select timezone from labelled regions
   that persist valid IANA identifiers, normalize documented common aliases, and
   validate any advanced IANA entry before writing runtime configuration.
+- **FR-CHAR-015**: An authenticated shutdown request shall immediately prevent
+  new goal work, pause every runnable goal, serialize behind any in-flight game
+  mutation, recover and route to freshly observed source-verified safety when
+  necessary, stop the keeper, call `leave` only with `forget=false`, verify the
+  character session is absent, and only then stop the controller and owned
+  broker. Failure to verify any boundary shall leave the process running with
+  goals paused and survival protection retained when joined.
 
 ### 4.2 Durable goal management
 

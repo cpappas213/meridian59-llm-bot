@@ -7,6 +7,10 @@ and intends to use semantic versioning after its first public release.
 
 ### Added
 
+- A coordinated runtime shutdown sequence that pauses all runnable goals,
+  recovers and routes to fresh source-verified safety, releases the keeper, logs
+  out without forgetting the character, and fails safe without terminating when
+  any required boundary cannot be verified.
 - First-run onboarding driven by an operator-defined name/persona and a
   configured OpenAI-compatible model.
 - A local installer persona wizard and JSON-input path that do not require a

@@ -20,6 +20,7 @@ class SimulatedBroker:
         schema_agent = {"type": "object", "properties": {"agent": {"type": "string"}}, "required": ["agent"]}
         self.tools = {
             "join": Tool("join", "join", {"type": "object", "properties": {"agent": {}, "account": {}, "password": {}}, "required": ["agent", "account", "password"]}),
+            "leave": Tool("leave", "leave", {"type": "object", "properties": {"agent": {}, "forget": {"type": "boolean"}}, "required": ["agent"]}),
             "look": Tool("look", "look", {"type": "object", "properties": {"agent": {"type": "string"}, "cached": {"type": "boolean"}}, "required": ["agent"]}),
             "status": Tool("status", "status", {"type": "object", "properties": {"agent": {}, "brief": {}}, "required": ["agent"]}),
             "inventory": Tool("inventory", "inventory", schema_agent),
@@ -72,6 +73,9 @@ class SimulatedBroker:
             return self.observe()["status"]
         if name == "inventory":
             return self.observe()["inventory"]
+        if name == "leave":
+            self.joined = False
+            return {"left": True, "forgotten": bool(arguments.get("forget", False))}
         if name == "inbox":
             return {"untrusted": True, "count": 0, "messages": []}
         if name == "act" and arguments.get("verb") == "drop":
