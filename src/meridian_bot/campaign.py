@@ -236,10 +236,14 @@ PHASE_TARGET_FIELDS: dict[str, frozenset[str]] = {
         {"id", "type", "dimension", "value"}
     ),
     "item_count_at_least": frozenset({"id", "type", "item", "count"}),
+    "equipment_count_at_least": frozenset(
+        {"id", "type", "category", "count"}
+    ),
     "inventory_not_full": frozenset({"id", "type"}),
     "location_reached": frozenset({"id", "type", "room_id", "name"}),
     "equipment_known": frozenset({"id", "type"}),
     "wielding_equals": frozenset({"id", "type", "items"}),
+    "wielding_contains": frozenset({"id", "type", "item", "category"}),
     "ability_at_least": frozenset(
         {"id", "type", "ability_kind", "name", "value"}
     ),
@@ -488,10 +492,43 @@ class CampaignCoordinator:
                     raise ValueError(
                         "item_count_at_least requires a non-empty item and positive integer count"
                     )
+                equipment_category = {
+                    "weapon": "weapon",
+                    "weapons": "weapon",
+                    "armor": "armor",
+                    "armour": "armor",
+                }.get(item.casefold())
+                criterion = (
+                    {
+                        "id": target_id,
+                        "kind": "equipment_count",
+                        "category": equipment_category,
+                        "count": count,
+                    }
+                    if equipment_category is not None
+                    else {
+                        "id": target_id,
+                        "kind": "inventory_contains",
+                        "item": item,
+                        "count": count,
+                    }
+                )
+            elif target_type == "equipment_count_at_least":
+                category = str(target.get("category") or "").strip().casefold()
+                count = target.get("count")
+                if (
+                    category not in {"weapon", "armor"}
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                ):
+                    raise ValueError(
+                        "equipment_count_at_least requires category=weapon|armor and a positive integer count"
+                    )
                 criterion = {
                     "id": target_id,
-                    "kind": "inventory_contains",
-                    "item": item,
+                    "kind": "equipment_count",
+                    "category": category,
                     "count": count,
                 }
             elif target_type == "inventory_not_full":
@@ -534,11 +571,45 @@ class CampaignCoordinator:
                     raise ValueError(
                         "wielding_equals.items must be null or an array of canonical names"
                     )
+                if (
+                    isinstance(items, list)
+                    and len(items) == 1
+                    and " ".join(items[0].split()).casefold() in {"weapon", "weapons"}
+                ):
+                    item = " ".join(items[0].split())
+                    category = {
+                        "weapon": "weapon",
+                        "weapons": "weapon",
+                    }.get(item.casefold())
+                    criterion = {
+                        "id": target_id,
+                        "kind": "equipment_wielding",
+                        **(
+                            {"category": category}
+                            if category is not None
+                            else {"item": item}
+                        ),
+                    }
+                else:
+                    criterion = {
+                        "id": target_id,
+                        "kind": "state_equals",
+                        "path": "equipment.wielding",
+                        "value": items,
+                    }
+            elif target_type == "wielding_contains":
+                item = " ".join(str(target.get("item") or "").split())
+                category = str(target.get("category") or "").strip().casefold()
+                has_item = bool(item)
+                has_category = category == "weapon"
+                if has_item == has_category:
+                    raise ValueError(
+                        "wielding_contains requires exactly one canonical item or category=weapon"
+                    )
                 criterion = {
                     "id": target_id,
-                    "kind": "state_equals",
-                    "path": "equipment.wielding",
-                    "value": items,
+                    "kind": "equipment_wielding",
+                    **({"item": item} if has_item else {"category": category}),
                 }
             elif target_type == "ability_at_least":
                 ability_kind = str(target.get("ability_kind") or "").casefold()
@@ -636,6 +707,8 @@ class CampaignCoordinator:
             criteria, phase_kind=kind, migrate_legacy=True
         )
         self._validate_phase_success_criteria(kind, criteria, goal, phase)
+        if observation is not None:
+            self._validate_material_equipment_targets(kind, criteria, observation)
         abandon_predicates = phase.get("abandon_predicates", [])
         if not isinstance(abandon_predicates, list):
             raise ValueError("campaign phase abandon_predicates must be an array")
@@ -685,7 +758,10 @@ class CampaignCoordinator:
                 unverified_preferences
             )
         if raw_targets is not None:
-            phase_context["phase_targets"] = redact(raw_targets)
+            # Replay only the compiled contract. Keeping a repaired raw target
+            # such as item="weapon" in planner context can resurrect the exact
+            # invalid literal interpretation the compiler just removed.
+            phase_context["phase_targets"] = redact(criteria)
         if ignored_abandon_predicates:
             phase_context["ignored_invalid_abandon_predicates"] = (
                 ignored_abandon_predicates
@@ -766,9 +842,54 @@ class CampaignCoordinator:
                 isinstance(value, dict)
                 and value.get("kind") == "state_equals"
                 and value.get("path") == "equipment.wielding"
-                and isinstance(value.get("value"), str)
             ):
-                value["value"] = [value["value"]]
+                expected = value.get("value")
+                if isinstance(expected, str):
+                    expected = [expected]
+                if (
+                    isinstance(expected, list)
+                    and len(expected) == 1
+                    and " ".join(str(expected[0] or "").split()).casefold()
+                    in {"weapon", "weapons"}
+                ):
+                    item = " ".join(str(expected[0] or "").split())
+                    category = (
+                        "weapon" if item.casefold() in {"weapon", "weapons"} else None
+                    )
+                    value = {
+                        "id": value.get("id"),
+                        "kind": "equipment_wielding",
+                        **(
+                            {"category": category}
+                            if category is not None
+                            else {"item": item}
+                        ),
+                    }
+                elif isinstance(expected, list) and isinstance(value, dict):
+                    value["value"] = expected
+            if (
+                isinstance(value, dict)
+                and value.get("kind") == "inventory_contains"
+                and " ".join(str(value.get("item") or "").split()).casefold()
+                in {"weapon", "weapons", "armor", "armour"}
+            ):
+                raw_item = " ".join(str(value.get("item") or "").split()).casefold()
+                value = {
+                    "id": value.get("id"),
+                    "kind": "equipment_count",
+                    "category": "weapon" if raw_item.startswith("weapon") else "armor",
+                    "count": value.get("count", 1),
+                }
+            if (
+                isinstance(value, dict)
+                and value.get("kind") == "inventory_contains"
+                and " ".join(str(value.get("item") or "").split()).casefold()
+                in {"gear", "equipment"}
+            ):
+                raise ValueError(
+                    "inventory_contains cannot verify a generic gear/equipment category; "
+                    "use equipment_count_at_least with category=weapon or armor"
+                )
             if (
                 isinstance(value, dict)
                 and phase_kind == "prepare_combat"
@@ -819,6 +940,41 @@ class CampaignCoordinator:
                     value["metric"] = "carried_currency"
             normalized.append(value)
         return normalized
+
+    @staticmethod
+    def _validate_material_equipment_targets(
+        phase_kind: str,
+        criteria: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> None:
+        """Reject support milestones that are already true when proposed."""
+
+        if phase_kind != "prepare_combat":
+            return
+        for criterion in criteria:
+            if not isinstance(criterion, dict):
+                continue
+            kind = criterion.get("kind")
+            if kind == "equipment_count":
+                category = str(criterion.get("category") or "")
+                required = int(criterion.get("count", 1) or 1)
+                current = CriteriaEvaluator.equipment_count(observation, category)
+                if required <= current:
+                    raise ValueError(
+                        f"prepare_combat equipment target is already true: verified {category} "
+                        f"count is {current}, so the target must exceed {current} or select a "
+                        "different observable improvement; do not create gear merely to reopen research"
+                    )
+            elif kind == "equipment_wielding" and CriteriaEvaluator.equipment_wielding(
+                observation,
+                item=criterion.get("item"),
+                category=criterion.get("category"),
+            ):
+                target = criterion.get("item") or criterion.get("category")
+                raise ValueError(
+                    f"prepare_combat wielding target {target!r} is already verified; select a "
+                    "different concrete item or another observable capability improvement"
+                )
 
     def _validate_phase_success_criteria(
         self,
@@ -906,7 +1062,7 @@ class CampaignCoordinator:
                 "prepare_combat cannot use mutating action success alone for "
                 + ", ".join(sorted(preparation_mutations))
                 + "; require an observable target such as item_count_at_least, "
-                "wielding_equals, equipment_known, or inventory_not_full"
+                "equipment_count_at_least, wielding_contains, equipment_known, or inventory_not_full"
             )
         max_health_goal = any(
             isinstance(criterion, dict)
@@ -966,6 +1122,8 @@ class CampaignCoordinator:
             return
         if kind in {
             "inventory_contains",
+            "equipment_count",
+            "equipment_wielding",
             "location_reached",
             "event_occurred",
             "composite_all",

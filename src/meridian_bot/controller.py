@@ -1541,7 +1541,7 @@ class BotController:
         )
 
     def _reconcile_recent_inventory_creation(
-        self, observation: dict[str, Any]
+        self, observation: dict[str, Any], *, emit_event: bool = True
     ) -> dict[str, Any]:
         """Apply a recent positive creation delta when inventory briefly regresses."""
 
@@ -1613,18 +1613,19 @@ class BotController:
         inventory = dict(inventory) if isinstance(inventory, dict) else {}
         inventory["items"] = items
         reconciled["inventory"] = inventory
-        self.storage.emit_event(
-            "action.inventory_observation_reconciled",
-            "Reconciled stale inventory from a successful creation delta",
-            severity="info",
-            interesting=False,
-            goal_id=receipt.get("goal_id"),
-            data={
-                "tool": receipt.get("tool"),
-                "expected": redact(expected),
-                "stale_observations_reconciled": stale_count + 1,
-            },
-        )
+        if emit_event:
+            self.storage.emit_event(
+                "action.inventory_observation_reconciled",
+                "Reconciled stale inventory from a successful creation delta",
+                severity="info",
+                interesting=False,
+                goal_id=receipt.get("goal_id"),
+                data={
+                    "tool": receipt.get("tool"),
+                    "expected": redact(expected),
+                    "stale_observations_reconciled": stale_count + 1,
+                },
+            )
         return reconciled
 
     def _repair_position_unknown_lessons(self) -> list[dict[str, Any]]:
@@ -4002,9 +4003,12 @@ class BotController:
                         )
                     )
                 )
+                acquisition_step = step.get("tool") in {"cast", "shop"} or (
+                    step.get("tool") == "act"
+                    and bool(re.search(r"\b(?:get|take|pick\s+up|acquire)\b", outcome))
+                )
                 outcome_covers = (
-                    step.get("tool") == "cast"
-                    and "create food" in outcome
+                    acquisition_step
                     and names_item(outcome, item_name)
                     and (
                         names_count(outcome, required)
@@ -4019,19 +4023,86 @@ class BotController:
                 if verification_covers or outcome_covers:
                     explicitly_covered = True
                     break
-                if step.get("tool") == "cast" and "create food" in outcome:
-                    relevant_mutations += 1
+                if (
+                    acquisition_step
+                    and names_item(outcome, item_name)
+                ):
+                    relevant_mutations += planned_repetitions(step)
             if explicitly_covered or relevant_mutations >= remaining:
                 continue
             display_item = "edible food" if item_name in {"food", "edible food"} else item_name
+            unit_note = (
+                "; each Create Food cast produces one item"
+                if item_name in {"food", "edible food"}
+                else ""
+            )
             return (
                 f"execution_plan does not cover active phase criterion {criterion.get('id')!r}: "
                 f"authoritative inventory has {current} {display_item} item(s), but the "
                 f"phase requires {required}. Purpose: a successful tool call is not phase "
                 "completion. Include mutation step(s) whose outcome or verification "
                 f"explicitly reaches {required} total {display_item} item(s), or "
-                f"{remaining} additional; each Create Food cast produces one item"
+                f"{remaining} additional{unit_note}"
             )
+
+        for criterion in (phase or {}).get("success_criteria", []):
+            if not isinstance(criterion, dict):
+                continue
+            kind = criterion.get("kind")
+            if kind == "equipment_count":
+                category = str(criterion.get("category") or "").casefold()
+                required = int(criterion.get("count", 1) or 1)
+                current = CriteriaEvaluator.equipment_count(observation, category)
+                if current >= required:
+                    continue
+                remaining = required - current
+                mutations = 0
+                for step in steps:
+                    tool = str(step.get("tool") or "")
+                    outcome = str(step.get("outcome") or "").casefold()
+                    if category == "weapon" and tool == "cast" and "create weapon" in outcome:
+                        mutations += planned_repetitions(step)
+                    elif tool == "shop" and (
+                        category in outcome
+                        or any(
+                            word in outcome
+                            for word in (WEAPON_WORDS if category == "weapon" else ARMOR_WORDS)
+                        )
+                    ):
+                        mutations += planned_repetitions(step)
+                if mutations < remaining:
+                    return (
+                        f"execution_plan does not cover active phase equipment_count criterion "
+                        f"{criterion.get('id')!r}: verified {category} count is {current}, required "
+                        f"{required}, but the plan has only {mutations} grounded acquisition(s). "
+                        "Purpose: equipment categories are verified semantic state, not literal "
+                        "inventory names; add enough Create Weapon or grounded purchase actions"
+                    )
+            elif kind == "equipment_wielding":
+                if CriteriaEvaluator.equipment_wielding(
+                    observation,
+                    item=criterion.get("item"),
+                    category=criterion.get("category"),
+                ):
+                    continue
+                requested = " ".join(
+                    str(criterion.get("item") or criterion.get("category") or "").split()
+                ).casefold()
+                covered = any(
+                    str(step.get("tool") or "") in {"equip_best", "act"}
+                    and (
+                        criterion.get("category") == "weapon"
+                        or requested in str(step.get("outcome") or "").casefold()
+                    )
+                    for step in steps
+                )
+                if not covered:
+                    return (
+                        f"execution_plan does not cover active phase equipment_wielding criterion "
+                        f"{criterion.get('id')!r}: {requested!r} is not currently wielded and no "
+                        "equipment mutation explicitly selects it. Purpose: creating or carrying a "
+                        "weapon does not prove that it was wielded"
+                    )
         return None
 
     def _phase_required_sale_plan_error(
@@ -7905,6 +7976,36 @@ class BotController:
             return float(current) / float(maximum) if float(maximum) > 0 else None
         except (TypeError, ValueError, ZeroDivisionError):
             return None
+
+    @staticmethod
+    def _vital_value(observation: dict[str, Any], name: str) -> float | None:
+        vital = deep_get(
+            observation,
+            f"status.vitals.{name}",
+            deep_get(observation, f"look.vitals.{name}"),
+        )
+        current = vital.get("current", vital.get("value")) if isinstance(vital, dict) else vital
+        try:
+            return float(current)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _required_mana_from_refusal(reason: Any) -> float | None:
+        text = " ".join(str(reason or "").split()).casefold()
+        patterns = (
+            r"costs?\s+(\d+(?:\.\d+)?)\s+mana",
+            r"(?:need|requires?|required)\s+(\d+(?:\.\d+)?)\s+mana",
+            r"mana[^\d]{0,20}(?:need|requires?|required)[^\d]{0,8}(\d+(?:\.\d+)?)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return float(match.group(1))
+                except (TypeError, ValueError):
+                    pass
+        return None
 
     def _live_overlevel_hostiles(
         self,
@@ -13506,17 +13607,18 @@ class BotController:
         prior_equipment = prior_equipment if isinstance(prior_equipment, dict) else {}
         current_equipment = current.get("equipment")
         current_equipment = current_equipment if isinstance(current_equipment, dict) else {}
-        for key in ("equipped", "wielding"):
-            prior_values = {
-                canonical_json(item)
-                for item in prior_equipment.get(key, [])
-            } if isinstance(prior_equipment.get(key), list) else set()
-            current_values = {
-                canonical_json(item)
-                for item in current_equipment.get(key, [])
-            } if isinstance(current_equipment.get(key), list) else set()
-            if current_values - prior_values:
-                changes.append(f"equipment_{key}_added")
+        prior_wielding = {
+            normalize(str(item))
+            for item in prior_equipment.get("wielding", [])
+            if str(item).strip()
+        } if isinstance(prior_equipment.get("wielding"), list) else set()
+        current_wielding = {
+            normalize(str(item))
+            for item in current_equipment.get("wielding", [])
+            if str(item).strip()
+        } if isinstance(current_equipment.get("wielding"), list) else set()
+        if current_wielding and current_wielding != prior_wielding:
+            changes.append("equipment_wielding_added")
 
         for kind in ("skills", "spells"):
             prior_rows = deep_get(previous, f"abilities.{kind}", [])
@@ -13547,23 +13649,85 @@ class BotController:
             str(item.get("name") or ""): item
             for item in prior_items if isinstance(item, dict) and item.get("name")
         }
+        def category_names(
+            state_equipment: dict[str, Any],
+            state_items: list[dict[str, Any]],
+            words: tuple[str, ...],
+            *,
+            include_wielding: bool = False,
+        ) -> set[str]:
+            names = {
+                str(item.get("name") or "")
+                for item in state_items
+                if isinstance(item, dict)
+                and item.get("name")
+                and any(word in str(item.get("name") or "") for word in words)
+            }
+            equipped_rows = state_equipment.get("equipped", [])
+            names.update(
+                str(item.get("name") or "")
+                for item in (equipped_rows if isinstance(equipped_rows, list) else [])
+                if isinstance(item, dict)
+                and item.get("name")
+                and any(word in str(item.get("name") or "") for word in words)
+            )
+            if include_wielding:
+                names.update(
+                    normalize(str(item))
+                    for item in state_equipment.get("wielding", [])
+                    if str(item).strip()
+                )
+            return names
+
+        for category, words, include_wielding in (
+            ("weapon", WEAPON_WORDS, True),
+            ("armor", ARMOR_WORDS, False),
+        ):
+            prior_names = category_names(
+                prior_equipment, prior_items, words, include_wielding=include_wielding
+            )
+            current_names = category_names(
+                current_equipment, current_items, words, include_wielding=include_wielding
+            )
+            # The first usable item in a missing category is a capability
+            # change. An unverified duplicate is not evidence of improvement.
+            if not prior_names and current_names:
+                changes.append(f"first_{category}_available")
+
         for item in current_items:
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             name = str(item["name"])
             prior = prior_by_name.get(name)
+            is_supply = any(
+                word in name
+                for word in (*HEALING_SUPPLY_WORDS, "potion", "cheese", "food")
+            )
             if prior is None:
-                changes.append("capability_inventory_added")
-                break
+                if is_supply:
+                    changes.append("capability_supplies_added")
+                    break
+                continue
             try:
                 prior_amount = float(prior.get("amount", 1) or 0)
                 current_amount = float(item.get("amount", 1) or 0)
             except (TypeError, ValueError):
                 prior_amount = current_amount = 0
-            if current_amount > prior_amount or any(
-                prior.get(key) != item.get(key) for key in ("condition", "quality", "equipped")
+            equipment_item = any(
+                word in name for word in (*WEAPON_WORDS, *ARMOR_WORDS)
+            )
+            if (is_supply and current_amount > prior_amount) or (
+                equipment_item
+                and any(
+                    prior.get(key) != item.get(key)
+                    for key in ("condition", "quality", "equipped")
+                )
             ):
-                changes.append("capability_inventory_improved")
+                changes.append(
+                    "capability_supplies_improved"
+                    if is_supply
+                    else "equipment_item_improved"
+                )
                 break
 
         if previous.get("knowledge_corpus_version") != current.get(
@@ -16042,6 +16206,18 @@ class BotController:
                         revision=execution_plan is not None,
                     )
                 except ModelError as exc:
+                    rejected_invariant = str(exc)[:1000]
+                    prior_failure_context = (
+                        (planner_feedback or {}).get("failure_context")
+                        if isinstance(planner_feedback, dict)
+                        else None
+                    )
+                    same_invalid_invariant = (
+                        execution_plan is None
+                        and isinstance(prior_failure_context, dict)
+                        and prior_failure_context.get("kind") == "invalid_execution_plan"
+                        and prior_failure_context.get("invariant") == rejected_invariant
+                    )
                     plan_rejections = int(
                         (planner_feedback or {}).get(
                             "consecutive_plan_rejections", 0
@@ -16077,7 +16253,7 @@ class BotController:
                         failure_context=(
                             {
                                 "kind": "rejected_optional_plan_revision",
-                                "invariant": str(exc)[:1000],
+                                "invariant": rejected_invariant,
                                 "purpose": "Preserve the existing verified execution plan.",
                                 "required_response": (
                                     "Act on an existing actionable step; do not submit another "
@@ -16087,7 +16263,7 @@ class BotController:
                             if execution_plan is not None
                             else {
                                 "kind": "invalid_execution_plan",
-                                "invariant": str(exc)[:1000],
+                                "invariant": rejected_invariant,
                                 "purpose": (
                                     "Prevent execution of a plan whose tool semantics, ordering, "
                                     "or prerequisites cannot produce the declared outcome."
@@ -16106,12 +16282,38 @@ class BotController:
                         interesting=plan_rejections >= 3,
                         goal_id=goal["id"],
                         data={
-                            "reason": str(exc)[:1000],
+                            "reason": rejected_invariant,
                             "plan": redact(decision.get("execution_plan")),
                             "consecutive_plan_rejections": plan_rejections,
                             "retained_verified_plan": execution_plan is not None,
                         },
                     )
+                    if same_invalid_invariant and plan_rejections >= 2:
+                        retired = self._fail_active_campaign_phase(
+                            goal,
+                            "campaign phase retired after the planner repeated the same "
+                            f"deterministically invalid execution plan: {rejected_invariant}",
+                        )
+                        if retired is not None:
+                            self._clear_planner_feedback()
+                            self.storage.emit_event(
+                                "campaign.phase.invalid_plan_retired",
+                                "Retired an infeasible phase after two equivalent invalid plans",
+                                severity="warning",
+                                interesting=True,
+                                goal_id=goal["id"],
+                                data={
+                                    "phase_id": retired.get("id"),
+                                    "invariant": rejected_invariant,
+                                    "strategic_goal_preserved": True,
+                                },
+                            )
+                            return {
+                                "plan_rejected": True,
+                                "phase_retired": True,
+                                "reason": rejected_invariant,
+                                "strategic_goal_preserved": True,
+                            }
                     return {"plan_rejected": True, "reason": str(exc)}
                 self._clear_planner_feedback()
                 return {"planned": True, "execution_plan": stored_plan}
@@ -17269,10 +17471,10 @@ class BotController:
         if (
             tool == "cast"
             and str(arguments.get("spell") or "").strip().casefold()
-            == "create food"
+            in {"create food", "create weapon"}
             and tool_spec.accepts("observe_created")
         ):
-            # Create Food succeeds silently. Ask the broker to establish a
+            # Creation spells can succeed silently. Ask the broker to establish a
             # before/after inventory delta so plan-step completion never rests
             # on the first potentially stale inventory read after the cast.
             arguments["observe_created"] = True
@@ -18361,6 +18563,17 @@ class BotController:
                 observation,
                 goal_id=goal["id"],
             )
+            if tool == "cast" and isinstance(result, dict) and result.get("created"):
+                # Consume the broker's authoritative creation delta in this
+                # action turn. The next cache refresh remains useful evidence,
+                # but a briefly stale inventory read must not hide a completed
+                # Create Food/Create Weapon mutation from phase verification.
+                reconciled_creation = self._reconcile_recent_inventory_creation(
+                    self.last_observation, emit_event=False
+                )
+                if reconciled_creation != self.last_observation:
+                    self.last_observation = reconciled_creation
+                    self.storage.record_snapshot(redact(reconciled_creation))
             reconciled_room = self._observation_room(self.last_observation)
             if str(reconciled_room) != str(observed_room):
                 self.storage.emit_event(
@@ -21207,6 +21420,26 @@ class BotController:
                     and self._carried_currency(observation) > int(entry.get("carried_currency", 0) or 0)
                 ):
                     continue
+                if tool == "cast":
+                    required_mana = entry.get("required_mana")
+                    if required_mana is None:
+                        required_mana = self._required_mana_from_refusal(
+                            entry.get("reason")
+                        )
+                    current_mana = self._vital_value(observation, "mana")
+                    try:
+                        mana_ready = (
+                            required_mana is not None
+                            and current_mana is not None
+                            and current_mana >= float(required_mana)
+                        )
+                    except (TypeError, ValueError):
+                        mana_ready = False
+                    if mana_ready:
+                        # An insufficient-mana refusal is valid only while the
+                        # verified resource state remains below the spell cost.
+                        self._discard_blocked_action(entry)
+                        continue
                 if (
                     tool == "shop"
                     and is_inventory_capacity_refusal(entry.get("reason"))
@@ -21339,6 +21572,9 @@ class BotController:
                 "object_id": arguments.get("to"),
                 "live_name": self._merchant_speaker_name(reason),
             }
+        required_mana = (
+            self._required_mana_from_refusal(reason) if tool == "cast" else None
+        )
         self._save_blocked_action(
             {
                 "goal_id": goal["id"],
@@ -21351,6 +21587,14 @@ class BotController:
                     "inventory_load_hash"
                 ),
                 "equipment_attempt_hash": self._equipment_attempt_hash(tool, observation),
+                **(
+                    {
+                        "observed_mana": self._vital_value(observation, "mana"),
+                        "required_mana": required_mana,
+                    }
+                    if tool == "cast" and required_mana is not None
+                    else {}
+                ),
                 "reason": reason[:500],
                 **(
                     {"offered_item_names": offered_item_names}

@@ -77,6 +77,8 @@ Supported criterion kinds in MVP:
 - `numeric_threshold`: an observed metric crosses a threshold;
 - `numeric_delta`: a metric changes from a captured baseline;
 - `inventory_contains`: verified inventory has matching item/count;
+- `equipment_count`: verified carried/equipped equipment reaches a semantic weapon/armor count;
+- `equipment_wielding`: a concrete item or semantic equipment category is currently wielded;
 - `location_reached`: verified room/coordinate/area is reached;
 - `event_occurred`: a matching durable event exists after activation;
 - `composite_all` or `composite_any`: references other criterion IDs; and
@@ -91,6 +93,8 @@ Hermes-visible criterion fields are closed by kind; unknown fields are rejected:
 | `numeric_threshold` | `kind`, `metric`, `value` | `id`, `operator` | The observed numeric metric satisfies `operator` (`>=` by default) against `value`. `metric` may be an observation dot path or `ability.skill.<canonical name>` / `ability.spell.<canonical name>`. |
 | `numeric_delta` | `kind`, `metric`, `value`, `baseline` | `id`, `operator` | Observed metric minus `baseline` satisfies the comparison against `value`; named ability metrics use the same syntax. |
 | `inventory_contains` | `kind`, `item` | `id`, `count` | Case-insensitive item-name substring appears at least `count` times; count defaults to 1. |
+| `equipment_count` | `kind`, `category`, `count` | `id` | Distinct verified carried and equipped objects in category `weapon` or `armor` reach `count`; wielded objects are deduplicated against inventory/equipment ids and names. |
+| `equipment_wielding` | `kind`, and exactly one of `item` or `category="weapon"` | `id` | Live wielding state contains the exact canonical item, or any weapon for the semantic category. |
 | `location_reached` | `kind`, and one of `location`, `room`, or `room_id` | `id` and either other locator | Room name contains `location`/`room`, or its exact id equals `room_id`. |
 | `event_occurred` | `kind`, `event_kind` | `id`, `after_cursor` | A goal-scoped durable event of the exact kind exists after the controller-supplied activation cursor. Submission reanchors omitted, stale, or future values to the current durable tail. |
 | `composite_all` | `kind`, and `criteria` or `criterion_ids` | `id` | Every referenced criterion id is verified. |

@@ -19,6 +19,119 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_equipment_criteria_count_distinct_pack_and_loadout_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                result = CriteriaEvaluator(storage).evaluate(
+                    {
+                        "id": "equipment-contract",
+                        "success_criteria": [
+                            {
+                                "id": "two-weapons",
+                                "kind": "equipment_count",
+                                "category": "weapon",
+                                "count": 2,
+                            },
+                            {
+                                "id": "scimitar-wielded",
+                                "kind": "equipment_wielding",
+                                "item": "Scimitar",
+                            },
+                        ],
+                    },
+                    {
+                        "inventory": {
+                            "items": [
+                                {"id": 7532, "name": "scimitar"},
+                                {"id": 13509, "name": "mace"},
+                            ]
+                        },
+                        "equipment": {
+                            "equipped": [{"id": 7532, "name": "scimitar"}],
+                            "wielding": ["scimitar"],
+                        },
+                    },
+                )
+
+                self.assertTrue(result["all_met"])
+                self.assertEqual(
+                    "verified weapon count 2; required 2",
+                    result["criteria"][0]["detail"],
+                )
+
+    def test_manager_repairs_generic_weapon_target_and_requires_improvement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload(request_id="typed-equipment-phase"))["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 7532, "name": "scimitar"},
+                            {"id": 13509, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {
+                        "equipped": [{"id": 7532, "name": "scimitar"}],
+                        "wielding": ["scimitar"],
+                    },
+                }
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "prepare_combat",
+                            "objective": "Acquire one additional weapon.",
+                            "targets": [
+                                {
+                                    "id": "weapon-count",
+                                    "type": "item_count_at_least",
+                                    "item": "weapon",
+                                    "count": 3,
+                                }
+                            ],
+                        },
+                    },
+                    observation,
+                )
+
+                self.assertEqual(
+                    {
+                        "id": "weapon-count",
+                        "kind": "equipment_count",
+                        "category": "weapon",
+                        "count": 3,
+                    },
+                    phase["success_criteria"][0],
+                )
+                storage.transition_campaign_phase(
+                    phase["id"], "failed", reason="exercise material validation"
+                )
+                with self.assertRaisesRegex(ValueError, "already true.*verified weapon count is 2"):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "prepare_combat",
+                                "objective": "Create redundant equipment.",
+                                "targets": [
+                                    {
+                                        "id": "already-owned",
+                                        "type": "equipment_count_at_least",
+                                        "category": "weapon",
+                                        "count": 2,
+                                    }
+                                ],
+                            },
+                        },
+                        observation,
+                    )
+
     def test_inventory_food_category_counts_edible_items_not_reagents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:

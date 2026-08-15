@@ -96,7 +96,8 @@ Every draft needs a concise title, an outcome-focused objective, and 1-20 determ
 success_criteria. Supported criterion kinds: {', '.join(CRITERION_KINDS)}.
 Use only the fields listed for each kind: {CRITERION_FIELD_GUIDE}.
 Required fields: state_equals needs path and value; numeric_threshold needs metric and value;
-numeric_delta needs metric, value, and baseline; inventory_contains needs item; location_reached
+numeric_delta needs metric, value, and baseline; inventory_contains needs item; equipment_count
+needs category and count; equipment_wielding needs exactly one of item or category=weapon; location_reached
 needs location, room, or room_id; event_occurred needs event_kind; composites need criteria or
 criterion_ids. Give every criterion a short unique id. Allowed event kinds are
 {', '.join(GOAL_EVENT_KINDS)}; never invent an event kind. HP progression uses numeric_threshold on
@@ -206,6 +207,10 @@ The execution plan must collectively reach every exact active_phase.success_crit
 inventory quantities. A tool-level success is not phase completion. For inventory_contains item="food",
 food is a semantic edible category rather than a literal item name; use direct_phase_capabilities.production
 for the possible concrete product, units per cast, and vigor semantics. Never rename the product "Snack".
+equipment_count is likewise a controller-evaluated weapon/armor category across carried and equipped
+objects, and equipment_wielding verifies an exact named item or category from live loadout state. Never
+search for a literal inventory object named "weapon". A Create Weapon result must be reobserved and then
+equipped separately when the phase also requires equipment_wielding.
 Account for inventory flow: selling, eating, or dropping an existing required item removes it from the starting
 count. For Create Food, multiply the live per-cast reagent list by every planned cast, subtract reagents already
 carried, and explicitly acquire the remainder. Verification prose cannot substitute for those resource inputs.
@@ -451,6 +456,7 @@ title, constraints, and priority. Supported criterion kinds: {', '.join(CRITERIO
 Use only the fields listed for each criterion kind: {CRITERION_FIELD_GUIDE}.
 Required kind-specific fields: state_equals needs path and value; numeric_threshold needs metric
 and value; numeric_delta needs metric, value, and baseline; inventory_contains needs item;
+equipment_count needs category and count; equipment_wielding needs exactly one of item or category=weapon;
 location_reached needs location, room, or room_id; event_occurred needs event_kind; composites need
 criteria or criterion_ids. `detail`, `met`, and other evaluation-result fields are never inputs.
 Allowed event_occurred event kinds are {', '.join(GOAL_EVENT_KINDS)}. Never invent combat.kill or
@@ -484,9 +490,11 @@ Supported targets (only the listed fields are accepted):
 - {{"id":string,"type":"inventory_items_at_most","count":non-negative integer}}
 - {{"id":string,"type":"inventory_room_for_at_least","dimension":"weight|bulk","value":number}}
 - {{"id":string,"type":"item_count_at_least","item":string,"count":positive integer}}
+- {{"id":string,"type":"equipment_count_at_least","category":"weapon|armor","count":positive integer}}
 - {{"id":string,"type":"inventory_not_full|equipment_known"}}
 - {{"id":string,"type":"location_reached","room_id":positive integer and/or "name":string}}
 - {{"id":string,"type":"wielding_equals","items":null or array of canonical weapon names}}
+- {{"id":string,"type":"wielding_contains","item":canonical item name OR "category":"weapon"}}
 - {{"id":string,"type":"ability_at_least","ability_kind":"skill|spell","name":canonical name,"value":number}}
 - {{"id":string,"type":"phase_action_succeeded","tools":[exact names from campaign.phase_capabilities[phase.kind]]}}
 
@@ -504,7 +512,12 @@ supporting evidence, but only hunting_grounds returns the typed room/prey candid
 validate and hand off as an executable farm recipe. Do not combine those aliases in the completion target.
 For prepare_combat, never use phase_action_succeeded alone for a mutating cast, shop, sell, sell_all, or act
 outcome. Adapter return does not prove the intended preparation happened. Include an observable typed target such
-as item_count_at_least for created food, wielding_equals/equipment_known for gear, or inventory_not_full for space.
+as item_count_at_least for created food, equipment_count_at_least/wielding_contains for gear, or
+inventory_not_full for space. Never use item_count_at_least(item="weapon"|"armor"): those are
+semantic equipment categories, not literal inventory names. A gear support phase must request a
+material observable improvement: equipment_count_at_least.count must exceed the supplied verified
+category count, or wielding_contains must name a different concrete item. Do not create redundant
+gear merely to perturb state or reopen a research retry gate.
 When campaign.research_retry.allowed is false, progression research is closed until one of its retry_requires
 materially changes. Choose a support phase with an observable state-changing target. A successful read of equipment
 or abilities, or an already-true equipment_known target, does not change capability and cannot reopen research.

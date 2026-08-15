@@ -834,9 +834,35 @@ class Storage:
             elif kind == "inventory_contains":
                 if not isinstance(item.get("item"), str) or not item["item"].strip():
                     raise ValueError("inventory_contains requires a non-empty item")
+                if " ".join(item["item"].split()).casefold() in {
+                    "weapon",
+                    "weapons",
+                    "armor",
+                    "armour",
+                    "gear",
+                    "equipment",
+                }:
+                    raise ValueError(
+                        "inventory_contains cannot verify equipment categories; use equipment_count"
+                    )
                 count = item.get("count", 1)
                 if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                     raise ValueError("inventory_contains.count must be an integer of at least 1")
+            elif kind == "equipment_count":
+                if item.get("category") not in {"weapon", "armor"}:
+                    raise ValueError("equipment_count.category must be weapon or armor")
+                count = item.get("count")
+                if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                    raise ValueError("equipment_count.count must be an integer of at least 1")
+            elif kind == "equipment_wielding":
+                requested_item = item.get("item")
+                category = item.get("category")
+                has_item = isinstance(requested_item, str) and bool(requested_item.strip())
+                has_category = category == "weapon"
+                if has_item == has_category:
+                    raise ValueError(
+                        "equipment_wielding requires exactly one of item or category"
+                    )
             elif kind == "location_reached":
                 names = [item.get("location"), item.get("room")]
                 has_name = any(isinstance(value, str) and value.strip() for value in names)

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .config import LearningConfig
+from .contracts import ARMOR_NAME_MARKERS, WEAPON_NAME_MARKERS
 from .storage import Storage
 from .utils import canonical_json, deep_get, json_hash, timestamp, uuid7
 
@@ -44,8 +45,8 @@ RECOVERABLE_PREPARATION_TOOLS = {
 }
 HOME_EVENT_KINDS = {"goal.home_reached"}
 COMBAT_MEMORY_KEY = "combat_outcomes_v1"
-WEAPON_WORDS = ("mace", "hammer", "sword", "axe", "dagger", "bow", "staff", "club")
-ARMOR_WORDS = ("armor", "armour", "shield", "gauntlet", "glove", "pants", "breeches", "vest", "mail", "helm")
+WEAPON_WORDS = WEAPON_NAME_MARKERS
+ARMOR_WORDS = ARMOR_NAME_MARKERS
 HEALING_SUPPLY_WORDS = ("flask", "healing potion")
 INVENTORY_CAPACITY_REFUSAL_MARKERS = (
     "carry too much",

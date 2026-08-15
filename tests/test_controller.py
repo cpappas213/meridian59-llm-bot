@@ -320,6 +320,24 @@ class InvalidRevisionModel:
         }
 
 
+class InvalidInitialPlanModel(FixedModel):
+    def plan(self, **_: object) -> dict[str, object]:
+        return {
+            "decision": "plan",
+            "tool": None,
+            "arguments": {},
+            "rationale": "Retry the same infeasible plan.",
+            "expected_observation": {},
+            "proposal": None,
+            "execution_plan": {
+                "summary": "An invalid empty initial plan.",
+                "steps": [],
+                "assumptions": [],
+                "revision_reason": None,
+            },
+        }
+
+
 class AuthorizedRevisionModel:
     def plan(self, **kwargs: object) -> dict[str, object]:
         authorization = kwargs.get("revision_authorization")
@@ -535,6 +553,32 @@ class StalePostCreateFoodBroker(SimulatedBroker):
                 "spell": "create food",
                 "mana_spent": 10,
                 "created": [{"name": "apple", "amount": 1}],
+            }
+        return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
+
+
+class StalePostCreateWeaponBroker(StalePostCreateFoodBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inventory_items = [{"id": 7532, "name": "scimitar", "amount": 1}]
+
+    def observe(self) -> dict[str, object]:
+        observation = super().observe()
+        observation["equipment"] = {
+            "known": True,
+            "equipped": [{"id": 7532, "name": "scimitar"}],
+            "wielding": ["scimitar"],
+        }
+        return observation
+
+    def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
+        if name == "cast":
+            self.calls.append((name, dict(arguments)))
+            return {
+                "cast": True,
+                "spell": "create weapon",
+                "mana_spent": 15,
+                "created": [{"id": 13509, "name": "mace", "amount": 1}],
             }
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
 
@@ -6278,6 +6322,93 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_create_weapon_is_observed_and_verified_in_same_action_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = StalePostCreateWeaponBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="typed-create-weapon",
+                        objective="Carry two weapons.",
+                        success_criteria=[
+                            {
+                                "id": "two-weapons",
+                                "kind": "equipment_count",
+                                "category": "weapon",
+                                "count": 2,
+                            }
+                        ],
+                    )
+                )["goal"]
+
+                result = controller._execute(
+                    goal,
+                    broker.observe(),
+                    {
+                        "tool": "cast",
+                        "arguments": {"spell": "create weapon"},
+                        "rationale": "Create the one additional required weapon.",
+                        "plan_step_id": "create-weapon",
+                    },
+                )
+
+                cast_arguments = next(
+                    arguments for name, arguments in broker.calls if name == "cast"
+                )
+                self.assertTrue(cast_arguments["observe_created"])
+                self.assertTrue(result["completion"]["all_met"])
+                self.assertEqual(
+                    2,
+                    CriteriaEvaluator.equipment_count(
+                        controller.last_observation, "weapon"
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_equipment_plan_feedback_names_typed_shortfall_not_create_food(self) -> None:
+        phase = {
+            "kind": "prepare_combat",
+            "success_criteria": [
+                {
+                    "id": "four-weapons",
+                    "kind": "equipment_count",
+                    "category": "weapon",
+                    "count": 4,
+                }
+            ],
+        }
+        observation = {
+            "inventory": {
+                "items": [
+                    {"id": 7532, "name": "scimitar"},
+                    {"id": 13509, "name": "mace"},
+                ]
+            },
+            "equipment": {
+                "equipped": [{"id": 7532, "name": "scimitar"}],
+                "wielding": ["scimitar"],
+            },
+        }
+        error = BotController._phase_inventory_plan_error(
+            phase,
+            [
+                {
+                    "id": "one-cast",
+                    "tool": "cast",
+                    "outcome": "Cast Create Weapon once.",
+                    "verification": "One created weapon is observed.",
+                }
+            ],
+            observation,
+        )
+
+        self.assertIn("equipment_count", error or "")
+        self.assertIn("only 1 grounded acquisition", error or "")
+        self.assertNotIn("Create Food", error or "")
+
     def test_zero_mana_cast_does_not_complete_plan_step(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -8432,6 +8563,48 @@ class ControllerTests(unittest.TestCase):
                     controller._blocked_action(goal, after, "equip_best", arguments)
                 )
                 self.assertEqual([], controller.storage.get_runtime("blocked_actions"))
+            finally:
+                controller.storage.close()
+
+    def test_insufficient_mana_block_expires_only_when_spell_cost_is_met(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="mana-sensitive-cast-block")
+                )["goal"]
+                arguments = {"agent": "primary", "spell": "create weapon"}
+
+                def observation(mana: int) -> dict[str, object]:
+                    return {
+                        "look": {"room": {"num": 52, "name": "Familiars"}},
+                        "status": {
+                            "vitals": {"mana": {"current": mana, "max": 30}}
+                        },
+                        "inventory": {"items": []},
+                    }
+
+                controller._record_blocked_action(
+                    goal,
+                    observation(7),
+                    "cast",
+                    arguments,
+                    "Create Weapon costs 15 mana, you have 7.",
+                )
+
+                self.assertIsNotNone(
+                    controller._blocked_action(
+                        goal, observation(12), "cast", arguments
+                    )
+                )
+                self.assertIsNone(
+                    controller._blocked_action(
+                        goal, observation(15), "cast", arguments
+                    )
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
             finally:
                 controller.storage.close()
 
@@ -13277,6 +13450,31 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_two_equivalent_invalid_initial_plans_retire_only_the_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.broker = SimulatedBroker()
+                controller.model = InvalidInitialPlanModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="bound-invalid-initial-plans")
+                )["goal"]
+
+                first = controller.turn()
+                second = controller.turn()
+
+                self.assertTrue(first["plan_rejected"])
+                self.assertTrue(second["plan_rejected"])
+                self.assertTrue(second["phase_retired"])
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                run = controller.storage.campaign_run(goal["id"])
+                self.assertIsNotNone(run)
+                self.assertIsNone(
+                    controller.storage.active_campaign_phase(run["id"])
+                )
+            finally:
+                controller.storage.close()
+
     def test_two_unauthorized_plan_revisions_force_bounded_replanning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -16369,6 +16567,39 @@ class ControllerTests(unittest.TestCase):
                 self.assertIn(
                     "equipment_wielding_added",
                     completed.detail["enabling_changes"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_research_retry_does_not_treat_duplicate_weapon_as_improvement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="duplicate-weapon-not-enabling")
+                )["goal"]
+                before = SimulatedBroker().observe()
+                before["inventory"]["items"] = [
+                    {"id": 7532, "name": "scimitar", "amount": 1}
+                ]
+                before["equipment"] = {
+                    "known": True,
+                    "equipped": [{"id": 7532, "name": "scimitar"}],
+                    "wielding": ["scimitar"],
+                }
+                after = copy.deepcopy(before)
+                after["inventory"]["items"].append(
+                    {"id": 13509, "name": "mace", "amount": 1}
+                )
+
+                changes = controller._research_retry_enabling_changes(
+                    controller._research_retry_state(goal, before),
+                    controller._research_retry_state(goal, after),
+                )
+
+                self.assertNotIn("first_weapon_available", changes)
+                self.assertFalse(
+                    any("inventory_added" in change for change in changes), changes
                 )
             finally:
                 controller.storage.close()
