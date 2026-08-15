@@ -338,6 +338,34 @@ class InvalidInitialPlanModel(FixedModel):
         }
 
 
+class MissingFarmLaunchModel(FixedModel):
+    def plan(self, **_: object) -> dict[str, object]:
+        return {
+            "decision": "plan",
+            "tool": None,
+            "arguments": {},
+            "rationale": "Submit an incomplete farm plan.",
+            "expected_observation": {},
+            "proposal": None,
+            "execution_plan": with_safe_ending(
+                {
+                    "summary": "Inspect inventory but omit the keeper launch.",
+                    "steps": [
+                        {
+                            "id": "inspect-pack",
+                            "tool": "inventory",
+                            "outcome": "Inspect carried equipment.",
+                            "verification": "Inventory is reported.",
+                        }
+                    ],
+                    "assumptions": [],
+                    "revision_reason": None,
+                },
+                100,
+            ),
+        }
+
+
 class AuthorizedRevisionModel:
     def plan(self, **kwargs: object) -> dict[str, object]:
         authorization = kwargs.get("revision_authorization")
@@ -13472,6 +13500,93 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(
                     controller.storage.active_campaign_phase(run["id"])
                 )
+            finally:
+                controller.storage.close()
+
+    def test_missing_farm_launch_is_repaired_with_controller_owned_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 100)
+                broker = SimulatedBroker()
+                broker.tools["rest_up"] = Tool(
+                    "rest_up",
+                    "Rest to a target vigor.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "to": {"type": "number"},
+                            "max_seconds": {"type": "number"},
+                        },
+                        "required": ["agent"],
+                    },
+                )
+                broker.tools["equip_best"] = Tool(
+                    "equip_best",
+                    "Equip the best carried weapon.",
+                    {
+                        "type": "object",
+                        "properties": {"agent": {"type": "string"}},
+                        "required": ["agent"],
+                    },
+                )
+                controller.broker = broker
+                controller.model = MissingFarmLaunchModel()  # type: ignore[assignment]
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="repair-missing-farm-launch",
+                        objective="Raise maximum HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm ants in room 563 to gain maximum health.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 24, "max_minutes": 45},
+                        "context": {
+                            "target": "ant",
+                            "room": 563,
+                            "use_safe_spots": True,
+                            "flee_below": 0.6,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller.turn()
+
+                self.assertTrue(
+                    result.get("planned"),
+                    (result, controller._planner_feedback(goal)),
+                )
+                self.assertTrue(result["plan_repaired"])
+                plan = controller._execution_plan(goal)
+                self.assertIsNotNone(plan)
+                step_ids = [step["id"] for step in plan["steps"]]
+                self.assertIn("rest-for-farm", step_ids)
+                self.assertIn("equip-before-farm", step_ids)
+                self.assertIn("launch-goal-keeper", step_ids)
+                self.assertIn("finish-safe", step_ids)
+                self.assertIsNone(controller._planner_feedback(goal))
+                events = controller.storage.events(kinds=["planner.plan.repaired"])[
+                    "events"
+                ]
+                self.assertEqual(1, len(events))
             finally:
                 controller.storage.close()
 

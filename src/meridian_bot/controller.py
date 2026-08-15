@@ -16207,6 +16207,50 @@ class BotController:
                     )
                 except ModelError as exc:
                     rejected_invariant = str(exc)[:1000]
+                    if (
+                        execution_plan is None
+                        and isinstance(campaign_phase, dict)
+                        and campaign_phase.get("kind") == "farm"
+                        and "structured farm goal plan requires one explicit autopilot launch step"
+                        in rejected_invariant
+                        and isinstance(decision.get("execution_plan"), dict)
+                    ):
+                        try:
+                            repaired_plan = self._store_execution_plan(
+                                goal,
+                                self._structured_farm_controller_plan(
+                                    goal,
+                                    selected_plan=decision["execution_plan"],
+                                ),
+                                grounding=grounding,
+                                revision=False,
+                            )
+                        except ModelError as repair_exc:
+                            # If another independent invariant is also broken,
+                            # preserve the normal exact-feedback path below.
+                            rejected_invariant = (
+                                f"{rejected_invariant}; deterministic farm-plan repair also failed: "
+                                f"{str(repair_exc)[:500]}"
+                            )[:1000]
+                        else:
+                            self._clear_planner_feedback()
+                            self.storage.emit_event(
+                                "planner.plan.repaired",
+                                "Inserted the controller-owned farm launch sequence into an incomplete plan",
+                                severity="info",
+                                interesting=False,
+                                goal_id=goal["id"],
+                                data={
+                                    "phase_id": campaign_phase.get("id"),
+                                    "repaired_invariant": rejected_invariant,
+                                    "source": "structured_farm_controller_plan",
+                                },
+                            )
+                            return {
+                                "planned": True,
+                                "plan_repaired": True,
+                                "execution_plan": repaired_plan,
+                            }
                     prior_failure_context = (
                         (planner_feedback or {}).get("failure_context")
                         if isinstance(planner_feedback, dict)
