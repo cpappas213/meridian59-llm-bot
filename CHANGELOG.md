@@ -32,6 +32,10 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Made exhausted progression-research support phases complete only after a
+  material equipment, ability, inventory, route, quarantine, max-health, or
+  knowledge change. Read-only equipment/ability calls no longer manufacture
+  progress or recreate the same phase loop.
 - Added authenticated `status` and graceful `stop` CLI commands plus a supported
   scheduled-controller restart script, preventing raw Task Scheduler stops from
   orphaning the Python controller or its owned Node broker on Windows.

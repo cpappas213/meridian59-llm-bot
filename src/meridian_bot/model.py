@@ -505,6 +505,9 @@ validate and hand off as an executable farm recipe. Do not combine those aliases
 For prepare_combat, never use phase_action_succeeded alone for a mutating cast, shop, sell, sell_all, or act
 outcome. Adapter return does not prove the intended preparation happened. Include an observable typed target such
 as item_count_at_least for created food, wielding_equals/equipment_known for gear, or inventory_not_full for space.
+When campaign.research_retry.allowed is false, progression research is closed until one of its retry_requires
+materially changes. Choose a support phase with an observable state-changing target. A successful read of equipment
+or abilities, or an already-true equipment_known target, does not change capability and cannot reopen research.
 When the intended supply is any edible product of Create Food, use item_count_at_least with item="food". This is
 the controller's semantic edible category. Never use item="Snack" or claim food heals health: Create Food yields
 concrete items such as apples and those restore vigor. Preserve the exact desired quantity in the target.

@@ -14,6 +14,7 @@ from .campaign import (
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
     PhaseOutcome,
+    RESEARCH_RETRY_UNLOCKED,
 )
 from .config import BotConfig
 from .criteria import CriteriaEvaluator, EDIBLE_FOOD_NAME_MARKERS
@@ -5189,6 +5190,56 @@ class BotController:
                 {
                     "reason": reason,
                     "grounding_blocker": redact(persisted_blocker),
+                },
+            )
+        support_completion = self._research_exhaustion_support_completion(
+            goal, phase, observation
+        )
+        if support_completion is not None:
+            # Old controller builds could latch this controller-owned fallback
+            # merely because a read-only equipment call returned successfully.
+            # Its only legitimate completion is a material retry-state delta.
+            stale_checkpoint = self._phase_completion_checkpoint(phase)
+            if (
+                stale_checkpoint is not None
+                and stale_checkpoint.get("completion") != support_completion
+            ):
+                self._clear_phase_completion_checkpoint(str(phase["id"]))
+            if support_completion.get("all_met") is not True:
+                return PhaseOutcome(False, False, phase, support_completion)
+            checkpoint = self._phase_completion_checkpoint(phase)
+            safety = self._safe_ending_reached(goal, observation)
+            if checkpoint is not None:
+                if safety.get("met") is True:
+                    outcome = self.campaign.complete_phase(
+                        run, phase, checkpoint["completion"]
+                    )
+                    self._clear_phase_completion_checkpoint(str(phase["id"]))
+                    return outcome
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        **checkpoint["completion"],
+                        "completion_deferred": True,
+                        "safe_ending": safety,
+                    },
+                )
+            if safety.get("met") is True:
+                return self.campaign.complete_phase(run, phase, support_completion)
+            checkpoint = self._latch_phase_completion(
+                goal, run, phase, support_completion
+            )
+            return PhaseOutcome(
+                False,
+                False,
+                phase,
+                {
+                    **support_completion,
+                    "completion_deferred": True,
+                    "safe_ending": safety,
+                    "checkpoint": redact(checkpoint),
                 },
             )
         if self._research_phase_requires_farm_recipe(phase):
@@ -13041,7 +13092,10 @@ class BotController:
                         "instruction": (
                             "Return one corrected decision. For phase_action_succeeded, copy only "
                             "exact tool names from phase_capabilities for the selected phase kind; "
-                            "context property names are facts, not tools."
+                            "context property names are facts, not tools. When research_retry.allowed "
+                            "is false, do not repeat research_progression: choose an observable phase "
+                            "outcome that changes one listed retry predicate. Reading unchanged "
+                            "equipment or abilities is evidence collection, not progress."
                         ),
                     },
                 }
@@ -13137,7 +13191,11 @@ class BotController:
                 data={"decision": redact(decision), "strategic_goal_preserved": True},
             )
             fallback_phase = (
-                self._research_exhaustion_support_phase(goal, retry_gate)
+                self._research_exhaustion_support_phase(
+                    goal,
+                    retry_gate,
+                    self._research_retry_state(goal, observation),
+                )
                 if retry_gate.get("allowed") is False
                 else self.campaign.fallback_phase(goal, observation)
             )
@@ -13712,21 +13770,23 @@ class BotController:
 
     @staticmethod
     def _research_exhaustion_support_phase(
-        goal: dict[str, Any], retry_gate: dict[str, Any]
+        goal: dict[str, Any],
+        retry_gate: dict[str, Any],
+        retry_state: dict[str, Any],
     ) -> dict[str, Any]:
         """Safe non-research fallback after an invalid repeated lookup choice."""
 
         return {
             "kind": "prepare_combat",
             "objective": (
-                "Assess current combat capabilities and apply the best available equipment before "
-                "reconsidering exhausted progression research."
+                "Make a material capability or world-evidence improvement that can reopen exhausted "
+                "progression research. Reading unchanged equipment or abilities does not complete "
+                "this phase."
             ),
             "success_criteria": [
                 {
-                    "id": "capability-assessment-succeeded",
-                    "kind": "phase_action_succeeded",
-                    "tools": ["equipment", "abilities", "equip_best", "wear_best"],
+                    "id": "material-research-retry-unlocked",
+                    "kind": RESEARCH_RETRY_UNLOCKED,
                 }
             ],
             "abandon_predicates": [],
@@ -13734,12 +13794,85 @@ class BotController:
             "context": {
                 "research_exhaustion_support": True,
                 "candidate_fingerprint": retry_gate.get("candidate_fingerprint"),
+                "retry_state_baseline": retry_state,
+                "retry_state_fingerprint": json_hash(retry_state),
                 "retry_requires": retry_gate.get("retry_requires", []),
             },
             "rationale": (
-                "An unchanged progression lookup is deterministically closed. Inspect and improve "
-                "combat capability instead of submitting the same research phase again."
+                "An unchanged progression lookup is deterministically closed. Produce a measurable "
+                "equipment, ability, inventory, route, quarantine, max-health, or knowledge-corpus "
+                "change before research can run again."
             ),
+        }
+
+    def _research_exhaustion_support_completion(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Verify a support phase only from a material research-retry delta."""
+
+        context = phase.get("context")
+        if (
+            not isinstance(context, dict)
+            or context.get("research_exhaustion_support") is not True
+        ):
+            return None
+        baseline = context.get("retry_state_baseline")
+        if not isinstance(baseline, dict):
+            retained = self.storage.get_runtime(
+                RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+            )
+            record = (
+                retained.get(str(goal.get("id") or ""))
+                if isinstance(retained, dict)
+                else None
+            )
+            baseline = (
+                record.get("retry_state") if isinstance(record, dict) else None
+            )
+        current = self._research_retry_state(goal, observation)
+        enabling_changes = (
+            self._research_retry_enabling_changes(baseline, current)
+            if isinstance(baseline, dict)
+            else []
+        )
+        met = bool(enabling_changes)
+        return {
+            "percent_estimate": 100 if met else 0,
+            "summary": (
+                "1 of 1 criteria verified"
+                if met
+                else "0 of 1 criteria verified"
+            ),
+            "evidence_event_ids": [],
+            "criteria": [
+                {
+                    "id": "material-research-retry-unlocked",
+                    "kind": RESEARCH_RETRY_UNLOCKED,
+                    "met": met,
+                    "detail": (
+                        "material retry state changed: "
+                        + ", ".join(enabling_changes)
+                        if met
+                        else (
+                            "unchanged equipment/ability observations cannot reopen "
+                            "research; awaiting one of: "
+                            + ", ".join(
+                                str(item)
+                                for item in context.get("retry_requires", [])
+                            )
+                        )
+                    ),
+                }
+            ],
+            "all_met": met,
+            "enabling_changes": enabling_changes,
+            "baseline_retry_state_fingerprint": (
+                json_hash(baseline) if isinstance(baseline, dict) else None
+            ),
+            "current_retry_state_fingerprint": json_hash(current),
         }
 
     def _reconcile_blocked_farm_exhaustion(

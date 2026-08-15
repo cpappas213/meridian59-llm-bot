@@ -13,6 +13,7 @@ from meridian_bot.broker import Tool, ToolCallError
 from meridian_bot.campaign import (
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
+    RESEARCH_RETRY_UNLOCKED,
 )
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
@@ -16287,6 +16288,14 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("prepare_combat", phase["kind"])
                 self.assertTrue(phase["context"]["research_exhaustion_support"])
                 self.assertEqual(
+                    RESEARCH_RETRY_UNLOCKED,
+                    phase["success_criteria"][0]["kind"],
+                )
+                self.assertEqual(
+                    state_fingerprint,
+                    phase["context"]["retry_state_fingerprint"],
+                )
+                self.assertEqual(
                     0,
                     len(
                         [
@@ -16296,6 +16305,134 @@ class ControllerTests(unittest.TestCase):
                         ]
                     ),
                 )
+            finally:
+                controller.storage.close()
+
+    def test_research_exhaustion_support_requires_material_retry_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="material-retry-support")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
+                phase = controller.campaign.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": controller._research_exhaustion_support_phase(
+                            goal,
+                            {
+                                "allowed": False,
+                                "candidate_fingerprint": "closed-candidates",
+                                "retry_requires": [
+                                    "equipment_change",
+                                    "ability_change",
+                                ],
+                            },
+                            baseline,
+                        ),
+                        "rationale": "Exercise the deterministic fallback.",
+                    },
+                    observation=observation,
+                )
+                self.assertIsNotNone(phase)
+
+                unchanged = controller._evaluate_campaign_phase(
+                    goal, run, phase, observation
+                )
+                self.assertFalse(unchanged.completed)
+                self.assertFalse(unchanged.failed)
+                self.assertFalse(unchanged.detail["all_met"])
+                self.assertIn(
+                    "unchanged equipment/ability observations",
+                    unchanged.detail["criteria"][0]["detail"],
+                )
+
+                source_verify_safe_rooms(controller, 100)
+                improved = copy.deepcopy(observation)
+                improved["equipment"] = {
+                    "known": True,
+                    "equipped": [{"name": "rusty sword"}],
+                    "wielding": ["rusty sword"],
+                }
+                completed = controller._evaluate_campaign_phase(
+                    goal, run, phase, improved
+                )
+                self.assertFalse(completed.completed)
+                self.assertFalse(completed.failed)
+                self.assertTrue(completed.detail["all_met"])
+                self.assertTrue(completed.detail["completion_deferred"])
+                self.assertIn(
+                    "equipment_wielding_added",
+                    completed.detail["enabling_changes"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_legacy_research_support_ignores_successful_read_only_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-read-only-support")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                baseline = controller._research_retry_state(goal, observation)
+                controller.storage.set_runtime(
+                    RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
+                    {
+                        goal["id"]: {
+                            "fingerprint": "closed-candidates",
+                            "repeat_count": 2,
+                            "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
+                            "retry_state": baseline,
+                            "retry_state_fingerprint": controller._research_retry_state_fingerprint(
+                                goal, observation
+                            ),
+                        }
+                    },
+                )
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Assess equipment.",
+                        "success_criteria": [
+                            {
+                                "id": "legacy-equipment-read",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["equipment"],
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 24, "max_minutes": 45},
+                        "context": {"research_exhaustion_support": True},
+                    },
+                    mode="start",
+                )
+                attempt_id = controller.storage.create_phase_attempt(
+                    phase["id"],
+                    semantic_action="equipment",
+                    signature="equipment:{}",
+                    expected_effect={"equipment_known": True},
+                )
+                controller.storage.update_phase_attempt(
+                    attempt_id,
+                    "succeeded",
+                    result={"known": True},
+                )
+
+                outcome = controller._evaluate_campaign_phase(
+                    goal, run, phase, observation
+                )
+                self.assertFalse(outcome.completed)
+                self.assertFalse(outcome.failed)
+                self.assertFalse(outcome.detail["all_met"])
             finally:
                 controller.storage.close()
 

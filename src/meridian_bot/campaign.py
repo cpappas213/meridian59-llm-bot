@@ -220,6 +220,8 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
 
 PHASE_ACTION_SUCCEEDED = "phase_action_succeeded"
 PHASE_ACTION_CRITERION_FIELDS = frozenset({"id", "kind", "tools"})
+RESEARCH_RETRY_UNLOCKED = "research_retry_unlocked"
+RESEARCH_RETRY_CRITERION_FIELDS = frozenset({"id", "kind"})
 
 # Campaign-manager output uses this small semantic vocabulary. The controller
 # compiles targets into verifier criteria, so an LLM can select an outcome but
@@ -835,6 +837,20 @@ class CampaignCoordinator:
             if criterion_id in ids:
                 raise ValueError(f"duplicate criterion id: {criterion_id}")
             ids.add(criterion_id)
+            if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
+                has_internal = True
+                unknown = set(criterion) - RESEARCH_RETRY_CRITERION_FIELDS
+                if unknown:
+                    raise ValueError(
+                        "unknown research_retry_unlocked criterion field(s): "
+                        + ", ".join(sorted(unknown))
+                    )
+                if phase_kind != "prepare_combat":
+                    raise ValueError(
+                        "research_retry_unlocked is reserved for controller-owned "
+                        "prepare_combat recovery phases"
+                    )
+                continue
             if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
                 self._validate_public_phase_criterion(criterion)
                 public_criteria.append(criterion)
@@ -978,7 +994,8 @@ class CampaignCoordinator:
         public = [
             criterion
             for criterion in annotated
-            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED
+            if criterion.get("kind")
+            not in {PHASE_ACTION_SUCCEEDED, RESEARCH_RETRY_UNLOCKED}
         ]
         public_results: dict[str, dict[str, Any]] = {}
         if public:
@@ -997,6 +1014,23 @@ class CampaignCoordinator:
         evidence_event_ids: list[str] = []
         for criterion in annotated:
             criterion_id = str(criterion["id"])
+            if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
+                # The CampaignCoordinator deliberately has no access to the
+                # controller's retained research-exhaustion evidence.  The
+                # controller evaluates this internal criterion against the
+                # phase's durable baseline before calling ordinary completion.
+                results.append(
+                    {
+                        "id": criterion_id,
+                        "kind": RESEARCH_RETRY_UNLOCKED,
+                        "met": False,
+                        "detail": (
+                            "awaiting a controller-verified material capability "
+                            "or world-evidence change"
+                        ),
+                    }
+                )
+                continue
             if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
                 result = public_results.get(criterion_id)
                 if result is not None:
