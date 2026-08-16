@@ -1339,7 +1339,7 @@ class BotController:
 
     @staticmethod
     def _transient_cast_failure_reason(tool: str, result: Any) -> str | None:
-        """Return a cast outcome that is safe to retry without changing tactics."""
+        """Return a cast outcome that is not durable evidence against a tactic."""
 
         if tool != "cast" or not isinstance(result, dict):
             return None
@@ -1352,15 +1352,41 @@ class BotController:
             and mana_spent == 0
         )
         failed_roll = "failed its roll" in folded or "half cost" in folded
-        if not no_cast and not failed_roll:
-            return None
-        if reading:
-            return reading[:500]
-        return (
-            "zero mana was spent; the requested cast did not happen"
-            if no_cast
-            else "the spell spent only its failure cost and failed its roll"
+        if no_cast or failed_roll:
+            if reading:
+                return reading[:500]
+            return (
+                "zero mana was spent; the requested cast did not happen"
+                if no_cast
+                else "the spell spent only its failure cost and failed its roll"
+            )
+
+        # Creation spells have an explicitly requested before/after inventory
+        # observation.  Full mana expenditure with neither an item delta nor an
+        # authoritative refusal is still inconclusive: it can mean a missed
+        # inventory update or hidden server hold-state disagreement.  It cannot
+        # prove that the spell is ineffective, and it especially cannot prove
+        # that the character lacks combat power.  Preserve the plan step and let
+        # a later live refresh/retry or an explicit refusal supply real evidence.
+        spell = " ".join(str(result.get("spell") or "").casefold().split())
+        created = result.get("created")
+        messages = result.get("messages")
+        full_cost_unverified_creation = (
+            spell in {"create food", "create weapon"}
+            and result.get("cast") is not False
+            and isinstance(mana_spent, (int, float))
+            and not isinstance(mana_spent, bool)
+            and mana_spent > 0
+            and isinstance(created, list)
+            and not created
+            and (not isinstance(messages, list) or not messages)
         )
+        if full_cost_unverified_creation:
+            return (
+                f"full-cost {spell} cast had no authoritative created-item delta "
+                "or refusal; refresh live inventory and equipment before retrying"
+            )[:500]
+        return None
 
     @staticmethod
     def _look_room_matches_destination(refreshed: Any, destination: Any) -> bool:
@@ -1735,7 +1761,7 @@ class BotController:
         return repaired
 
     def _repair_transient_cast_evidence(self) -> list[dict[str, Any]]:
-        """Remove legacy tactic blocks written for retryable cast outcomes."""
+        """Remove legacy tactic blocks written for non-durable cast outcomes."""
 
         transient_signatures: set[tuple[str, str]] = set()
         source_event_ids: list[str] = []
@@ -1760,9 +1786,6 @@ class BotController:
             )
             if event.get("id"):
                 source_event_ids.append(str(event["id"]))
-        if not transient_signatures:
-            return []
-
         removed_blocks: list[dict[str, Any]] = []
         blocked_actions = self.storage.get_runtime("blocked_actions", [])
         if isinstance(blocked_actions, list):
@@ -1772,7 +1795,14 @@ class BotController:
                     str(item.get("goal_id") or ""),
                     str(item.get("signature") or ""),
                 ) if isinstance(item, dict) else None
-                if key in transient_signatures:
+                legacy_unverified_creation = (
+                    isinstance(item, dict)
+                    and item.get("tool") == "cast"
+                    and "produced no verified carried item"
+                    in str(item.get("reason") or "").casefold()
+                    and not is_inventory_capacity_refusal(item.get("reason"))
+                )
+                if key in transient_signatures or legacy_unverified_creation:
                     removed_blocks.append(item)
                 else:
                     retained.append(item)
@@ -1794,7 +1824,18 @@ class BotController:
                 str(lesson.get("goal_id") or ""),
                 canonical_json({"tool": tool, "arguments": arguments}),
             )
-            if lesson.get("scope") != "tactic" or key not in transient_signatures:
+            legacy_misclassified_cast = (
+                lesson.get("scope") == "tactic"
+                and tool == "cast"
+                and " ".join(
+                    str(arguments.get("spell") or "").casefold().split()
+                )
+                in {"create food", "create weapon"}
+                and lesson.get("classification") == "insufficient_combat_power"
+            )
+            if lesson.get("scope") != "tactic" or (
+                key not in transient_signatures and not legacy_misclassified_cast
+            ):
                 continue
             repaired_lessons.append(
                 self.storage.update_goal_lesson(
@@ -1802,8 +1843,9 @@ class BotController:
                     "resolved",
                     evidence={
                         "repair": (
-                            "zero-cost and half-cost cast outcomes are transient; "
-                            "they preserve the current plan step and never block the tactic"
+                            "zero-cost, half-cost, and unverified creation-cast outcomes "
+                            "are not durable evidence against the tactic; cast failures "
+                            "also cannot be classified as insufficient combat power"
                         ),
                         "source_event_ids": source_event_ids,
                         "at": timestamp(),
@@ -1813,7 +1855,7 @@ class BotController:
         if removed_blocks or repaired_lessons:
             self.storage.emit_event(
                 "cast.transient_evidence_repaired",
-                "Removed durable tactic evidence created from transient cast outcomes",
+                "Removed durable tactic evidence created from non-durable cast outcomes",
                 severity="notice",
                 interesting=False,
                 data={
@@ -17851,7 +17893,9 @@ class BotController:
             recorded_block = self._blocked_action(goal, observation, tool, arguments)
             if recorded_block and is_inventory_capacity_refusal(recorded_block.get("reason")):
                 failure_reason = str(recorded_block.get("reason") or failure_reason)
-            capacity_refusal = tool == "shop" and is_inventory_capacity_refusal(failure_reason)
+            capacity_refusal = tool in {"shop", "cast"} and is_inventory_capacity_refusal(
+                failure_reason
+            )
             invalidates_plan = self._failure_invalidates_plan(tool, failure_reason)
             runtime_key = f"lesson_suppression:{goal['id']}:{lesson['id']}"
             suppressed_count = int(self.storage.get_runtime(runtime_key, 0) or 0) + 1
@@ -17901,7 +17945,9 @@ class BotController:
         blocked = self._blocked_action(goal, observation, tool, arguments)
         if blocked:
             blocked_reason = str(blocked.get("reason") or "")
-            capacity_refusal = tool == "shop" and is_inventory_capacity_refusal(blocked_reason)
+            capacity_refusal = tool in {"shop", "cast"} and is_inventory_capacity_refusal(
+                blocked_reason
+            )
             blocked["suppressed_count"] = int(blocked.get("suppressed_count", 0)) + 1
             self._save_blocked_action(blocked)
             phase_result = finish_phase_attempt(
@@ -18334,12 +18380,16 @@ class BotController:
                     tool, result
                 )
                 if transient_cast_failure:
-                    # A zero-cost swallowed packet or a half-cost random spell
-                    # failure does not disprove the spell, its reagents, or the
-                    # verified plan. It also must not enter blocked-action memory:
-                    # that memory is keyed by tool/arguments/room rather than
-                    # the one-second cast timer or a random roll and would turn
-                    # one transient miss into a permanent suppression.
+                    ambiguous_creation = "no authoritative created-item delta" in (
+                        transient_cast_failure.casefold()
+                    )
+                    # A zero-cost swallowed packet, half-cost random failure, or
+                    # full-cost creation with no authoritative item/refusal does
+                    # not disprove the spell, its reagents, or the verified plan.
+                    # None may enter blocked-action memory: that would turn a
+                    # timing/random/observation outcome into permanent suppression.
+                    # Repeated full-cost ambiguity is still bounded inside the
+                    # current phase so a broken observer cannot burn mana forever.
                     self._record_plan_action(
                         goal,
                         step_id=str(
@@ -18354,22 +18404,41 @@ class BotController:
                         attempt_id,
                         "failed",
                         result=redact(result),
-                        error_code="TRANSIENT_CAST_FAILURE",
+                        error_code=(
+                            "AMBIGUOUS_CREATION_RESULT"
+                            if ambiguous_creation
+                            else "TRANSIENT_CAST_FAILURE"
+                        ),
                     )
-                    finish_phase_attempt(
-                        "partial",
+                    phase_result = finish_phase_attempt(
+                        "failed" if ambiguous_creation else "partial",
                         action_attempt_id=attempt_id,
                         result=result,
                         verification={
                             "transient_cast_failure": True,
+                            "ambiguous_creation_result": ambiguous_creation,
                             "plan_step_complete": False,
                             "reason": transient_cast_failure,
                         },
                         reason=transient_cast_failure,
                     )
+                    plan_step_preserved = not phase_result.get("breaker_tripped")
+                    if not plan_step_preserved:
+                        self._invalidate_execution_plan(
+                            goal,
+                            "campaign breaker ended a phase after repeated ambiguous creation results",
+                        )
                     event = self.storage.emit_event(
                         "action.transient_failure",
-                        "Cast failed transiently; preserved the current plan step",
+                        (
+                            (
+                                "Creation cast result was ambiguous; preserved the current plan step"
+                                if plan_step_preserved
+                                else "Repeated ambiguous creation results ended the current phase"
+                            )
+                            if ambiguous_creation
+                            else "Cast failed transiently; preserved the current plan step"
+                        ),
                         severity="warning",
                         interesting=False,
                         goal_id=goal["id"],
@@ -18380,7 +18449,11 @@ class BotController:
                             "reason": transient_cast_failure,
                             "result": redact(result),
                             "attempt_id": attempt_id,
-                            "plan_step_preserved": True,
+                            "plan_step_preserved": plan_step_preserved,
+                            "ambiguous_creation_result": ambiguous_creation,
+                            "campaign_breaker": phase_result
+                            if phase_result.get("breaker_tripped")
+                            else None,
                         },
                         correlation_id=correlation_id,
                         policy_decision_id=policy.id,
@@ -18399,7 +18472,7 @@ class BotController:
                                 failure_observation,
                             ),
                             "transient": True,
-                            "plan_step_preserved": True,
+                            "plan_step_preserved": plan_step_preserved,
                         },
                     )
                     if assessment_id:
@@ -18408,6 +18481,7 @@ class BotController:
                             outcome={
                                 "no_progress": True,
                                 "transient_cast_failure": True,
+                                "ambiguous_creation_result": ambiguous_creation,
                                 "reason": transient_cast_failure,
                                 "result": redact(result),
                                 "action_event_id": event["id"],
@@ -18418,9 +18492,18 @@ class BotController:
                         "action": tool,
                         "no_progress": True,
                         "transient_failure": True,
-                        "plan_step_preserved": True,
+                        "ambiguous_creation_result": ambiguous_creation,
+                        "plan_step_preserved": plan_step_preserved,
                         "reason": transient_cast_failure,
                         "result": redact(result),
+                        **(
+                            {
+                                "campaign_breaker": phase_result,
+                                "strategic_goal_preserved": True,
+                            }
+                            if phase_result.get("breaker_tripped")
+                            else {}
+                        ),
                     }
                 self.storage.update_action_attempt(attempt_id, "failed", result=redact(result), error_code="NO_PROGRESS")
                 phase_result = finish_phase_attempt(
@@ -19284,6 +19367,38 @@ class BotController:
         observation: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         text = str(reason or "").casefold()
+        if tool == "cast" and "no authoritative created-item delta" in text:
+            return {
+                "kind": "creation_result_ambiguous",
+                "source": "broker_observation",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Preserve the incomplete plan step without writing a blocked-action "
+                    "fingerprint or durable lesson."
+                ),
+                "inventory_capacity": cls._inventory_capacity_context(observation),
+                "required_response": (
+                    "Refresh live inventory and equipment, recover the spell cost, and "
+                    "retry later or choose a different grounded acquisition route."
+                ),
+            }
+        if tool == "cast" and is_inventory_capacity_refusal(reason):
+            return {
+                "kind": "creation_inventory_capacity_refused",
+                "source": "server_message",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Defer only this creation attempt at the current carried load; "
+                    "the refusal is inventory state, not combat-power evidence."
+                ),
+                "item_transfer_verified": False,
+                "inventory_capacity": cls._inventory_capacity_context(observation),
+                "required_response": (
+                    "Free verified weight or bulk, refresh inventory, then retry the "
+                    "same creation spell. Do not raise HP or change hunting rooms for "
+                    "an inventory-capacity refusal."
+                ),
+            }
         if tool == "shop" and is_inventory_capacity_refusal(reason):
             return {
                 "kind": "inventory_capacity_refused",
@@ -19426,7 +19541,10 @@ class BotController:
             tool == "travel" and "travel route cycled" in text
         ) or (
             tool == "cast"
-            and "produced no verified carried item" in text
+            and (
+                "produced no verified carried item" in text
+                or is_inventory_capacity_refusal(text)
+            )
         )
 
     @staticmethod
@@ -19607,13 +19725,37 @@ class BotController:
                 "remains valid and incomplete. Recover enough mana and retry that same step; "
                 "this outcome does not disprove the spell, reagents, or plan."
             )
-        if tool == "cast" and "produced no verified carried item" in text:
+        if tool == "cast" and is_inventory_capacity_refusal(reason):
+            capacity = cls._inventory_capacity_context(observation)
+            facts = [
+                "The server explicitly refused to hand over the created item at the current carried load."
+            ]
+            if capacity.get("known"):
+                facts.append(
+                    "Broker carry evidence at failure: "
+                    f"items={capacity.get('items')}, "
+                    f"weight={capacity.get('weight')}/{capacity.get('weight_max')}, "
+                    f"bulk={capacity.get('bulk')}/{capacity.get('bulk_max')}, "
+                    f"exact={capacity.get('exact')}."
+                )
+            facts.append(
+                "Free verified weight or bulk and refresh inventory before retrying; "
+                "do not treat this as a need for more HP or combat training."
+            )
+            return prefix + " ".join(facts)
+        if tool == "cast" and any(
+            marker in text
+            for marker in (
+                "produced no verified carried item",
+                "no authoritative created-item delta",
+            )
+        ):
             return (
                 prefix
-                + "Mana expenditure proves the spell ran, but it does not prove the planned "
-                "inventory result. Refresh inventory before deciding the remaining quantity. "
-                "If the item is still absent, use the returned refusal or carry-capacity evidence; "
-                "do not count this plan step as complete or repeat it blindly."
+                + "Mana expenditure proves the spell ran, but there is no authoritative item "
+                "delta or refusal. Treat the result as an observation/dependency ambiguity, "
+                "refresh inventory and equipment, and preserve the plan step. Do not save a "
+                "durable lesson or infer insufficient combat power from this result."
             )
         if tool == "prey":
             return (
@@ -21752,6 +21894,17 @@ class BotController:
                 ):
                     continue
                 if tool == "cast":
+                    reason = str(entry.get("reason") or "")
+                    if (
+                        "produced no verified carried item" in reason.casefold()
+                        and not is_inventory_capacity_refusal(reason)
+                    ):
+                        # Older builds persisted an ambiguous broker observation
+                        # as a proven cast failure.  With no authoritative
+                        # refusal that fingerprint has no valid retry predicate,
+                        # so it must never suppress a fresh live attempt.
+                        self._discard_blocked_action(entry)
+                        continue
                     required_mana = entry.get("required_mana")
                     if required_mana is None:
                         required_mana = self._required_mana_from_refusal(
@@ -21772,7 +21925,7 @@ class BotController:
                         self._discard_blocked_action(entry)
                         continue
                 if (
-                    tool == "shop"
+                    tool in {"shop", "cast"}
                     and is_inventory_capacity_refusal(entry.get("reason"))
                     and self.learning.profile(observation).get("inventory_load_hash")
                     != entry.get("inventory_load_hash")

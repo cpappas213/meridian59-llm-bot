@@ -6669,7 +6669,53 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_full_cost_creation_without_delta_requires_replanning(self) -> None:
+    def test_cast_repair_resolves_legacy_combat_power_lesson_and_ambiguous_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="legacy-create-weapon-combat-power")
+                )["goal"]
+                arguments = {
+                    "agent": "primary",
+                    "observe_created": True,
+                    "spell": "create weapon",
+                }
+                deferred = controller.learning.defer_goal(
+                    goal,
+                    observation,
+                    tool="cast",
+                    arguments=arguments,
+                    reason="the exact cast tactic repeatedly made no progress in the same state",
+                    classification="insufficient_combat_power",
+                    scope="tactic",
+                    block=False,
+                )
+                controller._record_blocked_action(
+                    goal,
+                    observation,
+                    "cast",
+                    arguments,
+                    "create weapon spent 15 mana but produced no verified carried item",
+                )
+
+                repaired = controller._repair_transient_cast_evidence()
+
+                self.assertEqual(
+                    [deferred["lesson"]["id"]], [item["id"] for item in repaired]
+                )
+                self.assertEqual(
+                    "resolved",
+                    controller.storage.goal_lesson(deferred["lesson"]["id"])["status"],
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+            finally:
+                controller.storage.close()
+
+    def test_full_cost_creation_without_delta_is_ambiguous_not_durable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -6714,11 +6760,92 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertTrue(result["no_progress"])
-                self.assertIn("produced no verified carried item", result["reason"])
-                self.assertIsNone(controller._execution_plan(goal))
+                self.assertTrue(result["transient_failure"])
+                self.assertTrue(result["ambiguous_creation_result"])
+                self.assertIn("no authoritative created-item delta", result["reason"])
+                self.assertIsNotNone(controller._execution_plan(goal))
                 self.assertEqual(
                     [],
                     controller.storage.events(kinds=["action.succeeded"])["events"],
+                )
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
+                )
+                self.assertEqual([], controller.storage.goal_lessons())
+            finally:
+                controller.storage.close()
+
+    def test_authoritative_creation_capacity_refusal_is_not_transient(self) -> None:
+        result = {
+            "cast": True,
+            "spell": "create weapon",
+            "mana_spent": 15,
+            "created": [],
+            "messages": ["You cannot carry the mace."],
+            "what_the_mana_says": "full cost (15) - the spell was cast",
+        }
+
+        self.assertIsNone(
+            BotController._transient_cast_failure_reason("cast", result)
+        )
+        self.assertEqual(
+            "You cannot carry the mace.",
+            BotController._no_progress_reason(
+                result,
+                {"inventory": {"items": []}},
+                tool="cast",
+                arguments={"spell": "create weapon", "observe_created": True},
+            ),
+        )
+
+    def test_repeated_ambiguous_creation_ends_only_the_current_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = UnverifiedCreateFoodBroker(mana_spent=10)
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="bounded-ambiguous-creation")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "general",
+                        "objective": "Create one food item.",
+                        "success_criteria": [
+                            {
+                                "kind": "inventory_contains",
+                                "item": "food",
+                                "count": 2,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                action = {
+                    "tool": "cast",
+                    "arguments": {"spell": "create food"},
+                    "rationale": "Create the required food.",
+                    "plan_step_id": "create-food",
+                }
+
+                first = controller._execute(goal, broker.observe(), action)
+                repeated = controller._execute(goal, broker.observe(), action)
+
+                self.assertTrue(first["plan_step_preserved"])
+                self.assertNotIn("campaign_breaker", first)
+                self.assertFalse(repeated["plan_step_preserved"])
+                self.assertTrue(repeated["campaign_breaker"]["breaker_tripped"])
+                self.assertTrue(repeated["strategic_goal_preserved"])
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertEqual(
+                    "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
+                )
+                self.assertEqual(phase["id"], repeated["campaign_breaker"]["phase_id"])
+                self.assertEqual([], controller.storage.goal_lessons())
+                self.assertEqual(
+                    [], controller.storage.get_runtime("blocked_actions", [])
                 )
             finally:
                 controller.storage.close()

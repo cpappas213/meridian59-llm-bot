@@ -1106,6 +1106,17 @@ class GoalLearningTests(unittest.TestCase):
         self.assertEqual("tactic", scope)
         self.assertGreater(confidence, 0.9)
 
+    def test_creation_cast_failure_is_not_combat_readiness_evidence(self) -> None:
+        classification, scope, confidence = GoalLearning.classify(
+            "cast",
+            "the exact cast tactic repeatedly made no progress in the same state",
+            event_kind="action.retry_suppressed",
+        )
+
+        self.assertEqual("ineffective_tactic", classification)
+        self.assertEqual("tactic", scope)
+        self.assertGreater(confidence, 0.7)
+
     def test_silent_go_reply_is_dependency_failure_not_route_evidence(self) -> None:
         classification, scope, confidence = GoalLearning.classify(
             "travel",

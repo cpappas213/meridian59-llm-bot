@@ -21,7 +21,7 @@ FAILURE_CLASSES = {
     "dependency_failure",
 }
 
-COMBAT_TOOLS = {"pvp_engage", "pvp_seek", "fight", "attack", "cast", "approach", "autopilot"}
+COMBAT_TOOLS = {"pvp_engage", "pvp_seek", "fight", "attack", "approach", "autopilot"}
 ROUTE_TOOLS = {"travel", "map", "exits", "walk_to", "go_through", "escape_underworld", "leave_raza"}
 RECOVERABLE_PREPARATION_TOOLS = {
     *ROUTE_TOOLS,
@@ -35,6 +35,12 @@ RECOVERABLE_PREPARATION_TOOLS = {
     "merchants",
     "sell",
     "sell_all",
+    # A cast is a capability/preparation attempt unless its concrete result
+    # contains combat or survival evidence.  Treating every cast as combat made
+    # an ambiguous Create Weapon inventory receipt look like proof that the
+    # character needed more HP or equipment, then locked the very tactic that
+    # could supply that equipment.
+    "cast",
     "equip_best",
     "rest",
     "look",
@@ -1649,7 +1655,11 @@ class GoalLearning:
                     {"kind": "numeric_increase", "field": "carried_currency", "from": profile["carried_currency"]}
                 ],
             }
-        if retry_when is None and tool == "shop" and is_inventory_capacity_refusal(reason):
+        if (
+            retry_when is None
+            and tool in {"shop", "cast"}
+            and is_inventory_capacity_refusal(reason)
+        ):
             retry_when = {
                 "mode": "any",
                 "conditions": [
