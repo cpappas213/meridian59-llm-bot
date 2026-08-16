@@ -523,7 +523,8 @@ class GoalLearningTests(unittest.TestCase):
         self.assertFalse(evaluation["met"])
         self.assertEqual([lesson["id"]], [item["id"] for item in repaired])
         self.assertEqual("deferred", self.storage.goal_lesson(lesson["id"])["status"])
-        quarantine = self.storage.get_runtime("farm_tactic_quarantine_v1", {})["584"]
+        quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantine = next(iter(quarantines.values()))
         self.assertEqual("ant", quarantine["target"])
         self.assertTrue(quarantine["use_safe_spots"])
         self.assertEqual(goal["id"], quarantine["goal_id"])

@@ -44,7 +44,11 @@ class FakeApi:
 
     def status(self) -> dict[str, object]:
         return {
-            "controller": {"state": "running", "control_owner": "keeper"},
+            "controller": {
+                "state": "running",
+                "since": "2026-08-16T12:00:00.000Z",
+                "control_owner": "keeper",
+            },
             "game": {
                 "connection": "joined",
                 "character_name": "Sable",
@@ -64,6 +68,17 @@ class FakeApi:
                 },
                 "risk": "low",
                 "carried_currency": 12,
+                "finances": {
+                    "known_inventory_item_value": 345,
+                    "valuation_complete": True,
+                    "bank_accounts": [
+                        {
+                            "account": "shared mainland account",
+                            "last_known_balance": 1712,
+                            "recorded_at": "2026-08-16T12:30:00.000Z",
+                        }
+                    ],
+                },
                 "observation_age_seconds": 0.4,
             },
             "onboarding": {"status": "ready"},
@@ -350,6 +365,9 @@ class TuiTests(unittest.TestCase):
 
         self.assertIn("Sable", rendered)
         self.assertIn("HP 40/50", rendered)
+        self.assertIn(
+            "Banked Shillings 1712 | Total Inventory Value 345", rendered
+        )
         self.assertIn("Reach the bank", rendered)
         self.assertIn("Buy bread", rendered)
         self.assertIn("Dodge 12", rendered)
@@ -369,6 +387,34 @@ class TuiTests(unittest.TestCase):
         )
         self.assertIn("[X] Safe shutdown", rendered)
         self.assertIn("[Q] Detach TUI", rendered)
+
+    def test_dashboard_marks_unobserved_bank_balance_unknown(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["game"]["finances"]["bank_accounts"] = []
+        status["game"]["finances"]["valuation_complete"] = False
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Banked Shillings unknown", rendered)
+        self.assertIn(
+            "Total Inventory Value 345 (partial estimate)", rendered
+        )
+
+    def test_dashboard_does_not_present_a_prior_session_bank_balance(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["game"]["finances"]["bank_accounts"][0][
+            "recorded_at"
+        ] = "2026-08-15T12:30:00.000Z"
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Banked Shillings unknown", rendered)
 
     def test_dashboard_renders_safe_shutdown_progress(self) -> None:
         api = FakeApi()

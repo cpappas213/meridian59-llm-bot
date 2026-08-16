@@ -521,6 +521,45 @@ def render_dashboard(
     development = campaign.get("development") if isinstance(campaign.get("development"), dict) else {}
     readiness = campaign.get("readiness") if isinstance(campaign.get("readiness"), dict) else {}
     vitals = game.get("vitals") if isinstance(game.get("vitals"), dict) else {}
+    finances = game.get("finances") if isinstance(game.get("finances"), dict) else {}
+    bank_accounts = (
+        finances.get("bank_accounts")
+        if isinstance(finances.get("bank_accounts"), list)
+        else []
+    )
+    session_started_at = str(controller.get("since") or "")
+    known_bank_balances = [
+        account.get("last_known_balance")
+        for account in bank_accounts
+        if isinstance(account, dict)
+        and isinstance(account.get("last_known_balance"), (int, float))
+        and not isinstance(account.get("last_known_balance"), bool)
+        and (
+            not session_started_at
+            or (
+                account.get("recorded_at") is not None
+                and str(account["recorded_at"]) >= session_started_at
+            )
+        )
+    ]
+    banked_shillings = sum(known_bank_balances) if known_bank_balances else None
+    inventory_value = _first_record_value(
+        finances,
+        "known_inventory_item_value",
+        "source_estimated_inventory_value",
+    )
+    banked_text = (
+        _human_number(banked_shillings)
+        if banked_shillings is not None
+        else "unknown"
+    )
+    inventory_value_text = (
+        _human_number(inventory_value)
+        if inventory_value is not None
+        else "unknown"
+    )
+    if inventory_value is not None and finances.get("valuation_complete") is False:
+        inventory_value_text += " (partial estimate)"
     active = next((goal for goal in goals if goal.get("status") == "active"), None)
     displayed_goal = status.get("goal") if isinstance(status.get("goal"), dict) else active
     queue = [goal for goal in goals if goal.get("status") == "queued"]
@@ -543,6 +582,10 @@ def render_dashboard(
             f"{_paint('Vigor ' + _meter(vitals, 'vigor'), _vital_style(vitals.get('vigor')), color)}  "
             f"Risk {_paint(game.get('risk', '-'), _state_style(game.get('risk')), color)}  "
             f"Currency {_paint(game.get('carried_currency', '-'), 'yellow', color)}"
+        ),
+        (
+            f"Banked Shillings {_paint(banked_text, 'yellow' if banked_shillings is not None else 'dim', color)} | "
+            f"Total Inventory Value {_paint(inventory_value_text, 'yellow' if inventory_value is not None else 'dim', color)}"
         ),
         (
             f"Onboarding {_paint(onboarding.get('status', '-'), _state_style(onboarding.get('status')), color)} | "

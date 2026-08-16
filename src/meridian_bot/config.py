@@ -66,6 +66,7 @@ class ModelConfig:
     json_mode: bool = True
     disable_thinking: bool = False
     auth_mode: str = "auto"
+    tactical_prompt_protocol: str = "progressive"
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,7 @@ class BotConfig:
                 "json_mode",
                 "disable_thinking",
                 "auth_mode",
+                "tactical_prompt_protocol",
             },
             "model",
         )
@@ -243,10 +245,17 @@ class BotConfig:
             json_mode=bool(model_raw.get("json_mode", True)),
             disable_thinking=bool(model_raw.get("disable_thinking", False)),
             auth_mode=str(model_raw.get("auth_mode", "auto")),
+            tactical_prompt_protocol=str(
+                model_raw.get("tactical_prompt_protocol", "progressive")
+            ),
         )
         if model.auth_mode not in {"auto", "none", "bearer", "anthropic"}:
             raise ValueError(
                 "model.auth_mode must be auto, none, bearer, or anthropic"
+            )
+        if model.tactical_prompt_protocol not in {"legacy", "progressive"}:
+            raise ValueError(
+                "model.tactical_prompt_protocol must be legacy or progressive"
             )
         if not 0 <= model.temperature <= 2:
             raise ValueError("model.temperature must be between 0 and 2")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 import re
@@ -10,6 +11,15 @@ from typing import Any
 
 from .config import BotConfig
 from .contracts import CRITERION_FIELDS_BY_KIND, CRITERION_KINDS, GOAL_EVENT_KINDS
+from .tactical_protocol import (
+    EXECUTE_STEP,
+    PLAN_CREATE,
+    PLAN_REVISE,
+    REPAIR_ACTION,
+    REPAIR_PLAN,
+    TACTICAL_MODES,
+    tactical_system_prompt,
+)
 from .utils import parse_json_object
 
 
@@ -17,10 +27,20 @@ class ModelError(RuntimeError):
     code = "MODEL_UNAVAILABLE"
 
 
+class ModelResponseFormatError(ModelError):
+    """The endpoint responded, but its payload cannot satisfy the JSON contract."""
+
+    code = "MODEL_RESPONSE_INVALID_JSON"
+
+
 STRUCTURED_OUTPUT_TOKEN_FLOOR = 4096
 REASONING_RETRY_TOKEN_CEILING = 8192
 CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET = 24_000
 CAMPAIGN_MANAGER_TIMEOUT_RECOVERY_TOKEN_BUDGET = 12_000
+TACTICAL_EXECUTE_PROMPT_TOKEN_BUDGET = 6_000
+TACTICAL_REPAIR_PROMPT_TOKEN_BUDGET = 8_000
+TACTICAL_PLAN_PROMPT_TOKEN_BUDGET = 12_000
+TACTICAL_ACTION_OUTPUT_TOKEN_BUDGET = 1_024
 PROMPT_ESTIMATED_CHARS_PER_TOKEN = 4
 
 
@@ -329,7 +349,9 @@ do not repeat the lookup merely to keep it visible in the replacement plan. Nami
 is present in verified_no_progress_tactics; choose a different candidate and route.
 Prefer verified direct capabilities over speculative commerce. If a castable self-production spell such as
 Create Weapon directly supplies the missing phase requirement, use cast before constructing a buy-and-sell
-detour. A successful read-only catalogue or status lookup is evidence, not progress; after learning it once,
+detour. Knowing Create Weapon is not enough: when its live row says castable=false, the blocked_by list is an
+unmet precondition, so do not count the cast as weapon acquisition until those exact blockers are resolved.
+A successful read-only catalogue or status lookup is evidence, not progress; after learning it once,
 act on it or change the plan.
 For shopping, merchants searches item catalogs and map searches rooms: query merchants with the exact
 desired item/class, then resolve the returned merchant or shop name to a canonical numeric room and use
@@ -423,11 +445,12 @@ remaining recovery and explicit finish criteria. Never repeat hazardous work mer
 objective or operator_notes still contains its completed recipe.
 Before starting, compare live numeric vigor with fight_above_vigor. Resting reaches the ordinary 80-vigor
 keeper floor, so food and spending are never implicit launch requirements. The controller will not insert a
-food, reagent, or food-funding phase. You own that tactical choice: omit eat_before_fighting and buy_food (or
-set both false) for ordinary rested-floor farming. Set eat_before_fighting=true with an explicit
-fight_above_vigor above 80 only when you deliberately want the keeper to consume carried or created food.
-Set buy_food=true only when you deliberately want paid food acquisition and current financial evidence makes
-that route viable. Buying, creating, carrying, and eating food are separate choices. Carried herbs and
+food, reagent, or food-funding phase. At the ordinary 80-vigor floor, omitted eat_before_fighting lets the
+keeper consume carried or self-created food opportunistically; set it false only when the phase must preserve
+food. Set eat_before_fighting=true with an explicit fight_above_vigor above 80 only when you deliberately make
+that higher, food-dependent launch floor part of the tactic. Set buy_food=true only when you deliberately want
+paid food acquisition and current financial evidence makes that route viable; it remains false when omitted.
+Buying, creating, carrying, and eating food are separate choices. Carried herbs and
 elderberries are usable only when the verified spell list says the character knows Create Food. If a retreat
 happens before the assigned room is reached, treat it as hazardous-route evidence and do not condemn
 the destination room.
@@ -574,11 +597,25 @@ eligible again only after the controller reports a positive enabling change such
 ability, newly available equipment/supplies, a changed knowledge corpus, or removal of retained route or
 quarantine evidence. A newly created failure lesson, retry suppression, quarantine, stagnation record, or
 other negative evidence narrows the available tactics and never authorizes another research lookup.
+When that support choice raises an already-known skill, choose a meaningful milestone of at least five
+ability points above its current verified value, capped at Meridian's maximum of 99. Near the cap, target
+99; never select an already-capped skill. This minimum applies only to a capability-support detour, not to
+an operator-authored skill goal with its own explicit target.
+Research progress and research success are distinct. A changed normalized room/prey candidate set or changed
+tactic disposition is useful evidence, but research succeeds only when the controller reports an executable
+non-eliminated tactic. If all tactics are eliminated, choose a materially different support or room strategy;
+never call the lookup successful merely because its result changed. Preserve the room and prey only when the
+failure evidence is scoped to positioning: a nonlethal wall-only failure may justify an explicitly grounded
+open-field variant, while a death, room-population hazard, over-level spawn, or route failure normally requires
+a safer room or an enabling capability change. The keeper already varies individual wall coordinates. Do not
+invent Blink as a farm escape policy, and do not make flasks an automatic prerequisite; carried healing supplies
+are usable capability evidence, while acquiring supplies remains a deliberate, feasible planner choice.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
-and fight_above_vigor (80 by default). Optional booleans eat_before_fighting and buy_food are false when
-omitted; include them only for a deliberate food tactic. The controller persists and enforces these fields across planning turns. If choosing
+and fight_above_vigor (80 by default). Optional eat_before_fighting uses available food when omitted and may be
+set false to preserve it; buy_food is false when omitted. Set eat_before_fighting=true explicitly when choosing
+an above-80 food-dependent floor. The controller persists and enforces these fields across planning turns. If choosing
 open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
 it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey
@@ -680,6 +717,10 @@ class VllmClient:
         self.last_error: str | None = None
         self.last_ok_at: str | None = None
         self.last_prompt_metrics: dict[str, Any] | None = None
+        # Campaign-manager prompt metrics are consumed by status and regression
+        # tests. Keep tactical calls in a separate slot so one kind of planning
+        # cannot overwrite the most recent measurement for the other.
+        self.last_tactical_prompt_metrics: dict[str, Any] | None = None
 
     @staticmethod
     def _trim_prompt_value(
@@ -789,6 +830,269 @@ class VllmClient:
             (len(system) + len(user) + PROMPT_ESTIMATED_CHARS_PER_TOKEN - 1)
             // PROMPT_ESTIMATED_CHARS_PER_TOKEN,
         )
+
+    @staticmethod
+    def _normalize_tactical_mode(mode: str) -> str:
+        normalized = str(mode or "").strip().upper()
+        if normalized not in TACTICAL_MODES:
+            raise ModelError(
+                f"unsupported tactical protocol mode: {mode!r}; "
+                f"expected one of {', '.join(sorted(TACTICAL_MODES))}"
+            )
+        return normalized
+
+    @classmethod
+    def _normalize_tactical_envelope(
+        cls,
+        mode: str,
+        envelope: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        normalized_mode = cls._normalize_tactical_mode(mode)
+        if not isinstance(envelope, dict):
+            raise ModelError("tactical protocol envelope must be a JSON object")
+        normalized_envelope = deepcopy(envelope)
+        if "mode" in normalized_envelope:
+            envelope_mode = cls._normalize_tactical_mode(
+                normalized_envelope["mode"]
+            )
+            if envelope_mode != normalized_mode:
+                raise ModelError(
+                    "tactical protocol mode mismatch: "
+                    f"request selected {normalized_mode} but envelope selected "
+                    f"{envelope_mode}"
+                )
+        normalized_envelope["mode"] = normalized_mode
+        return normalized_mode, normalized_envelope
+
+    @classmethod
+    def _tactical_prompt_token_budget(cls, mode: str) -> int:
+        normalized_mode = cls._normalize_tactical_mode(mode)
+        if normalized_mode == EXECUTE_STEP:
+            return TACTICAL_EXECUTE_PROMPT_TOKEN_BUDGET
+        if normalized_mode in {REPAIR_PLAN, REPAIR_ACTION}:
+            return TACTICAL_REPAIR_PROMPT_TOKEN_BUDGET
+        if normalized_mode in {PLAN_CREATE, PLAN_REVISE}:
+            return TACTICAL_PLAN_PROMPT_TOKEN_BUDGET
+        raise AssertionError("normalized tactical mode has no prompt budget")
+
+    def _tactical_output_token_budgets(self, mode: str) -> tuple[int, int]:
+        """Return the mode target and transport-safe completion limit."""
+
+        normalized_mode = self._normalize_tactical_mode(mode)
+        if normalized_mode in {EXECUTE_STEP, REPAIR_ACTION}:
+            target = TACTICAL_ACTION_OUTPUT_TOKEN_BUDGET
+        else:
+            target = max(
+                STRUCTURED_OUTPUT_TOKEN_FLOOR,
+                self.config.model.max_output_tokens,
+            )
+        # _complete's structured responses have historically received this
+        # floor. Preserve it for providers whose reasoning and final JSON share
+        # one completion allowance, while retaining the smaller action target in
+        # prompt metrics for future provider-specific tuning.
+        return target, max(STRUCTURED_OUTPUT_TOKEN_FLOOR, target)
+
+    @staticmethod
+    def _tactical_optional_section_kind(key: Any) -> str | None:
+        normalized = str(key).casefold().replace("-", "_")
+        if (
+            normalized
+            in {"history", "recent_history", "recent_events", "event_history"}
+            or normalized.endswith("_history")
+        ):
+            return "history"
+        if (
+            normalized
+            in {
+                "evidence",
+                "failure_evidence",
+                "relevant_evidence",
+                "relevant_failures",
+            }
+            or normalized.endswith("_evidence")
+        ):
+            return "evidence"
+        if (
+            normalized
+            in {"example", "examples", "matched_examples", "rule_card_examples"}
+            or normalized.endswith("_example")
+            or normalized.endswith("_examples")
+        ):
+            return "examples"
+        return None
+
+    @classmethod
+    def _compact_tactical_optional_sections(
+        cls,
+        envelope: dict[str, Any],
+        *,
+        max_list: int,
+        max_dict: int,
+        max_string: int,
+        drop: bool = False,
+    ) -> dict[str, Any]:
+        """Compact only dispensable evidence, history, and example payloads.
+
+        Protocol identity, state tokens, phase/step contracts, legal actions,
+        violations, and every other required value remain byte-for-byte equal as
+        JSON values. If those required fields alone exceed a mode's budget, the
+        caller rejects the request rather than silently weakening its contract.
+        """
+
+        def compact_optional(value: Any, kind: str, depth: int = 0) -> Any:
+            if drop:
+                if isinstance(value, list):
+                    return []
+                if isinstance(value, dict):
+                    return {}
+                if isinstance(value, str):
+                    return ""
+                return value
+            if depth >= 8:
+                return "[nested optional value omitted]"
+            if isinstance(value, str):
+                if len(value) <= max_string:
+                    return value
+                return value[:max_string].rstrip() + "..."
+            if isinstance(value, list):
+                selected = value[-max_list:] if kind == "history" else value[:max_list]
+                return [compact_optional(item, kind, depth + 1) for item in selected]
+            if isinstance(value, dict):
+                return {
+                    key: compact_optional(item, kind, depth + 1)
+                    for key, item in list(value.items())[:max_dict]
+                }
+            return value
+
+        def visit(
+            value: Any,
+            *,
+            depth: int = 0,
+            in_rule_cards: bool = False,
+        ) -> Any:
+            if isinstance(value, list):
+                return [
+                    visit(item, depth=depth + 1, in_rule_cards=in_rule_cards)
+                    for item in value
+                ]
+            if not isinstance(value, dict):
+                return value
+            compacted: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized = str(key).casefold().replace("-", "_")
+                nested_rule_cards = in_rule_cards or normalized in {
+                    "rule_card",
+                    "rule_cards",
+                    "matched_rule_cards",
+                }
+                # Top-level routed context sections are explicitly optional.
+                # Within required contracts, similarly named JSON Schema fields
+                # (for example `examples`) must remain untouched. Rule-card
+                # examples/evidence are the one deliberately nested exception.
+                kind = (
+                    cls._tactical_optional_section_kind(key)
+                    if depth == 0 or in_rule_cards
+                    else None
+                )
+                compacted[key] = (
+                    compact_optional(item, kind)
+                    if kind is not None
+                    else visit(
+                        item,
+                        depth=depth + 1,
+                        in_rule_cards=nested_rule_cards,
+                    )
+                )
+            return compacted
+
+        return visit(deepcopy(envelope))
+
+    def _budget_tactical_envelope(
+        self,
+        mode: str,
+        envelope: dict[str, Any],
+        *,
+        system: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """Serialize a tactical request within its mode-specific input budget."""
+
+        normalized_mode, normalized_envelope = self._normalize_tactical_envelope(
+            mode, envelope
+        )
+        token_budget = self._tactical_prompt_token_budget(normalized_mode)
+        system = (
+            tactical_system_prompt(normalized_mode) if system is None else system
+        )
+        candidate = deepcopy(normalized_envelope)
+        user = json.dumps(candidate, ensure_ascii=False)
+        original_estimated = self._estimated_prompt_tokens(system, user)
+        estimated = original_estimated
+        compacted = False
+        if estimated > token_budget:
+            stages = (
+                (12, 16, 800, False),
+                (6, 8, 400, False),
+                (2, 4, 180, False),
+                (1, 2, 80, False),
+                (0, 0, 0, True),
+            )
+            for max_list, max_dict, max_string, drop in stages:
+                candidate = self._compact_tactical_optional_sections(
+                    normalized_envelope,
+                    max_list=max_list,
+                    max_dict=max_dict,
+                    max_string=max_string,
+                    drop=drop,
+                )
+                user = json.dumps(candidate, ensure_ascii=False)
+                estimated = self._estimated_prompt_tokens(system, user)
+                compacted = True
+                if estimated <= token_budget:
+                    break
+
+        target_output, effective_output = self._tactical_output_token_budgets(
+            normalized_mode
+        )
+        over_budget = estimated > token_budget
+        self.last_tactical_prompt_metrics = {
+            "kind": "tactical",
+            "mode": normalized_mode,
+            "estimated_tokens": estimated,
+            "original_estimated_tokens": original_estimated,
+            "token_budget": token_budget,
+            "user_context_characters": len(user),
+            "compacted": compacted,
+            "over_budget": over_budget,
+            "output_token_budget": target_output,
+            "effective_max_output_tokens": effective_output,
+            # ModelConfig exposes a completion limit, not a provider/model
+            # context-window limit. Treating max_output_tokens as the latter
+            # would produce false safety. Until a reliable total limit is
+            # configured, retain the mode's absolute input cap and make the
+            # missing reserve enforcement explicit in telemetry.
+            "context_window_limit_tokens": None,
+            "completion_reserve_tokens": effective_output,
+            "context_window_reserve_enforced": False,
+        }
+        LOG.info(
+            "tactical prompt mode=%s estimated_tokens=%s original_tokens=%s budget=%s "
+            "context_chars=%s compacted=%s over_budget=%s output_target=%s output_max=%s",
+            normalized_mode,
+            estimated,
+            original_estimated,
+            token_budget,
+            len(user),
+            compacted,
+            over_budget,
+            target_output,
+            effective_output,
+        )
+        if over_budget:
+            raise ModelError(
+                f"tactical {normalized_mode} required context exceeds its {token_budget}-token "
+                f"prompt budget ({estimated} estimated tokens after optional-context compaction)"
+            )
+        return candidate, user
 
     def _budget_campaign_manager_context(
         self,
@@ -932,6 +1236,7 @@ class VllmClient:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        allow_json_repair: bool = True,
     ) -> dict[str, Any]:
         headers = self._headers(content_type=True)
         request_messages = list(messages)
@@ -1009,7 +1314,7 @@ class VllmClient:
                 self.last_error = None
                 return value
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                if not json_repair_attempted:
+                if allow_json_repair and not json_repair_attempted:
                     json_repair_attempted = True
                     # A model may emit a truncated or syntactically malformed object.
                     # Give it one bounded repair
@@ -1029,7 +1334,13 @@ class VllmClient:
                     ]
                     continue
                 self.last_error = str(exc)
-                raise ModelError(f"model request failed after one JSON repair: {exc}") from exc
+                if not allow_json_repair:
+                    raise ModelResponseFormatError(
+                        f"model returned invalid JSON with repair disabled: {exc}"
+                    ) from exc
+                raise ModelError(
+                    f"model request failed after one JSON repair: {exc}"
+                ) from exc
 
     def draft_goal(
         self,
@@ -1066,6 +1377,33 @@ class VllmClient:
                 STRUCTURED_OUTPUT_TOKEN_FLOOR,
                 self.config.model.max_output_tokens,
             ),
+        )
+
+    def tactical_complete(
+        self,
+        *,
+        mode: str,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete one controller-selected progressive tactical contract."""
+
+        normalized_mode = self._normalize_tactical_mode(mode)
+        system = tactical_system_prompt(normalized_mode)
+        _, user = self._budget_tactical_envelope(
+            normalized_mode, envelope, system=system
+        )
+        _, effective_output = self._tactical_output_token_budgets(normalized_mode)
+        return self._complete(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            self.config.model.planner_timeout_seconds,
+            max_tokens=effective_output,
+            # Progressive repair is a controller-selected protocol mode. The
+            # generic transcript repair appends up to 16k characters of rejected
+            # output after prompt budgeting, so it must not run inside this path.
+            allow_json_repair=False,
         )
 
     def plan(

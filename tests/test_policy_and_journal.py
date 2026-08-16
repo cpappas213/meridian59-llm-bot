@@ -229,6 +229,92 @@ class PolicyAndJournalTests(unittest.TestCase):
             repair_payload = json.loads(repair_request.data.decode("utf-8"))
             self.assertIn("not valid complete JSON", repair_payload["messages"][-1]["content"])
 
+    def test_tactical_completion_normalizes_mode_and_keeps_metrics_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            campaign_metrics = {"kind": "campaign_manager", "mode": "normal"}
+            client.last_prompt_metrics = campaign_metrics
+            envelope = {
+                "mode": " execute_step ",
+                "request_id": "request-1",
+                "legal_actions": [],
+            }
+            response = {
+                "request_id": "request-1",
+                "action_token": "action-1",
+                "arguments": {},
+                "rationale": "Use the selected action.",
+                "expected_observation": {},
+            }
+            with patch.object(client, "_complete", return_value=response) as complete:
+                result = client.tactical_complete(
+                    mode=" execute_step ", envelope=envelope
+                )
+
+            self.assertEqual(response, result)
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual("EXECUTE_STEP", sent["mode"])
+            self.assertEqual(" execute_step ", envelope["mode"])
+            self.assertFalse(complete.call_args.kwargs["allow_json_repair"])
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+            self.assertIs(campaign_metrics, client.last_prompt_metrics)
+            self.assertEqual(
+                "EXECUTE_STEP", client.last_tactical_prompt_metrics["mode"]
+            )
+            self.assertEqual(
+                6000, client.last_tactical_prompt_metrics["token_budget"]
+            )
+            self.assertIsNone(
+                client.last_tactical_prompt_metrics["context_window_limit_tokens"]
+            )
+            self.assertFalse(
+                client.last_tactical_prompt_metrics[
+                    "context_window_reserve_enforced"
+                ]
+            )
+
+    def test_tactical_completion_rejects_conflicting_or_unknown_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch.object(client, "_complete") as complete:
+                with self.assertRaisesRegex(ModelError, "mode mismatch"):
+                    client.tactical_complete(
+                        mode="PLAN_CREATE",
+                        envelope={"mode": "EXECUTE_STEP"},
+                    )
+                with self.assertRaisesRegex(ModelError, "unsupported tactical"):
+                    client.tactical_complete(mode="invented", envelope={})
+            complete.assert_not_called()
+
+    def test_tactical_completion_disables_unbudgeted_json_transcript_repair(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {"choices": [{"message": {"content": '{"request_id":'}}]}
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch(
+                "meridian_bot.model.urllib.request.urlopen", return_value=Response()
+            ) as request:
+                with self.assertRaisesRegex(ModelError, "repair disabled"):
+                    client.tactical_complete(
+                        mode="EXECUTE_STEP",
+                        envelope={
+                            "mode": "EXECUTE_STEP",
+                            "request_id": "request-1",
+                            "legal_actions": [],
+                        },
+                    )
+            self.assertEqual(1, request.call_count)
+
     def test_character_onboarding_reserves_room_for_reasoning_then_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             client = VllmClient(config(Path(temporary)))

@@ -1680,9 +1680,20 @@ class CampaignCoordinator:
         compact: dict[str, Any] = {
             "room": value.get("room", blocker.get("assigned_room")),
             "target": value.get("target", blocker.get("hunt")),
+            "use_safe_spots": value.get(
+                "use_safe_spots", blocker.get("use_safe_spots")
+            ),
+            "tactic_id": value.get("tactic_id"),
             "reason": blocker.get("kind") or "unknown",
         }
-        for key in ("danger_limit", "use_safe_spots"):
+        disposition = value.get("disposition")
+        if isinstance(disposition, dict):
+            compact["disposition"] = {
+                key: disposition.get(key)
+                for key in ("class", "scope")
+                if disposition.get(key) is not None
+            }
+        for key in ("danger_limit",):
             if blocker.get(key) is not None:
                 compact[key] = blocker.get(key)
         reasons = deep_get(blocker, "evidence.reasons", blocker.get("reasons"))
@@ -1750,7 +1761,15 @@ class CampaignCoordinator:
         if isinstance(validation, dict):
             compact_validation: dict[str, Any] = {
                 key: validation.get(key)
-                for key in ("status", "fingerprint", "candidate_count")
+                for key in (
+                    "status",
+                    "fingerprint",
+                    "candidate_count",
+                    "candidate_set_fingerprint",
+                    "disposition_fingerprint",
+                    "tactic_count",
+                    "progress",
+                )
                 if validation.get(key) is not None
             }
             selected = validation.get("recipe")
@@ -1868,6 +1887,10 @@ class CampaignCoordinator:
                 "fingerprint",
                 "repeat_count",
                 "candidate_count",
+                "candidate_set_fingerprint",
+                "disposition_fingerprint",
+                "tactic_count",
+                "progress",
                 "recorded_at",
                 "retry_state_fingerprint",
             )
@@ -1891,7 +1914,7 @@ class CampaignCoordinator:
     ) -> dict[str, Any]:
         successful: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        unique_rejections: dict[tuple[str, str, str], dict[str, Any]] = {}
+        unique_rejections: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         research_fingerprints: dict[str, dict[str, Any]] = {}
         for phase in history:
             context = phase.get("context") if isinstance(phase.get("context"), dict) else {}
@@ -1929,6 +1952,7 @@ class CampaignCoordinator:
                 key = (
                     str(projected.get("room") or ""),
                     str(projected.get("target") or "").casefold(),
+                    str(projected.get("use_safe_spots")),
                     str(projected.get("reason") or ""),
                 )
                 unique_rejections[key] = projected
@@ -1939,6 +1963,7 @@ class CampaignCoordinator:
                 key = (
                     str(rejected.get("room") or ""),
                     str(rejected.get("target") or "").casefold(),
+                    str(rejected.get("use_safe_spots")),
                     str(rejected.get("reason") or ""),
                 )
                 unique_rejections[key] = rejected
