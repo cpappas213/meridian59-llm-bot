@@ -9,7 +9,7 @@ hosts, but mutation surfaces must remain loopback-local to the controller.
 ## 2. Prerequisites
 
 - Windows 10/11 and PowerShell 5.1+.
-- Python 3.11+ and a compatible Node.js on `PATH`, or explicit executable paths.
+- Python 3.11+ and Node.js 22+ on `PATH` (Node 24 LTS recommended), or explicit executable paths.
 - Git with the pinned `vendor/m59-harness` submodule initialized.
 - An authorized game account and a reachable server.
 - A reachable OpenAI-compatible API exposing `/models`, or a known model ID for
