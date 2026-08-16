@@ -1605,6 +1605,72 @@ class StorageTests(unittest.TestCase):
                     ][0]["id"],
                 )
 
+    def test_campaign_phase_can_defer_verified_abandonment_until_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(
+                    goal_payload(request_id="campaign-deferred-abandonment")
+                )["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm until retreat becomes necessary.",
+                        "success_criteria": [
+                            {
+                                "id": "max-hp",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                        "abandon_predicates": [
+                            {
+                                "id": "critical-health",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.value",
+                                "operator": "<",
+                                "value": 10,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                attempt_id = storage.create_phase_attempt(
+                    phase["id"],
+                    semantic_action="autopilot",
+                    signature="keeper-launched",
+                    expected_effect={"keeper_running": True},
+                )
+                storage.update_phase_attempt(
+                    attempt_id, "succeeded", verification={"keeper_running": True}
+                )
+                phase = storage.active_campaign_phase(run["id"])
+
+                outcome = coordinator.evaluate_phase(
+                    goal,
+                    run,
+                    phase,
+                    {
+                        "status": {
+                            "vitals": {
+                                "health": {"value": 7, "max": 26}
+                            }
+                        }
+                    },
+                    allow_abandonment=False,
+                )
+
+                self.assertFalse(outcome.completed)
+                self.assertFalse(outcome.failed)
+                self.assertTrue(outcome.detail["abandonment_deferred"])
+                self.assertEqual(
+                    "active", storage.active_campaign_phase(run["id"])["status"]
+                )
+
     def test_unchanged_goal_completion_does_not_churn_version(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:

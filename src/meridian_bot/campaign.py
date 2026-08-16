@@ -1263,6 +1263,7 @@ class CampaignCoordinator:
         observation: dict[str, Any],
         *,
         allow_completion: bool = True,
+        allow_abandonment: bool = True,
     ) -> PhaseOutcome:
         if phase is None:
             return PhaseOutcome(False, False, None, {"reason": "no_active_phase"})
@@ -1319,6 +1320,22 @@ class CampaignCoordinator:
                     str(item.get("detail") or item.get("id") or item.get("kind"))
                     for item in triggered[:5]
                 )
+                if not allow_abandonment:
+                    # A keeper-owned combat phase may still be outside safety
+                    # when an abandonment predicate becomes true.  Report the
+                    # verified outcome without terminalizing the phase so the
+                    # controller can retain survival ownership until a source-
+                    # verified sanctuary is reached.
+                    return PhaseOutcome(
+                        False,
+                        False,
+                        phase,
+                        {
+                            "reason": reason,
+                            "abandonment": abandonment,
+                            "abandonment_deferred": True,
+                        },
+                    )
                 finished = self.storage.transition_campaign_phase(
                     phase["id"], "failed", reason=reason, resume_parent=False
                 )

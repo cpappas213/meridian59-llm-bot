@@ -189,6 +189,7 @@ INVALID_PLAN_REVISION_LIMIT = 2
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY = "phase_exhaustion_checkpoints_v1"
+PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY = "phase_abandonment_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
@@ -2495,7 +2496,10 @@ class BotController:
                         {
                             "agent": self.config.game.agent,
                             "action": "stop",
-                            "hard": True,
+                            # The phase boundary is already source-verified
+                            # safe. Leave the inert telemetry/watchdog loop
+                            # alive while scheduler ownership changes.
+                            "hard": False,
                             "why": (
                                 "yielding at a verified safe campaign boundary to "
                                 "strictly higher-priority queued work"
@@ -2578,7 +2582,9 @@ class BotController:
         if action == "stop":
             args.update(
                 {
-                    "hard": True,
+                    # Off mode relinquishes gameplay mutations but is not a
+                    # process teardown. Preserve the upstream telemetry loop.
+                    "hard": False,
                     "why": "controller fallback mode is off",
                 }
             )
@@ -5105,6 +5111,126 @@ class BotController:
         values.pop(phase_id, None)
         self.storage.set_runtime(PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, values)
 
+    def _phase_abandonment_checkpoint(
+        self, phase: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Return a durable terminal outcome awaiting a verified safe boundary."""
+
+        if not isinstance(phase, dict):
+            return None
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict):
+            return None
+        value = values.get(str(phase.get("id") or ""))
+        if (
+            not isinstance(value, dict)
+            or value.get("phase_contract") != self._phase_contract(phase)
+            or not str(value.get("reason") or "").strip()
+            or not isinstance(value.get("abandonment"), dict)
+        ):
+            return None
+        return value
+
+    def _latch_phase_abandonment(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        detail: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve a failed combat phase until survival reaches sanctuary."""
+
+        existing = self._phase_abandonment_checkpoint(phase)
+        if existing is not None:
+            return existing
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        destination = self._phase_exhaustion_destination(goal, observation)
+        value = {
+            "goal_id": goal["id"],
+            "run_id": run["id"],
+            "phase_id": phase["id"],
+            "phase_contract": self._phase_contract(phase),
+            "reason": str(
+                detail.get("reason")
+                or "a phase abandonment predicate was verified"
+            ),
+            "abandonment": redact(detail.get("abandonment", {})),
+            "safe_ending": destination,
+            "abandoned_at": timestamp(),
+        }
+        values[phase["id"]] = value
+        self.storage.set_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+        )
+        self.storage.emit_event(
+            "campaign.phase.abandonment_latched",
+            "Campaign phase abandonment verified; preserving survival control until safe",
+            severity="warning",
+            interesting=True,
+            goal_id=goal["id"],
+            data={
+                "run_id": run["id"],
+                "phase_id": phase["id"],
+                "phase_kind": phase.get("kind"),
+                "reason": value["reason"],
+                "safe_ending": redact(destination),
+                "terminal_deferred": True,
+                "strategic_goal_preserved": True,
+            },
+        )
+        return value
+
+    def _clear_phase_abandonment_checkpoint(self, phase_id: str) -> None:
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or phase_id not in values:
+            return
+        values = dict(values)
+        values.pop(phase_id, None)
+        self.storage.set_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+        )
+
+    def _phase_abandonment_safety(
+        self,
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Accept only a source-verified sanctuary as terminalization safety."""
+
+        current = self._observation_room(observation)
+        verified = self._verified_safe_staging(current)
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint, dict)
+            and isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        if verified is not None:
+            return {
+                "met": True,
+                "current_room_id": current,
+                "safe_ending": redact(verified),
+                "verified_room": redact(verified),
+            }
+        return {
+            "met": False,
+            "reason": (
+                "phase abandonment is verified and the current room is not a "
+                "source-verified sanctuary"
+            ),
+            "current_room_id": current,
+            "safe_ending": redact(destination),
+        }
+
     def _phase_exhaustion_safety(
         self,
         goal: dict[str, Any],
@@ -5258,6 +5384,135 @@ class BotController:
             "safety_recovery": True,
         }
 
+    def _ensure_phase_abandonment_plan(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+        *,
+        grounding: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Install the sole allowed plan while abandonment awaits safety."""
+
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        if checkpoint is None:
+            return None
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        if destination is None:
+            destination = self._phase_exhaustion_destination(goal, observation)
+            if destination is not None:
+                values = self.storage.get_runtime(
+                    PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+                )
+                if isinstance(values, dict):
+                    values = dict(values)
+                    values[phase["id"]] = {
+                        **checkpoint,
+                        "safe_ending": destination,
+                    }
+                    self.storage.set_runtime(
+                        PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+                    )
+                    checkpoint = values[phase["id"]]
+        if not isinstance(destination, dict):
+            return None
+        verified = self._verified_safe_staging(destination.get("room_id"))
+        if verified is None:
+            return None
+        room_id = int(verified["room_id"])
+
+        existing = self._execution_plan(goal)
+        ending = existing.get("safe_ending") if isinstance(existing, dict) else None
+        existing_steps = (
+            existing.get("steps", []) if isinstance(existing, dict) else []
+        )
+        if (
+            isinstance(ending, dict)
+            and str(ending.get("room_id")) == str(room_id)
+            and str(ending.get("step_id") or "")
+            and isinstance(existing_steps, list)
+            and len(existing_steps) == 1
+            and isinstance(existing_steps[0], dict)
+            and str(existing_steps[0].get("id") or "")
+            == str(ending.get("step_id") or "")
+            and existing_steps[0].get("tool") == "travel"
+        ):
+            return existing
+
+        step_id = "phase-abandonment-safe-return"
+        return self._store_execution_plan(
+            goal,
+            {
+                "summary": (
+                    "Return to source-verified safety before closing the abandoned "
+                    "campaign phase."
+                ),
+                "steps": [
+                    {
+                        "id": step_id,
+                        "outcome": (
+                            f"Reach source-verified safe room {room_id} before the "
+                            "abandoned phase is finalized."
+                        ),
+                        "tool": "travel",
+                        "verification": f"Current room id is {room_id}.",
+                    }
+                ],
+                "safe_ending": {
+                    "room_id": room_id,
+                    "step_id": step_id,
+                    "rationale": (
+                        "Verified abandonment is a controller safety boundary; "
+                        "survival and safe return precede terminal phase state."
+                    ),
+                },
+                "assumptions": [],
+                "revision_reason": (
+                    "Campaign phase abandonment was verified outside safety."
+                ),
+            },
+            grounding=grounding,
+            revision=existing is not None,
+        )
+
+    def _structured_phase_abandonment_return_action(
+        self,
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+        execution_plan: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return directly to safety while a terminal failure is deferred."""
+
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        if checkpoint is None or not isinstance(phase, dict):
+            return None
+        if self._phase_abandonment_safety(phase, observation).get("met") is True:
+            return None
+        if not isinstance(execution_plan, dict):
+            return None
+        ending = execution_plan.get("safe_ending")
+        if not isinstance(ending, dict):
+            return None
+        destination = self._verified_safe_staging(ending.get("room_id"))
+        step_id = str(ending.get("step_id") or "")
+        if destination is None or not step_id:
+            return None
+        return {
+            "tool": "travel",
+            "arguments": {"to": int(destination["room_id"])},
+            "rationale": (
+                "The phase abandonment is verified; return directly to the "
+                "retained source-verified sanctuary before finalizing it."
+            ),
+            "expected_observation": {"room_id": int(destination["room_id"])},
+            "plan_step_id": step_id,
+            "safety_recovery": True,
+        }
+
     def _evaluate_campaign_phase(
         self,
         goal: dict[str, Any],
@@ -5269,6 +5524,46 @@ class BotController:
 
         if phase is None:
             return self.campaign.evaluate_phase(goal, run, phase, observation)
+        safety = self._safe_ending_reached(goal, observation)
+        abandonment_allowed = self._verified_safe_staging(
+            self._observation_room(observation)
+        ) is not None
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(phase)
+        if abandonment_checkpoint is not None:
+            abandonment_safety = self._phase_abandonment_safety(
+                phase, observation
+            )
+            if abandonment_safety.get("met") is not True:
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        "reason": abandonment_checkpoint.get("reason"),
+                        "abandonment": abandonment_checkpoint.get("abandonment"),
+                        "abandonment_deferred": True,
+                        "safe_ending": abandonment_safety,
+                        "checkpoint": redact(abandonment_checkpoint),
+                    },
+                )
+            finished = self.storage.transition_campaign_phase(
+                str(phase["id"]),
+                "failed",
+                reason=str(abandonment_checkpoint.get("reason")),
+                resume_parent=False,
+            )
+            self._clear_phase_abandonment_checkpoint(str(phase["id"]))
+            return PhaseOutcome(
+                False,
+                True,
+                finished,
+                {
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "abandonment": abandonment_checkpoint.get("abandonment"),
+                    "safe_ending": abandonment_safety,
+                    "terminal_deferred": False,
+                },
+            )
         persisted_blocker = self._campaign_phase_grounding_blocker(
             phase,
             observation,
@@ -5383,7 +5678,24 @@ class BotController:
                 phase,
                 observation,
                 allow_completion=False,
+                allow_abandonment=abandonment_allowed,
             )
+            if preview.detail.get("abandonment_deferred") is True:
+                checkpoint = self._latch_phase_abandonment(
+                    goal, run, phase, preview.detail, observation
+                )
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        **preview.detail,
+                        "safe_ending": self._phase_abandonment_safety(
+                            phase, observation
+                        ),
+                        "checkpoint": redact(checkpoint),
+                    },
+                )
             if preview.failed:
                 return preview
             phase = preview.phase if isinstance(preview.phase, dict) else phase
@@ -5451,7 +5763,24 @@ class BotController:
             phase,
             observation,
             allow_completion=safety.get("met") is True,
+            allow_abandonment=abandonment_allowed,
         )
+        if outcome.detail.get("abandonment_deferred") is True:
+            checkpoint = self._latch_phase_abandonment(
+                goal, run, phase, outcome.detail, observation
+            )
+            return PhaseOutcome(
+                False,
+                False,
+                phase,
+                {
+                    **outcome.detail,
+                    "safe_ending": self._phase_abandonment_safety(
+                        phase, observation
+                    ),
+                    "checkpoint": redact(checkpoint),
+                },
+            )
         if outcome.detail.get("completion_deferred") is not True:
             return outcome
         current_phase = outcome.phase if isinstance(outcome.phase, dict) else phase
@@ -6481,11 +6810,17 @@ class BotController:
         farm_intent = self._effective_farm_intent(goal)
         current_completion = self.criteria.evaluate(goal, self.last_observation or {})
         phase_exhaustion_pending = self._phase_exhaustion_checkpoint(phase) is not None
-        if not phase_exhaustion_pending:
+        phase_abandonment_pending = (
+            self._phase_abandonment_checkpoint(phase) is not None
+        )
+        phase_terminal_pending = (
+            phase_exhaustion_pending or phase_abandonment_pending
+        )
+        if not phase_terminal_pending:
             self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
         farm_work_remains = (
             False
-            if phase_exhaustion_pending
+            if phase_terminal_pending
             else self._keeper_combat_work_remains(goal, current_completion)
         )
         launch_indexes = [
@@ -10072,6 +10407,7 @@ class BotController:
             phase is not None
             and self._phase_completion_checkpoint(phase) is None
             and self._phase_exhaustion_checkpoint(phase) is None
+            and self._phase_abandonment_checkpoint(phase) is None
         )
 
     def _effective_farm_intent(self, goal: dict[str, Any]) -> dict[str, Any]:
@@ -11289,22 +11625,19 @@ class BotController:
             return None
 
         stopped = None
+        recovery = None
         if self._keeper_is_driving(status):
             # The broker can remain nominally running while retrying a graph
-            # route that it has already proved impossible. Yield movement and
-            # combat before retiring the phase so replacement work cannot race
-            # that loop.
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "the assigned farm route was authoritatively disproved",
-                },
-                timeout=20,
-                mutation=True,
-            )
+            # route that it has already proved impossible. Outside a verified
+            # sanctuary, retask that same keeper to survival in place before
+            # retiring the tactic. At safety, an ordinary inert stop is enough.
+            current_room = self._observation_room(observation)
+            if self._verified_safe_staging(current_room) is None:
+                recovery = self._ensure_survival_keeper()
+            else:
+                stopped = self._request_background_farm_stop(
+                    goal, "the assigned farm route was authoritatively disproved"
+                )
 
         assigned_room = failure["assigned_room"]
         target = str(failure["target"])
@@ -11386,9 +11719,12 @@ class BotController:
             f"background_farm_route_failure_handled_v1:{goal['id']}", True
         )
         self.storage.set_runtime("background_farm_owner_v1", {})
-        recovery = None
         health_fraction = self._vital_fraction(observation, "health")
-        if health_fraction is not None and health_fraction < 1.0:
+        if (
+            recovery is None
+            and health_fraction is not None
+            and health_fraction < 1.0
+        ):
             recovery = self._ensure_survival_keeper()
         self.storage.emit_event(
             "background_farm.route_failed",
@@ -11459,20 +11795,19 @@ class BotController:
             f"Keeper deferred assigned_room={assigned_room} for hunt={target}: "
             f"{detail}"
         )
-        stopped = self.broker.call_tool(
-            "autopilot",
-            {
-                "agent": self.config.game.agent,
-                "action": "stop",
-                "hard": True,
-                "why": "the assigned farm room tactic was authoritatively exhausted",
-            },
-            timeout=20,
-            mutation=True,
-        )
+        current_room = self._observation_room(observation)
+        stopped = None
+        recovery = None
+        if self._keeper_is_driving(status):
+            if self._verified_safe_staging(current_room) is None:
+                recovery = self._ensure_survival_keeper()
+            else:
+                stopped = self._request_background_farm_stop(
+                    goal,
+                    "the assigned farm room tactic was authoritatively exhausted",
+                )
         self.storage.set_runtime("background_farm_owner_v1", {})
 
-        current_room = self._observation_room(observation)
         stagnations = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
         stagnations = dict(stagnations) if isinstance(stagnations, dict) else {}
         stagnation_key = f"{goal['id']}|{assigned_room}|{target}"
@@ -11558,6 +11893,7 @@ class BotController:
                 "strategic_goal_preserved": True,
                 "goal_blocked": False,
                 "keeper_stop": redact(stopped),
+                "recovery": redact(recovery),
             },
         )
         return {
@@ -11567,6 +11903,7 @@ class BotController:
             "goal_blocked": False,
             "failure": stagnation,
             "keeper_stop": stopped,
+            "recovery": recovery,
             "completion": completion,
             **deferred,
         }
@@ -12164,13 +12501,17 @@ class BotController:
     def _request_background_farm_stop(
         self, goal: dict[str, Any], reason: str
     ) -> dict[str, Any]:
-        """Request one cooperative hard stop and latch it until status confirms exit."""
+        """Relinquish mutations while keeping the keeper's safety telemetry alive."""
         result = self.broker.call_tool(
             "autopilot",
             {
                 "agent": self.config.game.agent,
                 "action": "stop",
-                "hard": True,
+                # Ordinary phase/controller ownership changes must never turn
+                # off the watchdog while the game session remains live.  The
+                # upstream default is an inert keeper; a hard stop is reserved
+                # for process teardown after logout.
+                "hard": False,
                 "why": reason,
             },
             timeout=20,
@@ -12192,7 +12533,7 @@ class BotController:
         status: dict[str, Any],
         completion: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Hold ownership while one hard stop unwinds; retry only after a bounded wait."""
+        """Hold ownership while one cooperative stop unwinds."""
         key = self._background_farm_stop_key(str(goal["id"]))
         pending = self.storage.get_runtime(key, {})
         pending = pending if isinstance(pending, dict) else {}
@@ -12471,6 +12812,7 @@ class BotController:
             active_keeper_phase is not None
             and self._phase_completion_checkpoint(active_keeper_phase) is None
             and self._phase_exhaustion_checkpoint(active_keeper_phase) is None
+            and self._phase_abandonment_checkpoint(active_keeper_phase) is None
         )
         unhealthy = self._keeper_stall_is_persistent(status)
         if (unmet_health or phase_work_remains) and not unhealthy:
@@ -12638,6 +12980,43 @@ class BotController:
             active_keeper_phase is not None
             and self._background_farm_mismatch(goal, status) is None
         )
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(
+            active_keeper_phase
+        )
+        if abandonment_checkpoint is not None and matching_active_phase:
+            # The phase outcome is already decided, but terminal state must not
+            # revoke the only loop capable of withdrawing the character. Retask
+            # that same keeper in place; do not stop it, clear ownership, create
+            # a lesson, or pause the goal until sanctuary is verified.
+            switched = self._ensure_survival_keeper()
+            self.storage.emit_event(
+                "background_farm.abandonment_recovery_handoff",
+                "Abandoned farm retained continuous keeper ownership for recovery",
+                severity="warning",
+                interesting=True,
+                goal_id=goal["id"],
+                data={
+                    "phase_id": active_keeper_phase.get("id"),
+                    "room": evidence.get("room"),
+                    "health_fraction": evidence.get("health_fraction"),
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        abandonment_checkpoint.get("safe_ending")
+                    ),
+                    "result": redact(switched),
+                    "terminal_deferred": True,
+                    "ownership_preserved": True,
+                },
+            )
+            return {
+                "abandonment_recovery_handoff": True,
+                "switched_to_survival": True,
+                "campaign_phase_failed": None,
+                "strategic_goal_preserved": True,
+                "ownership_preserved": True,
+                "checkpoint": redact(abandonment_checkpoint),
+                "result": redact(switched),
+            }
         if not evidence.get("quarantine_reasons") and matching_active_phase:
             # The farm keeper already owns flee, withdrawal, and recovery. A
             # global critical-health advisory can observe the same health dip
@@ -15496,6 +15875,11 @@ class BotController:
             }
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
+        if outcome.detail.get("abandonment_deferred") is True:
+            # The verified failure is durable, but this phase still owns a
+            # character outside safety.  Leave it active so the ordinary
+            # keeper handoff and safe-return path keep continuous ownership.
+            return None
         if (
             exhaustion_checkpoint is not None
             and (
@@ -15603,21 +15987,9 @@ class BotController:
                     mutation=False,
                 )
                 keeper_result = keeper
-                if (
-                    self._keeper_is_driving(keeper)
-                    and str(keeper.get("mode") or "") == "farm"
-                    and keeper.get("goal_id") in {None, goal["id"]}
-                ):
-                    keeper_result = self.broker.call_tool(
-                        "autopilot",
-                        {
-                            "agent": self.config.game.agent,
-                            "action": "stop",
-                            "hard": True,
-                            "why": reason,
-                        },
-                        timeout=20,
-                        mutation=True,
+                if self._keeper_is_driving(keeper):
+                    keeper_result = self._request_background_farm_stop(
+                        goal, reason
                     )
                     self.storage.set_runtime("background_farm_owner_v1", {})
                 keeper_released = isinstance(keeper_result, dict) and not (
@@ -15801,6 +16173,7 @@ class BotController:
             goal = self.storage.set_goal_completion(goal["id"], completion)
             phase_completion_checkpoint = None
             phase_exhaustion_checkpoint = None
+            phase_abandonment_checkpoint = None
             phase_safe_return_checkpoint = None
             if completion_checkpoint is None:
                 phase_completion = self._reconcile_existing_campaign_phase(
@@ -15842,10 +16215,17 @@ class BotController:
                 phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
                     existing_phase
                 )
+                phase_abandonment_checkpoint = (
+                    self._phase_abandonment_checkpoint(existing_phase)
+                )
                 phase_safe_return_checkpoint = (
                     phase_completion_checkpoint
                     if phase_completion_checkpoint is not None
-                    else phase_exhaustion_checkpoint
+                    else (
+                        phase_exhaustion_checkpoint
+                        if phase_exhaustion_checkpoint is not None
+                        else phase_abandonment_checkpoint
+                    )
                 )
             expired_opportunity = self._expire_direct_pvp_opportunity(
                 goal, observation, completion
@@ -15990,8 +16370,13 @@ class BotController:
                         "the active campaign phase budget is exhausted; preserve "
                         "survival control before the safe-ending travel"
                         if phase_exhaustion_checkpoint is not None
-                        else "the active campaign phase outcome is verified; release "
-                        "movement control for the plan's safe-ending travel"
+                        else (
+                            "the active campaign phase abandonment is verified; preserve "
+                            "survival control before the safe-ending travel"
+                            if phase_abandonment_checkpoint is not None
+                            else "the active campaign phase outcome is verified; release "
+                            "movement control for the plan's safe-ending travel"
+                        )
                     )
                     if phase_safe_return_checkpoint is not None
                     else None
@@ -16100,10 +16485,17 @@ class BotController:
             phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
                 campaign_phase
             )
+            phase_abandonment_checkpoint = self._phase_abandonment_checkpoint(
+                campaign_phase
+            )
             phase_safe_return_checkpoint = (
                 phase_completion_checkpoint
                 if phase_completion_checkpoint is not None
-                else phase_exhaustion_checkpoint
+                else (
+                    phase_exhaustion_checkpoint
+                    if phase_exhaustion_checkpoint is not None
+                    else phase_abandonment_checkpoint
+                )
             )
             page = self.storage.events(after_cursor=max(0, self.storage.get_runtime("planner_event_cursor", 0) - 12), limit=20)
             pending_proposals = self.storage.proposals()[:10]
@@ -16150,6 +16542,25 @@ class BotController:
                         "closes this phase."
                     ),
                 }
+            if phase_abandonment_checkpoint is not None:
+                grounded_context["phase_abandonment_checkpoint"] = {
+                    "abandoned": True,
+                    "abandoned_at": phase_abandonment_checkpoint.get(
+                        "abandoned_at"
+                    ),
+                    "phase_id": campaign_phase.get("id"),
+                    "phase_kind": campaign_phase.get("kind"),
+                    "reason": phase_abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        phase_abandonment_checkpoint.get("safe_ending")
+                    ),
+                    "instruction": (
+                        "The active phase abandonment is verified. Do not continue "
+                        "goal work. Preserve survival control and execute only the "
+                        "exact source-verified safe-ending travel before the "
+                        "controller closes this phase."
+                    ),
+                }
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
@@ -16186,6 +16597,25 @@ class BotController:
                         f"safe-ending room: {exc}",
                     )
                     planner_feedback = self._planner_feedback(goal)
+            if (
+                phase_abandonment_checkpoint is not None
+                and isinstance(campaign_phase, dict)
+            ):
+                try:
+                    execution_plan = self._ensure_phase_abandonment_plan(
+                        goal,
+                        campaign_phase,
+                        observation,
+                        grounding=grounding,
+                    )
+                except ModelError as exc:
+                    self._set_planner_feedback(
+                        goal,
+                        "The phase abandonment is verified and safety return is the "
+                        "only permitted work. Build one travel-only plan to a source-"
+                        f"verified safe-ending room: {exc}",
+                    )
+                    planner_feedback = self._planner_feedback(goal)
             revision_authorization = self._plan_revision_authorization(
                 goal, execution_plan, planner_feedback
             )
@@ -16197,6 +16627,17 @@ class BotController:
             )
             if structured_exhaustion_return is not None:
                 return self._execute(goal, observation, structured_exhaustion_return)
+            structured_abandonment_return = (
+                self._structured_phase_abandonment_return_action(
+                    campaign_phase,
+                    observation,
+                    execution_plan,
+                )
+            )
+            if structured_abandonment_return is not None:
+                return self._execute(
+                    goal, observation, structured_abandonment_return
+                )
             structured_raza_exit = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -22711,6 +23152,7 @@ class BotController:
             else []
         )
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(phase)
         return {
             "run_id": run["id"],
             "status": run["status"],
@@ -22720,9 +23162,11 @@ class BotController:
                 self._phase_completion_checkpoint(phase) is not None
             ),
             "phase_exhaustion_latched": exhaustion_checkpoint is not None,
+            "phase_abandonment_latched": abandonment_checkpoint is not None,
             "safe_return_pending": (
                 self._phase_completion_checkpoint(phase) is not None
                 or exhaustion_checkpoint is not None
+                or abandonment_checkpoint is not None
             ),
             "phase_exhaustion": (
                 None
@@ -22731,6 +23175,17 @@ class BotController:
                     "exhausted_at": exhaustion_checkpoint.get("exhausted_at"),
                     "budget": redact(exhaustion_checkpoint.get("budget")),
                     "safe_ending": redact(exhaustion_checkpoint.get("safe_ending")),
+                }
+            ),
+            "phase_abandonment": (
+                None
+                if abandonment_checkpoint is None
+                else {
+                    "abandoned_at": abandonment_checkpoint.get("abandoned_at"),
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        abandonment_checkpoint.get("safe_ending")
+                    ),
                 }
             ),
             "recent_phases": phases[-8:],
