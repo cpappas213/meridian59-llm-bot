@@ -63,7 +63,7 @@ remain the operator's responsibility.
 
 - Windows 10 or 11 and PowerShell 5.1 or later.
 - Python 3.11 or later.
-- Node.js compatible with the pinned harness.
+- Node.js 22 or later; Node 24 LTS is recommended by the pinned harness.
 - Git with submodule support.
 - A reachable Meridian 59 server and authorized account.
 - An OpenAI-compatible chat-completions endpoint and model ID.
