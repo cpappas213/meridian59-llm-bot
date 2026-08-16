@@ -834,9 +834,35 @@ class Storage:
             elif kind == "inventory_contains":
                 if not isinstance(item.get("item"), str) or not item["item"].strip():
                     raise ValueError("inventory_contains requires a non-empty item")
+                if " ".join(item["item"].split()).casefold() in {
+                    "weapon",
+                    "weapons",
+                    "armor",
+                    "armour",
+                    "gear",
+                    "equipment",
+                }:
+                    raise ValueError(
+                        "inventory_contains cannot verify equipment categories; use equipment_count"
+                    )
                 count = item.get("count", 1)
                 if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                     raise ValueError("inventory_contains.count must be an integer of at least 1")
+            elif kind == "equipment_count":
+                if item.get("category") not in {"weapon", "armor"}:
+                    raise ValueError("equipment_count.category must be weapon or armor")
+                count = item.get("count")
+                if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                    raise ValueError("equipment_count.count must be an integer of at least 1")
+            elif kind == "equipment_wielding":
+                requested_item = item.get("item")
+                category = item.get("category")
+                has_item = isinstance(requested_item, str) and bool(requested_item.strip())
+                has_category = category == "weapon"
+                if has_item == has_category:
+                    raise ValueError(
+                        "equipment_wielding requires exactly one of item or category"
+                    )
             elif kind == "location_reached":
                 names = [item.get("location"), item.get("room")]
                 has_name = any(isinstance(value, str) and value.strip() for value in names)
@@ -2268,6 +2294,7 @@ class Storage:
         *,
         reason: str = "",
         resume_parent: bool = False,
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in {"succeeded", "failed", "superseded", "paused"}:
             raise ValueError("invalid campaign phase transition")
@@ -2276,12 +2303,15 @@ class Storage:
             if row is None:
                 raise NotFound(f"campaign phase not found: {phase_id}")
             now = timestamp()
+            failure = {"reason": reason, "recorded_at": now}
+            if status == "failed" and isinstance(failure_context, dict):
+                failure["cause"] = failure_context
             connection.execute(
                 "UPDATE campaign_phases SET status=?,last_failure_json=CASE WHEN ?='failed' THEN ? ELSE last_failure_json END,updated_at=?,terminal_at=? WHERE id=?",
                 (
                     status,
                     status,
-                    canonical_json({"reason": reason, "recorded_at": now}) if status == "failed" else None,
+                    canonical_json(failure) if status == "failed" else None,
                     now,
                     now if status in {"succeeded", "failed", "superseded"} else None,
                     phase_id,
@@ -2312,6 +2342,7 @@ class Storage:
                     "parent_phase_id": row["parent_phase_id"],
                     "kind": row["kind"],
                     "reason": reason[:1000],
+                    "failure_context": failure.get("cause"),
                     "resumed_parent": active_phase_id,
                 },
             )

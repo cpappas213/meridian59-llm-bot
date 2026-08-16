@@ -130,6 +130,44 @@ class GoalLearningTests(unittest.TestCase):
             readiness["farm_tactic_quarantines"][0]["effective_use_safe_spots"]
         )
 
+    def test_productive_assigned_room_recovery_is_not_a_risk_sample(self) -> None:
+        self.storage.set_runtime(
+            "background_farm_history_v1",
+            [
+                {
+                    "observed_at": "2026-08-04T11:00:00Z",
+                    "assigned_room": 535,
+                    "room": 535,
+                    "at_assigned_room": True,
+                    "target": "giant rat",
+                    "use_safe_spots": True,
+                    "deltas": {"kills": 5, "withdrawals": 1, "deaths": 0},
+                    "kills_by_target": {"giant rat": 5},
+                    "unattributed_kills": 0,
+                    "healing_supplies_used": 0,
+                    "recovery_reasons": [
+                        "health reached the keeper flee threshold",
+                        "the keeper had to withdraw",
+                    ],
+                    # Legacy records placed these ordinary recovery facts in
+                    # risk_reasons; the scorecard must repair that meaning.
+                    "risk_reasons": [
+                        "health reached the keeper flee threshold",
+                        "the keeper had to withdraw",
+                    ],
+                    "safe_spot_failure_count": 0,
+                }
+            ],
+        )
+
+        row = self.learning.farm_room_scorecard()[0]
+
+        self.assertEqual(5, row["target_kills"])
+        self.assertEqual(1, row["withdrawals"])
+        self.assertEqual(1, row["recovery_samples"])
+        self.assertEqual(0, row["risk_samples"])
+        self.assertFalse(row["quarantined"])
+
     def test_finish_coordinates_are_ignored_only_with_explicit_finish_location(self) -> None:
         self.assertTrue(
             self.learning._is_finish_coordinate(
@@ -485,7 +523,8 @@ class GoalLearningTests(unittest.TestCase):
         self.assertFalse(evaluation["met"])
         self.assertEqual([lesson["id"]], [item["id"] for item in repaired])
         self.assertEqual("deferred", self.storage.goal_lesson(lesson["id"])["status"])
-        quarantine = self.storage.get_runtime("farm_tactic_quarantine_v1", {})["584"]
+        quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantine = next(iter(quarantines.values()))
         self.assertEqual("ant", quarantine["target"])
         self.assertTrue(quarantine["use_safe_spots"])
         self.assertEqual(goal["id"], quarantine["goal_id"])
@@ -1067,6 +1106,17 @@ class GoalLearningTests(unittest.TestCase):
         self.assertEqual("route_unavailable", classification)
         self.assertEqual("tactic", scope)
         self.assertGreater(confidence, 0.9)
+
+    def test_creation_cast_failure_is_not_combat_readiness_evidence(self) -> None:
+        classification, scope, confidence = GoalLearning.classify(
+            "cast",
+            "the exact cast tactic repeatedly made no progress in the same state",
+            event_kind="action.retry_suppressed",
+        )
+
+        self.assertEqual("ineffective_tactic", classification)
+        self.assertEqual("tactic", scope)
+        self.assertGreater(confidence, 0.7)
 
     def test_silent_go_reply_is_dependency_failure_not_route_evidence(self) -> None:
         classification, scope, confidence = GoalLearning.classify(

@@ -484,7 +484,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "8363f8582c154f00be5db13e7d6d7353e50868c8"
+expected_revision = "4d12d69c94ce2974ff57d0525838a9b91bf282a6"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -499,6 +499,7 @@ planner_timeout_seconds = 120
 responder_timeout_seconds = 45
 max_output_tokens = 4096
 temperature = 0.2
+chat_temperature = 0.7
 json_mode = $($ModelJsonMode.ToString().ToLowerInvariant())
 disable_thinking = $($modelThinkingDisabled.ToString().ToLowerInvariant())
 
@@ -517,6 +518,8 @@ proactive_greetings_enabled = true
 greeting_cooldown_seconds = 1200
 greetings_per_minute = 20
 conversation_history_turns = 8
+conversation_window_messages = 12
+conversation_window_seconds = 1800
 minimum_goal_commitment_seconds = 3600
 minimum_stall_seconds = 300
 

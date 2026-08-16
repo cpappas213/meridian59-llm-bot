@@ -18,11 +18,12 @@ from .helpers import config
 class CliTests(unittest.TestCase):
     def test_parser_exposes_authenticated_runtime_commands(self) -> None:
         status = parser().parse_args(["status", "--require-joined"])
-        stop = parser().parse_args(["stop"])
+        stop = parser().parse_args(["stop", "--safe-room", "52"])
 
         self.assertEqual("status", status.command)
         self.assertTrue(status.require_joined)
         self.assertEqual("stop", stop.command)
+        self.assertEqual(52, stop.safe_room)
 
     def test_runtime_status_can_require_a_joined_game(self) -> None:
         class FakeControllerApi:
@@ -58,16 +59,25 @@ class CliTests(unittest.TestCase):
             def __init__(self, _config: object) -> None:
                 pass
 
-            def safe_stop(self) -> dict[str, bool]:
+            def safe_stop(
+                self, *, destination_room_id: int | None = None
+            ) -> dict[str, object]:
                 calls.append("safe_stop")
-                return {"stopping": True}
+                return {
+                    "stopping": True,
+                    "destination_room_id": destination_room_id,
+                }
 
+        output = io.StringIO()
         with patch("meridian_bot.cli.ControllerApi", FakeControllerApi):
-            with patch("sys.stdout", new=io.StringIO()):
-                result = runtime_command(config(Path(".")), "stop")
+            with patch("sys.stdout", new=output):
+                result = runtime_command(
+                    config(Path(".")), "stop", safe_room=52
+                )
 
         self.assertEqual(0, result)
         self.assertEqual(["safe_stop"], calls)
+        self.assertEqual(52, json.loads(output.getvalue())["destination_room_id"])
 
     def test_parser_exposes_local_persona_setup(self) -> None:
         args = parser().parse_args(

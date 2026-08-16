@@ -70,8 +70,9 @@ reduce injection risk:
 9. **Learned failures**: goal-family lessons, exact deferred tactics, failed
    state, retry evaluations, and supporting-goal suggestions. These are
    controller-owned facts; the model cannot declare their predicates met.
-10. **Untrusted material**: any player claims or conversation excerpts, enclosed in
-   a typed data field and explicitly labeled untrusted.
+10. **Untrusted material**: selected non-chat external evidence, enclosed in a
+   typed data field and explicitly labeled untrusted. Player/NPC chat and
+   conversation excerpts are excluded from planner context entirely.
 
 Mutable content never appears before the fixed system/policy/capability prefix.
 Raw webpages, files, or arbitrary player text are not inserted into system
@@ -118,9 +119,9 @@ after a type-specific TTL.
 
 ### 5.2 Episodic trajectory
 
-Keep a bounded window of recent observations, attempts, results, failures, chat,
-and policy decisions. Store it durably for audit; provide only a selected window
-to the planner.
+Keep a bounded window of recent observations, attempts, results, failures, and
+policy decisions for planning. Store chat separately for responder continuity and
+private audit; never provide it to the planner.
 
 ### 5.3 Typed durable facts
 

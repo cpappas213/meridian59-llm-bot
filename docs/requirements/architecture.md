@@ -287,10 +287,12 @@ sequenceDiagram
 3. Sanitizer produces quoted, untrusted conversation content.
 4. Responder receives only the persona, sanitized recent conversation, and
    allowed public context.
-5. Deterministic egress filtering runs.
-6. Broker sends the reply subject to chat pacing.
-7. A separate typed observation may be offered to the planner (for example,
-   `player_claim` with low confidence), never as an operator command.
+5. Controller checks the per-speaker rolling conversation window before invoking
+   the responder and again before sending a queued reply.
+6. Deterministic egress filtering runs.
+7. Broker sends the reply subject to chat pacing.
+8. Conversation content remains private to responder history and chat
+   observability; it is never offered to the planner, keeper, or gameplay loop.
 
 ### 4.3 Restart and reconciliation
 

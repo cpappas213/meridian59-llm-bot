@@ -5,14 +5,17 @@ import re
 import sqlite3
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
 from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
 from .campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
     PhaseOutcome,
+    RESEARCH_RETRY_UNLOCKED,
 )
 from .config import BotConfig
 from .criteria import CriteriaEvaluator, EDIBLE_FOOD_NAME_MARKERS
@@ -20,17 +23,41 @@ from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationEr
 from .contracts import parse_ability_metric
 from .learning import (
     ARMOR_WORDS,
+    FARM_RECOVERY_REASON_MARKERS,
     HEALING_SUPPLY_WORDS,
     WEAPON_WORDS,
     GoalDeferredError,
     GoalLearning,
+    farm_quarantine_entries,
+    farm_quarantine_evidence_class,
+    farm_quarantine_evidence_identity,
+    farm_quarantine_matches,
+    farm_quarantine_scope,
+    farm_tactic_identity,
+    farm_tactic_key,
+    is_obsolete_farm_recovery_failure,
     is_inventory_capacity_refusal,
+    normalize_farm_target,
 )
-from .model import ModelError, VllmClient
+from .model import ModelError, ModelResponseFormatError, VllmClient
 from .notifications import NotificationDispatcher
 from .policy import PolicyEngine
 from .pvp import PVP_SEEK_TOOL_NAME, PVP_TOOL_NAME, PvpCoordinator
 from .storage import InvalidTransition, Storage
+from .tactical_protocol import (
+    EXECUTE_STEP,
+    PLAN_CREATE,
+    PLAN_REVISE,
+    REPAIR_ACTION,
+    REPAIR_PLAN,
+    TACTICAL_PROTOCOL_VERSION,
+    TacticalProtocolError,
+    compile_action_response,
+    compile_plan_response,
+    make_action_option,
+    make_state_token,
+    select_rule_cards,
+)
 from .utils import canonical_json, contains_secret, deep_get, json_hash, redact, timestamp, uuid7
 
 
@@ -54,6 +81,26 @@ MOVEMENT_TOOLS = {
 # owns both the hazardous route and the combat loop.
 FOREGROUND_ROOM_TRANSITION_TOOLS = {"travel", "go_through", "leave_raza"}
 
+# These broker tools only observe or rank already-grounded state. They may run
+# beneath an active survival keeper and must not create a needless stop window
+# merely because the generic broker invocation path is marked as a mutation.
+KEEPER_COMPATIBLE_READ_ONLY_TOOLS = frozenset(
+    {
+        "abilities",
+        "equipment",
+        "history",
+        "hunting_grounds",
+        "inventory",
+        "look",
+        "map",
+        "merchants",
+        "prey",
+        "progress",
+        "safe_spots",
+        "status",
+    }
+)
+
 # These phrases are emitted only when the broker has no affirmative refusal or
 # route evidence after sending a room-transition request.  They describe a
 # missing/late protocol reply, not a bad exit.  Treating them like ordinary
@@ -66,18 +113,16 @@ TRANSIENT_MOVEMENT_FAILURE_MARKERS = (
 )
 
 TOS_BANK_ROOM_ID = 54
-# These IDs describe one concrete provisioning adapter, not a default home or
-# completion destination. Goal policy and farm staging must never derive from
-# them.
-TOS_PROVISION_ROOM_ID = 52
-RAZA_EXIT_SAFE_ROOM_ID = 52
-TOS_INNKEEPER_NAME = "paddock"
-TOS_CHEESE_NAME = "wheel of cheese"
-TOS_CHEESE_VIGOR = 30
+FAMILIARS_ROOM_ID = 52
+RAZA_EXIT_SAFE_ROOM_ID = FAMILIARS_ROOM_ID
+SALE_BUYER_REFUSAL_LIMIT = 3
 RESTED_VIGOR_FLOOR = 80
-# One cheese after ordinary rest reaches 110. This retains a useful combat
-# buffer without forcing multi-minute stomach-drain waits between phases.
-FARM_FIGHT_VIGOR = 100
+# Ordinary keeper farms may start at the game's natural rested floor. Combat
+# safety comes from the health/flee envelope.  The keeper should use food it
+# already carries (or can create) as optional endurance, without making food or
+# spending a prerequisite that can deadlock an empty-handed character.
+FARM_FIGHT_VIGOR = RESTED_VIGOR_FLOOR
+FARM_EAT_AVAILABLE_FOOD = True
 # The keeper reports a stall after five unsuccessful internal passes.  That is
 # useful telemetry, but the first report can be only a couple of seconds old
 # and a wandering monster or a break-off can still resolve it.  Give the live
@@ -98,11 +143,12 @@ FARM_TRANSIT_CYCLE_MAX_ROOMS = 3
 # old keeper run ended in a transient stall.  After a bounded cooldown it may
 # be retried; a fresh persistent stall records a new cooldown immediately.
 FARM_STAGNATION_RETRY_SECONDS = 15 * 60
-# A keeper crossing its configured retreat boundary is evidence that recovery
-# policy engaged, not proof that the farm is unusable. Only a second distinct
-# retreat inside this window escalates the exact tactic to quarantine.
+# A hard keeper stop is cooperative: the current pass may take several seconds
+# to unwind. Do not reissue and relearn the same stop on every controller turn.
+FARM_STOP_RETRY_SECONDS = 2 * 60
+# Keep a bounded audit trail of recovery episodes. These are ordinary work
+# cycles and never escalate to quarantine merely because they repeat.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
-FARM_RETREAT_QUARANTINE_COUNT = 2
 # A source-listed monster is provisionally too dangerous for autonomous
 # farming while its level exceeds max HP by more than this bounded
 # survivability margin.  Monster difficulty dominates attack accuracy in the
@@ -117,6 +163,11 @@ SAFE_STAGING_FLAGS = frozenset({"ROOM_SANCTUARY", "ROOM_NO_COMBAT"})
 SAFE_STAGING_RUNTIME_KEY = "verified_safe_staging_room_v1"
 RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY = "research_recipe_exhaustion_v1"
 RESEARCH_RETRY_STATE_SCHEMA_VERSION = 3
+# A support detour should create enough capability change to justify the cost
+# of leaving the strategic progression loop.  Meridian ability values cap at
+# 99, so the last bounded milestone may be smaller than the ordinary gain.
+RESEARCH_SUPPORT_SKILL_GAIN = 5
+ABILITY_VALUE_CAP = 99
 
 # The broker's keeper retains this many shillings as walking money and does not
 # expose that value through its public autopilot schema.  Sending a positive
@@ -183,11 +234,16 @@ LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
 EXECUTION_PLAN_SCHEMA_VERSION = 5
 EXECUTION_PLAN_MAX_STEPS = 10
+# Execution progress is controller-owned state rather than part of the authored
+# plan contract.  Keeping it in a sidecar preserves schema-v5 fingerprints while
+# giving the controller an honest ordered cursor for progressive action choices.
+EXECUTION_PLAN_PROGRESS_RUNTIME_KEY = "goal_execution_plan_progress_v1"
 INVALID_PLANNER_ACTION_LIMIT = 2
 INVALID_PLAN_REVISION_LIMIT = 2
 GOAL_COMPLETION_CHECKPOINT_RUNTIME_KEY = "goal_completion_checkpoints_v1"
 PHASE_COMPLETION_CHECKPOINT_RUNTIME_KEY = "phase_completion_checkpoints_v1"
 PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY = "phase_exhaustion_checkpoints_v1"
+PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY = "phase_abandonment_checkpoints_v1"
 PURCHASE_PREFLIGHT_RUNTIME_KEY = "purchase_preflights_v1"
 BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
@@ -195,6 +251,19 @@ RECENT_INVENTORY_CREATION_RUNTIME_KEY = "recent_inventory_creation_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 PLANNED_CONTROLLER_STOP_RUNTIME_KEY = "planned_controller_stop_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
+
+# A shutdown is deliberately much slower than a process stop. The keeper first
+# gets a bounded opportunity to recover or withdraw, and long ordinary-client
+# routes can take minutes. Failure never advances to logout/process termination.
+SHUTDOWN_RECOVERY_TIMEOUT_SECONDS = 3 * 60
+SHUTDOWN_TRAVEL_TIMEOUT_SECONDS = 10 * 60
+SHUTDOWN_KEEPER_STOP_TIMEOUT_SECONDS = 2 * 60
+SHUTDOWN_SESSION_EXIT_TIMEOUT_SECONDS = 15
+SHUTDOWN_MAX_SAFE_CANDIDATES = 4
+# Ordinary foreground ownership transfers should finish much faster than a
+# process shutdown.  The controller claims the foreground lease before asking
+# the keeper to yield, so even an asynchronous stop remains continuously owned.
+FOREGROUND_KEEPER_RELEASE_TIMEOUT_SECONDS = 30
 
 
 class OnboardingRequired(ValueError):
@@ -236,11 +305,21 @@ class BotController:
         }
         self.warnings: list[str] = []
         self.stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_status: dict[str, Any] | None = None
         self._turn_lock = threading.Lock()
         # Ambient conversation remains responsive, but must not inject broker
         # traffic into an in-flight navigation or combat transaction.
         self._game_action_active = threading.Event()
         self._foreground_action: dict[str, Any] | None = None
+        self._foreground_action_depth = 0
+        # Unit-level diagnostic calls may construct a controller without
+        # running startup.  Live safety enforcement becomes active as part of
+        # the connected startup transaction and remains active for the process
+        # lifetime.
+        self._safety_enforcement_active = False
 
         self._active_degradations: dict[str, str] = {}
         self.offline_diagnostics = False
@@ -271,6 +350,21 @@ class BotController:
             for key, value in (saved_history.items() if isinstance(saved_history, dict) else [])
             if isinstance(value, list)
         }
+        saved_activity = self.storage.get_runtime("conversation_activity_v1", {})
+        self._conversation_activity: dict[str, list[str]] = {
+            str(key): [str(stamp) for stamp in value if stamp]
+            for key, value in (
+                saved_activity.items() if isinstance(saved_activity, dict) else []
+            )
+            if isinstance(value, list)
+        }
+        for key, entries in self._conversation_history.items():
+            if key not in self._conversation_activity:
+                self._conversation_activity[key] = [
+                    str(entry.get("at"))
+                    for entry in entries
+                    if entry.get("at")
+                ]
         self._pending_conversation_replies: dict[str, dict[str, Any]] = {}
         self._farm_full_scan_goals: set[str] = set()
         self.notifications = NotificationDispatcher(
@@ -294,6 +388,7 @@ class BotController:
             "known": True,
             "room_id": facts.get("room_id", int(room_id)),
             "name": entity.get("canonical_name"),
+            "region": facts.get("region"),
             "flags": facts.get("flags", []),
             "terrain": facts.get("terrain", []),
             "flag_evidence": facts.get("flag_evidence"),
@@ -302,6 +397,36 @@ class BotController:
                 "source_ref": evidence.get("source_ref"),
                 "corpus_version": evidence.get("corpus_version"),
             },
+        }
+
+    def _room_properties(self, room_id: Any) -> dict[str, Any]:
+        """Return compact source-derived properties for a displayed room."""
+
+        try:
+            numeric_room_id = int(room_id)
+        except (TypeError, ValueError):
+            return {
+                "known": False,
+                "safe": None,
+                "flags": [],
+                "terrain": [],
+                "region": None,
+            }
+        policy = self._pvp_room_policy(numeric_room_id)
+        if not isinstance(policy, dict) or policy.get("known") is not True:
+            return {
+                "known": False,
+                "safe": None,
+                "flags": [],
+                "terrain": [],
+                "region": None,
+            }
+        return {
+            "known": True,
+            "safe": self._is_verified_safe_staging(policy),
+            "flags": sorted(str(value) for value in policy.get("flags", [])),
+            "terrain": sorted(str(value) for value in policy.get("terrain", [])),
+            "region": policy.get("region"),
         }
 
     @staticmethod
@@ -384,9 +509,52 @@ class BotController:
                     "basis": "source_verified_current_room",
                 },
             )
+        usable_candidates: list[dict[str, Any]] = []
+        excluded_routes: list[dict[str, Any]] = []
+        deferred_tactics = self.storage.goal_lessons(
+            statuses=["deferred"], limit=200
+        )
+        for candidate in candidates:
+            destination = candidate.get("room_id")
+            if destination is None:
+                continue
+            tactic_key = self.learning.tactic_key(
+                "travel",
+                {"agent": self.config.game.agent, "to": destination},
+                observation,
+            )
+            lesson = next(
+                (
+                    item
+                    for item in deferred_tactics
+                    if item.get("scope") == "tactic"
+                    and item.get("tactic_key") == tactic_key
+                ),
+                None,
+            )
+            if lesson is None:
+                usable_candidates.append(candidate)
+                continue
+            evaluation = self.learning.evaluate_retry(lesson, observation)
+            if evaluation.get("met") is True:
+                # Unlocking is owned by the normal learning refresh. Building
+                # planning context must remain read-only, particularly during
+                # diagnostics and status inspection.
+                usable_candidates.append(candidate)
+                continue
+            excluded_routes.append(
+                {
+                    "from_room_id": room_id,
+                    "room_id": destination,
+                    "classification": lesson.get("classification"),
+                    "summary": str(lesson.get("summary") or "")[:300],
+                    "scope": "exact_origin_destination_travel",
+                }
+            )
         return {
             **result,
-            "candidates": candidates[:12],
+            "candidates": usable_candidates[:12],
+            "excluded_exact_routes": excluded_routes[:12],
             "selection_owner": "planning_model",
             "required_source_flags": sorted(SAFE_STAGING_FLAGS),
         }
@@ -823,16 +991,14 @@ class BotController:
             self.storage.set_runtime("farm_tactic_retreat_incidents_v1", filtered)
 
     def _repair_policy_obsolete_farm_quarantines(self) -> list[dict[str, Any]]:
-        """Release records caused only by crossing a farm flee boundary.
+        """Release records caused only by ordinary farm recovery cycles.
 
-        A threshold crossing proves the keeper's recovery policy engaged. It
-        does not prove the room/prey tactic unsafe, regardless of whether the
-        stored boundary came from an older policy or the current one.
+        Threshold crossings, safe breakoffs, and successful withdrawals prove
+        that recovery policy engaged. Repetition does not turn them into room
+        failure. Deaths and independently verified hazards remain retained.
         """
         raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
-        if not isinstance(raw, dict):
-            return []
-        quarantines = dict(raw)
+        quarantines = dict(raw) if isinstance(raw, dict) else {}
         released: list[dict[str, Any]] = []
         for key, record in list(quarantines.items()):
             if not isinstance(record, dict):
@@ -846,37 +1012,100 @@ class BotController:
                 for reason in record.get("reasons", [])
                 if str(reason).strip()
             ]
-            deltas = record.get("deltas") if isinstance(record.get("deltas"), dict) else {}
-            threshold_only = bool(reasons) and all(
-                reason == "health reached the keeper flee threshold"
+            deltas = (
+                record.get("deltas")
+                if isinstance(record.get("deltas"), dict)
+                else {}
+            )
+            recovery_only = bool(reasons) and all(
+                any(marker in reason for marker in FARM_RECOVERY_REASON_MARKERS)
                 for reason in reasons
             )
-            consequential_failure = any(
+            fatal_failure = any(
                 int(deltas.get(name, 0) or 0) > 0
-                for name in ("deaths", "withdrawals")
+                for name in (
+                    "deaths",
+                    "deaths_in_safe_spot",
+                    "deaths_in_proven_safe_spot",
+                )
             )
-            if (
-                not threshold_only
-                or consequential_failure
-            ):
+            if not recovery_only or fatal_failure:
                 continue
             released.append(
                 {
                     **record,
                     "released_at": timestamp(),
                     "release_reason": (
-                        "a flee-threshold crossing is recovery evidence, not "
-                        "standalone quarantine evidence"
+                        "repeated successful farm recovery is work-cycle telemetry, "
+                        "not quarantine evidence"
                     ),
                     "prior_flee_threshold": prior_threshold,
                     "current_flee_threshold": FARM_FLEE_THRESHOLD,
                 }
             )
             quarantines.pop(key, None)
-        if not released:
+        if released:
+            self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
+            self._clear_released_farm_retreat_incidents(released)
+        affected_goal_ids = {
+            str(item.get("goal_id") or "")
+            for item in released
+            if item.get("goal_id")
+        }
+
+        def is_legacy_recovery_lesson(lesson: dict[str, Any]) -> bool:
+            if not is_obsolete_farm_recovery_failure(lesson.get("summary")):
+                return False
+            return bool(
+                (
+                    lesson.get("scope") == "tactic"
+                    and lesson.get("classification") == "ineffective_tactic"
+                )
+                or (
+                    lesson.get("scope") == "goal"
+                    and lesson.get("classification") == "insufficient_combat_power"
+                    and "repeated critical-health interrupts"
+                    in str(lesson.get("summary") or "").casefold()
+                )
+            )
+
+        repaired_lessons = [
+            self.storage.update_goal_lesson(
+                lesson["id"],
+                "resolved",
+                resolution_goal_id=lesson.get("goal_id"),
+                evidence={
+                    "repair": (
+                        "ordinary threshold/rest/withdraw/resume cycles cannot "
+                        "invalidate a productive farm tactic or strategic goal"
+                    ),
+                    "at": timestamp(),
+                },
+            )
+            for lesson in self.storage.goal_lessons(
+                statuses=["deferred", "unlocked"], limit=200
+            )
+            if is_legacy_recovery_lesson(lesson)
+        ]
+        affected_goal_ids.update(
+            str(lesson.get("goal_id") or "")
+            for lesson in repaired_lessons
+            if lesson.get("goal_id")
+        )
+        if not released and not repaired_lessons:
             return []
-        self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
-        self._clear_released_farm_retreat_incidents(released)
+        for goal_id in affected_goal_ids:
+            self._clear_research_recipe_exhaustion(goal_id)
+            self.storage.set_runtime(
+                f"background_farm_failure_handled_v1:{goal_id}", False
+            )
+            run = self.storage.campaign_run(goal_id)
+            blocker = run.get("external_blocker") if isinstance(run, dict) else None
+            if (
+                isinstance(blocker, dict)
+                and blocker.get("kind") == "no_usable_farm_recipe"
+            ):
+                self.storage.clear_campaign_external_blocker(str(run["id"]))
         suppression = self.storage.get_runtime("safety_suppression_v1")
         if isinstance(suppression, dict) and "quarantined_farm_tactic" in suppression.get(
             "blocker_kinds", []
@@ -885,7 +1114,7 @@ class BotController:
             self._clear_planner_feedback()
         self.storage.emit_event(
             "background_farm.quarantine_released",
-            "Released quarantines supported only by an ordinary flee-threshold crossing",
+            "Released quarantines created from ordinary farm recovery cycles",
             severity="notice",
             interesting=False,
             data={
@@ -894,6 +1123,8 @@ class BotController:
                     item.get("prior_flee_threshold") for item in released
                 ],
                 "current_threshold": FARM_FLEE_THRESHOLD,
+                "lesson_ids": [item.get("id") for item in repaired_lessons],
+                "research_retry_reopened": bool(affected_goal_ids),
             },
         )
         return released
@@ -1173,7 +1404,7 @@ class BotController:
 
     @staticmethod
     def _transient_cast_failure_reason(tool: str, result: Any) -> str | None:
-        """Return a cast outcome that is safe to retry without changing tactics."""
+        """Return a cast outcome that is not durable evidence against a tactic."""
 
         if tool != "cast" or not isinstance(result, dict):
             return None
@@ -1186,15 +1417,41 @@ class BotController:
             and mana_spent == 0
         )
         failed_roll = "failed its roll" in folded or "half cost" in folded
-        if not no_cast and not failed_roll:
-            return None
-        if reading:
-            return reading[:500]
-        return (
-            "zero mana was spent; the requested cast did not happen"
-            if no_cast
-            else "the spell spent only its failure cost and failed its roll"
+        if no_cast or failed_roll:
+            if reading:
+                return reading[:500]
+            return (
+                "zero mana was spent; the requested cast did not happen"
+                if no_cast
+                else "the spell spent only its failure cost and failed its roll"
+            )
+
+        # Creation spells have an explicitly requested before/after inventory
+        # observation.  Full mana expenditure with neither an item delta nor an
+        # authoritative refusal is still inconclusive: it can mean a missed
+        # inventory update or hidden server hold-state disagreement.  It cannot
+        # prove that the spell is ineffective, and it especially cannot prove
+        # that the character lacks combat power.  Preserve the plan step and let
+        # a later live refresh/retry or an explicit refusal supply real evidence.
+        spell = " ".join(str(result.get("spell") or "").casefold().split())
+        created = result.get("created")
+        messages = result.get("messages")
+        full_cost_unverified_creation = (
+            spell in {"create food", "create weapon"}
+            and result.get("cast") is not False
+            and isinstance(mana_spent, (int, float))
+            and not isinstance(mana_spent, bool)
+            and mana_spent > 0
+            and isinstance(created, list)
+            and not created
+            and (not isinstance(messages, list) or not messages)
         )
+        if full_cost_unverified_creation:
+            return (
+                f"full-cost {spell} cast had no authoritative created-item delta "
+                "or refusal; refresh live inventory and equipment before retrying"
+            )[:500]
+        return None
 
     @staticmethod
     def _look_room_matches_destination(refreshed: Any, destination: Any) -> bool:
@@ -1389,7 +1646,7 @@ class BotController:
         )
 
     def _reconcile_recent_inventory_creation(
-        self, observation: dict[str, Any]
+        self, observation: dict[str, Any], *, emit_event: bool = True
     ) -> dict[str, Any]:
         """Apply a recent positive creation delta when inventory briefly regresses."""
 
@@ -1461,18 +1718,19 @@ class BotController:
         inventory = dict(inventory) if isinstance(inventory, dict) else {}
         inventory["items"] = items
         reconciled["inventory"] = inventory
-        self.storage.emit_event(
-            "action.inventory_observation_reconciled",
-            "Reconciled stale inventory from a successful creation delta",
-            severity="info",
-            interesting=False,
-            goal_id=receipt.get("goal_id"),
-            data={
-                "tool": receipt.get("tool"),
-                "expected": redact(expected),
-                "stale_observations_reconciled": stale_count + 1,
-            },
-        )
+        if emit_event:
+            self.storage.emit_event(
+                "action.inventory_observation_reconciled",
+                "Reconciled stale inventory from a successful creation delta",
+                severity="info",
+                interesting=False,
+                goal_id=receipt.get("goal_id"),
+                data={
+                    "tool": receipt.get("tool"),
+                    "expected": redact(expected),
+                    "stale_observations_reconciled": stale_count + 1,
+                },
+            )
         return reconciled
 
     def _repair_position_unknown_lessons(self) -> list[dict[str, Any]]:
@@ -1568,7 +1826,7 @@ class BotController:
         return repaired
 
     def _repair_transient_cast_evidence(self) -> list[dict[str, Any]]:
-        """Remove legacy tactic blocks written for retryable cast outcomes."""
+        """Remove legacy tactic blocks written for non-durable cast outcomes."""
 
         transient_signatures: set[tuple[str, str]] = set()
         source_event_ids: list[str] = []
@@ -1593,9 +1851,6 @@ class BotController:
             )
             if event.get("id"):
                 source_event_ids.append(str(event["id"]))
-        if not transient_signatures:
-            return []
-
         removed_blocks: list[dict[str, Any]] = []
         blocked_actions = self.storage.get_runtime("blocked_actions", [])
         if isinstance(blocked_actions, list):
@@ -1605,7 +1860,14 @@ class BotController:
                     str(item.get("goal_id") or ""),
                     str(item.get("signature") or ""),
                 ) if isinstance(item, dict) else None
-                if key in transient_signatures:
+                legacy_unverified_creation = (
+                    isinstance(item, dict)
+                    and item.get("tool") == "cast"
+                    and "produced no verified carried item"
+                    in str(item.get("reason") or "").casefold()
+                    and not is_inventory_capacity_refusal(item.get("reason"))
+                )
+                if key in transient_signatures or legacy_unverified_creation:
                     removed_blocks.append(item)
                 else:
                     retained.append(item)
@@ -1627,7 +1889,18 @@ class BotController:
                 str(lesson.get("goal_id") or ""),
                 canonical_json({"tool": tool, "arguments": arguments}),
             )
-            if lesson.get("scope") != "tactic" or key not in transient_signatures:
+            legacy_misclassified_cast = (
+                lesson.get("scope") == "tactic"
+                and tool == "cast"
+                and " ".join(
+                    str(arguments.get("spell") or "").casefold().split()
+                )
+                in {"create food", "create weapon"}
+                and lesson.get("classification") == "insufficient_combat_power"
+            )
+            if lesson.get("scope") != "tactic" or (
+                key not in transient_signatures and not legacy_misclassified_cast
+            ):
                 continue
             repaired_lessons.append(
                 self.storage.update_goal_lesson(
@@ -1635,8 +1908,9 @@ class BotController:
                     "resolved",
                     evidence={
                         "repair": (
-                            "zero-cost and half-cost cast outcomes are transient; "
-                            "they preserve the current plan step and never block the tactic"
+                            "zero-cost, half-cost, and unverified creation-cast outcomes "
+                            "are not durable evidence against the tactic; cast failures "
+                            "also cannot be classified as insufficient combat power"
                         ),
                         "source_event_ids": source_event_ids,
                         "at": timestamp(),
@@ -1646,7 +1920,7 @@ class BotController:
         if removed_blocks or repaired_lessons:
             self.storage.emit_event(
                 "cast.transient_evidence_repaired",
-                "Removed durable tactic evidence created from transient cast outcomes",
+                "Removed durable tactic evidence created from non-durable cast outcomes",
                 severity="notice",
                 interesting=False,
                 data={
@@ -1874,6 +2148,7 @@ class BotController:
             tool="bank",
             arguments=arguments,
             result=result,
+            status="succeeded",
         )
         self.storage.emit_event(
             "action.succeeded",
@@ -2022,6 +2297,11 @@ class BotController:
                 self._start_conversation_listener()
             self.last_observation = self._reconcile_recent_inventory_creation(
                 self._reconcile_recent_room_transition(self.broker.observe())
+            )
+            self._safety_enforcement_active = True
+            self._ensure_outside_safety_owner(
+                self.last_observation,
+                reason="connected controller startup completed",
             )
             self._record_character_progress(self.last_observation)
             self._repair_bank_receipt()
@@ -2286,7 +2566,10 @@ class BotController:
                         {
                             "agent": self.config.game.agent,
                             "action": "stop",
-                            "hard": True,
+                            # The phase boundary is already source-verified
+                            # safe. Leave the inert telemetry/watchdog loop
+                            # alive while scheduler ownership changes.
+                            "hard": False,
                             "why": (
                                 "yielding at a verified safe campaign boundary to "
                                 "strictly higher-priority queued work"
@@ -2369,7 +2652,9 @@ class BotController:
         if action == "stop":
             args.update(
                 {
-                    "hard": True,
+                    # Off mode relinquishes gameplay mutations but is not a
+                    # process teardown. Preserve the upstream telemetry loop.
+                    "hard": False,
                     "why": "controller fallback mode is off",
                 }
             )
@@ -2760,6 +3045,69 @@ class BotController:
                 )
         return None
 
+    def _recent_shop_catalogues(self) -> list[dict[str, Any]]:
+        """Return the newest non-empty live catalogue for each exact seller."""
+
+        catalogues: list[dict[str, Any]] = []
+        seen_sellers: set[str] = set()
+        for event in reversed(
+            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
+        ):
+            data = event.get("data")
+            result = data.get("result") if isinstance(data, dict) else None
+            raw_catalogue = result.get("items") if isinstance(result, dict) else None
+            seller = result.get("seller") if isinstance(result, dict) else None
+            seller_key = str(seller)
+            if (
+                not isinstance(data, dict)
+                or data.get("tool") != "shop"
+                or seller is None
+                or seller_key in seen_sellers
+                or not isinstance(raw_catalogue, list)
+            ):
+                continue
+            items: dict[str, dict[str, Any]] = {}
+            for item in raw_catalogue:
+                if not isinstance(item, dict):
+                    continue
+                name = " ".join(str(item.get("name") or "").split()).casefold()
+                cost = item.get("cost")
+                if (
+                    name
+                    and isinstance(cost, (int, float))
+                    and not isinstance(cost, bool)
+                    and cost >= 0
+                    and name not in items
+                ):
+                    items[name] = {"id": item.get("id"), "cost": int(cost)}
+            if not items:
+                continue
+            seen_sellers.add(seller_key)
+            aliases = {seller_key.casefold()}
+            seller_identity = (
+                self.knowledge.merchant_identity(object_id=seller)
+                if hasattr(self.knowledge, "merchant_identity")
+                else None
+            )
+            if isinstance(seller_identity, dict):
+                aliases.update(
+                    " ".join(str(value or "").split()).casefold()
+                    for value in (
+                        seller_identity.get("merchant_class"),
+                        deep_get(seller_identity, "instance.name"),
+                    )
+                    if str(value or "").strip()
+                )
+            catalogues.append(
+                {
+                    "seller": seller,
+                    "aliases": aliases,
+                    "items": items,
+                    "observed_at": str(event.get("occurred_at") or ""),
+                }
+            )
+        return catalogues
+
     def _shop_plan_affordability_error(
         self,
         steps: list[dict[str, Any]],
@@ -2772,38 +3120,8 @@ class BotController:
             inventory.get("items"), list
         ):
             return None
-        catalog: dict[str, dict[str, Any]] = {}
-        catalog_event_at: str | None = None
-        for event in reversed(
-            self.storage.latest_events(limit=200, kinds=["action.succeeded"])
-        ):
-            data = event.get("data")
-            result = data.get("result") if isinstance(data, dict) else None
-            raw_catalog = result.get("items") if isinstance(result, dict) else None
-            if data.get("tool") != "shop" or not isinstance(raw_catalog, list):
-                continue
-            for item in raw_catalog:
-                if not isinstance(item, dict):
-                    continue
-                name = " ".join(str(item.get("name") or "").split()).casefold()
-                cost = item.get("cost")
-                if (
-                    name
-                    and isinstance(cost, (int, float))
-                    and not isinstance(cost, bool)
-                    and cost >= 0
-                    and name not in catalog
-                ):
-                    catalog[name] = {
-                        "cost": int(cost),
-                        "seller": result.get("seller"),
-                    }
-                    catalog_event_at = catalog_event_at or str(
-                        event.get("occurred_at") or ""
-                    )
-            if catalog:
-                break
-        if not catalog:
+        catalogues = self._recent_shop_catalogues()
+        if not catalogues:
             return None
 
         number_words = {
@@ -2830,9 +3148,66 @@ class BotController:
             if self._is_plan_funding_step(step):
                 funds_unknown = True
                 continue
-            if not self._is_plan_purchase_step(step) or funds_unknown:
+            if not self._is_plan_purchase_step(step):
                 continue
             outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
+            matching_catalogue = next(
+                (
+                    catalogue
+                    for catalogue in catalogues
+                    if any(
+                        re.search(
+                            rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
+                            outcome,
+                        )
+                        for alias in catalogue["aliases"]
+                        if alias
+                    )
+                ),
+                None,
+            )
+            if matching_catalogue is None:
+                # Do not apply one merchant's prices to an unrelated seller.
+                # A quote-first plan remains legal until its exact seller has
+                # produced a catalogue; persisted plans are revalidated after
+                # that read-only action.
+                continue
+            catalog = matching_catalogue["items"]
+            catalog_event_at = matching_catalogue["observed_at"]
+            catalog_seller = matching_catalogue["seller"]
+            purchase_match = re.search(
+                r"\b(?:buy|purchase|obtain|acquire)\s+(.+?)"
+                r"(?=\s+from\b|\s+using\b|[.;]|$)",
+                outcome,
+            )
+            requested_items: list[str] = []
+            if purchase_match is not None:
+                for component in re.split(
+                    r"\s*,\s*|\s+and\s+", purchase_match.group(1)
+                ):
+                    quantified = re.match(
+                        rf"^(?:\d+|{'|'.join(number_words)})\s+(?:x\s+)?(.+?)$",
+                        component.strip(),
+                    )
+                    if quantified is not None:
+                        requested_items.append(quantified.group(1).strip())
+            missing_items = [
+                requested
+                for requested in requested_items
+                if not any(
+                    re.fullmatch(item_pattern(name), requested) is not None
+                    for name in catalog
+                )
+            ]
+            if missing_items:
+                return (
+                    f"execution_plan step {step.get('id')!r} claims the already-observed "
+                    f"seller offers {', '.join(repr(item) for item in missing_items)}, but "
+                    "those quantified items are absent from that seller's live shop "
+                    f"catalogue observed at {catalog_event_at}. Purpose: a shop action "
+                    "cannot buy stock the named merchant does not carry; use actual "
+                    "catalogue items or choose a different grounded acquisition route"
+                )
             basket: list[dict[str, Any]] = []
             for name, item in catalog.items():
                 match = re.search(
@@ -2856,6 +3231,15 @@ class BotController:
                     }
                 )
             if not basket:
+                return (
+                    f"execution_plan step {step.get('id')!r} names live seller "
+                    f"{catalog_seller} but does not quantify an exact basket from its "
+                    f"catalogue observed at {catalog_event_at}. Purpose: words such as "
+                    "'enough' or 'some' cannot prove stock, nutrition, or affordability; "
+                    "after a live quote, name the exact quantity of each catalogue item "
+                    "before attempting a purchase"
+                )
+            if funds_unknown:
                 continue
             basket_cost = sum(item["subtotal"] for item in basket)
             if basket_cost > available:
@@ -3076,6 +3460,24 @@ class BotController:
                 return row
         return None
 
+    @staticmethod
+    def _live_spell_blocker(spell: dict[str, Any] | None) -> str:
+        """Summarize why a known live spell cannot satisfy a current precondition."""
+
+        spell = spell if isinstance(spell, dict) else {}
+        blocked_by = spell.get("blocked_by")
+        blockers = [
+            " ".join(str(item).split())
+            for item in blocked_by
+            if str(item).strip()
+        ] if isinstance(blocked_by, list) else []
+        if blockers:
+            return "; ".join(blockers)[:500]
+        mana = spell.get("mana")
+        if mana is not None:
+            return f"the live spell row requires {mana} mana or another undisclosed prerequisite"
+        return "the live spell row does not report all casting prerequisites as satisfied"
+
     def _farm_weapon_plan_error(
         self,
         steps: list[dict[str, Any]],
@@ -3128,7 +3530,7 @@ class BotController:
                     (
                         index
                         for index, step in enumerate(prior)
-                        if step.get("tool") in {"cast", "shop", "act"}
+                        if step.get("tool") in {"shop", "act"}
                         and re.search(
                             r"\b(?:weapon|mace|sword|axe|hammer|scimitar)\b",
                             step_text(step),
@@ -3137,6 +3539,16 @@ class BotController:
                     -1,
                 )
                 if acquisition_index < 0:
+                    if create_weapon is not None:
+                        blocker = self._live_spell_blocker(create_weapon)
+                        return (
+                            "the character is known unarmed with no carried weapon, and "
+                            f"live Create Weapon is not currently castable ({blocker}); "
+                            "the present plan cannot count that cast as weapon acquisition. "
+                            "First make its exact live prerequisites true in a separately "
+                            "verifiable phase/action, or acquire a weapon through another "
+                            "grounded route"
+                        )
                     return (
                         "the character is known unarmed with no carried weapon; the "
                         "farm plan must acquire or create a weapon before launch"
@@ -3175,7 +3587,8 @@ class BotController:
     ) -> dict[str, Any] | None:
         """Make directly useful live capabilities conspicuous to the tactical model."""
 
-        if str((phase or {}).get("kind") or "") != "prepare_combat":
+        phase_kind = str((phase or {}).get("kind") or "")
+        if phase_kind not in {"prepare_combat", "farm"}:
             return None
         phase_text = canonical_json(
             {
@@ -3190,8 +3603,8 @@ class BotController:
             re.search(r"\b(?:food|snack|consumable|healing suppl)\w*\b", phase_text)
         )
         if not needs_weapon and not needs_food:
-            # Preserve the longstanding generic prepare_combat behavior when a
-            # legacy phase has no descriptive objective/context.
+            # Preserve the longstanding generic preparation behavior when a
+            # legacy phase or farm has no descriptive equipment context.
             needs_weapon = True
         spells = deep_get(observation, "spells.spells", [])
         direct: list[dict[str, Any]] = []
@@ -3202,7 +3615,6 @@ class BotController:
             normalized_name = name.casefold()
             is_weapon = bool(
                 needs_weapon
-                and spell.get("castable") is True
                 and re.search(r"\b(?:create|conjure|summon)\s+weapon\b", name, re.I)
             )
             is_food = normalized_name == "create food" and needs_food
@@ -3220,7 +3632,14 @@ class BotController:
                         "funding_eligible": False,
                         "server_semantics": (
                             "Create Weapon marks its product IA_MADE. Item.CanBeGivenToNPC "
-                            "therefore rejects it before merchant preference is evaluated."
+                            "therefore rejects it before merchant preference is evaluated. "
+                            + (
+                                "The live spell is currently executable."
+                                if spell.get("castable") is True
+                                else "The live spell is not currently executable; resolve "
+                                "every listed blocked_by condition or use another grounded "
+                                "weapon route before counting it as acquisition."
+                            )
                         ),
                     }
                 )
@@ -3344,10 +3763,14 @@ class BotController:
         return {
             "purpose": (
                 "These verified capabilities and their live prerequisites directly apply "
-                "to requirements named by the current preparation phase. Prefer direct "
+                "to requirements named by the current phase. Prefer direct "
                 "use when castable and obey the listed server semantics."
             ),
-            "preferred_tool": "cast",
+            "preferred_tool": (
+                "cast"
+                if any(item.get("castable") is True for item in direct)
+                else None
+            ),
             "capabilities": direct,
         }
 
@@ -3751,9 +4174,12 @@ class BotController:
                         )
                     )
                 )
+                acquisition_step = step.get("tool") in {"cast", "shop"} or (
+                    step.get("tool") == "act"
+                    and bool(re.search(r"\b(?:get|take|pick\s+up|acquire)\b", outcome))
+                )
                 outcome_covers = (
-                    step.get("tool") == "cast"
-                    and "create food" in outcome
+                    acquisition_step
                     and names_item(outcome, item_name)
                     and (
                         names_count(outcome, required)
@@ -3768,19 +4194,86 @@ class BotController:
                 if verification_covers or outcome_covers:
                     explicitly_covered = True
                     break
-                if step.get("tool") == "cast" and "create food" in outcome:
-                    relevant_mutations += 1
+                if (
+                    acquisition_step
+                    and names_item(outcome, item_name)
+                ):
+                    relevant_mutations += planned_repetitions(step)
             if explicitly_covered or relevant_mutations >= remaining:
                 continue
             display_item = "edible food" if item_name in {"food", "edible food"} else item_name
+            unit_note = (
+                "; each Create Food cast produces one item"
+                if item_name in {"food", "edible food"}
+                else ""
+            )
             return (
                 f"execution_plan does not cover active phase criterion {criterion.get('id')!r}: "
                 f"authoritative inventory has {current} {display_item} item(s), but the "
                 f"phase requires {required}. Purpose: a successful tool call is not phase "
                 "completion. Include mutation step(s) whose outcome or verification "
                 f"explicitly reaches {required} total {display_item} item(s), or "
-                f"{remaining} additional; each Create Food cast produces one item"
+                f"{remaining} additional{unit_note}"
             )
+
+        for criterion in (phase or {}).get("success_criteria", []):
+            if not isinstance(criterion, dict):
+                continue
+            kind = criterion.get("kind")
+            if kind == "equipment_count":
+                category = str(criterion.get("category") or "").casefold()
+                required = int(criterion.get("count", 1) or 1)
+                current = CriteriaEvaluator.equipment_count(observation, category)
+                if current >= required:
+                    continue
+                remaining = required - current
+                mutations = 0
+                for step in steps:
+                    tool = str(step.get("tool") or "")
+                    outcome = str(step.get("outcome") or "").casefold()
+                    if category == "weapon" and tool == "cast" and "create weapon" in outcome:
+                        mutations += planned_repetitions(step)
+                    elif tool == "shop" and (
+                        category in outcome
+                        or any(
+                            word in outcome
+                            for word in (WEAPON_WORDS if category == "weapon" else ARMOR_WORDS)
+                        )
+                    ):
+                        mutations += planned_repetitions(step)
+                if mutations < remaining:
+                    return (
+                        f"execution_plan does not cover active phase equipment_count criterion "
+                        f"{criterion.get('id')!r}: verified {category} count is {current}, required "
+                        f"{required}, but the plan has only {mutations} grounded acquisition(s). "
+                        "Purpose: equipment categories are verified semantic state, not literal "
+                        "inventory names; add enough Create Weapon or grounded purchase actions"
+                    )
+            elif kind == "equipment_wielding":
+                if CriteriaEvaluator.equipment_wielding(
+                    observation,
+                    item=criterion.get("item"),
+                    category=criterion.get("category"),
+                ):
+                    continue
+                requested = " ".join(
+                    str(criterion.get("item") or criterion.get("category") or "").split()
+                ).casefold()
+                covered = any(
+                    str(step.get("tool") or "") in {"equip_best", "act"}
+                    and (
+                        criterion.get("category") == "weapon"
+                        or requested in str(step.get("outcome") or "").casefold()
+                    )
+                    for step in steps
+                )
+                if not covered:
+                    return (
+                        f"execution_plan does not cover active phase equipment_wielding criterion "
+                        f"{criterion.get('id')!r}: {requested!r} is not currently wielded and no "
+                        "equipment mutation explicitly selects it. Purpose: creating or carrying a "
+                        "weapon does not prove that it was wielded"
+                    )
         return None
 
     def _phase_required_sale_plan_error(
@@ -3968,6 +4461,28 @@ class BotController:
                 )
         return None
 
+    @staticmethod
+    def _stored_empty_merchant_lookup(last_action: Any) -> bool:
+        if (
+            not isinstance(last_action, dict)
+            or last_action.get("tool") != "merchants"
+            or last_action.get("status") != "succeeded"
+        ):
+            return False
+        summary = " ".join(str(last_action.get("result_summary") or "").split())
+        return bool(
+            re.search(r"['\"]matches['\"]\s*:\s*\[\s*\]", summary)
+            or (
+                all(
+                    re.search(
+                        rf"['\"]{field}['\"]\s*:\s*\[\s*\]",
+                        summary,
+                    )
+                    for field in ("buys_anything", "rules_mentioning")
+                )
+            )
+        )
+
     def _execution_plan(self, goal: dict[str, Any]) -> dict[str, Any] | None:
         values = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
         if not isinstance(values, dict):
@@ -4135,6 +4650,29 @@ class BotController:
             step for step in value.get("steps", []) if isinstance(step, dict)
         ]
         last_action = value.get("last_action")
+        if self._stored_empty_merchant_lookup(last_action):
+            reason = (
+                "the completed merchants step returned no candidate merchants, so "
+                "the stored plan has no grounded seller or destination"
+            )
+            self._invalidate_execution_plan(goal, reason)
+            self._set_planner_feedback(
+                goal,
+                reason,
+                failure_context={
+                    "kind": "merchant_lookup_no_candidates",
+                    "purpose": (
+                        "Retire a legacy plan that incorrectly recorded an empty "
+                        "merchant result as a successful prerequisite."
+                    ),
+                    "required_response": (
+                        "Use an exact source-grounded item query, actual known catalogue "
+                        "stock, or a different acquisition prerequisite; do not continue "
+                        "to travel or shop without a returned merchant."
+                    ),
+                },
+            )
+            return None
         completed_through_step_id = (
             str(last_action.get("step_id") or "")
             if isinstance(last_action, dict)
@@ -4236,18 +4774,28 @@ class BotController:
                 "buyer discovery" in sale_recovery_error
                 and "already completed" in sale_recovery_error
             )
+            sale_evidence_exhausted = (
+                "exhausting its source-catalogue sale hypothesis"
+                in sale_recovery_error
+            )
             required_response = (
                 "Build a replacement plan that selects a different exact inventory "
                 "item id or uses a non-sale funding route; merchant discovery cannot "
                 "make the rejected item transferable."
                 if intrinsic_item_reused
                 else (
-                    "Build a replacement plan that omits the repeated merchants lookup, "
-                    "uses a different candidate from its completed result, and preserves "
-                    "a separate travel step before the sale."
-                    if discovery_already_completed
-                    else "Build a replacement plan that discovers a compatible buyer "
-                    "before attempting another sale."
+                    "Build a replacement plan that does not sell or run buyer discovery "
+                    "for this exact item id; use a non-sale prerequisite or materially "
+                    "change inventory."
+                    if sale_evidence_exhausted
+                    else (
+                        "Build a replacement plan that omits the repeated merchants lookup, "
+                        "uses a different candidate from its completed result, and preserves "
+                        "a separate travel step before the sale."
+                        if discovery_already_completed
+                        else "Build a replacement plan that discovers a compatible buyer "
+                        "before attempting another sale."
+                    )
                 )
             )
             self._set_planner_feedback(
@@ -4259,14 +4807,24 @@ class BotController:
                     "kind": (
                         "item_not_npc_transferable"
                         if intrinsic_item_reused
-                        else "merchant_rejected_sale"
+                        else (
+                            "sale_evidence_exhausted"
+                            if sale_evidence_exhausted
+                            else "merchant_rejected_sale"
+                        )
                     ),
                     "purpose": (
                         "Retire a persisted plan that reused an exact inventory item "
                         "the server proved cannot be given to any NPC."
                         if intrinsic_item_reused
-                        else "Retire a persisted pre-enforcement commerce plan after "
-                        "durable evidence disproved its assumed buyer."
+                        else (
+                            "Retire only the exact carried item as a funding route after "
+                            "bounded independent live refusals, without blocking rooms, "
+                            "other items, or the strategic goal."
+                            if sale_evidence_exhausted
+                            else "Retire a persisted pre-enforcement commerce plan after "
+                            "durable evidence disproved its assumed buyer."
+                        )
                     ),
                     "required_response": required_response,
                 },
@@ -4284,17 +4842,32 @@ class BotController:
         )
         if affordability_error is not None:
             self._invalidate_execution_plan(goal, affordability_error)
+            stock_absent = (
+                "absent from that seller's live shop catalogue"
+                in affordability_error
+            )
             self._set_planner_feedback(
                 goal,
                 affordability_error,
                 failure_context={
-                    "kind": "known_basket_unaffordable",
+                    "kind": (
+                        "named_seller_missing_stock"
+                        if stock_absent
+                        else "known_basket_unaffordable"
+                    ),
                     "purpose": (
-                        "Prevent a known shop basket from executing when carried cash "
+                        "Prevent travel or purchase based on items absent from the named "
+                        "seller's already-observed live catalogue."
+                        if stock_absent
+                        else "Prevent a known shop basket from executing when carried cash "
                         "cannot cover its live catalogue price."
                     ),
                     "required_response": (
-                        "Add a preceding grounded funding route for the exact known "
+                        "Use items actually listed by that seller or choose a different "
+                        "source-grounded seller/acquisition prerequisite; more money does "
+                        "not make missing stock available."
+                        if stock_absent
+                        else "Add a preceding grounded funding route for the exact known "
                         "shortfall; preserve active-phase inventory."
                     ),
                 },
@@ -4647,6 +5220,126 @@ class BotController:
         values.pop(phase_id, None)
         self.storage.set_runtime(PHASE_EXHAUSTION_CHECKPOINT_RUNTIME_KEY, values)
 
+    def _phase_abandonment_checkpoint(
+        self, phase: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Return a durable terminal outcome awaiting a verified safe boundary."""
+
+        if not isinstance(phase, dict):
+            return None
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict):
+            return None
+        value = values.get(str(phase.get("id") or ""))
+        if (
+            not isinstance(value, dict)
+            or value.get("phase_contract") != self._phase_contract(phase)
+            or not str(value.get("reason") or "").strip()
+            or not isinstance(value.get("abandonment"), dict)
+        ):
+            return None
+        return value
+
+    def _latch_phase_abandonment(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any],
+        phase: dict[str, Any],
+        detail: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve a failed combat phase until survival reaches sanctuary."""
+
+        existing = self._phase_abandonment_checkpoint(phase)
+        if existing is not None:
+            return existing
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        destination = self._phase_exhaustion_destination(goal, observation)
+        value = {
+            "goal_id": goal["id"],
+            "run_id": run["id"],
+            "phase_id": phase["id"],
+            "phase_contract": self._phase_contract(phase),
+            "reason": str(
+                detail.get("reason")
+                or "a phase abandonment predicate was verified"
+            ),
+            "abandonment": redact(detail.get("abandonment", {})),
+            "safe_ending": destination,
+            "abandoned_at": timestamp(),
+        }
+        values[phase["id"]] = value
+        self.storage.set_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+        )
+        self.storage.emit_event(
+            "campaign.phase.abandonment_latched",
+            "Campaign phase abandonment verified; preserving survival control until safe",
+            severity="warning",
+            interesting=True,
+            goal_id=goal["id"],
+            data={
+                "run_id": run["id"],
+                "phase_id": phase["id"],
+                "phase_kind": phase.get("kind"),
+                "reason": value["reason"],
+                "safe_ending": redact(destination),
+                "terminal_deferred": True,
+                "strategic_goal_preserved": True,
+            },
+        )
+        return value
+
+    def _clear_phase_abandonment_checkpoint(self, phase_id: str) -> None:
+        values = self.storage.get_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or phase_id not in values:
+            return
+        values = dict(values)
+        values.pop(phase_id, None)
+        self.storage.set_runtime(
+            PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+        )
+
+    def _phase_abandonment_safety(
+        self,
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Accept only a source-verified sanctuary as terminalization safety."""
+
+        current = self._observation_room(observation)
+        verified = self._verified_safe_staging(current)
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint, dict)
+            and isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        if verified is not None:
+            return {
+                "met": True,
+                "current_room_id": current,
+                "safe_ending": redact(verified),
+                "verified_room": redact(verified),
+            }
+        return {
+            "met": False,
+            "reason": (
+                "phase abandonment is verified and the current room is not a "
+                "source-verified sanctuary"
+            ),
+            "current_room_id": current,
+            "safe_ending": redact(destination),
+        }
+
     def _phase_exhaustion_safety(
         self,
         goal: dict[str, Any],
@@ -4800,6 +5493,135 @@ class BotController:
             "safety_recovery": True,
         }
 
+    def _ensure_phase_abandonment_plan(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+        *,
+        grounding: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Install the sole allowed plan while abandonment awaits safety."""
+
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        if checkpoint is None:
+            return None
+        destination = (
+            checkpoint.get("safe_ending")
+            if isinstance(checkpoint.get("safe_ending"), dict)
+            else None
+        )
+        if destination is None:
+            destination = self._phase_exhaustion_destination(goal, observation)
+            if destination is not None:
+                values = self.storage.get_runtime(
+                    PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, {}
+                )
+                if isinstance(values, dict):
+                    values = dict(values)
+                    values[phase["id"]] = {
+                        **checkpoint,
+                        "safe_ending": destination,
+                    }
+                    self.storage.set_runtime(
+                        PHASE_ABANDONMENT_CHECKPOINT_RUNTIME_KEY, values
+                    )
+                    checkpoint = values[phase["id"]]
+        if not isinstance(destination, dict):
+            return None
+        verified = self._verified_safe_staging(destination.get("room_id"))
+        if verified is None:
+            return None
+        room_id = int(verified["room_id"])
+
+        existing = self._execution_plan(goal)
+        ending = existing.get("safe_ending") if isinstance(existing, dict) else None
+        existing_steps = (
+            existing.get("steps", []) if isinstance(existing, dict) else []
+        )
+        if (
+            isinstance(ending, dict)
+            and str(ending.get("room_id")) == str(room_id)
+            and str(ending.get("step_id") or "")
+            and isinstance(existing_steps, list)
+            and len(existing_steps) == 1
+            and isinstance(existing_steps[0], dict)
+            and str(existing_steps[0].get("id") or "")
+            == str(ending.get("step_id") or "")
+            and existing_steps[0].get("tool") == "travel"
+        ):
+            return existing
+
+        step_id = "phase-abandonment-safe-return"
+        return self._store_execution_plan(
+            goal,
+            {
+                "summary": (
+                    "Return to source-verified safety before closing the abandoned "
+                    "campaign phase."
+                ),
+                "steps": [
+                    {
+                        "id": step_id,
+                        "outcome": (
+                            f"Reach source-verified safe room {room_id} before the "
+                            "abandoned phase is finalized."
+                        ),
+                        "tool": "travel",
+                        "verification": f"Current room id is {room_id}.",
+                    }
+                ],
+                "safe_ending": {
+                    "room_id": room_id,
+                    "step_id": step_id,
+                    "rationale": (
+                        "Verified abandonment is a controller safety boundary; "
+                        "survival and safe return precede terminal phase state."
+                    ),
+                },
+                "assumptions": [],
+                "revision_reason": (
+                    "Campaign phase abandonment was verified outside safety."
+                ),
+            },
+            grounding=grounding,
+            revision=existing is not None,
+        )
+
+    def _structured_phase_abandonment_return_action(
+        self,
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+        execution_plan: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return directly to safety while a terminal failure is deferred."""
+
+        checkpoint = self._phase_abandonment_checkpoint(phase)
+        if checkpoint is None or not isinstance(phase, dict):
+            return None
+        if self._phase_abandonment_safety(phase, observation).get("met") is True:
+            return None
+        if not isinstance(execution_plan, dict):
+            return None
+        ending = execution_plan.get("safe_ending")
+        if not isinstance(ending, dict):
+            return None
+        destination = self._verified_safe_staging(ending.get("room_id"))
+        step_id = str(ending.get("step_id") or "")
+        if destination is None or not step_id:
+            return None
+        return {
+            "tool": "travel",
+            "arguments": {"to": int(destination["room_id"])},
+            "rationale": (
+                "The phase abandonment is verified; return directly to the "
+                "retained source-verified sanctuary before finalizing it."
+            ),
+            "expected_observation": {"room_id": int(destination["room_id"])},
+            "plan_step_id": step_id,
+            "safety_recovery": True,
+        }
+
     def _evaluate_campaign_phase(
         self,
         goal: dict[str, Any],
@@ -4811,6 +5633,46 @@ class BotController:
 
         if phase is None:
             return self.campaign.evaluate_phase(goal, run, phase, observation)
+        safety = self._safe_ending_reached(goal, observation)
+        abandonment_allowed = self._verified_safe_staging(
+            self._observation_room(observation)
+        ) is not None
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(phase)
+        if abandonment_checkpoint is not None:
+            abandonment_safety = self._phase_abandonment_safety(
+                phase, observation
+            )
+            if abandonment_safety.get("met") is not True:
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        "reason": abandonment_checkpoint.get("reason"),
+                        "abandonment": abandonment_checkpoint.get("abandonment"),
+                        "abandonment_deferred": True,
+                        "safe_ending": abandonment_safety,
+                        "checkpoint": redact(abandonment_checkpoint),
+                    },
+                )
+            finished = self.storage.transition_campaign_phase(
+                str(phase["id"]),
+                "failed",
+                reason=str(abandonment_checkpoint.get("reason")),
+                resume_parent=False,
+            )
+            self._clear_phase_abandonment_checkpoint(str(phase["id"]))
+            return PhaseOutcome(
+                False,
+                True,
+                finished,
+                {
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "abandonment": abandonment_checkpoint.get("abandonment"),
+                    "safe_ending": abandonment_safety,
+                    "terminal_deferred": False,
+                },
+            )
         persisted_blocker = self._campaign_phase_grounding_blocker(
             phase,
             observation,
@@ -4861,6 +5723,56 @@ class BotController:
                     "grounding_blocker": redact(persisted_blocker),
                 },
             )
+        support_completion = self._research_exhaustion_support_completion(
+            goal, phase, observation
+        )
+        if support_completion is not None:
+            # Old controller builds could latch this controller-owned fallback
+            # merely because a read-only equipment call returned successfully.
+            # Its only legitimate completion is a material retry-state delta.
+            stale_checkpoint = self._phase_completion_checkpoint(phase)
+            if (
+                stale_checkpoint is not None
+                and stale_checkpoint.get("completion") != support_completion
+            ):
+                self._clear_phase_completion_checkpoint(str(phase["id"]))
+            if support_completion.get("all_met") is not True:
+                return PhaseOutcome(False, False, phase, support_completion)
+            checkpoint = self._phase_completion_checkpoint(phase)
+            safety = self._safe_ending_reached(goal, observation)
+            if checkpoint is not None:
+                if safety.get("met") is True:
+                    outcome = self.campaign.complete_phase(
+                        run, phase, checkpoint["completion"]
+                    )
+                    self._clear_phase_completion_checkpoint(str(phase["id"]))
+                    return outcome
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        **checkpoint["completion"],
+                        "completion_deferred": True,
+                        "safe_ending": safety,
+                    },
+                )
+            if safety.get("met") is True:
+                return self.campaign.complete_phase(run, phase, support_completion)
+            checkpoint = self._latch_phase_completion(
+                goal, run, phase, support_completion
+            )
+            return PhaseOutcome(
+                False,
+                False,
+                phase,
+                {
+                    **support_completion,
+                    "completion_deferred": True,
+                    "safe_ending": safety,
+                    "checkpoint": redact(checkpoint),
+                },
+            )
         if self._research_phase_requires_farm_recipe(phase):
             # ``phase_action_succeeded`` proves only that the adapter returned.
             # A progression-research phase is useful only when that result can
@@ -4875,7 +5787,24 @@ class BotController:
                 phase,
                 observation,
                 allow_completion=False,
+                allow_abandonment=abandonment_allowed,
             )
+            if preview.detail.get("abandonment_deferred") is True:
+                checkpoint = self._latch_phase_abandonment(
+                    goal, run, phase, preview.detail, observation
+                )
+                return PhaseOutcome(
+                    False,
+                    False,
+                    phase,
+                    {
+                        **preview.detail,
+                        "safe_ending": self._phase_abandonment_safety(
+                            phase, observation
+                        ),
+                        "checkpoint": redact(checkpoint),
+                    },
+                )
             if preview.failed:
                 return preview
             phase = preview.phase if isinstance(preview.phase, dict) else phase
@@ -4943,7 +5872,24 @@ class BotController:
             phase,
             observation,
             allow_completion=safety.get("met") is True,
+            allow_abandonment=abandonment_allowed,
         )
+        if outcome.detail.get("abandonment_deferred") is True:
+            checkpoint = self._latch_phase_abandonment(
+                goal, run, phase, outcome.detail, observation
+            )
+            return PhaseOutcome(
+                False,
+                False,
+                phase,
+                {
+                    **outcome.detail,
+                    "safe_ending": self._phase_abandonment_safety(
+                        phase, observation
+                    ),
+                    "checkpoint": redact(checkpoint),
+                },
+            )
         if outcome.detail.get("completion_deferred") is not True:
             return outcome
         current_phase = outcome.phase if isinstance(outcome.phase, dict) else phase
@@ -5123,6 +6069,61 @@ class BotController:
                     )
         return candidates, attempts
 
+    @staticmethod
+    def _research_rejection_disposition(
+        blocker: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Project one blocker into stable, causal tactic evidence."""
+
+        blocker = blocker if isinstance(blocker, dict) else {}
+        kind = str(blocker.get("kind") or "unknown")
+        evidence = blocker.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        if kind in {"source_room_overlevel_hostile", "live_room_overlevel_hostile"}:
+            return {"class": "room_hazard", "scope": "room"}
+        if kind in {"retained_route_failure", "farm_route_failure"}:
+            return {"class": "route_failure", "scope": "route"}
+        if kind in {"quarantined_farm_tactic", "quarantined_farm_phase"}:
+            return farm_quarantine_evidence_identity(evidence)
+        if kind in {"stagnated_farm_tactic", "stagnated_farm_phase"}:
+            deltas = evidence.get("deltas")
+            deltas = deltas if isinstance(deltas, dict) else {}
+            try:
+                death_count = int(deltas.get("deaths", 0) or 0)
+            except (TypeError, ValueError):
+                death_count = 0
+            if death_count > 0:
+                return {"class": "death", "scope": "room_and_prey"}
+            return {
+                "class": "stagnation",
+                "scope": (
+                    "exact_tactic"
+                    if isinstance(evidence.get("use_safe_spots"), bool)
+                    else "room_and_prey"
+                ),
+            }
+        return {"class": kind or "unknown", "scope": "unknown"}
+
+    @classmethod
+    def _research_may_vary_positioning(
+        cls, blocker: dict[str, Any] | None
+    ) -> bool:
+        """Allow a same-room open-field trial only after nonlethal wall evidence."""
+
+        blocker = blocker if isinstance(blocker, dict) else {}
+        if blocker.get("kind") not in {
+            "quarantined_farm_tactic",
+            "quarantined_farm_phase",
+        }:
+            return False
+        disposition = cls._research_rejection_disposition(blocker)
+        evidence = blocker.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        return (
+            disposition == {"class": "safe_spot_failure", "scope": "exact_tactic"}
+            and evidence.get("use_safe_spots") is not False
+        )
+
     def _research_farm_recipe_validation(
         self,
         goal: dict[str, Any],
@@ -5152,7 +6153,7 @@ class BotController:
                 if isinstance(value, (int, str)) and str(value).strip()
             )
         successful_tactics = self._recent_successful_farm_tactics(run)
-        successful_rooms = {room for room, _target in successful_tactics}
+        successful_rooms = {room for room, _target, _safe in successful_tactics}
         # Successful evidence is stronger than an older diversity hint. The exact
         # tactic is ranked first below, while a different prey in the same room
         # remains only a soft preference question.
@@ -5162,12 +6163,19 @@ class BotController:
             indexed: tuple[int, dict[str, Any]],
         ) -> tuple[int, int, int]:
             index, candidate = indexed
-            key = (
-                str(candidate.get("room")),
-                normalize(str(candidate.get("target") or "")),
-            )
-            if key in successful_tactics:
-                return (0, successful_tactics[key], index)
+            keys = [
+                (
+                    str(candidate.get("room")),
+                    normalize_farm_target(candidate.get("target")),
+                    strategy,
+                )
+                for strategy in (True, False)
+            ]
+            successful_ranks = [
+                successful_tactics[key] for key in keys if key in successful_tactics
+            ]
+            if successful_ranks:
+                return (0, min(successful_ranks), index)
             if str(candidate.get("room")) not in avoid_rooms:
                 return (1, 0, index)
             return (2, 0, index)
@@ -5178,70 +6186,132 @@ class BotController:
                 enumerate(candidates), key=preference
             )
         ]
+        candidate_set = sorted(
+            [
+                {
+                    "room": str(candidate.get("room")),
+                    "target": normalize_farm_target(candidate.get("target")),
+                }
+                for candidate in candidates
+            ],
+            key=canonical_json,
+        )
+        candidate_set_fingerprint = json_hash(candidate_set)
+        exhaustion_values = self.storage.get_runtime(
+            RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+        )
+        exhaustion_values = (
+            exhaustion_values if isinstance(exhaustion_values, dict) else {}
+        )
+        prior_exhaustion = exhaustion_values.get(str(goal.get("id") or ""))
+        prior_exhaustion = (
+            prior_exhaustion if isinstance(prior_exhaustion, dict) else {}
+        )
+        prior_candidate_fingerprint = prior_exhaustion.get(
+            "candidate_set_fingerprint"
+        )
         rejected: list[dict[str, Any]] = []
         selected: dict[str, Any] | None = None
         for candidate in ordered_candidates:
-            proposed = {
-                "kind": "farm",
-                "context": {
-                    "room": candidate["room"],
-                    "target": candidate["target"],
-                    "use_safe_spots": True,
-                    "flee_below": FARM_FLEE_THRESHOLD,
-                    "fight_above_vigor": FARM_FIGHT_VIGOR,
-                },
-            }
-            blocker = self._campaign_phase_grounding_blocker(
-                proposed,
-                observation,
-                avoid_rooms=avoid_rooms,
-                goal_id=str(goal.get("id") or ""),
-            )
-            if blocker is None:
-                selected = {
-                    **proposed["context"],
-                    "research_phase_id": phase.get("id"),
-                    "research_attempt_id": candidate.get("attempt_id"),
-                    "source_evidence": candidate.get("source"),
-                    "selection_basis": (
-                        "recent_successful_tactic"
-                        if (
-                            str(candidate.get("room")),
-                            normalize(str(candidate.get("target") or "")),
-                        )
-                        in successful_tactics
-                        else (
-                            "grounded_new_room"
-                            if str(candidate.get("room")) not in avoid_rooms
-                            else "grounded_soft_avoided_room"
-                        )
-                    ),
+            room = candidate["room"]
+            target = candidate["target"]
+            successful_strategies = [
+                strategy
+                for strategy in (True, False)
+                if (
+                    str(room),
+                    normalize_farm_target(target),
+                    strategy,
+                )
+                in successful_tactics
+            ]
+            strategies = list(dict.fromkeys([*successful_strategies, True, False]))
+            for strategy_index, use_safe_spots in enumerate(strategies):
+                if strategy_index > 0:
+                    prior_blocker = deep_get(rejected[-1], "blocker") if rejected else None
+                    # Retain the room and prey only when the immediately prior
+                    # rejection causally disproved wall positioning alone.
+                    if use_safe_spots is False and not self._research_may_vary_positioning(
+                        prior_blocker
+                    ):
+                        break
+                proposed = {
+                    "kind": "farm",
+                    "context": {
+                        "room": room,
+                        "target": target,
+                        "use_safe_spots": use_safe_spots,
+                        "flee_below": FARM_FLEE_THRESHOLD,
+                        "fight_above_vigor": FARM_FIGHT_VIGOR,
+                    },
                 }
+                blocker = self._campaign_phase_grounding_blocker(
+                    proposed,
+                    observation,
+                    avoid_rooms=avoid_rooms,
+                    goal_id=str(goal.get("id") or ""),
+                )
+                tactic_id = farm_tactic_key(room, target, use_safe_spots)
+                if blocker is None:
+                    exact_success = (
+                        str(room),
+                        normalize_farm_target(target),
+                        use_safe_spots,
+                    ) in successful_tactics
+                    selected = {
+                        **proposed["context"],
+                        "tactic_id": tactic_id,
+                        "research_phase_id": phase.get("id"),
+                        "research_attempt_id": candidate.get("attempt_id"),
+                        "source_evidence": candidate.get("source"),
+                        "selection_basis": (
+                            "recent_successful_tactic"
+                            if exact_success
+                            else "grounded_positioning_variant"
+                            if use_safe_spots is False
+                            else (
+                                "grounded_new_room"
+                                if str(room) not in avoid_rooms
+                                else "grounded_soft_avoided_room"
+                            )
+                        ),
+                    }
+                    break
+                rejected.append(
+                    {
+                        "room": room,
+                        "target": target,
+                        "use_safe_spots": use_safe_spots,
+                        "tactic_id": tactic_id,
+                        "disposition": self._research_rejection_disposition(blocker),
+                        "blocker": redact(blocker),
+                    }
+                )
+            if selected is not None:
                 break
-            rejected.append(
-                {
-                    "room": candidate["room"],
-                    "target": candidate["target"],
-                    "blocker": redact(blocker),
-                }
-            )
 
         semantic_outcome = {
             "status": "selected" if selected is not None else (
                 "no_usable_candidate" if attempts else "awaiting_hunting_grounds"
             ),
             "candidate_count": len(candidates),
+            "candidate_set_fingerprint": candidate_set_fingerprint,
+            "tactic_count": len(rejected) + int(selected is not None),
             "rejected": [
                 {
                     "room": item.get("room"),
-                    "target": normalize(str(item.get("target") or "")),
+                    "target": normalize_farm_target(item.get("target")),
+                    "use_safe_spots": item.get("use_safe_spots"),
+                    "tactic_id": item.get("tactic_id"),
                     "kind": str(deep_get(item, "blocker.kind") or ""),
+                    "disposition": item.get("disposition"),
                 }
                 for item in sorted(
                     rejected,
                     key=lambda item: (
                         str(item.get("room")),
-                        normalize(str(item.get("target") or "")),
+                        normalize_farm_target(item.get("target")),
+                        str(item.get("use_safe_spots")),
                         str(deep_get(item, "blocker.kind") or ""),
                     ),
                 )
@@ -5264,7 +6334,65 @@ class BotController:
         # Research identity describes the decision-relevant candidate outcome.
         # Raw adapter payloads, ordering, timestamps, and soft avoid-room hints
         # must not let an equivalent empty/rejected set masquerade as new work.
-        fingerprint = json_hash(semantic_outcome)
+        stable_rejections = [
+            {
+                key: item.get(key)
+                for key in (
+                    "room",
+                    "target",
+                    "use_safe_spots",
+                    "tactic_id",
+                    "disposition",
+                )
+            }
+            for item in semantic_outcome["rejected"]
+        ]
+        # Adapter paths and blocker labels can change while the actionable
+        # conclusion remains identical.  Fingerprint the causal disposition,
+        # not which subsystem happened to report it.
+        fingerprint = json_hash(
+            {
+                "status": semantic_outcome["status"],
+                "candidate_set_fingerprint": candidate_set_fingerprint,
+                "tactic_count": semantic_outcome["tactic_count"],
+                "rejected": stable_rejections,
+                "selected": semantic_outcome["selected"],
+            }
+        )
+        disposition_fingerprint = json_hash(stable_rejections)
+        prior_disposition_fingerprint = prior_exhaustion.get(
+            "disposition_fingerprint"
+        )
+        if selected is not None:
+            progress_kind = "executable_candidate_found"
+        elif not attempts:
+            progress_kind = "awaiting_hunting_grounds"
+        elif (
+            prior_candidate_fingerprint
+            and prior_candidate_fingerprint != candidate_set_fingerprint
+        ):
+            progress_kind = "candidate_set_changed"
+        elif (
+            prior_disposition_fingerprint
+            and prior_disposition_fingerprint != disposition_fingerprint
+        ):
+            progress_kind = "candidate_dispositions_changed"
+        elif prior_exhaustion:
+            progress_kind = "candidate_set_unchanged"
+        else:
+            progress_kind = "initial_candidate_set_evaluated"
+        progress = {
+            "kind": progress_kind,
+            "candidate_set_changed": bool(
+                prior_candidate_fingerprint
+                and prior_candidate_fingerprint != candidate_set_fingerprint
+            ),
+            "dispositions_changed": bool(
+                prior_disposition_fingerprint
+                and prior_disposition_fingerprint != disposition_fingerprint
+            ),
+            "executable_candidate_found": selected is not None,
+        }
         if selected is not None:
             self._clear_research_recipe_exhaustion(str(goal.get("id") or ""))
             return {
@@ -5272,12 +6400,20 @@ class BotController:
                 "fingerprint": fingerprint,
                 "recipe": selected,
                 "candidate_count": len(candidates),
+                "candidate_set_fingerprint": candidate_set_fingerprint,
+                "disposition_fingerprint": disposition_fingerprint,
+                "tactic_count": semantic_outcome["tactic_count"],
+                "progress": progress,
                 "rejected": rejected,
             }
         return {
             "status": semantic_outcome["status"],
             "fingerprint": fingerprint,
             "candidate_count": len(candidates),
+            "candidate_set_fingerprint": candidate_set_fingerprint,
+            "disposition_fingerprint": disposition_fingerprint,
+            "tactic_count": semantic_outcome["tactic_count"],
+            "progress": progress,
             "rejected": rejected,
             "attempt_ids": [attempt.get("id") for attempt in attempts],
         }
@@ -5294,8 +6430,17 @@ class BotController:
             [
                 {
                     "room": item.get("room"),
-                    "target": normalize(str(item.get("target") or "")),
+                    "target": normalize_farm_target(item.get("target")),
+                    "use_safe_spots": item.get("use_safe_spots"),
+                    "tactic_id": item.get("tactic_id"),
                     "kind": str(deep_get(item, "blocker.kind") or ""),
+                    "disposition": (
+                        item.get("disposition")
+                        if isinstance(item.get("disposition"), dict)
+                        else BotController._research_rejection_disposition(
+                            item.get("blocker")
+                        )
+                    ),
                 }
                 for item in value.get("rejected", [])
                 if isinstance(item, dict)
@@ -5308,6 +6453,8 @@ class BotController:
         return {
             "status": status,
             "candidate_count": candidate_count,
+            "candidate_set_fingerprint": value.get("candidate_set_fingerprint"),
+            "disposition_fingerprint": value.get("disposition_fingerprint"),
             "rejected": rejected,
         }
 
@@ -5321,7 +6468,17 @@ class BotController:
         prior = context.get("recipe_validation")
         comparable = {
             key: validation.get(key)
-            for key in ("status", "fingerprint", "candidate_count", "recipe", "rejected")
+            for key in (
+                "status",
+                "fingerprint",
+                "candidate_count",
+                "candidate_set_fingerprint",
+                "disposition_fingerprint",
+                "tactic_count",
+                "progress",
+                "recipe",
+                "rejected",
+            )
             if key in validation
         }
         if prior == comparable:
@@ -5401,15 +6558,24 @@ class BotController:
             "repeat_count": len(phase_ids),
             "phase_ids": phase_ids[-10:],
             "candidate_count": validation.get("candidate_count", 0),
+            "candidate_set_fingerprint": validation.get(
+                "candidate_set_fingerprint"
+            ),
+            "disposition_fingerprint": validation.get(
+                "disposition_fingerprint"
+            ),
+            "tactic_count": validation.get("tactic_count", 0),
+            "progress": redact(validation.get("progress", {})),
             "rejected": redact(validation.get("rejected", [])),
             "retry_state_schema": RESEARCH_RETRY_STATE_SCHEMA_VERSION,
             "retry_state": retry_state,
             "retry_state_fingerprint": retry_state_fingerprint,
             "recorded_at": timestamp(),
             "guidance": (
-                "Every source-derived room/prey candidate conflicts with retained "
-                "quarantine, stagnation, or route evidence. New world, route, or "
-                "survivability evidence is required before retrying this lookup."
+                "Every source-derived room/prey/tactic candidate conflicts with "
+                "retained quarantine, stagnation, or route evidence. A changed "
+                "candidate set is research progress but is not executable success; "
+                "new enabling world, route, or survivability evidence is required."
             ),
         }
         values[goal_id] = record
@@ -5668,6 +6834,7 @@ class BotController:
         if not isinstance(removed, dict):
             return False
         self.storage.set_runtime(EXECUTION_PLAN_RUNTIME_KEY, values)
+        self._clear_execution_plan_progress(str(goal.get("id") or ""))
         self.storage.emit_event(
             "planner.plan.invalidated",
             "Invalidated an execution plan that requires replanning",
@@ -5973,11 +7140,17 @@ class BotController:
         farm_intent = self._effective_farm_intent(goal)
         current_completion = self.criteria.evaluate(goal, self.last_observation or {})
         phase_exhaustion_pending = self._phase_exhaustion_checkpoint(phase) is not None
-        if not phase_exhaustion_pending:
+        phase_abandonment_pending = (
+            self._phase_abandonment_checkpoint(phase) is not None
+        )
+        phase_terminal_pending = (
+            phase_exhaustion_pending or phase_abandonment_pending
+        )
+        if not phase_terminal_pending:
             self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
         farm_work_remains = (
             False
-            if phase_exhaustion_pending
+            if phase_terminal_pending
             else self._keeper_combat_work_remains(goal, current_completion)
         )
         launch_indexes = [
@@ -6120,6 +7293,7 @@ class BotController:
             if key in active_ids or key == goal["id"]
         }
         self.storage.set_runtime(EXECUTION_PLAN_RUNTIME_KEY, values)
+        self._reset_execution_plan_progress(goal, value)
         self.storage.emit_event(
             "planner.plan.revised" if revision else "planner.plan.verified",
             ("Revised" if revision else "Verified") + f" execution plan: {summary[:180]}",
@@ -6200,6 +7374,137 @@ class BotController:
             # The item failed Monster.ReqOffer's CanBeGivenToNPC check before
             # ObjectDesired/buyer preference. Buyer discovery cannot repair it.
             return None
+
+        observation = self.last_observation or {}
+        exhausted_items = self._sale_exhausted_items(
+            self._merchant_sale_refusals(goal, observation)
+        )
+        planned_sales_text = canonical_json(
+            [
+                step
+                for step in steps
+                if step.get("tool") in {"sell", "sell_all"}
+            ]
+        ).casefold()
+        for exhausted in exhausted_items:
+            item_id = str(exhausted.get("item_id") or "").casefold()
+            if not item_id or re.search(
+                rf"\b{re.escape(item_id)}\b", planned_sales_text
+            ) is None:
+                continue
+            return (
+                f"exact carried item {item_id} has been rejected by "
+                f"{exhausted.get('distinct_refusing_buyers')} independent live "
+                "buyers, exhausting its source-catalogue sale hypothesis for the "
+                "unchanged inventory; use a non-sale funding route or materially "
+                "change inventory instead of visiting another merchant"
+            )
+        for sale_index, planned_sale in enumerate(steps):
+            if planned_sale.get("tool") not in {"sell", "sell_all"}:
+                continue
+            sale_text = canonical_json(planned_sale).casefold()
+            preceding_movements = [
+                step
+                for step in steps[:sale_index]
+                if step.get("tool") in MOVEMENT_TOOLS
+            ]
+            destination_text = canonical_json(
+                [*(preceding_movements[-1:] or []), planned_sale]
+            ).casefold()
+            for refusal in self._merchant_sale_refusals(goal, observation):
+                item_ids = {
+                    str(value).casefold()
+                    for value in refusal.get("item_ids", [])
+                    if str(value).strip()
+                }
+                item_names = {
+                    " ".join(str(value).split()).casefold()
+                    for value in refusal.get("item_names", [])
+                    if str(value).strip()
+                }
+                same_item = any(
+                    re.search(rf"\b{re.escape(item_id)}\b", sale_text)
+                    for item_id in item_ids
+                ) or any(
+                    re.search(rf"\b{re.escape(item_name)}s?\b", sale_text)
+                    for item_name in item_names
+                )
+                if not same_item:
+                    continue
+                aliases = {
+                    str(value).casefold()
+                    for value in deep_get(refusal, "merchant.aliases", [])
+                    if str(value).strip()
+                }
+                alias_match = next(
+                    (alias for alias in aliases if alias in sale_text),
+                    None,
+                )
+                refused_room = refusal.get("room")
+                room_match = (
+                    refused_room is not None
+                    and re.search(
+                        rf"(?<!\d){re.escape(str(refused_room))}(?!\d)",
+                        destination_text,
+                    )
+                    is not None
+                )
+                if alias_match is None and not room_match:
+                    continue
+                if alias_match is None:
+                    finances = self._financial_context(observation)
+                    distinct_buyer_named = any(
+                        str(candidate.get("merchant") or "").casefold()
+                        in sale_text
+                        for item_row in finances.get("buyer_candidates", [])
+                        if isinstance(item_row, dict)
+                        and " ".join(
+                            str(item_row.get("item") or "").split()
+                        ).casefold()
+                        in item_names
+                        for candidate in item_row.get("candidates", [])
+                        if isinstance(candidate, dict)
+                        and any(
+                            str(room) == str(refused_room)
+                            for room in candidate.get("room_ids", [])
+                        )
+                    )
+                    if distinct_buyer_named:
+                        continue
+                    return (
+                        f"the proposed sale routes the same item back to room "
+                        f"{refused_room} without naming a grounded merchant distinct "
+                        "from the buyer that already refused it there; identify the "
+                        "different merchant explicitly or use another candidate room/item"
+                    )
+                item = next(iter(sorted(item_names or item_ids)), "offered item")
+                live_name = deep_get(refusal, "merchant.live_name")
+                source_classes = deep_get(
+                    refusal, "merchant.source_classes", []
+                )
+                buyer_names = [
+                    str(value)
+                    for value in [
+                        live_name,
+                        *(source_classes if isinstance(source_classes, list) else []),
+                    ]
+                    if value
+                ]
+                buyer = "/".join(dict.fromkeys(buyer_names)) or str(
+                    deep_get(refusal, "merchant.object_id", "that merchant")
+                )
+                object_id = deep_get(refusal, "merchant.object_id")
+                if object_id is not None:
+                    buyer += f" (merchant {object_id})"
+                rejected_identity = (
+                    f"merchant {object_id}" if object_id is not None else buyer
+                )
+                return (
+                    f"the proposed sale reuses {item!r} with buyer {buyer} in "
+                    f"room {refused_room}; {rejected_identity} already rejected that exact "
+                    "item/buyer placement live. Choose a candidate in a different "
+                    "room or offer a materially different unprotected item"
+                )
         sale_recovery_required = failure_kind in sale_failure_kinds
         if not sale_recovery_required:
             blocked_actions = self.storage.get_runtime("blocked_actions", [])
@@ -6225,27 +7530,6 @@ class BotController:
             )
         if not sale_recovery_required:
             return None
-        blocked_actions = self.storage.get_runtime("blocked_actions", [])
-        blocked_actions = (
-            blocked_actions if isinstance(blocked_actions, list) else []
-        )
-        for entry in blocked_actions:
-            if (
-                not isinstance(entry, dict)
-                or entry.get("goal_id") != goal.get("id")
-                or entry.get("tool") not in {"sell", "sell_all"}
-            ):
-                continue
-            rejected_target = deep_get(entry, "arguments.to")
-            if rejected_target is not None and re.search(
-                rf"\b{re.escape(str(rejected_target))}\b", sale_text
-            ):
-                return (
-                    f"the proposed sale targets merchant {rejected_target}, which already "
-                    "rejected this sale tactic; choose a different candidate returned by "
-                    "buyer discovery"
-                )
-
         prior_discovery = self._recent_buyer_discovery_evidence(
             goal, sale_text=sale_text
         )
@@ -6338,6 +7622,29 @@ class BotController:
                 and item.get("room") is not None
                 and item.get("excludes_it") is not True
             ]
+            refusals = self._merchant_sale_refusals(
+                goal, self.last_observation or {}
+            )
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not any(
+                    query.casefold()
+                    in {
+                        " ".join(str(value).split()).casefold()
+                        for value in refusal.get("item_names", [])
+                    }
+                    and str(candidate.get("room")) == str(refusal.get("room"))
+                    and str(candidate.get("merchant") or "").casefold()
+                    in {
+                        str(value).casefold()
+                        for value in deep_get(
+                            refusal, "merchant.aliases", []
+                        )
+                    }
+                    for refusal in refusals
+                )
+            ]
             if candidates:
                 return {
                     "query": query,
@@ -6346,6 +7653,1036 @@ class BotController:
                     "candidates": candidates[:20],
                 }
         return None
+
+    def _reset_execution_plan_progress(
+        self,
+        goal: dict[str, Any],
+        execution_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Initialize controller-owned ordered progress for one immutable plan."""
+
+        steps = [
+            step
+            for step in execution_plan.get("steps", [])
+            if isinstance(step, dict) and step.get("id") and step.get("tool")
+        ]
+        safe_step_id = str(deep_get(execution_plan, "safe_ending.step_id", ""))
+        step_state: dict[str, dict[str, Any]] = {}
+        for index, step in enumerate(steps):
+            step_id = str(step["id"])
+            try:
+                required_calls = max(1, int(step.get("repeat_count") or 1))
+            except (TypeError, ValueError):
+                required_calls = 1
+            step_state[step_id] = {
+                "index": index,
+                "status": (
+                    "locked_safe_return"
+                    if step_id == safe_step_id
+                    else ("ready" if index == 0 else "pending")
+                ),
+                "required_calls": required_calls,
+                "successful_calls": 0,
+                "attempt_count": 0,
+                "last_result_ref": None,
+            }
+        value = {
+            "goal_id": goal.get("id"),
+            "phase_id": execution_plan.get("phase_id"),
+            "plan_fingerprint": self._execution_plan_fingerprint(execution_plan),
+            "cursor": 0,
+            "steps": step_state,
+            "updated_at": timestamp(),
+        }
+        values = self.storage.get_runtime(
+            EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        values[str(goal.get("id") or "")] = value
+        active_ids = {
+            item["id"]
+            for item in self.storage.goals(
+                ["active", "queued", "paused", "blocked"]
+            )
+        }
+        values = {
+            key: item
+            for key, item in values.items()
+            if key in active_ids or key == str(goal.get("id") or "")
+        }
+        self.storage.set_runtime(EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, values)
+        return value
+
+    def _execution_plan_progress(
+        self,
+        goal: dict[str, Any],
+        execution_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return progress for the exact plan, rebuilding stale sidecars safely."""
+
+        values = self.storage.get_runtime(
+            EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, {}
+        )
+        value = (
+            values.get(str(goal.get("id") or ""))
+            if isinstance(values, dict)
+            else None
+        )
+        fingerprint = self._execution_plan_fingerprint(execution_plan)
+        expected_ids = [
+            str(step.get("id") or "")
+            for step in execution_plan.get("steps", [])
+            if isinstance(step, dict) and step.get("id") and step.get("tool")
+        ]
+        stored_ids = (
+            list(value.get("steps", {}).keys())
+            if isinstance(value, dict) and isinstance(value.get("steps"), dict)
+            else []
+        )
+        if (
+            not isinstance(value, dict)
+            or value.get("plan_fingerprint") != fingerprint
+            # Runtime JSON is canonicalized by storage, so object keys reload
+            # alphabetically rather than in authored plan order.  Ordering is
+            # carried by each step state's explicit index.
+            or len(stored_ids) != len(expected_ids)
+            or set(stored_ids) != set(expected_ids)
+        ):
+            return self._reset_execution_plan_progress(goal, execution_plan)
+        return value
+
+    def _clear_execution_plan_progress(self, goal_id: str) -> None:
+        values = self.storage.get_runtime(
+            EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, {}
+        )
+        if not isinstance(values, dict) or goal_id not in values:
+            return
+        values = dict(values)
+        values.pop(goal_id, None)
+        self.storage.set_runtime(EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, values)
+
+    def _active_execution_plan_step(
+        self,
+        goal: dict[str, Any],
+        execution_plan: dict[str, Any],
+        *,
+        safe_return_required: bool,
+    ) -> dict[str, Any] | None:
+        """Project the sole ordered step that may be offered to the LLM."""
+
+        steps = [
+            step
+            for step in execution_plan.get("steps", [])
+            if isinstance(step, dict) and step.get("id") and step.get("tool")
+        ]
+        if not steps:
+            return None
+        safe_step_id = str(deep_get(execution_plan, "safe_ending.step_id", ""))
+        if safe_return_required:
+            return next(
+                (
+                    step
+                    for step in steps
+                    if str(step.get("id") or "") == safe_step_id
+                ),
+                None,
+            )
+        progress = self._execution_plan_progress(goal, execution_plan)
+        states = (
+            progress.get("steps")
+            if isinstance(progress.get("steps"), dict)
+            else {}
+        )
+        try:
+            cursor = max(0, int(progress.get("cursor") or 0))
+        except (TypeError, ValueError):
+            cursor = 0
+        while cursor < len(steps):
+            step = steps[cursor]
+            step_id = str(step.get("id") or "")
+            state = states.get(step_id) if isinstance(states, dict) else None
+            if isinstance(state, dict) and state.get("status") in {
+                "satisfied",
+                "skipped",
+            }:
+                cursor += 1
+                continue
+            if step_id == safe_step_id:
+                return None
+            return step
+        return None
+
+    @staticmethod
+    def _compact_tactical_value(
+        value: Any,
+        *,
+        depth: int = 0,
+        max_depth: int = 6,
+        max_list: int = 24,
+        max_dict: int = 32,
+        max_string: int = 1000,
+    ) -> Any:
+        """Bound a controller projection before it reaches a mode prompt."""
+
+        if depth >= max_depth:
+            if isinstance(value, dict):
+                return {"omitted_nested_fields": len(value)}
+            if isinstance(value, list):
+                return ["nested values omitted", len(value)]
+            return str(value)[:max_string]
+        if isinstance(value, str):
+            return value if len(value) <= max_string else value[:max_string] + "..."
+        if isinstance(value, list):
+            return [
+                BotController._compact_tactical_value(
+                    item,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_list=max_list,
+                    max_dict=max_dict,
+                    max_string=max_string,
+                )
+                for item in value[:max_list]
+            ]
+        if isinstance(value, dict):
+            return {
+                str(key): BotController._compact_tactical_value(
+                    item,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_list=max_list,
+                    max_dict=max_dict,
+                    max_string=max_string,
+                )
+                for key, item in list(value.items())[:max_dict]
+            }
+        return value
+
+    @classmethod
+    def _tactical_live_state(cls, observation: dict[str, Any]) -> dict[str, Any]:
+        """Project fresh ordinary-client state without replaying raw history."""
+
+        look = observation.get("look") if isinstance(observation.get("look"), dict) else {}
+        value = {
+            "observation_id": observation.get("id"),
+            "observed_at": observation.get("observed_at"),
+            "room": look.get("room"),
+            "self": look.get("self"),
+            "vitals": deep_get(observation, "status.vitals", look.get("vitals")),
+            "objects": look.get("objects"),
+            "exits": look.get("exits", deep_get(observation, "map.exits")),
+            "inventory": observation.get("inventory"),
+            "equipment": observation.get("equipment"),
+            "abilities": observation.get("abilities"),
+            "autopilot": observation.get("autopilot"),
+        }
+        return cls._compact_tactical_value(
+            redact({key: item for key, item in value.items() if item is not None}),
+            max_list=32,
+            max_dict=40,
+            max_string=800,
+        )
+
+    @staticmethod
+    def _tactical_safe_ending_candidates(
+        safe_context: Any,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Assign stable candidate ids to controller-verified safe rooms."""
+
+        candidates = (
+            safe_context.get("candidates")
+            if isinstance(safe_context, dict)
+            else None
+        )
+        candidate_map: dict[str, dict[str, Any]] = {}
+        for raw in candidates if isinstance(candidates, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                room_id = int(raw.get("room_id"))
+            except (TypeError, ValueError):
+                continue
+            if room_id <= 0:
+                continue
+            candidate_id = f"safe:{room_id}"
+            candidate_map.setdefault(
+                candidate_id,
+                {
+                    **deepcopy(raw),
+                    "candidate_id": candidate_id,
+                    "room_id": room_id,
+                },
+            )
+        if not candidate_map:
+            raise TacticalProtocolError(
+                "NO_SAFE_ENDING_CANDIDATE",
+                "no source-verified safe-ending candidate is currently available",
+                details={
+                    "status": (
+                        safe_context.get("status")
+                        if isinstance(safe_context, dict)
+                        else "unavailable"
+                    )
+                },
+            )
+        return list(candidate_map.values()), candidate_map
+
+    @staticmethod
+    def _tactical_tool_contracts(
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        contracts: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+            description = " ".join(str(tool.get("description") or "").split())
+            # The kernel states this invariant once; repeating the broker suffix
+            # for every available tool only dilutes the active rule cards.
+            description = description.replace(
+                " The controller selects the only configured character; never supply an agent id.",
+                "",
+            )
+            contracts.append(
+                {
+                    "name": str(tool["name"]),
+                    "description": description[:500],
+                }
+            )
+        return contracts
+
+    @staticmethod
+    def _tactical_destination_argument_name(schema: dict[str, Any]) -> str:
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        for name in ("to", "destination", "room", "room_id"):
+            if name in properties:
+                return name
+        return "to"
+
+    @staticmethod
+    def _tactical_step_destination(step: dict[str, Any]) -> int | None:
+        text = " ".join(
+            str(step.get(key) or "") for key in ("outcome", "verification")
+        )
+        values = {
+            int(match)
+            for match in re.findall(r"(?<!\d)(\d{1,7})(?!\d)", text)
+            if int(match) > 0
+        }
+        return next(iter(values)) if len(values) == 1 else None
+
+    @staticmethod
+    def _tactical_free_argument_schema(
+        raw_schema: Any,
+        *,
+        locked_arguments: dict[str, Any],
+        fixed: bool = False,
+    ) -> dict[str, Any]:
+        if fixed:
+            return {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            }
+        schema = deepcopy(raw_schema) if isinstance(raw_schema, dict) else {}
+        schema.setdefault("type", "object")
+        properties = schema.get("properties")
+        properties = dict(properties) if isinstance(properties, dict) else {}
+        for name in locked_arguments:
+            properties.pop(name, None)
+        schema["properties"] = properties
+        required = schema.get("required")
+        required = list(required) if isinstance(required, list) else []
+        schema["required"] = [
+            name for name in required if name not in locked_arguments
+        ]
+        schema["additionalProperties"] = False
+        return schema
+
+    @staticmethod
+    def _tactical_schema_needs_model(schema: dict[str, Any]) -> bool:
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and properties:
+            return True
+        required = schema.get("required")
+        if isinstance(required, list) and required:
+            return True
+        return any(
+            key in schema
+            for key in ("$ref", "allOf", "anyOf", "oneOf", "minProperties")
+        )
+
+    @staticmethod
+    def _safe_ending_is_active_destination(
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        execution_plan: dict[str, Any],
+    ) -> bool:
+        room_id = deep_get(execution_plan, "safe_ending.room_id")
+        if room_id is None:
+            return False
+        criteria = [
+            goal.get("success_criteria", [])
+            if isinstance(goal.get("success_criteria"), list)
+            else [],
+            phase.get("success_criteria", [])
+            if isinstance(phase, dict)
+            and isinstance(phase.get("success_criteria"), list)
+            else [],
+        ]
+        return any(
+            contract
+            and all(
+                isinstance(criterion, dict)
+                and criterion.get("kind") == "location_reached"
+                and str(criterion.get("room_id")) == str(room_id)
+                for criterion in contract
+            )
+            for contract in criteria
+        )
+
+    def _progressive_plan_decision(
+        self,
+        *,
+        mode: str,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        completion: dict[str, Any],
+        campaign_phase: dict[str, Any] | None,
+        tools: list[dict[str, Any]],
+        planner_feedback: dict[str, Any] | None,
+        grounded_context: dict[str, Any],
+        learned_failures: dict[str, Any],
+        financial_context: dict[str, Any],
+        policy_summary: dict[str, Any],
+        execution_plan: dict[str, Any] | None,
+        revision_authorization: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        request_id = f"tactical-{uuid7()}"
+        live_state = self._tactical_live_state(observation)
+        plan_fingerprint = (
+            self._execution_plan_fingerprint(execution_plan)
+            if isinstance(execution_plan, dict)
+            else None
+        )
+        state_token = make_state_token(
+            live_state,
+            request_id=request_id,
+            goal_id=str(goal["id"]),
+            phase_id=(
+                str(campaign_phase.get("id"))
+                if isinstance(campaign_phase, dict) and campaign_phase.get("id")
+                else None
+            ),
+            plan_fingerprint=plan_fingerprint,
+        )
+        candidate_list, candidate_map = self._tactical_safe_ending_candidates(
+            grounded_context.get("safe_ending_candidates")
+        )
+        tool_names = [
+            str(tool.get("name") or "")
+            for tool in tools
+            if isinstance(tool, dict) and tool.get("name")
+        ]
+        rule_cards = select_rule_cards(
+            mode=mode,
+            phase=campaign_phase,
+            tool_names=tool_names,
+            feedback={
+                "goal": goal.get("objective"),
+                "phase": (
+                    campaign_phase.get("objective")
+                    if isinstance(campaign_phase, dict)
+                    else None
+                ),
+                "planner_feedback": planner_feedback,
+            },
+            limit=3,
+        )
+        unmet = [
+            item
+            for item in completion.get("criteria", [])
+            if isinstance(item, dict) and item.get("met") is not True
+        ]
+        grounding_projection = {
+            key: grounded_context.get(key)
+            for key in (
+                "corpus",
+                "goal_validation",
+                "relevant_entities",
+                "room_spawn_tables",
+                "hunt_room_options",
+                "rules",
+                "direct_phase_capabilities",
+                "farm_safe_staging",
+                "purchase_preflight",
+                "live_overlevel_hostiles",
+            )
+            if grounded_context.get(key) is not None
+        }
+        phase_contract = (
+            {
+                key: campaign_phase.get(key)
+                for key in (
+                    "id",
+                    "kind",
+                    "objective",
+                    "success_criteria",
+                    "abandon_predicates",
+                    "budget",
+                    "context",
+                )
+                if campaign_phase.get(key) is not None
+            }
+            if isinstance(campaign_phase, dict)
+            else None
+        )
+        envelope: dict[str, Any] = {
+            "protocol_version": TACTICAL_PROTOCOL_VERSION,
+            "mode": mode,
+            "request_id": request_id,
+            "state_token": state_token,
+            "goal_contract": {
+                key: goal.get(key)
+                for key in (
+                    "id",
+                    "version",
+                    "title",
+                    "objective",
+                    "success_criteria",
+                    "constraints",
+                )
+            },
+            "phase_contract": phase_contract,
+            "strategy_options": [],
+            "available_tools": self._tactical_tool_contracts(tools),
+            "plan_constraints": {
+                "max_model_steps": EXECUTION_PLAN_MAX_STEPS - 1,
+                "allowed_tools": tool_names,
+                "must_cover": [str(item.get("id") or "") for item in unmet],
+                "required_rule_codes": [
+                    str(card.get("violation_code") or "") for card in rule_cards
+                ],
+                "safe_ending_candidates": candidate_list,
+            },
+            "relevant_facts": self._compact_tactical_value(
+                {
+                    "live_state": live_state,
+                    "policy": policy_summary,
+                    "financial": financial_context,
+                    "grounding": grounding_projection,
+                },
+                max_list=20,
+                max_dict=32,
+                max_string=800,
+            ),
+            "relevant_failures": self._compact_tactical_value(
+                {
+                    "planner_feedback": planner_feedback,
+                    "learned": learned_failures,
+                },
+                max_list=12,
+                max_dict=24,
+                max_string=600,
+            ),
+            "planning_persona": self._compact_tactical_value(
+                self.storage.persona(), max_list=8, max_dict=20, max_string=500
+            ),
+            "rule_cards": rule_cards,
+        }
+        if mode == PLAN_REVISE:
+            envelope["existing_plan"] = redact(execution_plan)
+            envelope["revision_evidence"] = self._compact_tactical_value(
+                revision_authorization or {}, max_list=8, max_dict=20, max_string=600
+            )
+        repair_attempted = False
+        authorization_id = (
+            str((revision_authorization or {}).get("id") or "") or None
+        )
+
+        def request_plan_repair(
+            violation: dict[str, Any],
+            *,
+            rejected_response: Any = None,
+            response_unavailable: bool = False,
+        ) -> dict[str, Any]:
+            repair_cards = select_rule_cards(
+                mode=REPAIR_PLAN,
+                phase=campaign_phase,
+                tool_names=tool_names,
+                feedback=violation,
+                limit=2,
+            )
+            repair_envelope = {
+                key: envelope[key]
+                for key in (
+                    "protocol_version",
+                    "request_id",
+                    "state_token",
+                    "goal_contract",
+                    "phase_contract",
+                    "available_tools",
+                    "plan_constraints",
+                    "relevant_facts",
+                )
+            }
+            repair_envelope.update(
+                {
+                    "mode": REPAIR_PLAN,
+                    "original_mode": mode,
+                    "violations": [violation],
+                    "rule_cards": repair_cards,
+                }
+            )
+            if response_unavailable:
+                repair_envelope["rejected_response_unavailable"] = True
+            else:
+                repair_envelope["rejected_response"] = redact(rejected_response)
+            return self.model.tactical_complete(
+                mode=REPAIR_PLAN, envelope=repair_envelope
+            )
+
+        try:
+            raw_response = self.model.tactical_complete(mode=mode, envelope=envelope)
+        except ModelResponseFormatError as exc:
+            # Tactical transport deliberately does not append malformed output to
+            # the prompt. Spend the protocol's one bounded, freshly budgeted repair
+            # turn instead; transport failures remain ordinary model failures.
+            repair_attempted = True
+            raw_response = request_plan_repair(
+                {
+                    "code": exc.code,
+                    "message": str(exc)[:1000],
+                    "details": {"original_mode": mode},
+                },
+                response_unavailable=True,
+            )
+        try:
+            raw_plan = compile_plan_response(
+                raw_response,
+                candidate_map,
+                request_id=request_id,
+                revision_authorization_id=authorization_id,
+            )
+        except TacticalProtocolError as exc:
+            if repair_attempted:
+                raise
+            repair_attempted = True
+            raw_response = request_plan_repair(
+                exc.as_dict(), rejected_response=raw_response
+            )
+            raw_plan = compile_plan_response(
+                raw_response,
+                candidate_map,
+                request_id=request_id,
+                revision_authorization_id=authorization_id,
+            )
+        return (
+            {
+                "decision": "plan",
+                "tool": None,
+                "arguments": {},
+                "rationale": (
+                    "Compiled a controller-routed tactical plan revision."
+                    if mode == PLAN_REVISE
+                    else "Compiled a controller-routed tactical plan."
+                ),
+                "expected_observation": {},
+                "proposal": None,
+                "execution_plan": raw_plan,
+            },
+            {
+                "mode": mode,
+                "request_id": request_id,
+                "state_token": state_token,
+                "candidate_map": candidate_map,
+                "base_envelope": envelope,
+                "raw_response": redact(raw_response),
+                "revision_authorization_id": authorization_id,
+                "repair_attempted": repair_attempted,
+            },
+        )
+
+    def _progressive_action_decision(
+        self,
+        *,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        campaign_phase: dict[str, Any] | None,
+        tools: list[dict[str, Any]],
+        planner_feedback: dict[str, Any] | None,
+        execution_plan: dict[str, Any],
+        safe_return_required: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        step = self._active_execution_plan_step(
+            goal,
+            execution_plan,
+            safe_return_required=safe_return_required,
+        )
+        if step is None:
+            raise TacticalProtocolError(
+                "NO_ELIGIBLE_PLAN_STEP",
+                "the verified plan has no currently eligible ordered step",
+                details={
+                    "plan_fingerprint": self._execution_plan_fingerprint(
+                        execution_plan
+                    ),
+                    "safe_return_required": safe_return_required,
+                },
+            )
+        tool_name = str(step.get("tool") or "")
+        tool_contract = next(
+            (
+                tool
+                for tool in tools
+                if isinstance(tool, dict) and str(tool.get("name") or "") == tool_name
+            ),
+            None,
+        )
+        if not isinstance(tool_contract, dict):
+            raise TacticalProtocolError(
+                "STEP_TOOL_UNAVAILABLE",
+                "the active plan step tool is not available in the active phase",
+                details={"step_id": step.get("id"), "tool": tool_name},
+            )
+        raw_schema = (
+            tool_contract.get("input_schema")
+            if isinstance(tool_contract.get("input_schema"), dict)
+            else {}
+        )
+        locked_arguments: dict[str, Any] = {}
+        expected_observation: dict[str, Any] = {}
+        fixed = False
+        safe_step_id = str(deep_get(execution_plan, "safe_ending.step_id", ""))
+        last_action = execution_plan.get("last_action")
+        if (
+            isinstance(last_action, dict)
+            and last_action.get("status") == "partial_progress"
+            and str(last_action.get("step_id") or "") == str(step.get("id") or "")
+            and tool_name == "travel"
+        ):
+            prior_arguments = (
+                last_action.get("arguments")
+                if isinstance(last_action.get("arguments"), dict)
+                else {}
+            )
+            for name in ("to", "destination", "room", "room_id"):
+                if prior_arguments.get(name) is not None:
+                    locked_arguments[name] = prior_arguments[name]
+                    expected_observation = {"room_id": prior_arguments[name]}
+                    fixed = True
+                    break
+        elif str(step.get("id") or "") == safe_step_id:
+            room_id = deep_get(execution_plan, "safe_ending.room_id")
+            destination_name = self._tactical_destination_argument_name(raw_schema)
+            locked_arguments[destination_name] = room_id
+            expected_observation = {"room_id": room_id}
+            fixed = True
+        elif tool_name == "travel":
+            destination = self._tactical_step_destination(step)
+            if destination is not None:
+                destination_name = self._tactical_destination_argument_name(raw_schema)
+                locked_arguments[destination_name] = destination
+                expected_observation = {"room_id": destination}
+                fixed = True
+        free_schema = self._tactical_free_argument_schema(
+            raw_schema,
+            locked_arguments=locked_arguments,
+            fixed=fixed,
+        )
+        request_id = f"tactical-{uuid7()}"
+        live_state = self._tactical_live_state(observation)
+        plan_fingerprint = self._execution_plan_fingerprint(execution_plan)
+        state_token = make_state_token(
+            live_state,
+            request_id=request_id,
+            goal_id=str(goal["id"]),
+            phase_id=(
+                str(campaign_phase.get("id"))
+                if isinstance(campaign_phase, dict) and campaign_phase.get("id")
+                else None
+            ),
+            plan_fingerprint=plan_fingerprint,
+        )
+        option = make_action_option(
+            plan_fingerprint=plan_fingerprint,
+            observation_token=state_token,
+            step_id=str(step["id"]),
+            tool=tool_name,
+            locked_arguments=locked_arguments,
+            free_argument_schema=free_schema,
+            expected_observation=expected_observation,
+        )
+        response: dict[str, Any]
+        repair_attempted = False
+        if not self._tactical_schema_needs_model(free_schema):
+            response = {
+                "request_id": request_id,
+                "action_token": option["action_token"],
+                "arguments": {},
+                "rationale": "Execute the sole controller-bound ordered action.",
+                "expected_observation": expected_observation,
+            }
+        else:
+            rule_cards = select_rule_cards(
+                mode=EXECUTE_STEP,
+                phase=campaign_phase,
+                tool_names=[tool_name],
+                feedback={
+                    "planner_feedback": planner_feedback,
+                    "last_action": execution_plan.get("last_action"),
+                    "step": step,
+                },
+                limit=2,
+            )
+            envelope = {
+                "protocol_version": TACTICAL_PROTOCOL_VERSION,
+                "mode": EXECUTE_STEP,
+                "request_id": request_id,
+                "state_token": state_token,
+                "active_step": redact(step),
+                "legal_actions": [option],
+                "relevant_live_state": live_state,
+                "last_action": redact(execution_plan.get("last_action")),
+                "rule_cards": rule_cards,
+            }
+
+            def request_action_repair(
+                violation: dict[str, Any],
+                *,
+                rejected_response: Any = None,
+                response_unavailable: bool = False,
+            ) -> dict[str, Any]:
+                repair_envelope = {
+                    **envelope,
+                    "mode": REPAIR_ACTION,
+                    "original_mode": EXECUTE_STEP,
+                    "violations": [violation],
+                    "rule_cards": select_rule_cards(
+                        mode=REPAIR_ACTION,
+                        phase=campaign_phase,
+                        tool_names=[tool_name],
+                        feedback=violation,
+                        limit=2,
+                    ),
+                }
+                if response_unavailable:
+                    repair_envelope["rejected_response_unavailable"] = True
+                else:
+                    repair_envelope["rejected_response"] = redact(
+                        rejected_response
+                    )
+                return self.model.tactical_complete(
+                    mode=REPAIR_ACTION, envelope=repair_envelope
+                )
+
+            try:
+                response = self.model.tactical_complete(
+                    mode=EXECUTE_STEP, envelope=envelope
+                )
+            except ModelResponseFormatError as exc:
+                repair_attempted = True
+                response = request_action_repair(
+                    {
+                        "code": exc.code,
+                        "message": str(exc)[:1000],
+                        "details": {"original_mode": EXECUTE_STEP},
+                    },
+                    response_unavailable=True,
+                )
+            try:
+                decision = compile_action_response(
+                    response,
+                    [option],
+                    request_id=request_id,
+                    state_token=state_token,
+                )
+            except TacticalProtocolError as exc:
+                if repair_attempted:
+                    raise
+                repair_attempted = True
+                response = request_action_repair(
+                    exc.as_dict(), rejected_response=response
+                )
+                decision = compile_action_response(
+                    response,
+                    [option],
+                    request_id=request_id,
+                    state_token=state_token,
+                )
+            return decision, {
+                "mode": EXECUTE_STEP,
+                "request_id": request_id,
+                "state_token": state_token,
+                "options": [option],
+                "repair_attempted": repair_attempted,
+                "direct": False,
+            }
+        return (
+            compile_action_response(
+                response,
+                [option],
+                request_id=request_id,
+                state_token=state_token,
+            ),
+            {
+                "mode": EXECUTE_STEP,
+                "request_id": request_id,
+                "state_token": state_token,
+                "options": [option],
+                "repair_attempted": False,
+                "direct": True,
+            },
+        )
+
+    def _repair_progressive_plan_decision(
+        self,
+        context: dict[str, Any],
+        *,
+        rejected_plan: Any,
+        violation: str,
+    ) -> dict[str, Any]:
+        """Spend the one bounded retry on a deterministic plan invariant."""
+
+        envelope = context["base_envelope"]
+        repair_envelope = {
+            key: envelope[key]
+            for key in (
+                "protocol_version",
+                "request_id",
+                "state_token",
+                "goal_contract",
+                "phase_contract",
+                "available_tools",
+                "plan_constraints",
+                "relevant_facts",
+            )
+        }
+        repair_envelope.update(
+            {
+                "mode": REPAIR_PLAN,
+                "original_mode": context.get("mode"),
+                "rejected_response": context.get("raw_response", rejected_plan),
+                "compiled_rejected_plan": redact(rejected_plan),
+                "violations": [
+                    {
+                        "code": "PLAN_VALIDATION_FAILED",
+                        "message": str(violation)[:1000],
+                        "details": {},
+                    }
+                ],
+                "rule_cards": select_rule_cards(
+                    mode=REPAIR_PLAN,
+                    phase=envelope.get("phase_contract"),
+                    tool_names=envelope.get("plan_constraints", {}).get(
+                        "allowed_tools", []
+                    ),
+                    feedback=violation,
+                    limit=2,
+                ),
+            }
+        )
+        raw_response = self.model.tactical_complete(
+            mode=REPAIR_PLAN, envelope=repair_envelope
+        )
+        raw_plan = compile_plan_response(
+            raw_response,
+            context["candidate_map"],
+            request_id=str(context["request_id"]),
+            revision_authorization_id=context.get("revision_authorization_id"),
+        )
+        context["repair_attempted"] = True
+        context["raw_response"] = redact(raw_response)
+        return {
+            "decision": "plan",
+            "tool": None,
+            "arguments": {},
+            "rationale": "Corrected the plan against a deterministic controller invariant.",
+            "expected_observation": {},
+            "proposal": None,
+            "execution_plan": raw_plan,
+        }
+
+    def _update_execution_plan_progress(
+        self,
+        goal: dict[str, Any],
+        *,
+        step_id: str,
+        arguments: dict[str, Any],
+        result: Any,
+        status: str,
+    ) -> None:
+        # This runs inside action finalization, before every movement receipt
+        # has been reconciled into ``last_observation``.  Reading through
+        # _execution_plan here would run stale-state validators and could
+        # invalidate a just-succeeded travel plan.  The immutable raw plan was
+        # already verified when stored and is sufficient to update its sidecar.
+        plans = self.storage.get_runtime(EXECUTION_PLAN_RUNTIME_KEY, {})
+        plan = (
+            plans.get(str(goal.get("id") or ""))
+            if isinstance(plans, dict)
+            else None
+        )
+        if not isinstance(plan, dict):
+            # Retain helper-level compatibility for callers that provide an
+            # already-resolved plan without persisting it first. Production
+            # action finalization always takes the raw-runtime branch above.
+            plan = self._execution_plan(goal)
+        if not isinstance(plan, dict):
+            return
+        progress = self._execution_plan_progress(goal, plan)
+        states = progress.get("steps")
+        if not isinstance(states, dict) or not isinstance(states.get(step_id), dict):
+            return
+        state = dict(states[step_id])
+        state["attempt_count"] = int(state.get("attempt_count", 0) or 0) + 1
+        state["last_arguments"] = redact(arguments)
+        state["last_result_ref"] = {
+            "observed_at": timestamp(),
+            "summary": str(redact(result))[:500],
+        }
+        if status == "succeeded":
+            successes = int(state.get("successful_calls", 0) or 0) + 1
+            state["successful_calls"] = successes
+            required = max(1, int(state.get("required_calls", 1) or 1))
+            if successes >= required:
+                state["status"] = "satisfied"
+                progress["cursor"] = max(
+                    int(progress.get("cursor", 0) or 0),
+                    int(state.get("index", 0) or 0) + 1,
+                )
+                ordered = sorted(
+                    (
+                        item
+                        for item in states.values()
+                        if isinstance(item, dict)
+                    ),
+                    key=lambda item: int(item.get("index", 0) or 0),
+                )
+                next_index = int(progress["cursor"])
+                if next_index < len(ordered):
+                    next_state = ordered[next_index]
+                    if next_state.get("status") == "pending":
+                        next_state["status"] = "ready"
+            else:
+                state["status"] = "ready"
+        elif status == "partial_progress":
+            state["status"] = "partial"
+            progress["cursor"] = int(state.get("index", 0) or 0)
+        elif status == "transient_failure":
+            state["status"] = "ready"
+        else:
+            state["status"] = "failed"
+        states[step_id] = state
+        progress["steps"] = states
+        progress["updated_at"] = timestamp()
+        values = self.storage.get_runtime(
+            EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, {}
+        )
+        values = dict(values) if isinstance(values, dict) else {}
+        values[str(goal.get("id") or "")] = progress
+        self.storage.set_runtime(EXECUTION_PLAN_PROGRESS_RUNTIME_KEY, values)
 
     def _record_plan_action(
         self,
@@ -6373,6 +8710,14 @@ class BotController:
         values = dict(values)
         values[goal["id"]] = value
         self.storage.set_runtime(EXECUTION_PLAN_RUNTIME_KEY, values)
+        if status:
+            self._update_execution_plan_progress(
+                goal,
+                step_id=step_id,
+                arguments=arguments,
+                result=result,
+                status=status,
+            )
 
     @staticmethod
     def _purchase_plan(goal: dict[str, Any]) -> dict[str, Any] | None:
@@ -7291,6 +9636,33 @@ class BotController:
             effective_bank_above = int(requested_bank_above)
             if 0 < effective_bank_above < BROKER_WALKING_MONEY:
                 effective_bank_above = BROKER_WALKING_MONEY
+            # Eating carried or self-created food is useful routine vigor
+            # maintenance and does not widen the controller's spending authority.
+            # A caller may still explicitly preserve food with ``false``.  Raising
+            # the launch floor above the rest-reachable 80 remains separately
+            # opt-in so an empty larder can never retire the farm by accident.
+            explicit_food_floor = arguments.get("eat_before_fighting") is True
+            eat_before_fighting = (
+                arguments.get("eat_before_fighting", FARM_EAT_AVAILABLE_FOOD)
+                is not False
+            )
+            buy_food = arguments.get("buy_food") is True
+            try:
+                requested_fight_vigor = float(
+                    arguments.get("fight_above_vigor", FARM_FIGHT_VIGOR)
+                )
+            except (TypeError, ValueError):
+                requested_fight_vigor = float(FARM_FIGHT_VIGOR)
+            # Rested vigor is the viable default. A higher target is accepted
+            # only as part of an explicit planner-owned eating tactic; routine
+            # use of available food never raises the keeper's launch floor.
+            effective_fight_vigor: int | float = FARM_FIGHT_VIGOR
+            if explicit_food_floor:
+                effective_fight_vigor = min(
+                    200, max(FARM_FIGHT_VIGOR, requested_fight_vigor)
+                )
+                if float(effective_fight_vigor).is_integer():
+                    effective_fight_vigor = int(effective_fight_vigor)
             normalized.update(
                 {
                     "rest_below": max(
@@ -7301,11 +9673,11 @@ class BotController:
                     # preference. Normalize old queued recipes that still say
                     # 75-80% as well as overly aggressive lower proposals.
                     "flee_below": FARM_FLEE_THRESHOLD,
-                    # Historical 140-vigor recipes made a fed character wait
-                    # several minutes for stomach room before combat. Keep this
-                    # controller-owned activity boundary consistent across old
-                    # and new goals, just like the farm flee boundary above.
-                    "fight_above_vigor": FARM_FIGHT_VIGOR,
+                    "fight_above_vigor": effective_fight_vigor,
+                    # Available-food consumption defaults on. Paid acquisition
+                    # remains opt-in and an explicit false still preserves food.
+                    "eat_before_fighting": eat_before_fighting,
+                    "buy_food": buy_food,
                     # Open-field farming is permitted only when durable state
                     # chose it as a materially different tactic: either an
                     # operator-authored public goal or the planner's persisted
@@ -7375,75 +9747,34 @@ class BotController:
             return None
 
     @staticmethod
-    def _combat_vigor_supply(observation: dict[str, Any]) -> dict[str, Any]:
-        """Describe food the keeper can consume or make before an engagement."""
-        items = deep_get(observation, "inventory.items", [])
-        items = items if isinstance(items, list) else []
-        # viNutrition values from the game source. Counting items alone was not
-        # enough: the deterministic preflight must account for actual nutrition
-        # against the configured farm gate rather than merely count food items.
-        # the controller provisions enough food before handing control to the
-        # background keeper.
-        food_values = (
-            ("inky cap", 50),
-            ("chocolate mint", 5),
-            (TOS_CHEESE_NAME, TOS_CHEESE_VIGOR),
-            ("turkey leg", 15),
-            ("mug of", 6),
-            ("meat pie", 30),
-            ("stew", 15),
-            ("loaf of bread", 20),
-            ("waterskin", 3),
-            ("slice of pork", 9),
-            ("bowl of soup", 9),
-            ("spideye", 9),
-            ("bunch of grapes", 7),
-            ("apple", 10),
-            ("edible mushroom", 5),
-            ("drumstick", 9),
-            ("goblet", 3),
+    def _vital_value(observation: dict[str, Any], name: str) -> float | None:
+        vital = deep_get(
+            observation,
+            f"status.vitals.{name}",
+            deep_get(observation, f"look.vitals.{name}"),
         )
-        food_count = 0
-        vigor_points = 0
-        herbs = 0
-        elderberries = 0
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).casefold().strip()
-            raw_amount = item.get("amount", item.get("quantity", 1))
-            try:
-                amount = max(1, int(raw_amount or 1))
-            except (TypeError, ValueError):
-                amount = 1
-            food_value = next(
-                (value for marker, value in food_values if marker in name), None
-            )
-            if food_value is not None:
-                food_count += amount
-                vigor_points += food_value * amount
-            if name in {"herb", "herbs"}:
-                herbs += amount
-            if name in {"elderberry", "elderberries", "elder berry", "elder berries"}:
-                elderberries += amount
+        current = vital.get("current", vital.get("value")) if isinstance(vital, dict) else vital
+        try:
+            return float(current)
+        except (TypeError, ValueError):
+            return None
 
-        spells = deep_get(observation, "spells.spells", [])
-        spells = spells if isinstance(spells, list) else []
-        knows_create_food = any(
-            isinstance(spell, dict)
-            and str(spell.get("name", "")).casefold().strip() == "create food"
-            for spell in spells
+    @staticmethod
+    def _required_mana_from_refusal(reason: Any) -> float | None:
+        text = " ".join(str(reason or "").split()).casefold()
+        patterns = (
+            r"costs?\s+(\d+(?:\.\d+)?)\s+mana",
+            r"(?:need|requires?|required)\s+(\d+(?:\.\d+)?)\s+mana",
+            r"mana[^\d]{0,20}(?:need|requires?|required)[^\d]{0,8}(\d+(?:\.\d+)?)",
         )
-        cookable_casts = min(herbs // 2, elderberries // 2) if knows_create_food else 0
-        return {
-            "available": food_count > 0 or cookable_casts > 0,
-            "food_count": food_count,
-            "vigor_points": vigor_points,
-            "knows_create_food": knows_create_food,
-            "cookable_casts": cookable_casts,
-            "herbs": herbs,
-            "elderberries": elderberries,
-        }
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return float(match.group(1))
+                except (TypeError, ValueError):
+                    pass
+        return None
 
     def _live_overlevel_hostiles(
         self,
@@ -7595,42 +9926,16 @@ class BotController:
             blockers.append({"kind": "recover_mana", "mana_fraction": mana, "guidance": "return to full mana before a new hazardous encounter"})
         rested = deep_get(observation, "status.vitals.vigor.rested", deep_get(observation, "look.vitals.vigor.rested"))
         if rested is False:
-            blockers.append({"kind": "recover_vigor", "guidance": "eat or rest until the game reports rested"})
+            blockers.append(
+                {
+                    "kind": "recover_vigor",
+                    "guidance": (
+                        "rest until the game reports rested; food is an optional "
+                        "planner-owned tactic, never a controller prerequisite"
+                    ),
+                }
+            )
         if tool == "autopilot" and arguments.get("mode") == "farm":
-            vigor = deep_get(
-                observation,
-                "status.vitals.vigor.value",
-                deep_get(
-                    observation,
-                    "status.vitals.vigor.current",
-                    deep_get(observation, "look.vitals.vigor.value"),
-                ),
-            )
-            fight_vigor = int(
-                arguments.get("fight_above_vigor", FARM_FIGHT_VIGOR)
-                or FARM_FIGHT_VIGOR
-            )
-            if isinstance(vigor, (int, float)) and vigor < fight_vigor:
-                supply = self._combat_vigor_supply(observation)
-                verified_food_shortfall = (
-                    int(supply.get("vigor_points", 0) or 0)
-                    < max(0, fight_vigor - int(vigor))
-                    and int(supply.get("cookable_casts", 0) or 0) <= 0
-                )
-                if not supply["available"] or verified_food_shortfall:
-                    blockers.append(
-                        {
-                            "kind": "recover_combat_vigor",
-                            "vigor": vigor,
-                            "minimum": fight_vigor,
-                            "supply": supply,
-                            "guidance": (
-                                f"acquire enough edible food before launching the keeper so verified nutrition can raise vigor to at least {fight_vigor}; "
-                                "sitting cannot do this because resting stops at 80 vigor. Carried herbs and elderberries "
-                                "count only when the verified spell list contains Create Food"
-                            ),
-                        }
-                    )
             assigned_room = arguments.get("assigned_room")
             current_room = deep_get(observation, "look.room.num")
             if (
@@ -7653,10 +9958,8 @@ class BotController:
                     )
             quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
             quarantines = quarantines if isinstance(quarantines, dict) else {}
-            quarantine = quarantines.get(str(assigned_room)) if assigned_room is not None else None
-            if isinstance(quarantine, dict) and self._farm_quarantine_matches(
-                quarantine, arguments
-            ):
+            quarantine = self._matching_farm_quarantine(quarantines, arguments)
+            if isinstance(quarantine, dict):
                 blockers.append(
                     {
                         "kind": "quarantined_farm_tactic",
@@ -7683,16 +9986,6 @@ class BotController:
                         "guidance": stagnation.get("guidance")
                         or "query hunting_grounds once and choose a different grounded room; do not restart this stalled room/prey tactic unchanged",
                         "evidence": stagnation,
-                    }
-                )
-            readiness = self.learning.readiness_summary(observation)
-            if readiness.get("recent_combat_deaths") and int(readiness.get("healing_supply_count", 0) or 0) < 4:
-                blockers.append(
-                    {
-                        "kind": "replenish_healing_supplies_after_death",
-                        "healing_supply_count": readiness.get("healing_supply_count", 0),
-                        "minimum": 4,
-                        "guidance": "carry at least four verified healing flasks before another background farm",
                     }
                 )
         if tool in PVP_TOOL_NAMES:
@@ -7898,27 +10191,260 @@ class BotController:
             and arguments.get("mode") == "farm"
         )
 
+    @staticmethod
+    def _action_requires_keeper_yield(
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> bool:
+        """Return whether a concrete call can compete with keeper mutations."""
+
+        if tool in KEEPER_COMPATIBLE_READ_ONLY_TOOLS or tool == KNOWLEDGE_TOOL_NAME:
+            return False
+        action = str(arguments.get("action") or "").strip().casefold()
+        if tool == "bank" and action in {"balance", "check", "status"}:
+            return False
+        if tool == "shop" and action in {"list", "quote", "status"}:
+            return False
+        if (
+            tool == "autopilot"
+            and action == "start"
+            and arguments.get("mode") in {"farm", "survive"}
+        ):
+            # This is a direct keeper-to-keeper retask, not a release.
+            return False
+        return True
+
     def _begin_foreground_action(
         self, tool: str, *, goal_id: str | None = None
     ) -> None:
-        self._foreground_action = {
-            "tool": tool,
-            "goal_id": goal_id,
-            "started_at": timestamp(),
-        }
-        self._game_action_active.set()
+        if self._foreground_action_depth == 0:
+            self._foreground_action = {
+                "tool": tool,
+                "goal_id": goal_id,
+                "started_at": timestamp(),
+            }
+            self._game_action_active.set()
+        self._foreground_action_depth += 1
 
     def _end_foreground_action(self) -> None:
+        if self._foreground_action_depth > 1:
+            self._foreground_action_depth -= 1
+            return
+        self._foreground_action_depth = 0
         self._game_action_active.clear()
         self._foreground_action = None
+
+    @classmethod
+    def _keeper_owns_outside_safety(cls, status: Any) -> bool:
+        """Return whether a live keeper is actively protecting the character."""
+
+        return cls._keeper_is_driving(status) and str(
+            status.get("mode") or ""
+        ).casefold() in {"farm", "survive"}
+
+    def _ensure_outside_safety_owner(
+        self,
+        observation: dict[str, Any],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Establish a verified owner before yielding an unsafe controller turn.
+
+        A safe room is itself the passive safety boundary. Everywhere else a
+        farm/survival keeper or an in-flight foreground transaction must own
+        the character. The foreground marker is acquired before a missing or
+        unsuitable keeper is retasked, then released only after status proves
+        that the survival keeper is driving.
+        """
+
+        room_id = self._observation_room(observation)
+        safe_room = self._verified_safe_staging(room_id)
+        if safe_room is not None:
+            return {
+                "covered": True,
+                "owner": "verified_safe_room",
+                "room_id": room_id,
+            }
+        if self._game_action_active.is_set():
+            return {
+                "covered": True,
+                "owner": "controller_foreground_action",
+                "room_id": room_id,
+            }
+
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if self._keeper_owns_outside_safety(status):
+            return {
+                "covered": True,
+                "owner": "keeper",
+                "mode": status.get("mode"),
+                "activity": status.get("activity"),
+                "room_id": room_id,
+            }
+
+        self._begin_foreground_action("restore_safety_keeper")
+        try:
+            started = self._ensure_survival_keeper()
+            verified = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+            if not self._keeper_owns_outside_safety(verified):
+                raise ToolCallError(
+                    "outside-safe-room safety invariant failed: survival keeper "
+                    "did not acknowledge active ownership"
+                )
+            self.storage.emit_event(
+                "safety.ownership_restored",
+                "Restored keeper ownership before yielding an unsafe controller boundary",
+                severity="warning",
+                interesting=True,
+                goal_id=deep_get(self.storage.active_goal() or {}, "id"),
+                data={
+                    "room_id": room_id,
+                    "reason": reason,
+                    "previous_keeper": redact(status),
+                    "start": redact(started),
+                    "verified_mode": verified.get("mode"),
+                    "verified_activity": verified.get("activity"),
+                },
+            )
+            return {
+                "covered": True,
+                "owner": "keeper",
+                "mode": verified.get("mode"),
+                "activity": verified.get("activity"),
+                "room_id": room_id,
+                "restored": True,
+            }
+        finally:
+            self._end_foreground_action()
+
+    def _yield_keeper_to_foreground(self, *, tool: str) -> dict[str, Any]:
+        """Transfer mutations to an already-declared foreground transaction."""
+
+        if not self._game_action_active.is_set():
+            raise RuntimeError(
+                "keeper ownership may be transferred only after foreground ownership is declared"
+            )
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if not self._keeper_is_driving(status):
+            return status if isinstance(status, dict) else {"running": False}
+
+        result = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                "hard": False,
+                "why": f"controller foreground action is ready to execute: {tool}",
+            },
+            timeout=20,
+            mutation=True,
+        )
+        deadline = time.monotonic() + FOREGROUND_KEEPER_RELEASE_TIMEOUT_SECONDS
+        status = result
+        while self._keeper_is_driving(status) and time.monotonic() < deadline:
+            time.sleep(0.1)
+            status = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+        if self._keeper_is_driving(status):
+            raise ToolCallError(
+                f"keeper did not yield to foreground action {tool!r} before timeout"
+            )
+        return status if isinstance(status, dict) else {"running": False}
+
+    def _restore_safety_after_foreground(
+        self,
+        *,
+        tool: str,
+    ) -> dict[str, Any] | None:
+        """Restore keeper coverage before a foreground transaction releases."""
+
+        observation = self._reconcile_recent_inventory_creation(
+            self._reconcile_recent_room_transition(self.broker.observe())
+        )
+        self.last_observation = observation
+        self._remember_safe_staging(observation)
+        self.storage.record_snapshot(redact(observation))
+        room_id = self._observation_room(observation)
+        if self._verified_safe_staging(room_id) is not None:
+            return {
+                "covered": True,
+                "owner": "verified_safe_room",
+                "room_id": room_id,
+            }
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if self._keeper_owns_outside_safety(status):
+            return {
+                "covered": True,
+                "owner": "keeper",
+                "mode": status.get("mode"),
+                "room_id": room_id,
+            }
+        started = self._ensure_survival_keeper()
+        verified = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if not self._keeper_owns_outside_safety(verified):
+            raise ToolCallError(
+                "foreground safety handback failed: survival keeper did not "
+                "acknowledge active ownership"
+            )
+        self.storage.emit_event(
+            "safety.foreground_handoff",
+            "Foreground action handed an unsafe room back to the survival keeper",
+            severity="info",
+            interesting=False,
+            goal_id=deep_get(self.storage.active_goal() or {}, "id"),
+            data={
+                "tool": tool,
+                "room_id": room_id,
+                "start": redact(started),
+                "verified_mode": verified.get("mode"),
+            },
+        )
+        return {
+            "covered": True,
+            "owner": "keeper",
+            "mode": verified.get("mode"),
+            "room_id": room_id,
+            "restored": True,
+        }
 
     def _reconcile_after_action_error(
         self,
         *,
         error: str,
     ) -> dict[str, Any] | None:
+        inherited_foreground_ownership = self._game_action_active.is_set()
         try:
-            self._begin_foreground_action("reconcile_after_action_error")
+            if not inherited_foreground_ownership:
+                self._begin_foreground_action("reconcile_after_action_error")
             if "not in game" in error.casefold() and self.config.game.autojoin:
                 self.broker.ensure_joined()
             observation = self._reconcile_recent_inventory_creation(
@@ -7933,7 +10459,8 @@ class BotController:
             self.warnings = [*self.warnings[-9:], f"action reconciliation: {str(exc)[:300]}"]
             return None
         finally:
-            self._end_foreground_action()
+            if not inherited_foreground_ownership:
+                self._end_foreground_action()
 
     def _record_death(
         self,
@@ -8298,6 +10825,10 @@ class BotController:
         raise KnowledgeValidationError(validation)
 
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._shutdown_requested.is_set():
+            raise InvalidTransition(
+                "controller shutdown is draining; new gameplay goals are not accepted"
+            )
         onboarding = self._onboarding_status(self.last_observation or {})
         if not onboarding.get("ready_for_goals"):
             raise OnboardingRequired(
@@ -8687,6 +11218,13 @@ class BotController:
             raise
 
     def manage_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if (
+            self._shutdown_requested.is_set()
+            and payload.get("action") == "resume"
+        ):
+            raise InvalidTransition(
+                "controller shutdown is draining; goals cannot be resumed"
+            )
         goal = self.storage.goal(str(payload.get("goal_id", "")))
         if goal is None:
             # Preserve the storage layer's stable NOT_FOUND response.
@@ -8756,11 +11294,59 @@ class BotController:
             if self._planner_feedback(goal) is not None:
                 self._clear_planner_feedback()
             self._clear_safety_suppression(goal["id"])
+            keeper_handoff = self._handoff_paused_goal_keeper(goal)
+            if keeper_handoff is not None:
+                result["keeper_handoff"] = keeper_handoff
         if isinstance(resulting_goal, dict) and resulting_goal.get("status") == "cancelled":
             self.storage.complete_campaign_run(resulting_goal["id"], status="cancelled")
         if assessment is not None:
             result["cancellation_assessment"] = assessment
         return result
+
+    def _handoff_paused_goal_keeper(
+        self, goal: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Revoke a paused goal's background keeper without abandoning the character."""
+        owner = self.storage.get_runtime("background_farm_owner_v1", {})
+        owner = owner if isinstance(owner, dict) else {}
+        if owner.get("goal_id") != goal.get("id"):
+            return None
+
+        try:
+            handoff = self._ensure_survival_keeper()
+        except (BrokerError, ValueError) as exc:
+            failure = {
+                "attempted": True,
+                "switched_to_survival": False,
+                "error": str(exc)[:500],
+            }
+            # Keep the ownership record: it is authoritative evidence that a
+            # goal-owned keeper may still be driving and must be reconciled.
+            self.storage.emit_event(
+                "goal.pause_keeper_handoff_failed",
+                "Paused the goal, but could not hand its keeper to survival",
+                severity="error",
+                interesting=True,
+                goal_id=goal["id"],
+                data=redact(failure),
+            )
+            return failure
+
+        self.storage.set_runtime("background_farm_owner_v1", {})
+        response = {
+            "attempted": True,
+            "switched_to_survival": True,
+            "result": redact(handoff),
+        }
+        self.storage.emit_event(
+            "goal.pause_keeper_handoff",
+            "Paused goal handed its background keeper to survival",
+            severity="info",
+            interesting=True,
+            goal_id=goal["id"],
+            data=response,
+        )
+        return response
 
     def _active_goal_cancellation_assessment(
         self, goal: dict[str, Any], payload: dict[str, Any]
@@ -9115,6 +11701,9 @@ class BotController:
         backoff = 1.0
         while not self.stop_event.is_set():
             self.last_heartbeat_at = timestamp()
+            if self._shutdown_requested.is_set():
+                self._perform_safe_shutdown()
+                continue
             try:
                 self.turn()
                 backoff = 1.0
@@ -9152,11 +11741,16 @@ class BotController:
                 cadence = backoff
                 backoff = min(backoff * 2, self.config.controller.error_backoff_max_seconds)
             else:
-                if self.dependencies.get("broker") == "healthy" and self.dependencies.get("model") != "unhealthy":
+                if (
+                    not self._shutdown_requested.is_set()
+                    and self.dependencies.get("broker") == "healthy"
+                    and self.dependencies.get("model") != "unhealthy"
+                ):
                     self.state = "running"
                     self.warnings = []
                     self._active_degradations.clear()
-            self.stop_event.wait(cadence)
+            self._wake_event.wait(cadence)
+            self._wake_event.clear()
         self.state = "stopped"
 
     @staticmethod
@@ -9222,7 +11816,7 @@ class BotController:
         notes = str(constraints.get("operator_notes") or "") if isinstance(constraints, dict) else ""
         room_match = re.search(r"\bassigned_room\s*=\s*(\d+)\b", notes, re.IGNORECASE)
         hunt_match = re.search(
-            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
             notes,
             re.IGNORECASE,
         )
@@ -9230,7 +11824,12 @@ class BotController:
             "assigned_room": int(room_match.group(1)) if room_match else None,
             "hunt": " ".join(hunt_match.group(1).casefold().split()) if hunt_match else None,
         }
-        for field in ("use_safe_spots", "break_out_via_logoff"):
+        for field in (
+            "use_safe_spots",
+            "break_out_via_logoff",
+            "eat_before_fighting",
+            "buy_food",
+        ):
             match = re.search(
                 rf"\b{field}\s*=\s*(true|false)\b", notes, re.IGNORECASE
             )
@@ -9353,6 +11952,8 @@ class BotController:
             "hold_resume_above",
             "rest_below",
             "fight_above_vigor",
+            "eat_before_fighting",
+            "buy_food",
             "bank_above",
             "pull_within",
         ):
@@ -9416,6 +12017,7 @@ class BotController:
             phase is not None
             and self._phase_completion_checkpoint(phase) is None
             and self._phase_exhaustion_checkpoint(phase) is None
+            and self._phase_abandonment_checkpoint(phase) is None
         )
 
     def _effective_farm_intent(self, goal: dict[str, Any]) -> dict[str, Any]:
@@ -9438,6 +12040,22 @@ class BotController:
             )
             for key in keys
         }
+
+    def _farm_fight_vigor(self, goal: dict[str, Any]) -> int:
+        intent = self._effective_farm_intent(goal)
+        if intent.get("eat_before_fighting") is not True:
+            return FARM_FIGHT_VIGOR
+        try:
+            requested = int(intent.get("fight_above_vigor") or FARM_FIGHT_VIGOR)
+        except (TypeError, ValueError):
+            return FARM_FIGHT_VIGOR
+        return min(200, max(FARM_FIGHT_VIGOR, requested))
+
+    def _farm_eat_before_fighting(self, goal: dict[str, Any]) -> bool:
+        """Use available food by default without implying a higher vigor gate."""
+
+        intent = self._effective_farm_intent(goal)
+        return intent.get("eat_before_fighting", FARM_EAT_AVAILABLE_FOOD) is not False
 
     def _farm_launch_origin(
         self,
@@ -9563,337 +12181,6 @@ class BotController:
             "proposal": None,
         }
 
-    def _ensure_farm_healing_support_phase(
-        self,
-        goal: dict[str, Any],
-        observation: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Turn the post-death flask gate into executable supporting work.
-
-        A deterministic preflight that only suppresses the farm cannot satisfy
-        itself.  Preserve the selected farm as a paused parent, acquire the
-        exact inventory threshold used by the preflight, then let ordinary
-        phase completion resume that same recipe.
-        """
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        if not isinstance(phase, dict) or phase.get("kind") not in {
-            "farm",
-            "train_ability",
-        }:
-            return None
-        intent = self._campaign_phase_farm_intent(phase)
-        if intent.get("assigned_room") is None or not intent.get("hunt"):
-            return None
-        readiness = self.learning.readiness_summary(observation)
-        deaths = int(readiness.get("recent_combat_deaths", 0) or 0)
-        carried = int(readiness.get("healing_supply_count", 0) or 0)
-        minimum = 4
-        if deaths <= 0 or carried >= minimum:
-            return None
-
-        support = self.campaign.apply_manager_decision(
-            run,
-            goal,
-            {
-                "decision": "push_support_phase",
-                "phase": {
-                    "kind": "acquire_item",
-                    "objective": (
-                        f"Acquire at least {minimum} healing flasks before resuming "
-                        f"the {intent['hunt']} farm in room {intent['assigned_room']}."
-                    ),
-                    "success_criteria": [
-                        {
-                            "id": f"post-death-healing-flasks-{minimum}",
-                            "kind": "inventory_contains",
-                            "item": "flask",
-                            "count": minimum,
-                        }
-                    ],
-                    "abandon_predicates": [],
-                    "budget": {"max_actions": 40, "max_minutes": 90},
-                    "context": {
-                        "item": "flask",
-                        "required_count": minimum,
-                        "current_count": carried,
-                        "missing_count": minimum - carried,
-                        "reason": "replenish_healing_supplies_after_death",
-                        "resume_farm_phase_id": phase.get("id"),
-                        "resume_farm_recipe": redact(intent),
-                        "research_hint": (
-                            "Use merchants to find a live flask seller, then obtain a "
-                            "fresh shop quote before buying. Flasks are the source-"
-                            "verified Healer item."
-                        ),
-                    },
-                    "rationale": (
-                        "The controller's post-death farm preflight requires four "
-                        "verified healing flasks; acquire the missing supplies as a "
-                        "bounded child phase instead of repeatedly suppressing launch."
-                    ),
-                },
-                "rationale": "Satisfy the deterministic post-death healing gate.",
-            },
-            observation=observation,
-        )
-        if support is None:
-            return None
-        self._invalidate_execution_plan(
-            goal,
-            "post-death healing supplies require a bounded acquisition support phase",
-        )
-        self._clear_safety_suppression(str(goal.get("id") or ""))
-        self.storage.emit_event(
-            "campaign.farm.healing_support_started",
-            (
-                f"Paused farm to acquire {minimum - carried} additional healing "
-                "flask(s) required by post-death safety"
-            ),
-            severity="notice",
-            interesting=False,
-            goal_id=goal.get("id"),
-            data={
-                "farm_phase_id": phase.get("id"),
-                "support_phase_id": support.get("id"),
-                "current_count": carried,
-                "required_count": minimum,
-                "farm_recipe_preserved": True,
-            },
-        )
-        return support
-
-    def _ensure_combat_vigor_support_phase(
-        self,
-        goal: dict[str, Any],
-        observation: dict[str, Any],
-        *,
-        blockers: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any] | None:
-        """Convert an unsatisfied keeper-vigor gate into bounded preparation.
-
-        Resting deliberately stops at 80 vigor.  When the selected keeper phase
-        needs more and no carried/cookable food can bridge the gap, repeated
-        launch attempts cannot change the state.  Pause the exact farm as a
-        parent and let a typed child phase fund, acquire, create, and eat food.
-        """
-
-        run = self.storage.campaign_run(str(goal.get("id") or ""))
-        phase = self.storage.active_campaign_phase(run["id"]) if run else None
-        if not isinstance(phase, dict) or phase.get("kind") not in {
-            "farm",
-            "train_ability",
-        }:
-            return None
-
-        vigor_blocker = next(
-            (
-                item
-                for item in (blockers or [])
-                if isinstance(item, dict)
-                and item.get("kind") == "recover_combat_vigor"
-            ),
-            None,
-        )
-        required_raw = (
-            vigor_blocker.get("minimum")
-            if isinstance(vigor_blocker, dict)
-            # Farm launch normalizes every historical/model-proposed value to
-            # this controller-owned policy boundary.
-            else FARM_FIGHT_VIGOR
-        )
-        vigor_raw = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            required = max(FARM_FIGHT_VIGOR, int(required_raw or FARM_FIGHT_VIGOR))
-            current = int(vigor_raw or 0)
-        except (TypeError, ValueError):
-            return None
-        supply = self._combat_vigor_supply(observation)
-        if (
-            current >= required
-            or bool(supply.get("available"))
-            or (
-                blockers is not None
-                and not isinstance(vigor_blocker, dict)
-            )
-        ):
-            return None
-
-        intent = self._campaign_phase_farm_intent(phase)
-        finances = self._financial_context(observation)
-        support = self.campaign.apply_manager_decision(
-            run,
-            goal,
-            {
-                "decision": "push_support_phase",
-                "phase": {
-                    "kind": "prepare_combat",
-                    "objective": (
-                        f"Raise verified vigor from {current} to at least {required} "
-                        "by obtaining and consuming edible food before resuming combat."
-                    ),
-                    "success_criteria": [
-                        {
-                            "id": f"combat-vigor-{required}",
-                            "kind": "numeric_threshold",
-                            "metric": "status.vitals.vigor.value",
-                            "operator": ">=",
-                            "value": required,
-                        }
-                    ],
-                    "abandon_predicates": [],
-                    "budget": {"max_actions": 40, "max_minutes": 90},
-                    "context": {
-                        "reason": "recover_combat_vigor",
-                        "required_vigor": required,
-                        "current_vigor": current,
-                        "vigor_shortfall": required - current,
-                        "verified_supply": redact(supply),
-                        "funding": {
-                            "carried_shillings": finances.get("carried_shillings"),
-                            "bank_accounts": redact(finances.get("bank_accounts", [])),
-                            "buyer_candidates": redact(finances.get("buyer_candidates", [])),
-                            "purchase_quote_required": True,
-                            "instruction": (
-                                "Obtain a fresh merchant quote, compute the exact total and "
-                                "deficit, then fund it with a verified bank withdrawal or a "
-                                "guarded sale before purchasing."
-                            ),
-                        },
-                        "allowed_recovery": [
-                            "sell guarded excess inventory after a fresh quote",
-                            "withdraw verified bank funds",
-                            "buy edible food or exact Create Food reagents",
-                            "cast Create Food only when its live reagent check is satisfied",
-                            "consume verified edible food until the vigor target is observed",
-                        ],
-                        "resume_combat_phase_id": phase.get("id"),
-                        "resume_combat_recipe": redact(intent),
-                    },
-                    "rationale": (
-                        "The deterministic combat preflight cannot be satisfied by "
-                        "resting alone; perform the missing resource work in the smallest "
-                        "bounded child phase while preserving the strategic goal."
-                    ),
-                },
-                "rationale": "Satisfy the deterministic keeper-vigor prerequisite.",
-            },
-            observation=observation,
-        )
-        if support is None:
-            return None
-        self._invalidate_execution_plan(
-            goal, "combat vigor requires a bounded preparation support phase"
-        )
-        self._clear_safety_suppression(str(goal.get("id") or ""))
-        self._clear_planner_feedback()
-        resolved_lesson_ids: list[str] = []
-        for lesson in self.storage.goal_lessons(
-            statuses=["deferred", "unlocked"],
-            goal_id=str(goal.get("id") or ""),
-            limit=50,
-        ):
-            summary = str(lesson.get("summary") or "").casefold()
-            if (
-                lesson.get("scope") == "tactic"
-                and lesson.get("classification") == "ineffective_tactic"
-                and "deterministic safety suppression" in summary
-                and "vigor" in summary
-            ):
-                resolved = self.storage.update_goal_lesson(
-                    lesson["id"],
-                    "resolved",
-                    resolution_goal_id=str(goal.get("id") or ""),
-                    evidence={
-                        "repair": "bounded combat-vigor support phase started",
-                        "support_phase_id": support.get("id"),
-                        "required_vigor": required,
-                        "at": timestamp(),
-                    },
-                )
-                resolved_lesson_ids.append(str(resolved["id"]))
-        self.storage.emit_event(
-            "campaign.combat_vigor_support_started",
-            (
-                f"Paused combat phase to raise vigor from {current} to {required} "
-                "through verified provisioning"
-            ),
-            severity="notice",
-            interesting=False,
-            goal_id=goal.get("id"),
-            data={
-                "combat_phase_id": phase.get("id"),
-                "support_phase_id": support.get("id"),
-                "current_vigor": current,
-                "required_vigor": required,
-                "vigor_shortfall": required - current,
-                "resolved_safety_lesson_ids": resolved_lesson_ids,
-                "strategic_goal_preserved": True,
-            },
-        )
-        return support
-
-    def _recent_farm_food_quote(
-        self, goal: dict[str, Any]
-    ) -> dict[str, int] | None:
-        """Return the newest live Paddock cheese quote for this goal.
-
-        Merchant template ids are runtime evidence, not durable game facts.
-        Reusing the most recent quote avoids another model turn while keeping
-        deterministic provisioning bound to what the ordinary client saw.
-        """
-
-        for event in reversed(
-            self.storage.goal_events(
-                goal["id"], kinds=["action.succeeded"], limit=100
-            )
-        ):
-            data = event.get("data") if isinstance(event, dict) else None
-            if not isinstance(data, dict) or data.get("tool") != "shop":
-                continue
-            result = data.get("result")
-            items = result.get("items") if isinstance(result, dict) else None
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if (
-                    isinstance(item, dict)
-                    and str(item.get("name") or "").strip().casefold()
-                    == TOS_CHEESE_NAME
-                    and isinstance(item.get("id"), int)
-                    and isinstance(item.get("cost"), int)
-                    and int(item["cost"]) > 0
-                    and isinstance(result.get("seller"), int)
-                ):
-                    return {
-                        "seller": int(result["seller"]),
-                        "item_id": int(item["id"]),
-                        "cost": int(item["cost"]),
-                    }
-        return None
-
-    @staticmethod
-    def _visible_tos_innkeeper(observation: dict[str, Any]) -> int | None:
-        objects = deep_get(observation, "look.objects", [])
-        for item in objects if isinstance(objects, list) else []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip().casefold()
-            capabilities = item.get("can")
-            if (
-                name == TOS_INNKEEPER_NAME
-                and isinstance(item.get("id"), int)
-                and isinstance(capabilities, list)
-                and "buy" in capabilities
-            ):
-                return int(item["id"])
-        return None
-
     def _structured_farm_controller_plan(
         self,
         goal: dict[str, Any],
@@ -9910,88 +12197,47 @@ class BotController:
         launch_room = int(launch_origin["room_id"])
         launch_name = str(launch_origin["name"])
         readiness = self.learning.readiness_summary(observation)
-        needs_created_weapon = bool(
+        create_weapon = self._live_spell_readiness(observation, "create weapon")
+        known_missing_weapon = bool(
             readiness.get("equipment_state") == "known"
             and not readiness.get("wielded_weapons")
             and not readiness.get("carried_weapons")
-            and self._live_spell_readiness(observation, "create weapon")
-            is not None
         )
-        supply = self._combat_vigor_supply(observation)
-        vigor = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            live_vigor = int(vigor or 0)
-        except (TypeError, ValueError):
-            live_vigor = 0
-        nutrition_shortfall = max(
-            0,
-            FARM_FIGHT_VIGOR
-            - max(live_vigor, RESTED_VIGOR_FLOOR)
-            - int(supply.get("vigor_points", 0) or 0),
-        )
-        needs_provisions = (
-            launch_room == TOS_PROVISION_ROOM_ID
-            and nutrition_shortfall > 0
-            and int(supply.get("cookable_casts", 0) or 0) <= 0
-        )
-        steps: list[dict[str, Any]] = []
-        if needs_provisions:
-            # This is a concrete food-vendor adapter selected only when that
-            # source-verified room is already the staging point. It is not a
-            # regional or completion default.
-            steps.extend(
-                [
-                    {
-                        "id": "farm-bank-transit",
-                        "outcome": (
-                            f"Reach First Royal Bank of Tos (room {TOS_BANK_ROOM_ID}) "
-                            "before withdrawing the bounded food shortfall."
-                        ),
-                        "tool": "travel",
-                        "verification": f"Current room id is {TOS_BANK_ROOM_ID}.",
-                    },
-                    {
-                        "id": "withdraw-provision-funds",
-                        "outcome": "Withdraw only the live quoted cost of the remaining farm food.",
-                        "tool": "bank",
-                        "verification": "Carried shillings increased by the requested amount.",
-                    },
-                    {
-                        "id": "farm-provision-transit",
-                        "outcome": (
-                            f"Return to {launch_name} (room {launch_room}) to obtain "
-                            "the bounded farm provisions."
-                        ),
-                        "tool": "travel",
-                        "verification": f"Current room id is {launch_room}.",
-                    },
-                    {
-                        "id": "buy-farm-food",
-                        "outcome": f"Quote or buy enough wheel(s) of cheese from Paddock to satisfy the {FARM_FIGHT_VIGOR}-vigor launch gate.",
-                        "tool": "shop",
-                        "verification": f"Verified carried food nutrition plus rested vigor reaches at least {FARM_FIGHT_VIGOR}.",
-                    },
-                ]
+        if known_missing_weapon and (
+            not isinstance(create_weapon, dict)
+            or create_weapon.get("castable") is not True
+        ):
+            if isinstance(create_weapon, dict):
+                detail = (
+                    "live Create Weapon is not currently castable "
+                    f"({self._live_spell_blocker(create_weapon)})"
+                )
+            else:
+                detail = "no live Create Weapon capability is available"
+            raise ModelError(
+                "cannot build a deterministic farm preparation plan while the "
+                f"character is known unarmed with no carried weapon: {detail}; "
+                "the tactical planner must first ground another acquisition route"
             )
-        else:
-            steps.append(
-                {
-                    "id": "farm-staging-transit",
-                    "outcome": (
-                        f"Reach source-verified safe staging {launch_name} "
-                        f"(room {launch_room}) for the next preparation action."
-                    ),
-                    "tool": "travel",
-                    "verification": (
-                        f"Current room id is {launch_room} and its source flags include "
-                        "ROOM_SANCTUARY or ROOM_NO_COMBAT."
-                    ),
-                }
-            )
+        needs_created_weapon = bool(
+            known_missing_weapon
+            and isinstance(create_weapon, dict)
+            and create_weapon.get("castable") is True
+        )
+        steps: list[dict[str, Any]] = [
+            {
+                "id": "farm-staging-transit",
+                "outcome": (
+                    f"Reach source-verified safe staging {launch_name} "
+                    f"(room {launch_room}) for the next preparation action."
+                ),
+                "tool": "travel",
+                "verification": (
+                    f"Current room id is {launch_room} and its source flags include "
+                    "ROOM_SANCTUARY or ROOM_NO_COMBAT."
+                ),
+            }
+        ]
         steps.extend(
             (
                 [
@@ -10048,8 +12294,8 @@ class BotController:
             "steps": steps,
             "assumptions": [],
             "revision_reason": (
-                "Bind launch staging to source safety facts and live state; use "
-                "the Tos food adapter only when its room is already that staging point."
+                "Bind launch staging to source safety facts and live state. Food "
+                "acquisition and consumption remain planner-owned optional tactics."
             ),
         }
         return (
@@ -10078,25 +12324,23 @@ class BotController:
             return None
         launch_room = int(launch_origin["room_id"])
         readiness = self.learning.readiness_summary(observation)
-        supply = self._combat_vigor_supply(observation)
-        vigor = deep_get(
-            observation,
-            "status.vitals.vigor.value",
-            deep_get(observation, "look.vitals.vigor.value", 0),
-        )
-        try:
-            live_vigor = int(vigor or 0)
-        except (TypeError, ValueError):
-            return None
-        fight_vigor = FARM_FIGHT_VIGOR
-        prepared_vigor = max(live_vigor, RESTED_VIGOR_FLOOR)
-        nutrition_shortfall = max(
-            0,
-            fight_vigor
-            - prepared_vigor
-            - int(supply.get("vigor_points", 0) or 0),
-        )
-        can_make_food = int(supply.get("cookable_casts", 0) or 0) > 0
+
+        if (
+            readiness.get("equipment_state") == "known"
+            and not readiness.get("wielded_weapons")
+            and not readiness.get("carried_weapons")
+        ):
+            create_weapon = self._live_spell_readiness(
+                observation, "create weapon"
+            )
+            if (
+                not isinstance(create_weapon, dict)
+                or create_weapon.get("castable") is not True
+            ):
+                # The controller owns only a fully executable preparation chain.
+                # Let the tactical planner resolve the disclosed live blockers or
+                # ground another acquisition route before deterministic transit.
+                return None
 
         def action(
             tool: str,
@@ -10150,66 +12394,6 @@ class BotController:
                 "proposal": None,
                 "plan_step_id": step_id,
             }
-
-        if nutrition_shortfall > 0 and not can_make_food:
-            if launch_room != TOS_PROVISION_ROOM_ID:
-                # The deterministic adapter only knows this exact vendor/bank
-                # pair. Let the tactical planner locate supplies elsewhere;
-                # never turn one provider into a regional travel policy.
-                return None
-            quote = self._recent_farm_food_quote(goal)
-            if quote is None:
-                if str(current_room) != str(TOS_PROVISION_ROOM_ID):
-                    return action(
-                        "travel",
-                        {"to": TOS_PROVISION_ROOM_ID},
-                        "farm-provision-transit",
-                        "Reach the selected safe staging room to obtain a fresh quote from its verified provisioner.",
-                    )
-                seller = self._visible_tos_innkeeper(observation)
-                if seller is None:
-                    return None
-                return action(
-                    "shop",
-                    {"seller": seller},
-                    "buy-farm-food",
-                    "Read Paddock's live catalog before moving any money.",
-                )
-
-            cheese_needed = max(
-                1,
-                (nutrition_shortfall + TOS_CHEESE_VIGOR - 1)
-                // TOS_CHEESE_VIGOR,
-            )
-            required_funds = cheese_needed * int(quote["cost"])
-            carried = self._carried_currency(observation)
-            if carried < required_funds:
-                if str(current_room) != str(TOS_BANK_ROOM_ID):
-                    return action(
-                        "travel",
-                        {"to": TOS_BANK_ROOM_ID},
-                        "farm-bank-transit",
-                        "Reach the verified Tos bank to withdraw only the food shortfall.",
-                    )
-                return action(
-                    "bank",
-                    {"action": "withdraw", "amount": required_funds - carried},
-                    "withdraw-provision-funds",
-                    "Withdraw exactly the remaining live quoted food cost.",
-                )
-            if str(current_room) != str(TOS_PROVISION_ROOM_ID):
-                return action(
-                    "travel",
-                    {"to": TOS_PROVISION_ROOM_ID},
-                    "farm-provision-transit",
-                    "Return to the selected staging room's verified provisioner with the bounded funds.",
-                )
-            return action(
-                "shop",
-                {"seller": quote["seller"], "buy_ids": [quote["item_id"]]},
-                "buy-farm-food",
-                "Buy one verified wheel at a time until carried nutrition reaches the gate.",
-            )
 
         if str(current_room) != str(launch_room):
             return action(
@@ -10277,26 +12461,42 @@ class BotController:
         record whose sole evidence was a disproved wall can be safely inferred
         to describe the wall strategy, allowing an explicit open-field retry.
         """
-        recorded_target = str(quarantine.get("target") or "").strip().casefold()
-        requested_target = str(arguments.get("hunt") or "").strip().casefold()
-        if recorded_target and requested_target and recorded_target != requested_target:
-            return False
+        return farm_quarantine_matches(
+            quarantine,
+            room=arguments.get("assigned_room"),
+            target=arguments.get("hunt"),
+            use_safe_spots=arguments.get("use_safe_spots"),
+        )
 
-        recorded_safe_spots = quarantine.get("use_safe_spots")
-        if not isinstance(recorded_safe_spots, bool):
-            reasons = [
-                str(item).casefold()
-                for item in quarantine.get("reasons", [])
-                if item is not None
-            ]
-            if reasons and all("safe spot" in reason for reason in reasons):
-                recorded_safe_spots = True
-        requested_safe_spots = arguments.get("use_safe_spots")
-        if isinstance(recorded_safe_spots, bool) and isinstance(
-            requested_safe_spots, bool
-        ):
-            return recorded_safe_spots == requested_safe_spots
-        return True
+    @classmethod
+    def _matching_farm_quarantine(
+        cls, raw: Any, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the strongest retained disposition for one exact tactic."""
+
+        matching = [
+            record
+            for _key, record in farm_quarantine_entries(
+                raw, room=arguments.get("assigned_room")
+            )
+            if cls._farm_quarantine_matches(record, arguments)
+        ]
+        if not matching:
+            return None
+        priority = {
+            "room_hazard": 4,
+            "death": 3,
+            "survivability_failure": 2,
+            "safe_spot_failure": 1,
+            "open_field_failure": 1,
+        }
+        return max(
+            matching,
+            key=lambda record: (
+                priority.get(farm_quarantine_evidence_class(record), 0),
+                str(record.get("quarantined_at") or ""),
+            ),
+        )
 
     @staticmethod
     def _keeper_stall_is_persistent(status: dict[str, Any]) -> bool:
@@ -10327,7 +12527,16 @@ class BotController:
         return float(age) >= FARM_STALL_GRACE_SECONDS
 
     def _farm_stagnation_blocks(self, stagnation: dict[str, Any]) -> bool:
-        """Keep fresh/unsafe stalls blocked while allowing old proven farms a retry."""
+        """Block durable tactic outcomes and cool down ordinary inactivity.
+
+        Keeper assignment deferral is the terminal result of a bounded wall
+        search, not a momentary lack of activity.  Time passing cannot change
+        the room geometry that exhausted every candidate, so replaying the
+        exact room/prey assignment after the generic stagnation cooldown only
+        repeats the same search.  Keep that *tactic-scoped* result until an
+        explicit repair or positive evidence invalidates it; other death-free
+        stalls may still receive the normal bounded retry.
+        """
 
         placement = (
             stagnation.get("placement")
@@ -10355,6 +12564,9 @@ class BotController:
         # inactivity is different: rooms repopulate and transit conditions
         # change, so it receives a bounded cooldown instead of a quarantine.
         if last_error:
+            return True
+
+        if stagnation.get("kind") == "farm_assignment_deferred":
             return True
 
         deltas = stagnation.get("deltas")
@@ -10699,7 +12911,12 @@ class BotController:
         owner = self.storage.get_runtime("background_farm_owner_v1", {})
         owner = owner if isinstance(owner, dict) else {}
         intent = self._effective_farm_intent(goal)
-        expected = {**intent, "fight_above_vigor": FARM_FIGHT_VIGOR}
+        expected = {
+            **intent,
+            "fight_above_vigor": self._farm_fight_vigor(goal),
+            "eat_before_fighting": self._farm_eat_before_fighting(goal),
+            "buy_food": intent.get("buy_food") is True,
+        }
         actual = {
             "assigned_room": self._farm_assigned_room(status),
             "hunt": self._farm_target(status).strip().casefold(),
@@ -10708,6 +12925,16 @@ class BotController:
                 status,
                 "policy.fightAboveVigor",
                 deep_get(status, "policy.fight_above_vigor"),
+            ),
+            "eat_before_fighting": deep_get(
+                status,
+                "policy.eatBeforeFighting",
+                deep_get(status, "policy.eat_before_fighting"),
+            ),
+            "buy_food": deep_get(
+                status,
+                "policy.buyFood",
+                deep_get(status, "policy.buy_food"),
             ),
         }
         reasons: list[str] = []
@@ -10727,6 +12954,8 @@ class BotController:
             "hunt",
             "use_safe_spots",
             "fight_above_vigor",
+            "eat_before_fighting",
+            "buy_food",
         ):
             wanted = expected.get(field)
             if wanted is not None and str(actual.get(field)) != str(wanted):
@@ -11077,22 +13306,19 @@ class BotController:
             return None
 
         stopped = None
+        recovery = None
         if self._keeper_is_driving(status):
             # The broker can remain nominally running while retrying a graph
-            # route that it has already proved impossible. Yield movement and
-            # combat before retiring the phase so replacement work cannot race
-            # that loop.
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "the assigned farm route was authoritatively disproved",
-                },
-                timeout=20,
-                mutation=True,
-            )
+            # route that it has already proved impossible. Outside a verified
+            # sanctuary, retask that same keeper to survival in place before
+            # retiring the tactic. At safety, an ordinary inert stop is enough.
+            current_room = self._observation_room(observation)
+            if self._verified_safe_staging(current_room) is None:
+                recovery = self._ensure_survival_keeper()
+            else:
+                stopped = self._request_background_farm_stop(
+                    goal, "the assigned farm route was authoritatively disproved"
+                )
 
         assigned_room = failure["assigned_room"]
         target = str(failure["target"])
@@ -11174,9 +13400,12 @@ class BotController:
             f"background_farm_route_failure_handled_v1:{goal['id']}", True
         )
         self.storage.set_runtime("background_farm_owner_v1", {})
-        recovery = None
         health_fraction = self._vital_fraction(observation, "health")
-        if health_fraction is not None and health_fraction < 1.0:
+        if (
+            recovery is None
+            and health_fraction is not None
+            and health_fraction < 1.0
+        ):
             recovery = self._ensure_survival_keeper()
         self.storage.emit_event(
             "background_farm.route_failed",
@@ -11208,6 +13437,92 @@ class BotController:
             **deferred,
         }
 
+    @staticmethod
+    def _farm_assignment_deferral_evidence(
+        status: dict[str, Any],
+        *,
+        assigned_room: Any,
+        minimum_pass: int | None,
+    ) -> dict[str, Any] | None:
+        """Return launch-scoped proof that the keeper exhausted an assignment.
+
+        ``placement.assignment_deferred`` is a transition signal, not a durable
+        state: the keeper can clear it as soon as recovery or alternate-room
+        travel starts.  Its journal deliberately retains two typed records for
+        that transition.  Consume either record while it is still in the
+        compact tail, but only when its pass is at or beyond this farm launch;
+        otherwise a later launch could inherit stale exhaustion evidence.
+        """
+
+        placement = status.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
+        if placement.get("assignment_deferred") is True:
+            return {
+                "source": "placement",
+                "record": dict(placement),
+                "reason": str(
+                    placement.get("assignment_deferred_reason")
+                    or "the keeper exhausted its bounded placement search"
+                ).strip(),
+            }
+
+        if minimum_pass is None:
+            return None
+
+        markers = {
+            "room wall search exhausted",
+            "working an alternate room while the assignment is deferred",
+        }
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for source in ("journal", "recent"):
+            values = status.get(source)
+            if not isinstance(values, list):
+                continue
+            for value in values[-40:]:
+                if not isinstance(value, dict):
+                    continue
+                what = " ".join(str(value.get("what") or "").casefold().split())
+                if what not in markers:
+                    continue
+                record_pass = value.get("pass")
+                if (
+                    not isinstance(record_pass, (int, float))
+                    or isinstance(record_pass, bool)
+                    or int(record_pass) < minimum_pass
+                ):
+                    continue
+                record_room = value.get("assigned_room", value.get("room_num"))
+                if record_room is None or str(record_room) != str(assigned_room):
+                    continue
+                identity = canonical_json(value)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                reason = str(
+                    value.get("why_assignment_deferred")
+                    or value.get("why")
+                    or "the keeper exhausted its bounded placement search"
+                ).strip()
+                found.append(
+                    {
+                        "source": source,
+                        "record": dict(value),
+                        "reason": reason,
+                        "pass": int(record_pass),
+                        "at": value.get("at"),
+                    }
+                )
+        if not found:
+            return None
+        return max(
+            found,
+            key=lambda item: (
+                int(item.get("pass", 0) or 0),
+                float(item.get("at", 0) or 0),
+            ),
+        )
+
     def _handle_deferred_farm_assignment(
         self,
         goal: dict[str, Any],
@@ -11223,14 +13538,11 @@ class BotController:
         the campaign phase claiming ownership while the keeper relocates.
         """
 
-        placement = status.get("placement")
-        placement = placement if isinstance(placement, dict) else {}
-        if placement.get("assignment_deferred") is not True:
-            return None
-
         phase = self._active_keeper_combat_phase(goal)
         if phase is None:
             return None
+        placement = status.get("placement")
+        placement = placement if isinstance(placement, dict) else {}
         intent = self._campaign_phase_farm_intent(phase)
         assigned_room = placement.get("assigned_room") or intent.get(
             "assigned_room"
@@ -11239,28 +13551,46 @@ class BotController:
         if assigned_room is None or not target:
             return None
 
+        snapshot = self.storage.get_runtime(
+            f"background_farm_snapshot_v2:{goal['id']}", {}
+        )
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        pass_floor = snapshot.get("pass_floor")
+        pass_floor = (
+            int(pass_floor)
+            if isinstance(pass_floor, (int, float))
+            and not isinstance(pass_floor, bool)
+            else None
+        )
+        deferral_evidence = self._farm_assignment_deferral_evidence(
+            status,
+            assigned_room=assigned_room,
+            minimum_pass=pass_floor,
+        )
+        if deferral_evidence is None:
+            return None
+
         detail = str(
-            placement.get("assignment_deferred_reason")
+            deferral_evidence.get("reason")
             or "the keeper exhausted its bounded placement search"
         ).strip()
         reason = (
             f"Keeper deferred assigned_room={assigned_room} for hunt={target}: "
             f"{detail}"
         )
-        stopped = self.broker.call_tool(
-            "autopilot",
-            {
-                "agent": self.config.game.agent,
-                "action": "stop",
-                "hard": True,
-                "why": "the assigned farm room tactic was authoritatively exhausted",
-            },
-            timeout=20,
-            mutation=True,
-        )
+        current_room = self._observation_room(observation)
+        stopped = None
+        recovery = None
+        if self._keeper_is_driving(status):
+            if self._verified_safe_staging(current_room) is None:
+                recovery = self._ensure_survival_keeper()
+            else:
+                stopped = self._request_background_farm_stop(
+                    goal,
+                    "the assigned farm room tactic was authoritatively exhausted",
+                )
         self.storage.set_runtime("background_farm_owner_v1", {})
 
-        current_room = self._observation_room(observation)
         stagnations = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
         stagnations = dict(stagnations) if isinstance(stagnations, dict) else {}
         stagnation_key = f"{goal['id']}|{assigned_room}|{target}"
@@ -11277,8 +13607,11 @@ class BotController:
             "count": count,
             "recorded_at": timestamp(),
             "placement": redact(placement),
-            # Keep the typed bounded outcome on the normal tactic cooldown.
-            # ``last_error`` is reserved for durable keeper faults.
+            "deferral_evidence": redact(deferral_evidence),
+            # ``last_error`` is reserved for durable keeper faults.  The typed
+            # bounded outcome itself remains an exact-tactic gate until
+            # positive evidence or a targeted repair invalidates it; elapsed
+            # time cannot change exhausted room geometry.
             "last_error": "",
             "reason": detail,
             "guidance": (
@@ -11346,6 +13679,7 @@ class BotController:
                 "strategic_goal_preserved": True,
                 "goal_blocked": False,
                 "keeper_stop": redact(stopped),
+                "recovery": redact(recovery),
             },
         )
         return {
@@ -11355,6 +13689,7 @@ class BotController:
             "goal_blocked": False,
             "failure": stagnation,
             "keeper_stop": stopped,
+            "recovery": recovery,
             "completion": completion,
             **deferred,
         }
@@ -11520,6 +13855,52 @@ class BotController:
         self.storage.set_runtime("farm_tactic_retreat_incidents_v1", records)
         return record
 
+    def _renew_farm_progress_lease(
+        self,
+        goal: dict[str, Any],
+        *,
+        kill_delta: int,
+        cumulative_kills: int,
+    ) -> dict[str, Any] | None:
+        """Renew a long farm phase whenever the keeper verifies another kill."""
+
+        if kill_delta <= 0:
+            return None
+        phase = self._active_keeper_combat_phase(goal)
+        if not isinstance(phase, dict) or phase.get("kind") != "farm":
+            return None
+        leases = self.storage.get_runtime(
+            CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+        )
+        leases = dict(leases) if isinstance(leases, dict) else {}
+        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
+        downtime_seconds = 0.0
+        if (
+            isinstance(downtime, dict)
+            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
+        ):
+            try:
+                downtime_seconds = max(
+                    0.0, float(downtime.get("seconds", 0.0) or 0.0)
+                )
+            except (TypeError, ValueError):
+                downtime_seconds = 0.0
+        value = {
+            "goal_id": goal.get("id"),
+            "phase_id": phase.get("id"),
+            "renewed_at": timestamp(),
+            "progress_kind": "verified_keeper_kill",
+            "kill_delta": int(kill_delta),
+            "cumulative_kills": int(cumulative_kills),
+            "downtime_seconds": downtime_seconds,
+        }
+        leases[str(phase["id"])] = value
+        self.storage.set_runtime(
+            CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+            dict(list(leases.items())[-100:]),
+        )
+        return value
+
     @staticmethod
     def _farm_kill_records(
         status: dict[str, Any],
@@ -11644,6 +14025,11 @@ class BotController:
                 result={"disengaged": True, "target": target, "source": "keeper_status_delta"},
                 after=observation,
             )
+        progress_lease = self._renew_farm_progress_lease(
+            goal,
+            kill_delta=deltas["kills"],
+            cumulative_kills=counters["kills"],
+        )
 
         observed_safe_spot_failures = self._farm_safe_spot_failure_ids(
             status, minimum_pass=pass_floor
@@ -11720,10 +14106,6 @@ class BotController:
                       else ()),
                 ],
             )
-            if int(retreat_record.get("count", 0) or 0) >= FARM_RETREAT_QUARANTINE_COUNT:
-                quarantine_reasons.append(
-                    "repeated retreat episodes reached the farm tactic safety limit"
-                )
         last_death = status.get("last_death") if isinstance(status.get("last_death"), dict) else None
         death_at = str(last_death.get("at")) if last_death and last_death.get("at") is not None else None
         death_is_new = bool(
@@ -11738,8 +14120,9 @@ class BotController:
         # A wall being disproved is useful coordinate-local learning. The
         # keeper already retires that exact square and selects another one;
         # neither three failed squares nor low carried supplies prove the rest
-        # of the room unsafe. Health, repeated retreat, withdrawal, death, and
-        # live over-level-hostile boundaries above remain fail-closed signals.
+        # of the room unsafe. Routine health recovery and withdrawal cycles are
+        # likewise telemetry; death and live over-level-hostile boundaries are
+        # the fail-closed signals.
         if safe_spot_disproved and safe_spot_failure_count >= 3:
             tactic_warnings.append(
                 "multiple safe-spot coordinates were retired; the room remains eligible"
@@ -11748,7 +14131,22 @@ class BotController:
             tactic_warnings.append(
                 "the last healing supply was consumed; replenish before a later hazardous launch"
             )
-        risk_reasons.extend(recovery_reasons)
+        if at_assigned_room is False:
+            # Recovery before arrival is useful route evidence. Once at the
+            # assignment, the same rest/withdraw/resume cycle is ordinary work.
+            risk_reasons.extend(recovery_reasons)
+            if (
+                recovery_reasons
+                and isinstance(retreat_record, dict)
+                and int(retreat_record.get("count", 0) or 0) >= 2
+            ):
+                # Reaching safety twice without ever reaching the assignment
+                # disproves only this launch route. It does not condemn the
+                # destination room, quarry, strategic goal, or future combat
+                # sessions that successfully arrive there.
+                quarantine_reasons.append(
+                    "repeated pre-arrival recovery could not reach the assigned room by the current route"
+                )
         risk_reasons.extend(quarantine_reasons)
 
         snapshot = {
@@ -11786,6 +14184,7 @@ class BotController:
             ),
             "recovery_reasons": list(dict.fromkeys(recovery_reasons)),
             "quarantine_reasons": list(dict.fromkeys(quarantine_reasons)),
+            "progress_lease": redact(progress_lease),
         }
         self.storage.set_runtime(key, snapshot)
         if any(deltas.values()) or supplies_used or safe_spot_disproved or tactic_warnings:
@@ -11843,6 +14242,7 @@ class BotController:
                 if isinstance(retreat_record, dict)
                 else 0
             ),
+            "progress_lease": redact(progress_lease),
         }
 
     def _quarantine_farm_tactic(
@@ -11852,14 +14252,17 @@ class BotController:
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         room = evidence.get("room")
+        assigned_room = evidence.get("assigned_room")
+        target = evidence.get("target")
+        use_safe_spots = evidence.get("use_safe_spots")
         quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
         quarantines = dict(quarantines) if isinstance(quarantines, dict) else {}
         record = {
             "room": room,
-            "assigned_room": evidence.get("assigned_room"),
+            "assigned_room": assigned_room,
             "at_assigned_room": evidence.get("at_assigned_room"),
-            "target": evidence.get("target"),
-            "use_safe_spots": evidence.get("use_safe_spots"),
+            "target": target,
+            "use_safe_spots": use_safe_spots,
             "quarantined_at": timestamp(),
             "goal_id": goal["id"],
             "reasons": evidence.get("quarantine_reasons")
@@ -11875,10 +14278,118 @@ class BotController:
                 else "The retreat occurred during transit before the assigned room; do not label the target farm room unsafe. Recover and meet the keeper's vigor gate before another launch."
             ),
         }
-        if evidence.get("at_assigned_room") is True and evidence.get("assigned_room") is not None:
-            quarantines[str(evidence.get("assigned_room"))] = record
+        tactic_id = farm_tactic_key(assigned_room, target, use_safe_spots)
+        record["tactic_id"] = tactic_id
+        evidence_identity = farm_quarantine_evidence_identity(record)
+        record["evidence_class"] = evidence_identity["class"]
+        record["evidence_scope"] = evidence_identity["scope"]
+        record["evidence_fingerprint"] = json_hash(
+            {"tactic_id": tactic_id, "disposition": evidence_identity}
+        )
+        if evidence.get("at_assigned_room") is True and assigned_room is not None:
+            # Replace only the same controllable legacy tactic. A broad room
+            # hazard may match this request causally, but must not be erased by
+            # a newer, narrower failure in the same room.
+            for key, prior in farm_quarantine_entries(
+                quarantines, room=assigned_room
+            ):
+                if key.startswith("farm:"):
+                    continue
+                prior_strategy = prior.get("use_safe_spots")
+                if (
+                    not isinstance(prior_strategy, bool)
+                    and farm_quarantine_evidence_class(prior)
+                    == "safe_spot_failure"
+                ):
+                    prior_strategy = True
+                if farm_tactic_key(
+                    prior.get("assigned_room", prior.get("room")),
+                    prior.get("target"),
+                    prior_strategy,
+                ) == tactic_id:
+                    quarantines.pop(key, None)
+            quarantines[tactic_id] = record
             self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
         return record
+
+    @staticmethod
+    def _background_farm_stop_key(goal_id: str) -> str:
+        return f"background_farm_stop_pending_v1:{goal_id}"
+
+    def _request_background_farm_stop(
+        self, goal: dict[str, Any], reason: str
+    ) -> dict[str, Any]:
+        """Relinquish mutations while keeping the keeper's safety telemetry alive."""
+        result = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                # Ordinary phase/controller ownership changes must never turn
+                # off the watchdog while the game session remains live.  The
+                # upstream default is an inert keeper; a hard stop is reserved
+                # for process teardown after logout.
+                "hard": False,
+                "why": reason,
+            },
+            timeout=20,
+            mutation=True,
+        )
+        self.storage.set_runtime(
+            self._background_farm_stop_key(str(goal["id"])),
+            {
+                "requested_at": timestamp(),
+                "requested_at_epoch": time.time(),
+                "reason": reason,
+            },
+        )
+        return result if isinstance(result, dict) else {"result": redact(result)}
+
+    def _pending_background_farm_stop(
+        self,
+        goal: dict[str, Any],
+        status: dict[str, Any],
+        completion: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Hold ownership while one cooperative stop unwinds."""
+        key = self._background_farm_stop_key(str(goal["id"]))
+        pending = self.storage.get_runtime(key, {})
+        pending = pending if isinstance(pending, dict) else {}
+        if not pending:
+            return None
+        if status.get("running") is not True or self._keeper_is_inert(status):
+            self.storage.set_runtime(key, {})
+            return None
+
+        requested_at = pending.get("requested_at_epoch")
+        age = (
+            max(0.0, time.time() - float(requested_at))
+            if isinstance(requested_at, (int, float))
+            else 0.0
+        )
+        if age >= FARM_STOP_RETRY_SECONDS:
+            self.storage.set_runtime(key, {})
+            self.storage.emit_event(
+                "background_farm.stop_retry",
+                "Keeper did not finish a requested stop within the retry window",
+                severity="warning",
+                interesting=True,
+                goal_id=goal["id"],
+                data={
+                    "age_seconds": round(age, 1),
+                    "reason": pending.get("reason"),
+                    "activity": status.get("activity"),
+                },
+            )
+            return None
+        return {
+            "background_farm_stopping": True,
+            "already_requested": True,
+            "reason": pending.get("reason"),
+            "age_seconds": round(age, 1),
+            "activity": status.get("activity"),
+            "completion": completion,
+        }
 
     def _manage_background_farm(
         self,
@@ -11911,12 +14422,36 @@ class BotController:
         )
         if route_failure is not None:
             return route_failure
+        pending_stop = self._pending_background_farm_stop(
+            goal, status, completion
+        )
+        if pending_stop is not None:
+            return pending_stop
+        current_room = self._observation_room(observation)
+        outside_safety = self._verified_safe_staging(current_room) is None
         # Upstream now implements ordinary stop as an inert telemetry loop.
-        # Once route diagnosis has had its chance, it is safe for foreground or
-        # campaign work to proceed and must not be stopped again forever.
+        # Inert telemetry is not a safety owner. Outside a sanctuary revive it
+        # as survival before returning; at safety foreground/campaign work may
+        # proceed without repeatedly stopping the observer loop.
         if self._keeper_is_inert(status):
+            if outside_safety and self._safety_enforcement_active:
+                restored = self._ensure_survival_keeper()
+                return {
+                    "background_survival_restored": True,
+                    "reason": "keeper was inert outside a verified safe room",
+                    "result": redact(restored),
+                    "completion": completion,
+                }
             return None
         if status.get("running") is not True:
+            if outside_safety and self._safety_enforcement_active:
+                restored = self._ensure_survival_keeper()
+                return {
+                    "background_survival_restored": True,
+                    "reason": "keeper was stopped outside a verified safe room",
+                    "result": redact(restored),
+                    "completion": completion,
+                }
             return None
 
         keeper_mode = str(status.get("mode") or "unknown")
@@ -11929,10 +14464,9 @@ class BotController:
             # until a later status call proves the loop has exited.
             health_fraction = self._vital_fraction(observation, "health")
             activity = str(status.get("activity") or "").strip().casefold()
-            current_room = self._observation_room(observation)
             safe_ending_pending = bool(
                 force_stop_reason
-                and self._verified_safe_staging(current_room) is None
+                and outside_safety
             )
             quiescent = activity in {
                 "",
@@ -11947,9 +14481,11 @@ class BotController:
             # no destination telling it which sanctuary the verified plan
             # selected.  Waiting merely because that safe ending is pending
             # therefore deadlocks ownership forever once health is full.  Let
-            # it retain the character while recovery is genuinely unfinished;
-            # at full health stop it even outside town so the foreground
-            # controller can execute the already-verified travel step.
+            # it retain the character while recovery is genuinely unfinished.
+            # Once recovered, planning may proceed while the keeper continues
+            # to protect the character; the foreground action wrapper performs
+            # the atomic stop/action/restore handoff only after a concrete tool
+            # is ready to execute.
             if (
                 keeper_mode == "survive"
                 and health_fraction is not None
@@ -11966,16 +14502,24 @@ class BotController:
                     "safe_ending_pending": safe_ending_pending,
                     "completion": completion,
                 }
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "foreground campaign work is taking permanent ownership",
-                },
-                timeout=20,
-                mutation=True,
+            if outside_safety:
+                if keeper_mode != "survive":
+                    restored = self._ensure_survival_keeper()
+                    return {
+                        "background_survival_restored": True,
+                        "reason": (
+                            f"keeper mode {keeper_mode!r} did not own survival "
+                            "outside a verified safe room"
+                        ),
+                        "result": redact(restored),
+                        "completion": completion,
+                    }
+                # Full-health survival mode remains the safety owner during
+                # model inference and validation. Do not return a synthetic
+                # stop boundary here; allow this same turn to select work.
+                return None
+            stopped = self._request_background_farm_stop(
+                goal, "foreground campaign work is taking permanent ownership"
             )
             self.storage.set_runtime("background_farm_owner_v1", {})
             return {
@@ -11987,8 +14531,7 @@ class BotController:
             }
 
         if force_stop_reason:
-            current_room = self._observation_room(observation)
-            if self._verified_safe_staging(current_room) is None:
+            if outside_safety:
                 switched = self._ensure_survival_keeper()
                 self.storage.set_runtime("background_farm_owner_v1", {})
                 self.storage.emit_event(
@@ -12009,17 +14552,7 @@ class BotController:
                     "result": redact(switched),
                     "completion": completion,
                 }
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": force_stop_reason,
-                },
-                timeout=20,
-                mutation=True,
-            )
+            stopped = self._request_background_farm_stop(goal, force_stop_reason)
             self.storage.set_runtime("background_farm_owner_v1", {})
             return {
                 "background_farm_stopping": True,
@@ -12031,32 +14564,41 @@ class BotController:
 
         mismatch = self._background_farm_mismatch(goal, status)
         if mismatch:
-            stopped = self.broker.call_tool(
-                "autopilot",
-                {
-                    "agent": self.config.game.agent,
-                    "action": "stop",
-                    "hard": True,
-                    "why": "the running farm does not match the active durable goal",
-                },
-                timeout=20,
-                mutation=True,
+            stopped = (
+                self._ensure_survival_keeper()
+                if outside_safety
+                else self._request_background_farm_stop(
+                    goal, "the running farm does not match the active durable goal"
+                )
             )
             self.storage.set_runtime("background_farm_owner_v1", {})
             self._set_planner_feedback(
                 goal,
-                "A stale background farm from another goal was stopped. Wait for the keeper to finish its current pass, then launch only the hunt and assigned_room named by this goal.",
+                (
+                    "A stale background farm from another goal was handed to survival "
+                    "without releasing safety ownership. Plan the corrected tactic while "
+                    "that keeper protects the character."
+                    if outside_safety
+                    else "A stale background farm from another goal was stopped. Wait "
+                    "for the keeper to finish its current pass, then launch only the "
+                    "hunt and assigned_room named by this goal."
+                ),
             )
             self.storage.emit_event(
                 "background_farm.owner_mismatch",
-                "Stopped a background farm whose goal or tactic did not match the active goal",
+                (
+                    "Retasked a stale background farm to survival without an ownership gap"
+                    if outside_safety
+                    else "Stopped a background farm whose goal or tactic did not match the active goal"
+                ),
                 severity="warning",
                 interesting=True,
                 goal_id=goal["id"],
                 data={**mismatch, "result": redact(stopped)},
             )
             return {
-                "background_farm_stale_stopped": True,
+                "background_farm_stale_stopped": not outside_safety,
+                "background_farm_stale_survival_handoff": outside_safety,
                 "mismatch": mismatch,
                 "completion": completion,
             }
@@ -12119,8 +14661,9 @@ class BotController:
                         "retreat_incident_count": evidence.get(
                             "retreat_incident_count"
                         ),
-                        "quarantine_after": FARM_RETREAT_QUARANTINE_COUNT,
                         "window_seconds": FARM_RETREAT_INCIDENT_WINDOW_SECONDS,
+                        "classification": "ordinary_recovery_telemetry",
+                        "quarantine_from_repetition": False,
                     },
                 )
             return {
@@ -12139,6 +14682,7 @@ class BotController:
             active_keeper_phase is not None
             and self._phase_completion_checkpoint(active_keeper_phase) is None
             and self._phase_exhaustion_checkpoint(active_keeper_phase) is None
+            and self._phase_abandonment_checkpoint(active_keeper_phase) is None
         )
         unhealthy = self._keeper_stall_is_persistent(status)
         if (unmet_health or phase_work_remains) and not unhealthy:
@@ -12176,27 +14720,17 @@ class BotController:
         # A stalled or errored keeper is also released so the planner can repair
         # the tactic on the following turn. Returning here prevents a foreground
         # mutation from racing the keeper during the same controller turn.
-        stopped = self.broker.call_tool(
-            "autopilot",
-            {
-                "agent": self.config.game.agent,
-                "action": "stop",
-                "hard": True,
-                "why": (
-                    "background keeper stalled or errored"
-                    if unhealthy
-                    else "bounded keeper-combat target reached"
-                ),
-            },
-            timeout=20,
-            mutation=True,
-        )
-        self.storage.set_runtime("background_farm_owner_v1", {})
         reason = (
             "background keeper stalled or errored"
             if unhealthy
             else "bounded keeper-combat target reached"
         )
+        stopped = (
+            self._ensure_survival_keeper()
+            if outside_safety
+            else self._request_background_farm_stop(goal, reason)
+        )
+        self.storage.set_runtime("background_farm_owner_v1", {})
         if unhealthy:
             room = self._farm_room(status, observation)
             assigned_room = self._farm_assigned_room(status)
@@ -12265,7 +14799,12 @@ class BotController:
         self._set_planner_feedback(
             goal,
             (
-                f"The farming keeper was stopped because {reason}. "
+                (
+                    f"The farming keeper was retasked to survival because {reason}; "
+                    "safety ownership remains continuous. "
+                    if outside_safety
+                    else f"The farming keeper was stopped because {reason}. "
+                )
                 + (
                     "On the next turn query hunting_grounds once and launch the same bounded phase "
                     "in a different grounded, non-quarantined room; do not restart the stalled "
@@ -12277,8 +14816,16 @@ class BotController:
             ),
         )
         self.storage.emit_event(
-            "background_farm.stopped",
-            f"Stopped background farming keeper: {reason}",
+            (
+                "background_farm.survival_handoff"
+                if outside_safety
+                else "background_farm.stopped"
+            ),
+            (
+                f"Retasked background farm to survival without releasing ownership: {reason}"
+                if outside_safety
+                else f"Stopped background farming keeper: {reason}"
+            ),
             severity="warning" if unhealthy else "info",
             interesting=unhealthy,
             goal_id=goal["id"],
@@ -12291,7 +14838,8 @@ class BotController:
             },
         )
         return {
-            "background_farm_stopped": True,
+            "background_farm_stopped": not outside_safety,
+            "background_farm_survival_handoff": outside_safety,
             "reason": reason,
             "completion": completion,
         }
@@ -12320,14 +14868,51 @@ class BotController:
             active_keeper_phase is not None
             and self._background_farm_mismatch(goal, status) is None
         )
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(
+            active_keeper_phase
+        )
+        if abandonment_checkpoint is not None and matching_active_phase:
+            # The phase outcome is already decided, but terminal state must not
+            # revoke the only loop capable of withdrawing the character. Retask
+            # that same keeper in place; do not stop it, clear ownership, create
+            # a lesson, or pause the goal until sanctuary is verified.
+            switched = self._ensure_survival_keeper()
+            self.storage.emit_event(
+                "background_farm.abandonment_recovery_handoff",
+                "Abandoned farm retained continuous keeper ownership for recovery",
+                severity="warning",
+                interesting=True,
+                goal_id=goal["id"],
+                data={
+                    "phase_id": active_keeper_phase.get("id"),
+                    "room": evidence.get("room"),
+                    "health_fraction": evidence.get("health_fraction"),
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        abandonment_checkpoint.get("safe_ending")
+                    ),
+                    "result": redact(switched),
+                    "terminal_deferred": True,
+                    "ownership_preserved": True,
+                },
+            )
+            return {
+                "abandonment_recovery_handoff": True,
+                "switched_to_survival": True,
+                "campaign_phase_failed": None,
+                "strategic_goal_preserved": True,
+                "ownership_preserved": True,
+                "checkpoint": redact(abandonment_checkpoint),
+                "result": redact(switched),
+            }
         if not evidence.get("quarantine_reasons") and matching_active_phase:
             # The farm keeper already owns flee, withdrawal, and recovery. A
             # global critical-health advisory can observe the same health dip
             # one turn earlier than the farm supervisor, but that timing does
             # not turn a first recoverable incident into proof that the room
             # or phase failed. Keep the bounded phase and keeper recipe intact;
-            # repeated retreats, a death, or another precise quarantine reason
-            # will still take the terminal handoff below.
+            # a death or another precise structural quarantine reason will
+            # still take the terminal handoff below.
             self.storage.emit_event(
                 "background_farm.critical_recovery_monitored",
                 "Critical health remained under the active farm keeper's recovery control",
@@ -12754,6 +15339,59 @@ class BotController:
             },
         )
 
+    def _repair_persisted_phase_tactic_preferences(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Remove legacy model-authored exclusions from an active phase.
+
+        New manager decisions are normalized before persistence, but a live
+        deployment may inherit an active phase written by an older controller.
+        Room and target exclusions are evidence, not planning preferences, and
+        therefore belong to controller-owned route lessons, farm tactic
+        quarantines, and scorecards. Keep the model's proposal only as an audit
+        note and force a fresh execution plan against the repaired contract.
+        """
+
+        if not isinstance(phase, dict):
+            return phase
+        raw_context = phase.get("context")
+        if not isinstance(raw_context, dict) or not any(
+            field in raw_context for field in ("avoid_rooms", "avoid_targets")
+        ):
+            return phase
+
+        context = dict(raw_context)
+        proposed: dict[str, Any] = {}
+        for field in ("avoid_rooms", "avoid_targets"):
+            value = context.pop(field, None)
+            if value not in (None, []):
+                proposed[field] = redact(value)
+        if proposed:
+            existing = context.get("ignored_unverified_tactic_preferences")
+            audit = dict(existing) if isinstance(existing, dict) else {}
+            audit.update(proposed)
+            context["ignored_unverified_tactic_preferences"] = audit
+
+        repaired = self.storage.update_campaign_phase_guardrails(
+            str(phase["id"]),
+            abandon_predicates=list(phase.get("abandon_predicates", [])),
+            context=context,
+            reason=(
+                "discarded legacy model-authored room and target exclusions; "
+                "negative tactic evidence is controller-owned"
+            ),
+        )
+        self._invalidate_execution_plan(
+            goal,
+            (
+                "active phase contained legacy model-authored room or target "
+                "exclusions without controller evidence"
+            ),
+        )
+        return repaired
+
     def _campaign_turn_state(
         self,
         goal: dict[str, Any],
@@ -12762,6 +15400,7 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         """Reconcile the durable internal phase and select one when needed."""
         run, phase = self.campaign.ensure(goal)
+        phase = self._repair_persisted_phase_tactic_preferences(goal, phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if outcome.completed or outcome.failed:
             handoff = (
@@ -12877,6 +15516,9 @@ class BotController:
                 progression_context=progression,
                 persona=self.storage.persona(),
             )
+            decision = self._normalize_research_support_skill_phase(
+                decision, observation, retry_gate
+            )
             validation_error = self._campaign_manager_decision_error(
                 run,
                 goal,
@@ -12896,7 +15538,10 @@ class BotController:
                         "instruction": (
                             "Return one corrected decision. For phase_action_succeeded, copy only "
                             "exact tool names from phase_capabilities for the selected phase kind; "
-                            "context property names are facts, not tools."
+                            "context property names are facts, not tools. When research_retry.allowed "
+                            "is false, do not repeat research_progression: choose an observable phase "
+                            "outcome that changes one listed retry predicate. Reading unchanged "
+                            "equipment or abilities is evidence collection, not progress."
                         ),
                     },
                 }
@@ -12920,6 +15565,9 @@ class BotController:
                     financial_context=financial,
                     progression_context=progression,
                     persona=self.storage.persona(),
+                )
+                decision = self._normalize_research_support_skill_phase(
+                    decision, observation, retry_gate
                 )
             self.dependencies["model"] = "healthy"
         else:
@@ -12992,7 +15640,11 @@ class BotController:
                 data={"decision": redact(decision), "strategic_goal_preserved": True},
             )
             fallback_phase = (
-                self._research_exhaustion_support_phase(goal, retry_gate)
+                self._research_exhaustion_support_phase(
+                    goal,
+                    retry_gate,
+                    self._research_retry_state(goal, observation),
+                )
                 if retry_gate.get("allowed") is False
                 else self.campaign.fallback_phase(goal, observation)
             )
@@ -13061,44 +15713,36 @@ class BotController:
         return None
 
     def _recent_research_avoid_rooms(self, run: dict[str, Any]) -> set[str]:
-        """Return soft room-diversity hints from the newest research phase."""
+        """Return controller-owned room-wide exclusions.
 
-        run_id = run.get("id") if isinstance(run, dict) else None
-        if not run_id:
-            return set()
-        for prior in reversed(self.storage.campaign_phases(str(run_id))):
-            if prior.get("kind") != "research_progression":
-                continue
-            context = prior.get("context")
-            context = context if isinstance(context, dict) else {}
-            values = context.get("avoid_rooms")
-            if not isinstance(values, list):
-                continue
-            return {
-                str(value)
-                for value in values
-                if isinstance(value, (int, str)) and str(value).strip()
-            }
+        No current negative evidence has room-wide semantics: route lessons are
+        exact origin/destination tactics and farm quarantines are exact
+        room/prey/strategy combinations. Older phases persisted model-authored
+        ``avoid_rooms`` lists, but replaying those opinions as evidence made one
+        unrelated safe-return failure poison productive hunting rooms.
+        """
+
         return set()
 
     def _recent_successful_farm_tactics(
         self, run: dict[str, Any]
-    ) -> dict[tuple[str, str], int]:
-        """Return successful room/prey pairs ranked newest first."""
+    ) -> dict[tuple[str, str, bool], int]:
+        """Return successful exact farm tactics ranked newest first."""
 
         run_id = run.get("id") if isinstance(run, dict) else None
         if not run_id:
             return {}
-        ranked: dict[tuple[str, str], int] = {}
+        ranked: dict[tuple[str, str, bool], int] = {}
         for prior in reversed(self.storage.campaign_phases(str(run_id))):
             if prior.get("kind") != "farm" or prior.get("status") != "succeeded":
                 continue
             intent = self._campaign_phase_farm_intent(prior)
             room = intent.get("assigned_room")
-            target = normalize(str(intent.get("hunt") or ""))
-            if room is None or not target:
+            target = normalize_farm_target(intent.get("hunt"))
+            use_safe_spots = intent.get("use_safe_spots")
+            if room is None or not target or not isinstance(use_safe_spots, bool):
                 continue
-            key = (str(room), target)
+            key = (str(room), target, use_safe_spots)
             if key not in ranked:
                 ranked[key] = len(ranked)
         return ranked
@@ -13114,6 +15758,14 @@ class BotController:
         remaining = dict(values)
         remaining.pop(goal_id, None)
         self.storage.set_runtime(RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, remaining)
+        run = self.storage.campaign_run(goal_id)
+        blocker = run.get("external_blocker") if isinstance(run, dict) else None
+        if (
+            isinstance(run, dict)
+            and isinstance(blocker, dict)
+            and blocker.get("kind") == "no_usable_farm_recipe"
+        ):
+            self.storage.clear_campaign_external_blocker(str(run["id"]))
 
     def _research_retry_state(
         self, goal: dict[str, Any], observation: dict[str, Any]
@@ -13224,13 +15876,18 @@ class BotController:
         quarantine_gates = sorted(
             [
                 {
-                    "key": str(key),
+                    "tactic_id": item.get("tactic_id")
+                    or farm_tactic_key(
+                        item.get("room", item.get("assigned_room")),
+                        item.get("target"),
+                        item.get("use_safe_spots"),
+                    ),
                     "room": item.get("room", item.get("assigned_room")),
-                    "target": normalize(str(item.get("target") or "")),
+                    "target": normalize_farm_target(item.get("target")),
                     "use_safe_spots": item.get("use_safe_spots"),
+                    "disposition": farm_quarantine_evidence_identity(item),
                 }
-                for key, item in quarantines.items()
-                if isinstance(item, dict)
+                for _key, item in farm_quarantine_entries(quarantines)
             ],
             key=canonical_json,
         )
@@ -13312,17 +15969,18 @@ class BotController:
         prior_equipment = prior_equipment if isinstance(prior_equipment, dict) else {}
         current_equipment = current.get("equipment")
         current_equipment = current_equipment if isinstance(current_equipment, dict) else {}
-        for key in ("equipped", "wielding"):
-            prior_values = {
-                canonical_json(item)
-                for item in prior_equipment.get(key, [])
-            } if isinstance(prior_equipment.get(key), list) else set()
-            current_values = {
-                canonical_json(item)
-                for item in current_equipment.get(key, [])
-            } if isinstance(current_equipment.get(key), list) else set()
-            if current_values - prior_values:
-                changes.append(f"equipment_{key}_added")
+        prior_wielding = {
+            normalize(str(item))
+            for item in prior_equipment.get("wielding", [])
+            if str(item).strip()
+        } if isinstance(prior_equipment.get("wielding"), list) else set()
+        current_wielding = {
+            normalize(str(item))
+            for item in current_equipment.get("wielding", [])
+            if str(item).strip()
+        } if isinstance(current_equipment.get("wielding"), list) else set()
+        if current_wielding and current_wielding != prior_wielding:
+            changes.append("equipment_wielding_added")
 
         for kind in ("skills", "spells"):
             prior_rows = deep_get(previous, f"abilities.{kind}", [])
@@ -13353,23 +16011,85 @@ class BotController:
             str(item.get("name") or ""): item
             for item in prior_items if isinstance(item, dict) and item.get("name")
         }
+        def category_names(
+            state_equipment: dict[str, Any],
+            state_items: list[dict[str, Any]],
+            words: tuple[str, ...],
+            *,
+            include_wielding: bool = False,
+        ) -> set[str]:
+            names = {
+                str(item.get("name") or "")
+                for item in state_items
+                if isinstance(item, dict)
+                and item.get("name")
+                and any(word in str(item.get("name") or "") for word in words)
+            }
+            equipped_rows = state_equipment.get("equipped", [])
+            names.update(
+                str(item.get("name") or "")
+                for item in (equipped_rows if isinstance(equipped_rows, list) else [])
+                if isinstance(item, dict)
+                and item.get("name")
+                and any(word in str(item.get("name") or "") for word in words)
+            )
+            if include_wielding:
+                names.update(
+                    normalize(str(item))
+                    for item in state_equipment.get("wielding", [])
+                    if str(item).strip()
+                )
+            return names
+
+        for category, words, include_wielding in (
+            ("weapon", WEAPON_WORDS, True),
+            ("armor", ARMOR_WORDS, False),
+        ):
+            prior_names = category_names(
+                prior_equipment, prior_items, words, include_wielding=include_wielding
+            )
+            current_names = category_names(
+                current_equipment, current_items, words, include_wielding=include_wielding
+            )
+            # The first usable item in a missing category is a capability
+            # change. An unverified duplicate is not evidence of improvement.
+            if not prior_names and current_names:
+                changes.append(f"first_{category}_available")
+
         for item in current_items:
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             name = str(item["name"])
             prior = prior_by_name.get(name)
+            is_supply = any(
+                word in name
+                for word in (*HEALING_SUPPLY_WORDS, "potion", "cheese", "food")
+            )
             if prior is None:
-                changes.append("capability_inventory_added")
-                break
+                if is_supply:
+                    changes.append("capability_supplies_added")
+                    break
+                continue
             try:
                 prior_amount = float(prior.get("amount", 1) or 0)
                 current_amount = float(item.get("amount", 1) or 0)
             except (TypeError, ValueError):
                 prior_amount = current_amount = 0
-            if current_amount > prior_amount or any(
-                prior.get(key) != item.get(key) for key in ("condition", "quality", "equipped")
+            equipment_item = any(
+                word in name for word in (*WEAPON_WORDS, *ARMOR_WORDS)
+            )
+            if (is_supply and current_amount > prior_amount) or (
+                equipment_item
+                and any(
+                    prior.get(key) != item.get(key)
+                    for key in ("condition", "quality", "equipped")
+                )
             ):
-                changes.append("capability_inventory_improved")
+                changes.append(
+                    "capability_supplies_improved"
+                    if is_supply
+                    else "equipment_item_improved"
+                )
                 break
 
         if previous.get("knowledge_corpus_version") != current.get(
@@ -13381,18 +16101,28 @@ class BotController:
         prior_negative = prior_negative if isinstance(prior_negative, dict) else {}
         current_negative = current.get("negative_gates")
         current_negative = current_negative if isinstance(current_negative, dict) else {}
-        prior_gates = {
-            canonical_json(item)
-            for group in prior_negative.values()
-            if isinstance(group, list)
-            for item in group
-        }
-        current_gates = {
-            canonical_json(item)
-            for group in current_negative.values()
-            if isinstance(group, list)
-            for item in group
-        }
+        def gate_ids(values: dict[str, Any]) -> set[str]:
+            found: set[str] = set()
+            for group_name, group in values.items():
+                if not isinstance(group, list):
+                    continue
+                for item in group:
+                    if not isinstance(item, dict):
+                        found.add(f"{group_name}:{canonical_json(item)}")
+                        continue
+                    if group_name == "quarantines":
+                        identity = item.get("tactic_id") or farm_tactic_key(
+                            item.get("room"),
+                            item.get("target"),
+                            item.get("use_safe_spots"),
+                        )
+                    else:
+                        identity = item.get("key") or item.get("id") or canonical_json(item)
+                    found.add(f"{group_name}:{identity}")
+            return found
+
+        prior_gates = gate_ids(prior_negative)
+        current_gates = gate_ids(current_negative)
         if prior_gates - current_gates:
             changes.append("blocking_evidence_removed")
         return list(dict.fromkeys(changes))
@@ -13576,21 +16306,23 @@ class BotController:
 
     @staticmethod
     def _research_exhaustion_support_phase(
-        goal: dict[str, Any], retry_gate: dict[str, Any]
+        goal: dict[str, Any],
+        retry_gate: dict[str, Any],
+        retry_state: dict[str, Any],
     ) -> dict[str, Any]:
         """Safe non-research fallback after an invalid repeated lookup choice."""
 
         return {
             "kind": "prepare_combat",
             "objective": (
-                "Assess current combat capabilities and apply the best available equipment before "
-                "reconsidering exhausted progression research."
+                "Make a material capability or world-evidence improvement that can reopen exhausted "
+                "progression research. Reading unchanged equipment or abilities does not complete "
+                "this phase."
             ),
             "success_criteria": [
                 {
-                    "id": "capability-assessment-succeeded",
-                    "kind": "phase_action_succeeded",
-                    "tools": ["equipment", "abilities", "equip_best", "wear_best"],
+                    "id": "material-research-retry-unlocked",
+                    "kind": RESEARCH_RETRY_UNLOCKED,
                 }
             ],
             "abandon_predicates": [],
@@ -13598,12 +16330,223 @@ class BotController:
             "context": {
                 "research_exhaustion_support": True,
                 "candidate_fingerprint": retry_gate.get("candidate_fingerprint"),
+                "retry_state_baseline": retry_state,
+                "retry_state_fingerprint": json_hash(retry_state),
                 "retry_requires": retry_gate.get("retry_requires", []),
             },
             "rationale": (
-                "An unchanged progression lookup is deterministically closed. Inspect and improve "
-                "combat capability instead of submitting the same research phase again."
+                "An unchanged progression lookup is deterministically closed. Produce a measurable "
+                "equipment, ability, inventory, route, quarantine, max-health, or knowledge-corpus "
+                "change before research can run again."
             ),
+        }
+
+    def _normalize_research_support_skill_phase(
+        self,
+        decision: Any,
+        observation: dict[str, Any],
+        retry_gate: dict[str, Any],
+    ) -> Any:
+        """Require a material existing-skill gain from research support.
+
+        This policy is deliberately scoped to a manager-selected support phase
+        while unchanged progression research is closed. It does not rewrite an
+        operator's explicit skill goal or an ordinary training campaign. The
+        model still chooses the skill and training tactic; deterministic code
+        only raises an undersized milestone to the minimum useful gain and
+        respects Meridian's hard ability cap.
+        """
+
+        if retry_gate.get("allowed") is not False or not isinstance(decision, dict):
+            return decision
+        phase = decision.get("phase")
+        if not isinstance(phase, dict) or phase.get("kind") != "train_ability":
+            return decision
+        observed = self._observed_ability_values(observation)
+        if not isinstance(observed, dict):
+            return decision
+
+        normalized_phase = dict(phase)
+        changes: list[dict[str, Any]] = []
+
+        raw_targets = phase.get("targets")
+        if isinstance(raw_targets, list):
+            targets = [dict(item) if isinstance(item, dict) else item for item in raw_targets]
+            for target in targets:
+                if (
+                    not isinstance(target, dict)
+                    or target.get("type") != "ability_at_least"
+                    or str(target.get("ability_kind") or "").casefold() != "skill"
+                ):
+                    continue
+                name = " ".join(str(target.get("name") or "").split())
+                current = observed.get(f"skill:{name.casefold()}")
+                if not isinstance(current, dict):
+                    continue
+                try:
+                    baseline = int(current["ability"])
+                    requested = int(target.get("value"))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if baseline >= ABILITY_VALUE_CAP:
+                    continue
+                required = min(
+                    ABILITY_VALUE_CAP,
+                    baseline + RESEARCH_SUPPORT_SKILL_GAIN,
+                )
+                normalized = min(ABILITY_VALUE_CAP, max(requested, required))
+                target["value"] = normalized
+                changes.append(
+                    {
+                        "kind": "skill",
+                        "name": str(current.get("name") or name),
+                        "baseline": baseline,
+                        "requested_target": requested,
+                        "normalized_target": normalized,
+                        "minimum_gain": min(
+                            RESEARCH_SUPPORT_SKILL_GAIN,
+                            ABILITY_VALUE_CAP - baseline,
+                        ),
+                        "cap": ABILITY_VALUE_CAP,
+                    }
+                )
+            normalized_phase["targets"] = targets
+        else:
+            raw_criteria = phase.get("success_criteria")
+            if isinstance(raw_criteria, list):
+                criteria = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in raw_criteria
+                ]
+                for criterion in criteria:
+                    if (
+                        not isinstance(criterion, dict)
+                        or criterion.get("kind") != "numeric_threshold"
+                        or str(criterion.get("operator") or "") != ">="
+                    ):
+                        continue
+                    parsed = parse_ability_metric(criterion.get("metric"))
+                    if parsed is None or parsed[0] != "skill":
+                        continue
+                    name = parsed[1]
+                    current = observed.get(f"skill:{name.casefold()}")
+                    if not isinstance(current, dict):
+                        continue
+                    try:
+                        baseline = int(current["ability"])
+                        requested = int(criterion.get("value"))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if baseline >= ABILITY_VALUE_CAP:
+                        continue
+                    required = min(
+                        ABILITY_VALUE_CAP,
+                        baseline + RESEARCH_SUPPORT_SKILL_GAIN,
+                    )
+                    normalized = min(ABILITY_VALUE_CAP, max(requested, required))
+                    criterion["value"] = normalized
+                    changes.append(
+                        {
+                            "kind": "skill",
+                            "name": str(current.get("name") or name),
+                            "baseline": baseline,
+                            "requested_target": requested,
+                            "normalized_target": normalized,
+                            "minimum_gain": min(
+                                RESEARCH_SUPPORT_SKILL_GAIN,
+                                ABILITY_VALUE_CAP - baseline,
+                            ),
+                            "cap": ABILITY_VALUE_CAP,
+                        }
+                    )
+                normalized_phase["success_criteria"] = criteria
+
+        if not changes:
+            return decision
+        context = (
+            dict(normalized_phase.get("context"))
+            if isinstance(normalized_phase.get("context"), dict)
+            else {}
+        )
+        context["research_support_skill_policy"] = changes
+        normalized_phase["context"] = context
+        if len(changes) == 1:
+            change = changes[0]
+            normalized_phase["objective"] = (
+                f"Raise {change['name']} from {change['baseline']} to at least "
+                f"{change['normalized_target']} as a material capability improvement "
+                "that reopens progression research."
+            )
+        return {**decision, "phase": normalized_phase}
+
+    def _research_exhaustion_support_completion(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Verify a support phase only from a material research-retry delta."""
+
+        context = phase.get("context")
+        if (
+            not isinstance(context, dict)
+            or context.get("research_exhaustion_support") is not True
+        ):
+            return None
+        baseline = context.get("retry_state_baseline")
+        if not isinstance(baseline, dict):
+            retained = self.storage.get_runtime(
+                RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
+            )
+            record = (
+                retained.get(str(goal.get("id") or ""))
+                if isinstance(retained, dict)
+                else None
+            )
+            baseline = (
+                record.get("retry_state") if isinstance(record, dict) else None
+            )
+        current = self._research_retry_state(goal, observation)
+        enabling_changes = (
+            self._research_retry_enabling_changes(baseline, current)
+            if isinstance(baseline, dict)
+            else []
+        )
+        met = bool(enabling_changes)
+        return {
+            "percent_estimate": 100 if met else 0,
+            "summary": (
+                "1 of 1 criteria verified"
+                if met
+                else "0 of 1 criteria verified"
+            ),
+            "evidence_event_ids": [],
+            "criteria": [
+                {
+                    "id": "material-research-retry-unlocked",
+                    "kind": RESEARCH_RETRY_UNLOCKED,
+                    "met": met,
+                    "detail": (
+                        "material retry state changed: "
+                        + ", ".join(enabling_changes)
+                        if met
+                        else (
+                            "unchanged equipment/ability observations cannot reopen "
+                            "research; awaiting one of: "
+                            + ", ".join(
+                                str(item)
+                                for item in context.get("retry_requires", [])
+                            )
+                        )
+                    ),
+                }
+            ],
+            "all_met": met,
+            "enabling_changes": enabling_changes,
+            "baseline_retry_state_fingerprint": (
+                json_hash(baseline) if isinstance(baseline, dict) else None
+            ),
+            "current_retry_state_fingerprint": json_hash(current),
         }
 
     def _reconcile_blocked_farm_exhaustion(
@@ -13978,10 +16921,8 @@ class BotController:
         }
         quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
         quarantines = quarantines if isinstance(quarantines, dict) else {}
-        quarantine = quarantines.get(str(assigned_room))
-        if isinstance(quarantine, dict) and self._farm_quarantine_matches(
-            quarantine, arguments
-        ):
+        quarantine = self._matching_farm_quarantine(quarantines, arguments)
+        if isinstance(quarantine, dict):
             return {
                 "kind": "quarantined_farm_phase",
                 "assigned_room": assigned_room,
@@ -14506,15 +17447,29 @@ class BotController:
             key: value.get(key)
             for key in (
                 "carried_shillings",
+                "source_estimated_inventory_value",
+                "source_estimated_liquidatable_inventory_value",
+                "confirmed_live_quote_liquidatable_value",
                 "known_inventory_item_value",
+                "known_liquidatable_inventory_value",
                 "known_total_carried_value",
                 "valuation_complete",
                 "valuation_note",
+                "liquidation_status",
                 "banking_policy",
             )
             if value.get(key) is not None
         }
-        for key in ("valued_items", "unknown_value_items"):
+        for key in (
+            "valued_items",
+            "unknown_value_items",
+            "unquoted_liquidatable_items",
+            "valid_live_sell_quotes",
+            "protected_sale_items",
+            "rejected_buyer_candidates",
+            "merchant_sale_refusals",
+            "sale_exhausted_items",
+        ):
             items = value.get(key)
             if isinstance(items, list):
                 compact[key] = items[:16]
@@ -14527,6 +17482,19 @@ class BotController:
                     "candidate_count": len(item.get("candidates", []))
                     if isinstance(item.get("candidates"), list)
                     else 0,
+                    "usable_room_ids": sorted(
+                        {
+                            room
+                            for candidate in item.get("candidates", [])
+                            if isinstance(candidate, dict)
+                            for room in (
+                                candidate.get("room_ids", [])
+                                if isinstance(candidate.get("room_ids"), list)
+                                else []
+                            )
+                        },
+                        key=str,
+                    )[:12],
                 }
                 for item in buyers[:16]
                 if isinstance(item, dict)
@@ -14563,17 +17531,111 @@ class BotController:
                 if isinstance(item, dict)
             ]
 
+        readiness = value.get("combat_readiness")
+        readiness = readiness if isinstance(readiness, dict) else {}
+        room_evidence: list[dict[str, Any]] = []
+        for quarantine in readiness.get("farm_tactic_quarantines", []):
+            if not isinstance(quarantine, dict):
+                continue
+            room = quarantine.get("assigned_room", quarantine.get("room"))
+            if room is None:
+                continue
+            room_evidence.append(
+                {
+                    "classification": "quarantined_exact_farm_tactic",
+                    "evidence_strength": "hard",
+                    "scope": "exact_room_target_strategy",
+                    "room": room,
+                    "target": quarantine.get("target"),
+                    "use_safe_spots": quarantine.get(
+                        "effective_use_safe_spots",
+                        quarantine.get("use_safe_spots"),
+                    ),
+                    "room_wide_block": False,
+                    "reasons": quarantine.get("reasons", [])[:4]
+                    if isinstance(quarantine.get("reasons"), list)
+                    else [],
+                }
+            )
+        for score in readiness.get("farm_room_scorecard", []):
+            if not isinstance(score, dict) or score.get("room") is None:
+                continue
+            target_kills = int(score.get("target_kills", 0) or 0)
+            deaths = int(score.get("deaths", 0) or 0)
+            withdrawals = int(score.get("withdrawals", 0) or 0)
+            if score.get("quarantined") is True:
+                classification = "quarantined_exact_farm_tactic"
+                strength = "hard"
+            elif target_kills > 0 and deaths == 0:
+                classification = "productive_if_level_eligible"
+                strength = "positive"
+            elif deaths > 0 or withdrawals > 0:
+                classification = "mixed_or_unsafe_observation"
+                strength = "negative"
+            else:
+                classification = "insufficient_yield_evidence"
+                strength = "informational"
+            room_evidence.append(
+                {
+                    "classification": classification,
+                    "evidence_strength": strength,
+                    "scope": "exact_room_target_strategy",
+                    "room": score.get("room"),
+                    "target": score.get("target"),
+                    "strategy": score.get("strategy"),
+                    "target_kills": target_kills,
+                    "deaths": deaths,
+                    "withdrawals": withdrawals,
+                    "room_wide_block": False,
+                }
+            )
+        raw_tactics = value.get("deferred_tactics")
+        raw_tactics = raw_tactics if isinstance(raw_tactics, list) else []
+        for lesson in raw_tactics:
+            if (
+                not isinstance(lesson, dict)
+                or lesson.get("classification") != "route_unavailable"
+            ):
+                continue
+            failed = lesson.get("failed_tactic")
+            failed = failed if isinstance(failed, dict) else {}
+            arguments = failed.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            destination = next(
+                (
+                    arguments.get(key)
+                    for key in ("to", "destination", "room", "room_id")
+                    if arguments.get(key) is not None
+                ),
+                None,
+            )
+            if destination is None:
+                continue
+            room_evidence.append(
+                {
+                    "classification": "unavailable_exact_route",
+                    "evidence_strength": "hard",
+                    "scope": "exact_origin_destination_tool",
+                    "tool": failed.get("tool"),
+                    "origin_room": failed.get("room"),
+                    "destination_room": destination,
+                    "room_wide_block": False,
+                    "summary": str(lesson.get("summary") or "")[:300],
+                }
+            )
+
         return {
             "goal_family": value.get("goal_family"),
             "instructions": value.get("instructions"),
             "lessons": lessons("lessons", 8),
             "deferred_tactics": lessons("deferred_tactics", 12),
-            "combat_readiness": value.get("combat_readiness"),
+            "combat_readiness": readiness,
             "combat_history": (
                 value.get("combat_history", [])[:8]
                 if isinstance(value.get("combat_history"), list)
                 else value.get("combat_history")
             ),
+            "room_evidence": room_evidence[:24],
         }
 
     def _campaign_context(
@@ -14599,6 +17661,8 @@ class BotController:
                         "arguments",
                         "room",
                         "reason",
+                        "offered_item_names",
+                        "merchant_identity",
                         "suppressed_count",
                         "updated_at",
                     )
@@ -14640,8 +17704,236 @@ class BotController:
         phase = self.storage.active_campaign_phase(run["id"])
         if phase is None:
             return None
+        phase_context = (
+            dict(phase.get("context"))
+            if isinstance(phase.get("context"), dict)
+            else {}
+        )
+        obsolete_healing_gate = (
+            phase.get("kind") == "acquire_item"
+            and phase_context.get("reason")
+            == "replenish_healing_supplies_after_death"
+        )
+        if (
+            obsolete_healing_gate
+            and deep_get(observation, "autopilot.running") is not True
+        ):
+            reason = (
+                "retired obsolete controller-imposed post-death flask phase; "
+                "healing supplies are now planner discretion"
+            )
+            retired = self.storage.transition_campaign_phase(
+                phase["id"], "superseded", reason=reason, resume_parent=True
+            )
+            resumed = self.storage.active_campaign_phase(run["id"])
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.post_death_healing_policy_migrated",
+                "Removed obsolete controller-imposed healing-supply work",
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "retired_phase_id": retired.get("id"),
+                    "resumed_parent_phase_id": (
+                        resumed.get("id") if isinstance(resumed, dict) else None
+                    ),
+                    "strategic_goal_preserved": True,
+                },
+            )
+            return {
+                "campaign_phase_policy_migrated": True,
+                "phase": retired,
+                "next_phase": resumed,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
+        combat_recipe_phase = phase.get("kind") == "farm" or (
+            phase.get("kind") == "train_ability"
+            and phase_context.get("training_method") == "combat"
+        )
+        policy_normalized = False
+        if (
+            combat_recipe_phase
+            and phase_context.get("eat_before_fighting") is not True
+            and phase_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR
+            and deep_get(observation, "autopilot.running") is not True
+        ):
+            phase_context["fight_above_vigor"] = FARM_FIGHT_VIGOR
+            phase = self.storage.update_campaign_phase_guardrails(
+                phase["id"],
+                abandon_predicates=phase.get("abandon_predicates", []),
+                context=phase_context,
+                reason=(
+                    "normalized persisted combat vigor policy to the natural "
+                    f"rested floor of {FARM_FIGHT_VIGOR}"
+                ),
+            )
+            policy_normalized = True
+        retired_phases: list[dict[str, Any]] = []
+        old_required_vigor: int | None = None
+        retired_rest_reachable_recovery = False
+        while phase is not None and len(retired_phases) < 2:
+            context = (
+                phase.get("context")
+                if isinstance(phase.get("context"), dict)
+                else {}
+            )
+            phase_reason = context.get("reason")
+            obsolete_bootstrap = (
+                phase.get("kind") == "farm"
+                and phase_reason == "bootstrap_combat_funding"
+            )
+            obsolete_recovery = False
+            required_vigor: int | None = None
+            if (
+                phase.get("kind") == "prepare_combat"
+                and phase_reason == "recover_combat_vigor"
+            ):
+                try:
+                    required_vigor = int(context.get("required_vigor") or 0)
+                except (TypeError, ValueError):
+                    required_vigor = 0
+                # Above-rest gates are normalized away, while an at/below-rest
+                # gate is recoverable by the keeper itself.  Neither belongs in
+                # a persisted food-provisioning phase.
+                obsolete_recovery = required_vigor > 0
+                if obsolete_recovery:
+                    old_required_vigor = required_vigor
+                    retired_rest_reachable_recovery = (
+                        retired_rest_reachable_recovery
+                        or required_vigor <= RESTED_VIGOR_FLOOR
+                    )
+            if not obsolete_bootstrap and not obsolete_recovery:
+                break
+            if obsolete_bootstrap and deep_get(observation, "autopilot.running") is True:
+                # Never abandon a keeper-owned phase while it may be outside
+                # safe staging. A later safe restart/reconciliation can retire
+                # the obsolete stack without orphaning hazardous movement.
+                break
+            reason = (
+                "retired obsolete combat-provision funding bootstrap"
+                if obsolete_bootstrap
+                else (
+                    f"retired unnecessary {old_required_vigor}-vigor provisioning gate; "
+                    f"ordinary rest reaches {RESTED_VIGOR_FLOOR} and the keeper owns recovery"
+                )
+            )
+            retired_phases.append(
+                self.storage.transition_campaign_phase(
+                    phase["id"],
+                    "superseded",
+                    reason=reason,
+                    resume_parent=True,
+                )
+            )
+            phase = self.storage.active_campaign_phase(run["id"])
+        if retired_phases:
+            reason = (
+                (
+                    "retired rest-reachable vigor provisioning; ordinary recovery "
+                    "belongs to the keeper"
+                )
+                if retired_rest_reachable_recovery
+                else (
+                    "retired obsolete above-rest vigor recovery stack; ordinary farms "
+                    f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                )
+            )
+            if isinstance(phase, dict) and phase.get("kind") in {
+                "farm",
+                "train_ability",
+            }:
+                resumed_context = (
+                    dict(phase.get("context"))
+                    if isinstance(phase.get("context"), dict)
+                    else {}
+                )
+                if (
+                    resumed_context.get("eat_before_fighting") is not True
+                    and resumed_context.get("fight_above_vigor")
+                    != FARM_FIGHT_VIGOR
+                ):
+                    resumed_context["fight_above_vigor"] = FARM_FIGHT_VIGOR
+                    phase = self.storage.update_campaign_phase_guardrails(
+                        phase["id"],
+                        abandon_predicates=phase.get("abandon_predicates", []),
+                        context=resumed_context,
+                        reason=reason,
+                    )
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.combat_vigor_policy_migrated",
+                (
+                    "Removed unnecessary rest-reachable vigor support work"
+                    if retired_rest_reachable_recovery
+                    else "Removed obsolete above-rest vigor support work"
+                ),
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "retired_phase_ids": [item.get("id") for item in retired_phases],
+                    "old_required_vigor": old_required_vigor,
+                    "new_required_vigor": FARM_FIGHT_VIGOR,
+                    "resumed_parent_phase_id": (
+                        phase.get("id") if isinstance(phase, dict) else None
+                    ),
+                    "strategic_goal_preserved": True,
+                },
+            )
+            return {
+                "campaign_phase_completed": True,
+                "campaign_phase_policy_migrated": True,
+                "phase": retired_phases[-1],
+                "next_phase": phase,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
+        if policy_normalized:
+            reason = (
+                "normalized persisted combat vigor policy to the natural rested "
+                f"floor of {FARM_FIGHT_VIGOR}"
+            )
+            self._invalidate_execution_plan(goal, reason)
+            self._clear_safety_suppression(str(goal.get("id") or ""))
+            self._clear_planner_feedback()
+            self.storage.emit_event(
+                "campaign.combat_vigor_policy_migrated",
+                "Normalized an active combat phase to the rested vigor floor",
+                severity="notice",
+                interesting=False,
+                goal_id=goal.get("id"),
+                data={
+                    "phase_id": phase.get("id"),
+                    "new_required_vigor": FARM_FIGHT_VIGOR,
+                    "strategic_goal_preserved": True,
+                },
+            )
+            return {
+                "campaign_phase_policy_migrated": True,
+                "phase": phase,
+                "next_phase": phase,
+                "goal_blocked": False,
+                "goal": self.storage.goal(goal["id"]),
+                "keeper_released": True,
+                "strategic_goal_preserved": True,
+            }
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
+        if outcome.detail.get("abandonment_deferred") is True:
+            # The verified failure is durable, but this phase still owns a
+            # character outside safety.  Leave it active so the ordinary
+            # keeper handoff and safe-return path keep continuous ownership.
+            return None
         if (
             exhaustion_checkpoint is not None
             and (
@@ -14749,26 +18041,24 @@ class BotController:
                     mutation=False,
                 )
                 keeper_result = keeper
-                if (
-                    self._keeper_is_driving(keeper)
-                    and str(keeper.get("mode") or "") == "farm"
-                    and keeper.get("goal_id") in {None, goal["id"]}
-                ):
-                    keeper_result = self.broker.call_tool(
-                        "autopilot",
-                        {
-                            "agent": self.config.game.agent,
-                            "action": "stop",
-                            "hard": True,
-                            "why": reason,
-                        },
-                        timeout=20,
-                        mutation=True,
-                    )
+                if self._keeper_is_driving(keeper):
+                    current_room = self._observation_room(observation)
+                    if self._verified_safe_staging(current_room) is None:
+                        # Terminal phase bookkeeping is not an action owner.
+                        # Retask the same keeper in place and let the next turn
+                        # plan the safe ending under continuous protection.
+                        keeper_result = self._ensure_survival_keeper()
+                        keeper_released = False
+                    else:
+                        keeper_result = self._request_background_farm_stop(
+                            goal, reason
+                        )
+                        keeper_released = isinstance(keeper_result, dict) and not (
+                            self._keeper_is_driving(keeper_result)
+                        )
                     self.storage.set_runtime("background_farm_owner_v1", {})
-                keeper_released = isinstance(keeper_result, dict) and not (
-                    self._keeper_is_driving(keeper_result)
-                )
+                else:
+                    keeper_released = True
             except (BrokerError, ValueError):
                 # The phase result is already deterministic and durable. The
                 # next turn will reconcile any keeper still owning movement.
@@ -14819,6 +18109,11 @@ class BotController:
             self.storage.record_snapshot(redact(observation))
             self._record_character_progress(observation)
             self.dependencies["broker"] = "healthy"
+            if self._safety_enforcement_active:
+                self._ensure_outside_safety_owner(
+                    observation,
+                    reason="controller turn entry",
+                )
             self.learning.refresh_unlocks(observation)
             repaired_goal_blocks = self._repair_controller_goal_blocks()
             farm_blockers = self._reconcile_blocked_farm_exhaustion(observation)
@@ -14947,6 +18242,7 @@ class BotController:
             goal = self.storage.set_goal_completion(goal["id"], completion)
             phase_completion_checkpoint = None
             phase_exhaustion_checkpoint = None
+            phase_abandonment_checkpoint = None
             phase_safe_return_checkpoint = None
             if completion_checkpoint is None:
                 phase_completion = self._reconcile_existing_campaign_phase(
@@ -14988,10 +18284,17 @@ class BotController:
                 phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
                     existing_phase
                 )
+                phase_abandonment_checkpoint = (
+                    self._phase_abandonment_checkpoint(existing_phase)
+                )
                 phase_safe_return_checkpoint = (
                     phase_completion_checkpoint
                     if phase_completion_checkpoint is not None
-                    else phase_exhaustion_checkpoint
+                    else (
+                        phase_exhaustion_checkpoint
+                        if phase_exhaustion_checkpoint is not None
+                        else phase_abandonment_checkpoint
+                    )
                 )
             expired_opportunity = self._expire_direct_pvp_opportunity(
                 goal, observation, completion
@@ -15136,8 +18439,13 @@ class BotController:
                         "the active campaign phase budget is exhausted; preserve "
                         "survival control before the safe-ending travel"
                         if phase_exhaustion_checkpoint is not None
-                        else "the active campaign phase outcome is verified; release "
-                        "movement control for the plan's safe-ending travel"
+                        else (
+                            "the active campaign phase abandonment is verified; preserve "
+                            "survival control before the safe-ending travel"
+                            if phase_abandonment_checkpoint is not None
+                            else "the active campaign phase outcome is verified; release "
+                            "movement control for the plan's safe-ending travel"
+                        )
                     )
                     if phase_safe_return_checkpoint is not None
                     else None
@@ -15145,30 +18453,6 @@ class BotController:
             )
             if farm_control is not None:
                 return farm_control
-            healing_support = (
-                None
-                if phase_safe_return_checkpoint is not None
-                else self._ensure_farm_healing_support_phase(goal, observation)
-            )
-            if healing_support is not None:
-                return {
-                    "campaign_support_phase_started": True,
-                    "phase": healing_support,
-                    "reason": "replenish_healing_supplies_after_death",
-                    "strategic_goal_preserved": True,
-                }
-            vigor_support = (
-                None
-                if phase_safe_return_checkpoint is not None
-                else self._ensure_combat_vigor_support_phase(goal, observation)
-            )
-            if vigor_support is not None:
-                return {
-                    "campaign_support_phase_started": True,
-                    "phase": vigor_support,
-                    "reason": "recover_combat_vigor",
-                    "strategic_goal_preserved": True,
-                }
             structured_purchase = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -15270,10 +18554,17 @@ class BotController:
             phase_exhaustion_checkpoint = self._phase_exhaustion_checkpoint(
                 campaign_phase
             )
+            phase_abandonment_checkpoint = self._phase_abandonment_checkpoint(
+                campaign_phase
+            )
             phase_safe_return_checkpoint = (
                 phase_completion_checkpoint
                 if phase_completion_checkpoint is not None
-                else phase_exhaustion_checkpoint
+                else (
+                    phase_exhaustion_checkpoint
+                    if phase_exhaustion_checkpoint is not None
+                    else phase_abandonment_checkpoint
+                )
             )
             page = self.storage.events(after_cursor=max(0, self.storage.get_runtime("planner_event_cursor", 0) - 12), limit=20)
             pending_proposals = self.storage.proposals()[:10]
@@ -15320,6 +18611,25 @@ class BotController:
                         "closes this phase."
                     ),
                 }
+            if phase_abandonment_checkpoint is not None:
+                grounded_context["phase_abandonment_checkpoint"] = {
+                    "abandoned": True,
+                    "abandoned_at": phase_abandonment_checkpoint.get(
+                        "abandoned_at"
+                    ),
+                    "phase_id": campaign_phase.get("id"),
+                    "phase_kind": campaign_phase.get("kind"),
+                    "reason": phase_abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        phase_abandonment_checkpoint.get("safe_ending")
+                    ),
+                    "instruction": (
+                        "The active phase abandonment is verified. Do not continue "
+                        "goal work. Preserve survival control and execute only the "
+                        "exact source-verified safe-ending travel before the "
+                        "controller closes this phase."
+                    ),
+                }
             grounded_context["live_overlevel_hostiles"] = self._live_overlevel_hostiles(
                 observation
             )
@@ -15356,6 +18666,25 @@ class BotController:
                         f"safe-ending room: {exc}",
                     )
                     planner_feedback = self._planner_feedback(goal)
+            if (
+                phase_abandonment_checkpoint is not None
+                and isinstance(campaign_phase, dict)
+            ):
+                try:
+                    execution_plan = self._ensure_phase_abandonment_plan(
+                        goal,
+                        campaign_phase,
+                        observation,
+                        grounding=grounding,
+                    )
+                except ModelError as exc:
+                    self._set_planner_feedback(
+                        goal,
+                        "The phase abandonment is verified and safety return is the "
+                        "only permitted work. Build one travel-only plan to a source-"
+                        f"verified safe-ending room: {exc}",
+                    )
+                    planner_feedback = self._planner_feedback(goal)
             revision_authorization = self._plan_revision_authorization(
                 goal, execution_plan, planner_feedback
             )
@@ -15367,6 +18696,17 @@ class BotController:
             )
             if structured_exhaustion_return is not None:
                 return self._execute(goal, observation, structured_exhaustion_return)
+            structured_abandonment_return = (
+                self._structured_phase_abandonment_return_action(
+                    campaign_phase,
+                    observation,
+                    execution_plan,
+                )
+            )
+            if structured_abandonment_return is not None:
+                return self._execute(
+                    goal, observation, structured_abandonment_return
+                )
             structured_raza_exit = (
                 None
                 if phase_safe_return_checkpoint is not None
@@ -15401,31 +18741,213 @@ class BotController:
             )
             if structured_research is not None:
                 return self._execute(goal, observation, structured_research)
-            decision = self.model.plan(
-                goal=goal,
-                observation=redact(observation),
-                tools=self._planner_tools(campaign_phase),
-                persona=self.storage.persona(),
-                recent_events=page["events"],
-                pending_proposals=[
-                    {
-                        "id": proposal["id"],
-                        "title": proposal["goal_draft"].get("title"),
-                        "objective": proposal["goal_draft"].get("objective"),
-                    }
-                    for proposal in pending_proposals
-                ],
-                planner_feedback=planner_feedback,
-                policy_summary=self.policy.summary(observation),
-                financial_context=self._financial_context(observation),
-                grounded_knowledge=grounded_context,
-                learned_failures=self.learning.context_for(goal, redact(observation)),
-                execution_plan=redact(execution_plan) if execution_plan else None,
-                revision_authorization=revision_authorization,
-                campaign_context=self._campaign_context(
-                    campaign_run, campaign_phase, audience="tactical"
-                ),
+            planner_tools = self._planner_tools(campaign_phase)
+            policy_summary = self.policy.summary(observation)
+            financial_context = self._financial_context(observation)
+            learned_failures = self.learning.context_for(
+                goal, redact(observation)
             )
+            progressive_context: dict[str, Any] | None = None
+            tactical_complete = getattr(self.model, "tactical_complete", None)
+            progressive_enabled = (
+                getattr(
+                    self.config.model,
+                    "tactical_prompt_protocol",
+                    "progressive",
+                )
+                == "progressive"
+                and callable(tactical_complete)
+            )
+            if progressive_enabled:
+                safe_return_checkpoint = (
+                    completion_checkpoint
+                    if completion_checkpoint is not None
+                    else phase_safe_return_checkpoint
+                )
+                safe_return_required = safe_return_checkpoint is not None
+                if isinstance(execution_plan, dict) and not safe_return_required:
+                    safe_return_required = self._safe_ending_is_active_destination(
+                        goal, campaign_phase, execution_plan
+                    )
+                failure_context = (
+                    planner_feedback.get("failure_context")
+                    if isinstance(planner_feedback, dict)
+                    else None
+                )
+                failure_kind = (
+                    str(failure_context.get("kind") or "")
+                    if isinstance(failure_context, dict)
+                    else ""
+                )
+                revision_needed = bool(
+                    isinstance(execution_plan, dict)
+                    and isinstance(revision_authorization, dict)
+                    and safe_return_checkpoint is None
+                    and isinstance(planner_feedback, dict)
+                    and (
+                        isinstance(planner_feedback.get("blocked_action"), dict)
+                        or (
+                            failure_kind
+                            and failure_kind
+                            not in {
+                                "invalid_planner_action",
+                                "unauthorized_plan_revision",
+                                "rejected_optional_plan_revision",
+                            }
+                        )
+                    )
+                )
+                try:
+                    if execution_plan is None:
+                        decision, progressive_context = (
+                            self._progressive_plan_decision(
+                                mode=PLAN_CREATE,
+                                goal=goal,
+                                observation=observation,
+                                completion=completion,
+                                campaign_phase=campaign_phase,
+                                tools=planner_tools,
+                                planner_feedback=planner_feedback,
+                                grounded_context=grounded_context,
+                                learned_failures=learned_failures,
+                                financial_context=financial_context,
+                                policy_summary=policy_summary,
+                                execution_plan=None,
+                                revision_authorization=None,
+                            )
+                        )
+                    elif revision_needed:
+                        decision, progressive_context = (
+                            self._progressive_plan_decision(
+                                mode=PLAN_REVISE,
+                                goal=goal,
+                                observation=observation,
+                                completion=completion,
+                                campaign_phase=campaign_phase,
+                                tools=planner_tools,
+                                planner_feedback=planner_feedback,
+                                grounded_context=grounded_context,
+                                learned_failures=learned_failures,
+                                financial_context=financial_context,
+                                policy_summary=policy_summary,
+                                execution_plan=execution_plan,
+                                revision_authorization=revision_authorization,
+                            )
+                        )
+                    else:
+                        active_step = self._active_execution_plan_step(
+                            goal,
+                            execution_plan,
+                            safe_return_required=safe_return_required,
+                        )
+                        if active_step is None:
+                            if isinstance(revision_authorization, dict):
+                                decision, progressive_context = (
+                                    self._progressive_plan_decision(
+                                        mode=PLAN_REVISE,
+                                        goal=goal,
+                                        observation=observation,
+                                        completion=completion,
+                                        campaign_phase=campaign_phase,
+                                        tools=planner_tools,
+                                        planner_feedback=planner_feedback,
+                                        grounded_context=grounded_context,
+                                        learned_failures=learned_failures,
+                                        financial_context=financial_context,
+                                        policy_summary=policy_summary,
+                                        execution_plan=execution_plan,
+                                        revision_authorization=revision_authorization,
+                                    )
+                                )
+                            else:
+                                self._invalidate_execution_plan(
+                                    goal,
+                                    "verified plan has no eligible ordered work step and no fresh revision evidence",
+                                )
+                                execution_plan = None
+                                revision_authorization = None
+                                decision, progressive_context = (
+                                    self._progressive_plan_decision(
+                                        mode=PLAN_CREATE,
+                                        goal=goal,
+                                        observation=observation,
+                                        completion=completion,
+                                        campaign_phase=campaign_phase,
+                                        tools=planner_tools,
+                                        planner_feedback=planner_feedback,
+                                        grounded_context=grounded_context,
+                                        learned_failures=learned_failures,
+                                        financial_context=financial_context,
+                                        policy_summary=policy_summary,
+                                        execution_plan=None,
+                                        revision_authorization=None,
+                                    )
+                                )
+                        else:
+                            decision, progressive_context = (
+                                self._progressive_action_decision(
+                                    goal=goal,
+                                    observation=observation,
+                                    campaign_phase=campaign_phase,
+                                    tools=planner_tools,
+                                    planner_feedback=planner_feedback,
+                                    execution_plan=execution_plan,
+                                    safe_return_required=safe_return_required,
+                                )
+                            )
+                except TacticalProtocolError as exc:
+                    self._set_planner_feedback(
+                        goal,
+                        f"Progressive tactical contract rejected: {exc.code}: {exc}",
+                        failure_context={
+                            "kind": "tactical_protocol_rejection",
+                            "code": exc.code,
+                            "details": redact(exc.details),
+                        },
+                    )
+                    self.storage.emit_event(
+                        "planner.protocol.rejected",
+                        f"Rejected progressive tactical object: {exc.code}",
+                        severity="warning",
+                        interesting=False,
+                        goal_id=goal["id"],
+                        data={
+                            "code": exc.code,
+                            "reason": str(exc)[:500],
+                            "details": redact(exc.details),
+                        },
+                    )
+                    return {
+                        "tactical_protocol_rejected": True,
+                        "code": exc.code,
+                        "reason": str(exc),
+                    }
+            else:
+                decision = self.model.plan(
+                    goal=goal,
+                    observation=redact(observation),
+                    tools=planner_tools,
+                    persona=self.storage.persona(),
+                    recent_events=page["events"],
+                    pending_proposals=[
+                        {
+                            "id": proposal["id"],
+                            "title": proposal["goal_draft"].get("title"),
+                            "objective": proposal["goal_draft"].get("objective"),
+                        }
+                        for proposal in pending_proposals
+                    ],
+                    planner_feedback=planner_feedback,
+                    policy_summary=policy_summary,
+                    financial_context=financial_context,
+                    grounded_knowledge=grounded_context,
+                    learned_failures=learned_failures,
+                    execution_plan=redact(execution_plan) if execution_plan else None,
+                    revision_authorization=revision_authorization,
+                    campaign_context=self._campaign_context(
+                        campaign_run, campaign_phase, audience="tactical"
+                    ),
+                )
             self.dependencies["model"] = "healthy"
             self.storage.set_runtime("planner_event_cursor", page["next_cursor"])
             if decision["decision"] == "plan":
@@ -15457,6 +18979,117 @@ class BotController:
                         revision=execution_plan is not None,
                     )
                 except ModelError as exc:
+                    rejected_invariant = str(exc)[:1000]
+                    if (
+                        isinstance(progressive_context, dict)
+                        and progressive_context.get("mode")
+                        in {PLAN_CREATE, PLAN_REVISE}
+                        and progressive_context.get("repair_attempted") is not True
+                    ):
+                        try:
+                            repaired_decision = self._repair_progressive_plan_decision(
+                                progressive_context,
+                                rejected_plan=decision.get("execution_plan"),
+                                violation=rejected_invariant,
+                            )
+                            repaired_plan = self._store_execution_plan(
+                                goal,
+                                repaired_decision.get("execution_plan"),
+                                grounding=grounding,
+                                revision=execution_plan is not None,
+                            )
+                        except (ModelError, TacticalProtocolError) as repair_exc:
+                            progressive_context["repair_attempted"] = True
+                            rejected_invariant = (
+                                f"{rejected_invariant}; bounded progressive repair also "
+                                f"failed: {str(repair_exc)[:500]}"
+                            )[:1000]
+                        else:
+                            self._clear_planner_feedback()
+                            self.storage.emit_event(
+                                "planner.plan.repaired",
+                                "Corrected a progressive plan against a deterministic invariant",
+                                severity="info",
+                                interesting=False,
+                                goal_id=goal["id"],
+                                data={
+                                    "protocol_version": TACTICAL_PROTOCOL_VERSION,
+                                    "mode": progressive_context.get("mode"),
+                                    "request_id": progressive_context.get("request_id"),
+                                    "repaired_invariant": rejected_invariant,
+                                },
+                            )
+                            return {
+                                "planned": True,
+                                "plan_repaired": True,
+                                "execution_plan": repaired_plan,
+                            }
+                    repairable_keeper_plan = (
+                        isinstance(campaign_phase, dict)
+                        and (
+                            campaign_phase.get("kind") == "farm"
+                            or self._train_ability_uses_combat_keeper(campaign_phase)
+                        )
+                        and any(
+                            invariant in rejected_invariant
+                            for invariant in (
+                                "structured farm goal plan requires one explicit autopilot launch step",
+                                "farm launch step must name the goal-owned prey and exact assigned room",
+                            )
+                        )
+                    )
+                    if (
+                        execution_plan is None
+                        and repairable_keeper_plan
+                        and isinstance(decision.get("execution_plan"), dict)
+                    ):
+                        try:
+                            repaired_plan = self._store_execution_plan(
+                                goal,
+                                self._structured_farm_controller_plan(
+                                    goal,
+                                    selected_plan=decision["execution_plan"],
+                                ),
+                                grounding=grounding,
+                                revision=False,
+                            )
+                        except ModelError as repair_exc:
+                            # If another independent invariant is also broken,
+                            # preserve the normal exact-feedback path below.
+                            rejected_invariant = (
+                                f"{rejected_invariant}; deterministic farm-plan repair also failed: "
+                                f"{str(repair_exc)[:500]}"
+                            )[:1000]
+                        else:
+                            self._clear_planner_feedback()
+                            self.storage.emit_event(
+                                "planner.plan.repaired",
+                                "Compiled the controller-owned keeper launch from the accepted combat phase",
+                                severity="info",
+                                interesting=False,
+                                goal_id=goal["id"],
+                                data={
+                                    "phase_id": campaign_phase.get("id"),
+                                    "repaired_invariant": rejected_invariant,
+                                    "source": "structured_farm_controller_plan",
+                                },
+                            )
+                            return {
+                                "planned": True,
+                                "plan_repaired": True,
+                                "execution_plan": repaired_plan,
+                            }
+                    prior_failure_context = (
+                        (planner_feedback or {}).get("failure_context")
+                        if isinstance(planner_feedback, dict)
+                        else None
+                    )
+                    same_invalid_invariant = (
+                        execution_plan is None
+                        and isinstance(prior_failure_context, dict)
+                        and prior_failure_context.get("kind") == "invalid_execution_plan"
+                        and prior_failure_context.get("invariant") == rejected_invariant
+                    )
                     plan_rejections = int(
                         (planner_feedback or {}).get(
                             "consecutive_plan_rejections", 0
@@ -15492,7 +19125,7 @@ class BotController:
                         failure_context=(
                             {
                                 "kind": "rejected_optional_plan_revision",
-                                "invariant": str(exc)[:1000],
+                                "invariant": rejected_invariant,
                                 "purpose": "Preserve the existing verified execution plan.",
                                 "required_response": (
                                     "Act on an existing actionable step; do not submit another "
@@ -15502,7 +19135,7 @@ class BotController:
                             if execution_plan is not None
                             else {
                                 "kind": "invalid_execution_plan",
-                                "invariant": str(exc)[:1000],
+                                "invariant": rejected_invariant,
                                 "purpose": (
                                     "Prevent execution of a plan whose tool semantics, ordering, "
                                     "or prerequisites cannot produce the declared outcome."
@@ -15521,12 +19154,38 @@ class BotController:
                         interesting=plan_rejections >= 3,
                         goal_id=goal["id"],
                         data={
-                            "reason": str(exc)[:1000],
+                            "reason": rejected_invariant,
                             "plan": redact(decision.get("execution_plan")),
                             "consecutive_plan_rejections": plan_rejections,
                             "retained_verified_plan": execution_plan is not None,
                         },
                     )
+                    if same_invalid_invariant and plan_rejections >= 2:
+                        retired = self._fail_active_campaign_phase(
+                            goal,
+                            "campaign phase retired after the planner repeated the same "
+                            f"deterministically invalid execution plan: {rejected_invariant}",
+                        )
+                        if retired is not None:
+                            self._clear_planner_feedback()
+                            self.storage.emit_event(
+                                "campaign.phase.invalid_plan_retired",
+                                "Retired an infeasible phase after two equivalent invalid plans",
+                                severity="warning",
+                                interesting=True,
+                                goal_id=goal["id"],
+                                data={
+                                    "phase_id": retired.get("id"),
+                                    "invariant": rejected_invariant,
+                                    "strategic_goal_preserved": True,
+                                },
+                            )
+                            return {
+                                "plan_rejected": True,
+                                "phase_retired": True,
+                                "reason": rejected_invariant,
+                                "strategic_goal_preserved": True,
+                            }
                     return {"plan_rejected": True, "reason": str(exc)}
                 self._clear_planner_feedback()
                 return {"planned": True, "execution_plan": stored_plan}
@@ -15872,7 +19531,14 @@ class BotController:
                 execution_plan=execution_plan,
             )
         finally:
-            self._turn_lock.release()
+            try:
+                if self._safety_enforcement_active and self.last_observation:
+                    self._ensure_outside_safety_owner(
+                        self.last_observation,
+                        reason="controller turn exit",
+                    )
+            finally:
+                self._turn_lock.release()
 
     @staticmethod
     def _execution_plan_fingerprint(execution_plan: dict[str, Any]) -> str:
@@ -16212,6 +19878,74 @@ class BotController:
             }
         )
 
+    @staticmethod
+    def _selected_sale_inventory(
+        arguments: dict[str, Any], observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Resolve a sell request to exact current inventory evidence."""
+
+        raw_selected = arguments.get("items")
+        selected = raw_selected if isinstance(raw_selected, list) else [raw_selected]
+        selected_ids: set[str] = set()
+        selected_names: set[str] = set()
+        requested_amounts: dict[str, int] = {}
+        for value in selected:
+            if isinstance(value, dict):
+                item_id = value.get("id", value.get("object_id"))
+                name = value.get("name")
+                if item_id is not None and str(item_id).strip():
+                    item_id_key = str(item_id).strip().casefold()
+                    selected_ids.add(item_id_key)
+                    amount = value.get("amount")
+                    if (
+                        isinstance(amount, (int, float))
+                        and not isinstance(amount, bool)
+                        and amount > 0
+                    ):
+                        requested_amounts[item_id_key] = int(amount)
+                if name is not None and str(name).strip():
+                    selected_names.add(str(name).strip().casefold())
+            elif value is not None and str(value).strip():
+                clean = str(value).strip().casefold()
+                selected_ids.add(clean)
+                selected_names.add(clean)
+
+        inventory = deep_get(observation, "inventory.items", [])
+        resolved: list[dict[str, Any]] = []
+        for item in inventory if isinstance(inventory, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id", item.get("object_id"))
+            item_id_key = (
+                str(item_id).strip().casefold() if item_id is not None else ""
+            )
+            name = " ".join(str(item.get("name") or "").split())
+            if not (
+                (item_id_key and item_id_key in selected_ids)
+                or name.casefold() in selected_names
+            ):
+                continue
+            raw_quantity = item.get(
+                "amount", item.get("quantity", item.get("count", 1))
+            )
+            quantity = (
+                int(raw_quantity)
+                if isinstance(raw_quantity, (int, float))
+                and not isinstance(raw_quantity, bool)
+                and raw_quantity > 0
+                else 1
+            )
+            offered_quantity = requested_amounts.get(item_id_key, quantity)
+            resolved.append(
+                {
+                    "id": item_id,
+                    "name": name,
+                    "quantity": offered_quantity,
+                    "inventory_quantity": quantity,
+                }
+            )
+        return resolved
+
     def _guard_prepare_combat_sale(
         self,
         goal: dict[str, Any],
@@ -16456,11 +20190,128 @@ class BotController:
                 "signature": signature,
                 "offered_price": result.get("offered_price"),
                 "quoted_at": timestamp(),
+                "goal_id": goal.get("id"),
+                "phase_id": (phase or {}).get("id"),
+                "merchant_id": arguments.get("to", arguments.get("merchant")),
+                "room_id": self._observation_room(observation),
+                "items": self._selected_sale_inventory(arguments, observation),
             }
         )
         self.storage.set_runtime("prepare_combat_sell_quotes_v1", values[-30:])
 
-    def _execute(self, goal: dict[str, Any], observation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    def _phase_action_failure_context(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        observation: dict[str, Any],
+        plan: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        safety_recovery: bool = False,
+    ) -> dict[str, Any]:
+        """Describe exactly which action failed and whether it was phase work."""
+
+        execution_plan = self._execution_plan(goal)
+        safe_ending = (
+            execution_plan.get("safe_ending")
+            if isinstance(execution_plan, dict)
+            and isinstance(execution_plan.get("safe_ending"), dict)
+            else {}
+        )
+        plan_step_id = str(plan.get("plan_step_id") or "").strip() or None
+        safe_step_id = str(safe_ending.get("step_id") or "").strip()
+        terminal_checkpoint = bool(
+            isinstance(phase, dict)
+            and (
+                self._phase_completion_checkpoint(phase) is not None
+                or self._phase_exhaustion_checkpoint(phase) is not None
+            )
+        )
+        safe_return = bool(
+            safety_recovery
+            or (tool == "travel" and terminal_checkpoint)
+            or (
+                tool == "travel"
+                and plan_step_id is not None
+                and safe_step_id
+                and plan_step_id == safe_step_id
+            )
+        )
+        destination = next(
+            (
+                arguments.get(key)
+                for key in ("to", "destination", "room", "room_id")
+                if arguments.get(key) is not None
+            ),
+            None,
+        )
+        origin_room = {
+            "id": self._observation_room(observation),
+            "name": self._observation_room_name(observation) or None,
+        }
+        return {
+            "stage": "safe_return" if safe_return else "phase_work",
+            "tool": tool,
+            "arguments": redact(arguments),
+            "plan_step_id": plan_step_id,
+            "phase_kind": phase.get("kind") if isinstance(phase, dict) else None,
+            "origin_room": {
+                key: value for key, value in origin_room.items() if value is not None
+            },
+            "destination_room": destination,
+            "phase_work_implicated": not safe_return,
+        }
+
+    def _execute(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one concrete tool under continuous safety ownership."""
+
+        tool = str(plan.get("tool") or "")
+        if tool == KNOWLEDGE_TOOL_NAME:
+            # Local knowledge lookup never mutates or competes with the keeper.
+            return self._execute_with_ownership(goal, observation, plan)
+
+        self._begin_foreground_action(tool, goal_id=goal["id"])
+        try:
+            if self._safety_enforcement_active:
+                arguments = (
+                    plan.get("arguments")
+                    if isinstance(plan.get("arguments"), dict)
+                    else {}
+                )
+                if self._action_requires_keeper_yield(tool, arguments):
+                    self._yield_keeper_to_foreground(tool=tool)
+                # The keeper may have completed a room hop before acknowledging
+                # the yield. Re-observe after the transfer so every policy and
+                # preflight decision below uses the handoff boundary, not the
+                # model's earlier snapshot.
+                observation = self._reconcile_recent_inventory_creation(
+                    self._reconcile_recent_room_transition(self.broker.observe())
+                )
+                self.last_observation = observation
+                self._remember_safe_staging(observation)
+                self.storage.record_snapshot(redact(observation))
+            return self._execute_with_ownership(goal, observation, plan)
+        finally:
+            try:
+                if self._safety_enforcement_active:
+                    self._restore_safety_after_foreground(tool=tool)
+            finally:
+                self._end_foreground_action()
+
+    def _execute_with_ownership(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Implementation for an action whose foreground lease is established."""
+
         tool = str(plan.get("tool") or "")
         safety_recovery = plan.get("safety_recovery") is True
         arguments = plan.get("arguments")
@@ -16480,6 +20331,8 @@ class BotController:
         )
         if safety_recovery:
             checkpoint = self._phase_exhaustion_checkpoint(campaign_phase)
+            if checkpoint is None:
+                checkpoint = self._phase_abandonment_checkpoint(campaign_phase)
             destination = (
                 checkpoint.get("safe_ending")
                 if isinstance(checkpoint, dict)
@@ -16502,8 +20355,8 @@ class BotController:
                 or self._verified_safe_staging(requested_room) is None
             ):
                 raise ModelError(
-                    "safety_recovery is reserved for an exhausted phase's exact "
-                    "source-verified sanctuary travel"
+                    "safety_recovery is reserved for an exhausted or abandoned "
+                    "phase's exact source-verified sanctuary travel"
                 )
         self._guard_map_semantics(campaign_phase, tool, arguments)
         if (
@@ -16620,10 +20473,10 @@ class BotController:
         if (
             tool == "cast"
             and str(arguments.get("spell") or "").strip().casefold()
-            == "create food"
+            in {"create food", "create weapon"}
             and tool_spec.accepts("observe_created")
         ):
-            # Create Food succeeds silently. Ask the broker to establish a
+            # Creation spells can succeed silently. Ask the broker to establish a
             # before/after inventory delta so plan-step completion never rests
             # on the first potentially stale inventory read after the cast.
             arguments["observe_created"] = True
@@ -16671,6 +20524,15 @@ class BotController:
             observation=observation,
             expected_effect=plan.get("expected_observation"),
         )
+        phase_failure_context = self._phase_action_failure_context(
+            goal,
+            campaign_phase,
+            observation,
+            plan,
+            tool,
+            arguments,
+            safety_recovery=safety_recovery,
+        )
         if repeated_signature:
             breaker = self.campaign.trip_breaker(
                 goal,
@@ -16679,6 +20541,7 @@ class BotController:
                 semantic_action=tool,
                 failure_count=self.campaign.ACTION_FAILURE_LIMIT,
                 reason="equivalent action already failed twice in the same verified state",
+                failure_context=phase_failure_context,
             )
             self._invalidate_execution_plan(
                 goal, "campaign circuit breaker rejected an equivalent failed action"
@@ -16709,6 +20572,7 @@ class BotController:
                 result=result,
                 verification=verification,
                 reason=reason,
+                failure_context=phase_failure_context,
             )
 
         preflight = self._safety_preflight(tool, arguments, observation, goal)
@@ -16724,18 +20588,6 @@ class BotController:
                     str(item.get("guidance") or item.get("kind")) for item in preflight
                 ),
             )
-            vigor_support = self._ensure_combat_vigor_support_phase(
-                goal, observation, blockers=preflight
-            )
-            if vigor_support is not None:
-                return {
-                    "action": tool,
-                    "safety_suppressed": True,
-                    "blockers": preflight,
-                    "campaign_support_phase_started": True,
-                    "phase": vigor_support,
-                    "strategic_goal_preserved": True,
-                }
             suppression = self._record_safety_suppression(
                 goal, observation, tool, arguments, preflight
             )
@@ -16845,7 +20697,9 @@ class BotController:
             recorded_block = self._blocked_action(goal, observation, tool, arguments)
             if recorded_block and is_inventory_capacity_refusal(recorded_block.get("reason")):
                 failure_reason = str(recorded_block.get("reason") or failure_reason)
-            capacity_refusal = tool == "shop" and is_inventory_capacity_refusal(failure_reason)
+            capacity_refusal = tool in {"shop", "cast"} and is_inventory_capacity_refusal(
+                failure_reason
+            )
             invalidates_plan = self._failure_invalidates_plan(tool, failure_reason)
             runtime_key = f"lesson_suppression:{goal['id']}:{lesson['id']}"
             suppressed_count = int(self.storage.get_runtime(runtime_key, 0) or 0) + 1
@@ -16895,7 +20749,9 @@ class BotController:
         blocked = self._blocked_action(goal, observation, tool, arguments)
         if blocked:
             blocked_reason = str(blocked.get("reason") or "")
-            capacity_refusal = tool == "shop" and is_inventory_capacity_refusal(blocked_reason)
+            capacity_refusal = tool in {"shop", "cast"} and is_inventory_capacity_refusal(
+                blocked_reason
+            )
             blocked["suppressed_count"] = int(blocked.get("suppressed_count", 0)) + 1
             self._save_blocked_action(blocked)
             phase_result = finish_phase_attempt(
@@ -17054,115 +20910,111 @@ class BotController:
                     limit=int(arguments.get("limit", 5)),
                 )
             else:
-                self._begin_foreground_action(tool, goal_id=goal["id"])
-                try:
-                    if tool == PVP_TOOL_NAME:
-                        result = self.pvp.engage(arguments, timeout=self.config.model.planner_timeout_seconds)
-                        self._emit_pvp_result(goal, result, correlation_id=correlation_id, policy_decision_id=policy.id)
-                    elif tool == PVP_SEEK_TOOL_NAME:
-                        result = self.pvp.seek(
-                            arguments,
-                            timeout=max(360, self.config.model.planner_timeout_seconds),
-                        )
-                        self._emit_pvp_result(goal, result, correlation_id=correlation_id, policy_decision_id=policy.id)
-                    else:
-                        if tool in MOVEMENT_TOOLS and "rest" in capabilities:
-                            stood = self.broker.call_tool(
-                                "rest",
-                                {"agent": self.config.game.agent, "stand": True},
-                                timeout=10,
-                                mutation=True,
-                            )
-                            self.storage.emit_event(
-                                "action.movement_prepared",
-                                "Stood the character up before movement",
-                                severity="info",
-                                interesting=False,
-                                goal_id=goal["id"],
-                                data={"tool": tool, "result": redact(stood)},
-                                correlation_id=correlation_id,
-                                policy_decision_id=policy.id,
-                            )
-                        if tool in MOVEMENT_TOOLS and "look" in capabilities:
-                            # The ordinary client can temporarily lose its self
-                            # object across posture/room-content transitions. A
-                            # look in a prior planner turn is not sufficient;
-                            # refresh position immediately before movement.
-                            self.broker.call_tool(
-                                "look",
-                                {"agent": self.config.game.agent},
-                                timeout=20,
-                                mutation=False,
-                            )
-                        result = self.broker.call_tool(
-                            tool,
-                            arguments,
-                            timeout=self._broker_action_timeout(tool),
+                if tool == PVP_TOOL_NAME:
+                    result = self.pvp.engage(arguments, timeout=self.config.model.planner_timeout_seconds)
+                    self._emit_pvp_result(goal, result, correlation_id=correlation_id, policy_decision_id=policy.id)
+                elif tool == PVP_SEEK_TOOL_NAME:
+                    result = self.pvp.seek(
+                        arguments,
+                        timeout=max(360, self.config.model.planner_timeout_seconds),
+                    )
+                    self._emit_pvp_result(goal, result, correlation_id=correlation_id, policy_decision_id=policy.id)
+                else:
+                    if tool in MOVEMENT_TOOLS and "rest" in capabilities:
+                        stood = self.broker.call_tool(
+                            "rest",
+                            {"agent": self.config.game.agent, "stand": True},
+                            timeout=10,
                             mutation=True,
                         )
-                        transient_movement_failure = self._transient_movement_failure_reason(
-                            tool, result
+                        self.storage.emit_event(
+                            "action.movement_prepared",
+                            "Stood the character up before movement",
+                            severity="info",
+                            interesting=False,
+                            goal_id=goal["id"],
+                            data={"tool": tool, "result": redact(stood)},
+                            correlation_id=correlation_id,
+                            policy_decision_id=policy.id,
                         )
-                        if transient_movement_failure and "look" in capabilities:
-                            # A lost self position or an explicitly silent go
-                            # response does not disprove the route. Refresh the
-                            # authoritative room first, then retry at most once.
-                            # If the delayed first response already moved us,
-                            # synthesize success instead of sending go in the
-                            # newly entered room.
-                            first_result = result
-                            refreshed = self.broker.call_tool(
-                                "look",
-                                {"agent": self.config.game.agent},
-                                timeout=20,
-                                mutation=False,
-                            )
-                            if self._look_room_matches_destination(
-                                refreshed, arguments.get("to")
-                            ):
-                                result = {
-                                    "arrived": True,
-                                    "room": redact(
-                                        refreshed.get("room")
-                                        if isinstance(refreshed, dict)
-                                        else None
-                                    ),
-                                    "recovered_after_silent_reply": True,
-                                }
-                            else:
-                                result = self.broker.call_tool(
-                                    tool,
-                                    arguments,
-                                    timeout=self._broker_action_timeout(tool),
-                                    mutation=True,
-                                )
-                            position_unknown = "own position unknown" in transient_movement_failure.casefold()
-                            self.storage.emit_event(
-                                (
-                                    "action.movement_relocalized"
-                                    if position_unknown
-                                    else "action.movement_retried"
+                    if tool in MOVEMENT_TOOLS and "look" in capabilities:
+                        # The ordinary client can temporarily lose its self
+                        # object across posture/room-content transitions. A
+                        # look in a prior planner turn is not sufficient;
+                        # refresh position immediately before movement.
+                        self.broker.call_tool(
+                            "look",
+                            {"agent": self.config.game.agent},
+                            timeout=20,
+                            mutation=False,
+                        )
+                    result = self.broker.call_tool(
+                        tool,
+                        arguments,
+                        timeout=self._broker_action_timeout(tool),
+                        mutation=True,
+                    )
+                    transient_movement_failure = self._transient_movement_failure_reason(
+                        tool, result
+                    )
+                    if transient_movement_failure and "look" in capabilities:
+                        # A lost self position or an explicitly silent go
+                        # response does not disprove the route. Refresh the
+                        # authoritative room first, then retry at most once.
+                        # If the delayed first response already moved us,
+                        # synthesize success instead of sending go in the
+                        # newly entered room.
+                        first_result = result
+                        refreshed = self.broker.call_tool(
+                            "look",
+                            {"agent": self.config.game.agent},
+                            timeout=20,
+                            mutation=False,
+                        )
+                        if self._look_room_matches_destination(
+                            refreshed, arguments.get("to")
+                        ):
+                            result = {
+                                "arrived": True,
+                                "room": redact(
+                                    refreshed.get("room")
+                                    if isinstance(refreshed, dict)
+                                    else None
                                 ),
-                                (
-                                    "Relocalized the character and retried movement once"
-                                    if position_unknown
-                                    else "Refreshed live room state after a silent transition and retried once"
-                                ),
-                                severity="info",
-                                interesting=False,
-                                goal_id=goal["id"],
-                                data={
-                                    "tool": tool,
-                                    "initial_failure": transient_movement_failure,
-                                    "initial_result": redact(first_result),
-                                    "look": redact(refreshed),
-                                    "result": redact(result),
-                                },
-                                correlation_id=correlation_id,
-                                policy_decision_id=policy.id,
+                                "recovered_after_silent_reply": True,
+                            }
+                        else:
+                            result = self.broker.call_tool(
+                                tool,
+                                arguments,
+                                timeout=self._broker_action_timeout(tool),
+                                mutation=True,
                             )
-                finally:
-                    self._end_foreground_action()
+                        position_unknown = "own position unknown" in transient_movement_failure.casefold()
+                        self.storage.emit_event(
+                            (
+                                "action.movement_relocalized"
+                                if position_unknown
+                                else "action.movement_retried"
+                            ),
+                            (
+                                "Relocalized the character and retried movement once"
+                                if position_unknown
+                                else "Refreshed live room state after a silent transition and retried once"
+                            ),
+                            severity="info",
+                            interesting=False,
+                            goal_id=goal["id"],
+                            data={
+                                "tool": tool,
+                                "initial_failure": transient_movement_failure,
+                                "initial_result": redact(first_result),
+                                "look": redact(refreshed),
+                                "result": redact(result),
+                            },
+                            correlation_id=correlation_id,
+                            policy_decision_id=policy.id,
+                        )
             post_action = (
                 self.broker.observe()
                 if tool
@@ -17328,12 +21180,16 @@ class BotController:
                     tool, result
                 )
                 if transient_cast_failure:
-                    # A zero-cost swallowed packet or a half-cost random spell
-                    # failure does not disprove the spell, its reagents, or the
-                    # verified plan. It also must not enter blocked-action memory:
-                    # that memory is keyed by tool/arguments/room rather than
-                    # the one-second cast timer or a random roll and would turn
-                    # one transient miss into a permanent suppression.
+                    ambiguous_creation = "no authoritative created-item delta" in (
+                        transient_cast_failure.casefold()
+                    )
+                    # A zero-cost swallowed packet, half-cost random failure, or
+                    # full-cost creation with no authoritative item/refusal does
+                    # not disprove the spell, its reagents, or the verified plan.
+                    # None may enter blocked-action memory: that would turn a
+                    # timing/random/observation outcome into permanent suppression.
+                    # Repeated full-cost ambiguity is still bounded inside the
+                    # current phase so a broken observer cannot burn mana forever.
                     self._record_plan_action(
                         goal,
                         step_id=str(
@@ -17348,22 +21204,41 @@ class BotController:
                         attempt_id,
                         "failed",
                         result=redact(result),
-                        error_code="TRANSIENT_CAST_FAILURE",
+                        error_code=(
+                            "AMBIGUOUS_CREATION_RESULT"
+                            if ambiguous_creation
+                            else "TRANSIENT_CAST_FAILURE"
+                        ),
                     )
-                    finish_phase_attempt(
-                        "partial",
+                    phase_result = finish_phase_attempt(
+                        "failed" if ambiguous_creation else "partial",
                         action_attempt_id=attempt_id,
                         result=result,
                         verification={
                             "transient_cast_failure": True,
+                            "ambiguous_creation_result": ambiguous_creation,
                             "plan_step_complete": False,
                             "reason": transient_cast_failure,
                         },
                         reason=transient_cast_failure,
                     )
+                    plan_step_preserved = not phase_result.get("breaker_tripped")
+                    if not plan_step_preserved:
+                        self._invalidate_execution_plan(
+                            goal,
+                            "campaign breaker ended a phase after repeated ambiguous creation results",
+                        )
                     event = self.storage.emit_event(
                         "action.transient_failure",
-                        "Cast failed transiently; preserved the current plan step",
+                        (
+                            (
+                                "Creation cast result was ambiguous; preserved the current plan step"
+                                if plan_step_preserved
+                                else "Repeated ambiguous creation results ended the current phase"
+                            )
+                            if ambiguous_creation
+                            else "Cast failed transiently; preserved the current plan step"
+                        ),
                         severity="warning",
                         interesting=False,
                         goal_id=goal["id"],
@@ -17374,7 +21249,11 @@ class BotController:
                             "reason": transient_cast_failure,
                             "result": redact(result),
                             "attempt_id": attempt_id,
-                            "plan_step_preserved": True,
+                            "plan_step_preserved": plan_step_preserved,
+                            "ambiguous_creation_result": ambiguous_creation,
+                            "campaign_breaker": phase_result
+                            if phase_result.get("breaker_tripped")
+                            else None,
                         },
                         correlation_id=correlation_id,
                         policy_decision_id=policy.id,
@@ -17393,7 +21272,7 @@ class BotController:
                                 failure_observation,
                             ),
                             "transient": True,
-                            "plan_step_preserved": True,
+                            "plan_step_preserved": plan_step_preserved,
                         },
                     )
                     if assessment_id:
@@ -17402,6 +21281,7 @@ class BotController:
                             outcome={
                                 "no_progress": True,
                                 "transient_cast_failure": True,
+                                "ambiguous_creation_result": ambiguous_creation,
                                 "reason": transient_cast_failure,
                                 "result": redact(result),
                                 "action_event_id": event["id"],
@@ -17412,9 +21292,18 @@ class BotController:
                         "action": tool,
                         "no_progress": True,
                         "transient_failure": True,
-                        "plan_step_preserved": True,
+                        "ambiguous_creation_result": ambiguous_creation,
+                        "plan_step_preserved": plan_step_preserved,
                         "reason": transient_cast_failure,
                         "result": redact(result),
+                        **(
+                            {
+                                "campaign_breaker": phase_result,
+                                "strategic_goal_preserved": True,
+                            }
+                            if phase_result.get("breaker_tripped")
+                            else {}
+                        ),
                     }
                 self.storage.update_action_attempt(attempt_id, "failed", result=redact(result), error_code="NO_PROGRESS")
                 phase_result = finish_phase_attempt(
@@ -17713,6 +21602,17 @@ class BotController:
                 observation,
                 goal_id=goal["id"],
             )
+            if tool == "cast" and isinstance(result, dict) and result.get("created"):
+                # Consume the broker's authoritative creation delta in this
+                # action turn. The next cache refresh remains useful evidence,
+                # but a briefly stale inventory read must not hide a completed
+                # Create Food/Create Weapon mutation from phase verification.
+                reconciled_creation = self._reconcile_recent_inventory_creation(
+                    self.last_observation, emit_event=False
+                )
+                if reconciled_creation != self.last_observation:
+                    self.last_observation = reconciled_creation
+                    self.storage.record_snapshot(redact(reconciled_creation))
             reconciled_room = self._observation_room(self.last_observation)
             if str(reconciled_room) != str(observed_room):
                 self.storage.emit_event(
@@ -17768,6 +21668,9 @@ class BotController:
                 )
                 self.storage.set_runtime(
                     f"background_farm_route_failure_handled_v1:{goal['id']}", False
+                )
+                self.storage.set_runtime(
+                    self._background_farm_stop_key(str(goal["id"])), {}
                 )
                 self.storage.set_runtime(
                     "background_farm_owner_v1",
@@ -18264,6 +22167,38 @@ class BotController:
         observation: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         text = str(reason or "").casefold()
+        if tool == "cast" and "no authoritative created-item delta" in text:
+            return {
+                "kind": "creation_result_ambiguous",
+                "source": "broker_observation",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Preserve the incomplete plan step without writing a blocked-action "
+                    "fingerprint or durable lesson."
+                ),
+                "inventory_capacity": cls._inventory_capacity_context(observation),
+                "required_response": (
+                    "Refresh live inventory and equipment, recover the spell cost, and "
+                    "retry later or choose a different grounded acquisition route."
+                ),
+            }
+        if tool == "cast" and is_inventory_capacity_refusal(reason):
+            return {
+                "kind": "creation_inventory_capacity_refused",
+                "source": "server_message",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Defer only this creation attempt at the current carried load; "
+                    "the refusal is inventory state, not combat-power evidence."
+                ),
+                "item_transfer_verified": False,
+                "inventory_capacity": cls._inventory_capacity_context(observation),
+                "required_response": (
+                    "Free verified weight or bulk, refresh inventory, then retry the "
+                    "same creation spell. Do not raise HP or change hunting rooms for "
+                    "an inventory-capacity refusal."
+                ),
+            }
         if tool == "shop" and is_inventory_capacity_refusal(reason):
             return {
                 "kind": "inventory_capacity_refused",
@@ -18350,6 +22285,20 @@ class BotController:
                     "Change the offered item or buyer using live merchant evidence."
                 ),
             }
+        if tool == "merchants" and "no candidate merchants" in text:
+            return {
+                "kind": "merchant_lookup_no_candidates",
+                "reason": str(reason)[:500],
+                "purpose": (
+                    "Keep an empty read-only merchant search from satisfying a plan "
+                    "step or authorizing travel to an undefined seller."
+                ),
+                "required_response": (
+                    "Use an exact source-grounded item query, actual known catalogue "
+                    "stock, or a different acquisition prerequisite; do not continue "
+                    "to travel or shop without a returned merchant."
+                ),
+            }
         return {
             "kind": "action_made_no_progress",
             "reason": str(reason)[:500],
@@ -18380,6 +22329,8 @@ class BotController:
                     )
                 )
             )
+        ) or (
+            tool == "merchants" and "no candidate merchants" in text
         ) or tool == "sell" or (
             tool == "sell_all"
             and (
@@ -18390,7 +22341,10 @@ class BotController:
             tool == "travel" and "travel route cycled" in text
         ) or (
             tool == "cast"
-            and "produced no verified carried item" in text
+            and (
+                "produced no verified carried item" in text
+                or is_inventory_capacity_refusal(text)
+            )
         )
 
     @staticmethod
@@ -18487,8 +22441,9 @@ class BotController:
             return (
                 prefix
                 + "The merchant catalogue is already known. This read-only success is evidence, not progress: "
-                "do not inspect the same stock again. Act on it with sufficient carried funds, use sell or "
-                "guarded sell_all to fund the purchase, use a verified direct capability, or replace the plan."
+                "do not inspect the same stock again. Act on it with sufficient carried funds, use only a "
+                "funding route explicitly still viable in current financial_context, use a verified direct "
+                "capability, or replace the plan."
             )
         if tool == "shop" and is_inventory_capacity_refusal(reason):
             capacity = cls._inventory_capacity_context(observation)
@@ -18570,13 +22525,37 @@ class BotController:
                 "remains valid and incomplete. Recover enough mana and retry that same step; "
                 "this outcome does not disprove the spell, reagents, or plan."
             )
-        if tool == "cast" and "produced no verified carried item" in text:
+        if tool == "cast" and is_inventory_capacity_refusal(reason):
+            capacity = cls._inventory_capacity_context(observation)
+            facts = [
+                "The server explicitly refused to hand over the created item at the current carried load."
+            ]
+            if capacity.get("known"):
+                facts.append(
+                    "Broker carry evidence at failure: "
+                    f"items={capacity.get('items')}, "
+                    f"weight={capacity.get('weight')}/{capacity.get('weight_max')}, "
+                    f"bulk={capacity.get('bulk')}/{capacity.get('bulk_max')}, "
+                    f"exact={capacity.get('exact')}."
+                )
+            facts.append(
+                "Free verified weight or bulk and refresh inventory before retrying; "
+                "do not treat this as a need for more HP or combat training."
+            )
+            return prefix + " ".join(facts)
+        if tool == "cast" and any(
+            marker in text
+            for marker in (
+                "produced no verified carried item",
+                "no authoritative created-item delta",
+            )
+        ):
             return (
                 prefix
-                + "Mana expenditure proves the spell ran, but it does not prove the planned "
-                "inventory result. Refresh inventory before deciding the remaining quantity. "
-                "If the item is still absent, use the returned refusal or carry-capacity evidence; "
-                "do not count this plan step as complete or repeat it blindly."
+                + "Mana expenditure proves the spell ran, but there is no authoritative item "
+                "delta or refusal. Treat the result as an observation/dependency ambiguity, "
+                "refresh inventory and equipment, and preserve the plan step. Do not save a "
+                "durable lesson or infer insufficient combat power from this result."
             )
         if tool == "prey":
             return (
@@ -18761,6 +22740,17 @@ class BotController:
                     f"carried shillings did not move in the requested direction after {action}: "
                     f"before {before_currency}, after {after_currency}"
                 )[:500]
+        if tool == "merchants":
+            candidate_fields = [
+                result.get(key)
+                for key in ("matches", "buys_anything", "rules_mentioning")
+                if isinstance(result.get(key), list)
+            ]
+            if candidate_fields and not any(candidate_fields):
+                return (
+                    "merchant lookup returned no candidate merchants for the "
+                    "requested item/query"
+                )
         if tool in {"map", KNOWLEDGE_TOOL_NAME} and result.get("matches") == []:
             return "authoritative lookup returned no matches"
         if tool == "map" and (arguments or {}).get("to") is not None:
@@ -18979,10 +22969,10 @@ class BotController:
     def _social_tick(self) -> None:
         if self.offline_diagnostics or not self.config.controller.conversation_enabled:
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         self._reconcile_conversation_listener()
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         look = self.broker.call_tool(
             "look",
@@ -19029,12 +23019,60 @@ class BotController:
             return []
         return entries[-(self.config.controller.conversation_history_turns * 2) :]
 
-    def _remember_conversation(self, key: str, role: str, content: str, *, speaker_kind: str) -> None:
+    def _recent_conversation_message_count(
+        self, key: str, *, now: float | None = None
+    ) -> int:
+        """Count retained incoming and delivered outgoing lines in the rolling window."""
+
+        cutoff = (time.time() if now is None else now) - float(
+            self.config.controller.conversation_window_seconds
+        )
+        count = 0
+        for value in self._conversation_activity.get(key, []):
+            occurred_at = str(value or "").strip()
+            try:
+                parsed = datetime.fromisoformat(
+                    occurred_at.replace("Z", "+00:00")
+                )
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if parsed.timestamp() >= cutoff:
+                count += 1
+        return count
+
+    def _conversation_window_allows(
+        self, key: str, *, additional_messages: int, now: float | None = None
+    ) -> bool:
+        return (
+            self._recent_conversation_message_count(key, now=now)
+            + max(0, int(additional_messages))
+            <= self.config.controller.conversation_window_messages
+        )
+
+    def _remember_conversation(
+        self,
+        key: str,
+        role: str,
+        content: str,
+        *,
+        speaker_kind: str,
+        speaker: Any = None,
+    ) -> None:
         clean = " ".join(str(content).split())[:600]
         if not clean:
             return
         entries = self._conversation_history.setdefault(key, [])
-        entries.append({"role": role, "content": clean, "speaker_kind": speaker_kind, "at": timestamp()})
+        entry = {
+            "role": role,
+            "content": clean,
+            "speaker_kind": speaker_kind,
+            "at": timestamp(),
+        }
+        if speaker:
+            entry["speaker"] = " ".join(str(speaker).split())[:100]
+        entries.append(entry)
         del entries[: -self.config.controller.conversation_history_turns * 2]
         if len(self._conversation_history) > 100:
             oldest = min(
@@ -19042,7 +23080,19 @@ class BotController:
                 key=lambda candidate: str((self._conversation_history[candidate] or [{}])[-1].get("at", "")),
             )
             self._conversation_history.pop(oldest, None)
+        activity = self._conversation_activity.setdefault(key, [])
+        activity.append(str(entry["at"]))
+        del activity[:-200]
+        if len(self._conversation_activity) > 100:
+            oldest_activity = min(
+                self._conversation_activity,
+                key=lambda candidate: str(
+                    (self._conversation_activity[candidate] or [""])[-1]
+                ),
+            )
+            self._conversation_activity.pop(oldest_activity, None)
         self.storage.set_runtime("conversation_history_v1", self._conversation_history)
+        self.storage.set_runtime("conversation_activity_v1", self._conversation_activity)
 
     @staticmethod
     def _visible_objects(look: dict[str, Any]) -> list[dict[str, Any]]:
@@ -19133,6 +23183,24 @@ class BotController:
         # but this spacing keeps a crowded-room arrival from becoming a burst of spam.
         key = next(iter(self._pending_greetings))
         encounter = self._pending_greetings[key]
+        if not self._conversation_window_allows(
+            key, additional_messages=1, now=now
+        ):
+            self._pending_greetings.pop(key, None)
+            self._greeted_at[key] = now
+            self._save_social_presence()
+            self.storage.emit_event(
+                "conversation.rate_limited",
+                f"Skipped a greeting to {encounter['name']} at the rolling conversation limit",
+                severity="info",
+                interesting=False,
+                data={
+                    "speaker_kind": "player",
+                    "window_messages": self.config.controller.conversation_window_messages,
+                    "window_seconds": self.config.controller.conversation_window_seconds,
+                },
+            )
+            return
         result = self.model.greet(
             persona=persona,
             encounter=encounter,
@@ -19144,7 +23212,7 @@ class BotController:
             self._greeted_at[key] = now
             self._save_social_presence()
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             # Keep the pending greeting for the next quiet social tick.
             return
         if contains_secret(result["reply"], self.config.secrets):
@@ -19172,7 +23240,13 @@ class BotController:
         self._greeted_at[key] = now
         self._greeting_times.append(now)
         self._save_social_presence()
-        self._remember_conversation(key, "assistant", result["reply"], speaker_kind="player")
+        self._remember_conversation(
+            key,
+            "assistant",
+            result["reply"],
+            speaker_kind="player",
+            speaker=encounter["name"],
+        )
         self.storage.emit_event(
             "conversation.greeted",
             f"Greeted visible player {encounter['name']}",
@@ -19187,7 +23261,7 @@ class BotController:
         persona = self.storage.persona()
         if self.offline_diagnostics or not self.config.controller.conversation_enabled or persona.get("version", 0) == 0:
             return
-        if self._game_action_active.is_set():
+        if self._shutdown_requested.is_set() or self._game_action_active.is_set():
             return
         look = look if isinstance(look, dict) else {}
         inbox = self.broker.call_tool(
@@ -19212,6 +23286,49 @@ class BotController:
             if pending is None:
                 incoming = str(message.get("utterance", ""))
                 history = self._history_for(speaker_key)
+                allowed = self._conversation_window_allows(
+                    speaker_key,
+                    # Reserve room for this incoming line and MANIAC's reply.
+                    additional_messages=2,
+                )
+                self._remember_conversation(
+                    speaker_key,
+                    "speaker",
+                    incoming,
+                    speaker_kind=speaker_kind,
+                    speaker=source.get("name"),
+                )
+                if not allowed:
+                    self.broker.call_tool(
+                        "inbox",
+                        {
+                            "agent": self.config.game.agent,
+                            "action": "resolve",
+                            "id": message_id,
+                            "state": "refused",
+                            "note": (
+                                "rolling conversation limit reached "
+                                f"({self.config.controller.conversation_window_messages} "
+                                "messages per "
+                                f"{int(self.config.controller.conversation_window_seconds)}s)"
+                            ),
+                        },
+                        timeout=10,
+                        mutation=False,
+                    )
+                    self.storage.emit_event(
+                        "conversation.rate_limited",
+                        "Declined dialogue at the per-speaker rolling conversation limit",
+                        severity="info",
+                        interesting=False,
+                        data={
+                            "inbox_item_id": message_id,
+                            "speaker_kind": speaker_kind,
+                            "window_messages": self.config.controller.conversation_window_messages,
+                            "window_seconds": self.config.controller.conversation_window_seconds,
+                        },
+                    )
+                    continue
                 result = self.model.respond(
                     persona=persona,
                     message=redact(message),
@@ -19227,7 +23344,6 @@ class BotController:
                         interesting=True,
                         data={"inbox_item_id": message_id, "speaker_kind": speaker_kind},
                     )
-                self._remember_conversation(speaker_key, "speaker", incoming, speaker_kind=speaker_kind)
                 if result["ignore"] or not result["reply"]:
                     self.broker.call_tool(
                         "inbox",
@@ -19255,14 +23371,44 @@ class BotController:
                 pending = {
                     "reply": result["reply"],
                     "speaker_key": speaker_key,
+                    "speaker": source.get("name"),
                     "speaker_kind": speaker_kind,
                     "persona_version": persona["version"],
                     "attempts": 0,
                     "retry_after": 0.0,
                 }
 
-            if self._game_action_active.is_set():
+            if self._shutdown_requested.is_set() or self._game_action_active.is_set():
                 self._pending_conversation_replies[str(message_id)] = pending
+                continue
+            if not self._conversation_window_allows(
+                str(pending["speaker_key"]), additional_messages=1
+            ):
+                self.broker.call_tool(
+                    "inbox",
+                    {
+                        "agent": self.config.game.agent,
+                        "action": "resolve",
+                        "id": message_id,
+                        "state": "refused",
+                        "note": "rolling conversation limit reached before delivery",
+                    },
+                    timeout=10,
+                    mutation=False,
+                )
+                self._pending_conversation_replies.pop(str(message_id), None)
+                self.storage.emit_event(
+                    "conversation.rate_limited",
+                    "Withheld a queued reply at the per-speaker rolling conversation limit",
+                    severity="info",
+                    interesting=False,
+                    data={
+                        "inbox_item_id": message_id,
+                        "speaker_kind": pending["speaker_kind"],
+                        "window_messages": self.config.controller.conversation_window_messages,
+                        "window_seconds": self.config.controller.conversation_window_seconds,
+                    },
+                )
                 continue
             delivery = self.broker.call_tool(
                 "inbox",
@@ -19311,6 +23457,7 @@ class BotController:
                     "assistant",
                     str(pending["reply"]),
                     speaker_kind=str(pending["speaker_kind"]),
+                    speaker=pending.get("speaker"),
                 )
             else:
                 self.broker.call_tool(
@@ -19522,7 +23669,27 @@ class BotController:
         npc_transfer_restricted_names = self._intrinsically_unsellable_item_names(
             active_goal, observation
         )
+        protected_sale_ids, protected_sale_names = (
+            self._protected_sale_inventory(observation)
+        )
+        merchant_refusals = self._merchant_sale_refusals(
+            active_goal, observation
+        )
+        sale_exhausted_items = self._sale_exhausted_items(merchant_refusals)
+        sale_exhausted_ids = {
+            str(item.get("item_id") or "").casefold()
+            for item in sale_exhausted_items
+            if item.get("item_id")
+        }
         bank_accounts = self._latest_bank_balance_context()
+        raw_sell_quotes = self.storage.get_runtime(
+            "prepare_combat_sell_quotes_v1", []
+        )
+        sell_quotes = (
+            [item for item in raw_sell_quotes if isinstance(item, dict)]
+            if isinstance(raw_sell_quotes, list)
+            else []
+        )
         signature = canonical_json(
             {
                 "items": items,
@@ -19532,7 +23699,12 @@ class BotController:
                 "npc_transfer_restricted_names": sorted(
                     npc_transfer_restricted_names
                 ),
+                "protected_sale_ids": sorted(protected_sale_ids),
+                "protected_sale_names": sorted(protected_sale_names),
+                "merchant_refusals": merchant_refusals,
+                "sale_exhausted_items": sale_exhausted_items,
                 "bank_accounts": bank_accounts,
+                "sell_quotes": sell_quotes,
             }
         )
         if (
@@ -19547,10 +23719,47 @@ class BotController:
         valued_items: list[dict[str, Any]] = []
         unknown_value_items: list[dict[str, Any]] = []
         npc_transfer_restricted_items: list[dict[str, Any]] = []
+        protected_sale_items: list[dict[str, Any]] = []
+        sale_eligible_items: list[dict[str, Any]] = []
+        sale_eligible_details: list[dict[str, Any]] = []
+        sale_eligible_by_id: dict[str, dict[str, Any]] = {}
         for item in items:
             name = " ".join(str(item.get("name") or "").split())
             if not name or "shilling" in name.casefold():
                 continue
+            item_id = item.get("id", item.get("object_id"))
+            item_id_key = (
+                str(item_id).strip().casefold()
+                if item_id is not None
+                else None
+            )
+            protected_loadout = (
+                item_id_key in protected_sale_ids
+                if item_id_key is not None
+                else name.casefold() in protected_sale_names
+            )
+            transfer_restricted = (
+                item_id_key in npc_transfer_restricted_ids
+                if item_id_key is not None
+                else name.casefold() in npc_transfer_restricted_names
+            )
+            sale_exhausted = bool(
+                item_id_key and item_id_key in sale_exhausted_ids
+            )
+            if protected_loadout:
+                protected_sale_items.append(
+                    {
+                        "id": item_id,
+                        "name": name,
+                        "reason": "equipped or in-use active loadout",
+                    }
+                )
+            if (
+                not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_items.append(item)
             raw_quantity = item.get("amount", item.get("quantity", item.get("count", 1)))
             quantity = (
                 int(raw_quantity)
@@ -19559,6 +23768,25 @@ class BotController:
                 and raw_quantity > 0
                 else 1
             )
+            if (
+                not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_details.append(
+                    {"id": item_id, "name": name, "quantity": quantity}
+                )
+            if (
+                item_id_key
+                and not protected_loadout
+                and not transfer_restricted
+                and not sale_exhausted
+            ):
+                sale_eligible_by_id[item_id_key] = {
+                    "id": item_id,
+                    "name": name,
+                    "quantity": quantity,
+                }
             valuation = self.knowledge.item_valuation(name)
             unit_value = valuation.get("unit_value")
             basis = valuation.get("basis")
@@ -19572,13 +23800,11 @@ class BotController:
             if isinstance(unit_value, (int, float)) and not isinstance(unit_value, bool):
                 subtotal = float(unit_value) * quantity
                 known_inventory_value += subtotal
-                item_id = item.get("id", item.get("object_id"))
-                transfer_restricted = (
-                    item_id is not None
-                    and str(item_id).strip().casefold()
-                    in npc_transfer_restricted_ids
-                )
-                if not transfer_restricted:
+                if (
+                    not transfer_restricted
+                    and not protected_loadout
+                    and not sale_exhausted
+                ):
                     known_liquidatable_inventory_value += subtotal
                 valued_items.append(
                     {
@@ -19590,6 +23816,11 @@ class BotController:
                         "basis": basis,
                         "source_ref": source_ref,
                         "npc_transferable": not transfer_restricted,
+                        "sale_protected": protected_loadout,
+                        "sale_evidence_exhausted": sale_exhausted,
+                        "liquidatable": not transfer_restricted
+                        and not protected_loadout
+                        and not sale_exhausted,
                     }
                 )
                 if transfer_restricted:
@@ -19609,6 +23840,7 @@ class BotController:
                         "name": name,
                         "quantity": quantity,
                         "reason": valuation.get("status", "value_unknown"),
+                        "sale_evidence_exhausted": sale_exhausted,
                     }
                 )
 
@@ -19625,15 +23857,171 @@ class BotController:
         known_total: int | float = carried_shillings + known_inventory_value
         if isinstance(known_total, float) and known_total.is_integer():
             known_total = int(known_total)
+        raw_buyers = (
+            self.knowledge.buyer_candidates(
+                sale_eligible_items,
+                per_item_limit=10,
+            )
+            if hasattr(self.knowledge, "buyer_candidates")
+            else []
+        )
+        buyer_candidates, rejected_buyer_candidates = (
+            self._filter_refused_buyer_candidates(
+                raw_buyers,
+                merchant_refusals,
+            )
+        )
+        valid_live_sell_quotes: list[dict[str, Any]] = []
+        quoted_item_ids: set[str] = set()
+        for quote in sell_quotes:
+            offered_price = quote.get("offered_price")
+            quote_items = quote.get("items")
+            if (
+                not isinstance(offered_price, (int, float))
+                or isinstance(offered_price, bool)
+                or offered_price <= 0
+                or not isinstance(quote_items, list)
+                or not quote_items
+            ):
+                continue
+            item_ids: set[str] = set()
+            normalized_items: list[dict[str, Any]] = []
+            valid = True
+            for quoted_item in quote_items:
+                if not isinstance(quoted_item, dict):
+                    valid = False
+                    break
+                quoted_id = quoted_item.get("id", quoted_item.get("object_id"))
+                quoted_id_key = (
+                    str(quoted_id).strip().casefold()
+                    if quoted_id is not None
+                    else ""
+                )
+                current = sale_eligible_by_id.get(quoted_id_key)
+                inventory_quantity_at_quote = quoted_item.get(
+                    "inventory_quantity", quoted_item.get("quantity")
+                )
+                offered_quantity = quoted_item.get("quantity")
+                if (
+                    not quoted_id_key
+                    or current is None
+                    or str(current.get("name") or "").casefold()
+                    != str(quoted_item.get("name") or "").casefold()
+                    or current.get("quantity") != inventory_quantity_at_quote
+                    or not isinstance(offered_quantity, int)
+                    or isinstance(offered_quantity, bool)
+                    or offered_quantity <= 0
+                    or offered_quantity > current.get("quantity", 0)
+                ):
+                    valid = False
+                    break
+                item_ids.add(quoted_id_key)
+                normalized_items.append(
+                    {
+                        **current,
+                        "quantity": offered_quantity,
+                        "inventory_quantity": current.get("quantity"),
+                    }
+                )
+            if not valid or not item_ids:
+                continue
+            valid_live_sell_quotes.append(
+                {
+                    "offered_price": offered_price,
+                    "quoted_at": quote.get("quoted_at"),
+                    "merchant_id": quote.get("merchant_id"),
+                    "room_id": quote.get("room_id"),
+                    "items": normalized_items,
+                    "_item_ids": item_ids,
+                }
+            )
+
+        # Quotes can overlap. Count a conservative disjoint subset so one
+        # carried object is never represented twice in the confirmed total.
+        confirmed_live_quote_value = 0.0
+        counted_item_ids: set[str] = set()
+        for quote in sorted(
+            valid_live_sell_quotes,
+            key=lambda item: float(item.get("offered_price", 0)),
+            reverse=True,
+        ):
+            quote_ids = quote.pop("_item_ids")
+            counted = not bool(quote_ids & counted_item_ids)
+            quote["counted_in_confirmed_total"] = counted
+            if counted:
+                counted_item_ids.update(quote_ids)
+                confirmed_live_quote_value += float(quote["offered_price"])
+            for quoted_item in quote.get("items", []):
+                if (
+                    quoted_item.get("quantity")
+                    == quoted_item.get("inventory_quantity")
+                    and quoted_item.get("id") is not None
+                ):
+                    quoted_item_ids.add(
+                        str(quoted_item["id"]).strip().casefold()
+                    )
+
+        confirmed_quote_total: int | float = (
+            int(confirmed_live_quote_value)
+            if confirmed_live_quote_value.is_integer()
+            else confirmed_live_quote_value
+        )
+        unquoted_liquidatable_items = [
+            item
+            for item in sale_eligible_details
+            if item.get("id") is None
+            or str(item["id"]).strip().casefold() not in quoted_item_ids
+        ]
+        has_grounded_buyer = any(
+            isinstance(item, dict)
+            and isinstance(item.get("candidates"), list)
+            and bool(item["candidates"])
+            for item in buyer_candidates
+        )
+        if confirmed_quote_total:
+            liquidation_state = "live_quotes_available"
+            liquidation_interpretation = (
+                "At least one exact current inventory selection has a positive live "
+                "merchant quote. Re-quote immediately before a mutating sale."
+            )
+        elif sale_eligible_items and has_grounded_buyer:
+            liquidation_state = "quote_required"
+            liquidation_interpretation = (
+                "Sale-eligible inventory and grounded buyer candidates exist, but no "
+                "positive live quote is recorded for the unchanged exact items. Zero "
+                "confirmed quote value means unquoted, not worthless."
+            )
+        elif sale_eligible_items:
+            liquidation_state = "buyer_discovery_required"
+            liquidation_interpretation = (
+                "Sale-eligible inventory exists, but no currently usable grounded buyer "
+                "placement is known. Seek new buyer evidence or use another funding route."
+            )
+        else:
+            liquidation_state = "no_sale_eligible_inventory"
+            liquidation_interpretation = (
+                "No current inventory instance is eligible for sale after loadout and "
+                "live negative-evidence protections."
+            )
         value = {
             "carried_shillings": carried_shillings,
+            "source_estimated_inventory_value": inventory_total,
+            "source_estimated_liquidatable_inventory_value": liquidatable_total,
+            "confirmed_live_quote_liquidatable_value": confirmed_quote_total,
             "known_inventory_item_value": inventory_total,
             "known_liquidatable_inventory_value": liquidatable_total,
             "known_total_carried_value": known_total,
             "valuation_complete": not unknown_value_items,
             "valued_items": valued_items[:30],
             "unknown_value_items": unknown_value_items[:30],
+            "unquoted_liquidatable_items": unquoted_liquidatable_items[:30],
+            "valid_live_sell_quotes": valid_live_sell_quotes[:30],
+            "liquidation_status": {
+                "state": liquidation_state,
+                "interpretation": liquidation_interpretation,
+            },
             "npc_transfer_restricted_items": npc_transfer_restricted_items[:30],
+            "protected_sale_items": protected_sale_items[:30],
             "npc_transfer_rules": [
                 {
                     "source": "Create Weapon",
@@ -19645,25 +24033,22 @@ class BotController:
                 }
             ],
             "bank_accounts": bank_accounts,
-            "buyer_candidates": (
-                self.knowledge.buyer_candidates(
-                    [
-                        item
-                        for item in items
-                        if str(item.get("id", item.get("object_id")))
-                        .strip()
-                        .casefold()
-                        not in npc_transfer_restricted_ids
-                    ]
-                )
-                if hasattr(self.knowledge, "buyer_candidates")
-                else []
-            ),
+            "buyer_candidates": buyer_candidates,
+            "rejected_buyer_candidates": rejected_buyer_candidates,
+            "merchant_sale_refusals": merchant_refusals,
+            "sale_exhausted_items": sale_exhausted_items,
             "valuation_note": (
-                "Best-effort base/live values, not a guaranteed merchant resale quote. "
-                "known_liquidatable_inventory_value excludes exact instances the live "
-                "server proved cannot be given to an NPC. Unknown items mean the true "
-                "total may be higher."
+                "source_estimated_* and the legacy known_* value fields are best-effort "
+                "base/live inventory estimates, not spendable cash or guaranteed resale. "
+                "source_estimated_liquidatable_inventory_value excludes equipped/in-use loadout "
+                "items and exact instances the live server proved cannot be given to an "
+                "NPC and exact carried items whose source sale hypothesis was disproved "
+                f"by {SALE_BUYER_REFUSAL_LIMIT} independent live buyers. Source buyer "
+                "candidates exclude exact item/merchant/room placements already refused "
+                "live. confirmed_live_quote_liquidatable_value contains only positive live "
+                "quotes whose exact item ids, names, and quantities still match inventory; "
+                "zero means no current quote evidence, not zero market value. Unknown items "
+                "mean the source estimate may be higher."
             ),
             "banking_policy": {
                 "mode": "planner_discretion",
@@ -19743,6 +24128,351 @@ class BotController:
             if item_id is not None and str(item_id).strip():
                 result.add(str(item_id).strip().casefold())
         return result
+
+    @staticmethod
+    def _merchant_speaker_name(reason: Any) -> str | None:
+        """Recover the live NPC name from an authoritative refusal message."""
+
+        text = " ".join(str(reason or "").split())
+        match = re.match(
+            r'^\s*([^\"]+?)\s+(?:tells\s+you|says)(?:\s*,)?\s*[,:]?\s*[\"]',
+            text,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        name = match.group(1).strip(" ,:'\"")
+        return name or None
+
+    @staticmethod
+    def _protected_sale_inventory(
+        observation: dict[str, Any],
+    ) -> tuple[set[str], set[str]]:
+        """Return exact carried items protected by the active loadout.
+
+        Source value and NPC transferability do not make equipped gear
+        liquidatable. Prefer exact ids so an unequipped duplicate with the same
+        name remains eligible. A name-only equipment record protects the name
+        only when there is one matching carried instance.
+        """
+
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = raw_items if isinstance(raw_items, list) else []
+        equipped = deep_get(observation, "equipment.equipped", [])
+        equipped = equipped if isinstance(equipped, list) else []
+        protected_ids: set[str] = set()
+        unresolved_names: set[str] = set()
+        counts: dict[str, int] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+            if item.get("in_use") is True or item.get("equipped") is True:
+                item_id = item.get("id", item.get("object_id"))
+                if item_id is not None:
+                    protected_ids.add(str(item_id).strip().casefold())
+                elif name:
+                    unresolved_names.add(name)
+        for item in equipped:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id", item.get("object_id"))
+            name = " ".join(str(item.get("name") or "").split()).casefold()
+            if item_id is not None:
+                protected_ids.add(str(item_id).strip().casefold())
+            elif name:
+                unresolved_names.add(name)
+        protected_names = {
+            name for name in unresolved_names if counts.get(name, 0) == 1
+        }
+        return protected_ids, protected_names
+
+    def _merchant_sale_refusals(
+        self,
+        goal: dict[str, Any] | None,
+        observation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Normalize live buyer refusals across NPC ids and source classes."""
+
+        if not isinstance(goal, dict):
+            return []
+        raw_items = deep_get(observation, "inventory.items", [])
+        items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        source_buyers = (
+            self.knowledge.buyer_candidates(items, per_item_limit=10)
+            if hasattr(self.knowledge, "buyer_candidates")
+            else []
+        )
+        buyer_rows = {
+            " ".join(str(row.get("item") or "").split()).casefold(): row
+            for row in source_buyers
+            if isinstance(row, dict) and row.get("item")
+        }
+        result: list[dict[str, Any]] = []
+        entries = self.storage.get_runtime("blocked_actions", [])
+        for entry in entries if isinstance(entries, list) else []:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("goal_id") != goal.get("id")
+                or entry.get("tool") not in {"sell", "sell_all"}
+                or deep_get(
+                    self._failure_context(
+                        str(entry.get("tool") or ""),
+                        str(entry.get("reason") or ""),
+                        observation,
+                    ),
+                    "kind",
+                )
+                != "merchant_rejected_sale"
+            ):
+                continue
+            arguments = entry.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            item_names = {
+                " ".join(str(value).split()).casefold()
+                for value in entry.get("offered_item_names", [])
+                if str(value).strip()
+            } if isinstance(entry.get("offered_item_names"), list) else set()
+            item_names.update(
+                self._sale_selected_item_names(arguments, observation)
+            )
+            room = entry.get("room")
+            identity = entry.get("merchant_identity")
+            identity = identity if isinstance(identity, dict) else {}
+            live_name = str(
+                identity.get("live_name")
+                or self._merchant_speaker_name(entry.get("reason"))
+                or ""
+            ).strip()
+            live_name_key = " ".join(live_name.split()).casefold()
+            target = identity.get("object_id", arguments.get("to"))
+            target_key = (
+                str(target).strip().casefold() if target is not None else ""
+            )
+            source_classes: set[str] = set()
+            resolved_identity = (
+                self.knowledge.merchant_identity(
+                    object_id=target,
+                    name=live_name,
+                )
+                if hasattr(self.knowledge, "merchant_identity")
+                else None
+            )
+            if isinstance(resolved_identity, dict) and resolved_identity.get(
+                "merchant_class"
+            ):
+                source_classes.add(str(resolved_identity["merchant_class"]))
+            for item_name in item_names:
+                row = buyer_rows.get(item_name)
+                candidates = row.get("candidates") if isinstance(row, dict) else []
+                for candidate in candidates if isinstance(candidates, list) else []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    instances = candidate.get("instances")
+                    instances = instances if isinstance(instances, list) else []
+                    identity_match = any(
+                        isinstance(instance, dict)
+                        and (
+                            (
+                                target_key
+                                and str(
+                                    instance.get("seller_id_at_build")
+                                ).strip().casefold()
+                                == target_key
+                            )
+                            or (
+                                live_name_key
+                                and " ".join(
+                                    str(instance.get("name") or "").split()
+                                ).casefold()
+                                == live_name_key
+                            )
+                        )
+                        for instance in instances
+                    )
+                    if not identity_match:
+                        continue
+                    merchant_class = str(candidate.get("merchant") or "").strip()
+                    if merchant_class:
+                        source_classes.add(merchant_class)
+            if isinstance(identity.get("source_classes"), list):
+                source_classes.update(
+                    str(value).strip()
+                    for value in identity["source_classes"]
+                    if str(value).strip()
+                )
+            aliases = {
+                value.casefold()
+                for value in [live_name, *source_classes]
+                if value
+            }
+            if target is not None:
+                aliases.add(str(target).strip().casefold())
+            result.append(
+                {
+                    "tool": entry.get("tool"),
+                    "room": room,
+                    "item_ids": sorted(self._sale_item_ids(arguments)),
+                    "item_names": sorted(item_names),
+                    "merchant": {
+                        "object_id": target,
+                        "live_name": live_name or None,
+                        "source_classes": sorted(source_classes),
+                        "aliases": sorted(aliases),
+                    },
+                    "reason": str(entry.get("reason") or "")[:500],
+                    "updated_at": entry.get("updated_at"),
+                }
+            )
+        return result[-20:]
+
+    @staticmethod
+    def _sale_exhausted_items(
+        refusals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Retire one exact carried item after independent buyer disprovals.
+
+        This is deliberately neither room-wide nor goal-wide. A single refusal
+        removes only that buyer placement. Reaching the bound means enough live
+        buyers have independently disproved the source catalogue's sale
+        hypothesis for this exact object id; a new item id remains eligible.
+        """
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for refusal in refusals:
+            if not isinstance(refusal, dict):
+                continue
+            merchant = refusal.get("merchant")
+            merchant = merchant if isinstance(merchant, dict) else {}
+            identity = str(
+                merchant.get("object_id")
+                or merchant.get("live_name")
+                or ""
+            ).strip().casefold()
+            if not identity:
+                continue
+            for raw_item_id in refusal.get("item_ids", []):
+                item_id = str(raw_item_id).strip().casefold()
+                if not item_id:
+                    continue
+                row = grouped.setdefault(
+                    item_id,
+                    {
+                        "item_id": item_id,
+                        "item_names": set(),
+                        "merchant_identities": set(),
+                        "refusals": [],
+                    },
+                )
+                row["item_names"].update(
+                    " ".join(str(value).split()).casefold()
+                    for value in refusal.get("item_names", [])
+                    if str(value).strip()
+                )
+                row["merchant_identities"].add(identity)
+                row["refusals"].append(refusal)
+        result: list[dict[str, Any]] = []
+        for row in grouped.values():
+            identities = row["merchant_identities"]
+            if len(identities) < SALE_BUYER_REFUSAL_LIMIT:
+                continue
+            result.append(
+                {
+                    "item_id": row["item_id"],
+                    "item_names": sorted(row["item_names"]),
+                    "distinct_refusing_buyers": len(identities),
+                    "threshold": SALE_BUYER_REFUSAL_LIMIT,
+                    "scope": "exact_carried_item_instance",
+                    "reason": (
+                        "multiple independent live buyers rejected this exact "
+                        "item; use a non-sale funding route or materially change "
+                        "inventory before retrying it"
+                    ),
+                }
+            )
+        return sorted(result, key=lambda item: item["item_id"])
+
+    @staticmethod
+    def _filter_refused_buyer_candidates(
+        buyers: list[dict[str, Any]],
+        refusals: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Remove only exact item/merchant/room placements disproved live."""
+
+        usable: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for raw in buyers:
+            if not isinstance(raw, dict):
+                continue
+            item_name = " ".join(str(raw.get("item") or "").split()).casefold()
+            item_refusals = [
+                refusal
+                for refusal in refusals
+                if item_name in set(refusal.get("item_names", []))
+            ]
+            candidates: list[dict[str, Any]] = []
+            for raw_candidate in raw.get("candidates", []):
+                if not isinstance(raw_candidate, dict):
+                    continue
+                candidate = dict(raw_candidate)
+                room_ids = (
+                    list(candidate.get("room_ids", []))
+                    if isinstance(candidate.get("room_ids"), list)
+                    else []
+                )
+                merchant_class = str(
+                    candidate.get("merchant") or ""
+                ).casefold()
+                matching_refusals = [
+                    refusal
+                    for refusal in item_refusals
+                    if merchant_class
+                    and merchant_class
+                    in {
+                        str(value).casefold()
+                        for value in deep_get(
+                            refusal, "merchant.aliases", []
+                        )
+                    }
+                ]
+                refused_rooms = {
+                    str(refusal.get("room"))
+                    for refusal in matching_refusals
+                    if refusal.get("room") is not None
+                }
+                kept_rooms = [
+                    room for room in room_ids if str(room) not in refused_rooms
+                ]
+                removed_rooms = [
+                    room for room in room_ids if str(room) in refused_rooms
+                ]
+                if removed_rooms:
+                    matching = next(
+                        (
+                            refusal
+                            for refusal in matching_refusals
+                            if str(refusal.get("room"))
+                            in {str(room) for room in removed_rooms}
+                        ),
+                        {},
+                    )
+                    rejected.append(
+                        {
+                            "item": raw.get("item"),
+                            "merchant": candidate.get("merchant"),
+                            "room_ids": removed_rooms,
+                            "live_name": deep_get(matching, "merchant.live_name"),
+                            "reason": matching.get("reason"),
+                            "scope": "exact_item_buyer_placement",
+                        }
+                    )
+                if kept_rooms:
+                    candidate["room_ids"] = kept_rooms
+                    candidates.append(candidate)
+            usable.append({**raw, "candidates": candidates[:5]})
+        return usable, rejected[-30:]
 
     def _intrinsically_unsellable_item_ids(
         self,
@@ -19963,8 +24693,39 @@ class BotController:
                     and self._carried_currency(observation) > int(entry.get("carried_currency", 0) or 0)
                 ):
                     continue
+                if tool == "cast":
+                    reason = str(entry.get("reason") or "")
+                    if (
+                        "produced no verified carried item" in reason.casefold()
+                        and not is_inventory_capacity_refusal(reason)
+                    ):
+                        # Older builds persisted an ambiguous broker observation
+                        # as a proven cast failure.  With no authoritative
+                        # refusal that fingerprint has no valid retry predicate,
+                        # so it must never suppress a fresh live attempt.
+                        self._discard_blocked_action(entry)
+                        continue
+                    required_mana = entry.get("required_mana")
+                    if required_mana is None:
+                        required_mana = self._required_mana_from_refusal(
+                            entry.get("reason")
+                        )
+                    current_mana = self._vital_value(observation, "mana")
+                    try:
+                        mana_ready = (
+                            required_mana is not None
+                            and current_mana is not None
+                            and current_mana >= float(required_mana)
+                        )
+                    except (TypeError, ValueError):
+                        mana_ready = False
+                    if mana_ready:
+                        # An insufficient-mana refusal is valid only while the
+                        # verified resource state remains below the spell cost.
+                        self._discard_blocked_action(entry)
+                        continue
                 if (
-                    tool == "shop"
+                    tool in {"shop", "cast"}
                     and is_inventory_capacity_refusal(entry.get("reason"))
                     and self.learning.profile(observation).get("inventory_load_hash")
                     != entry.get("inventory_load_hash")
@@ -20077,6 +24838,27 @@ class BotController:
         arguments: dict[str, Any],
         reason: str,
     ) -> None:
+        failure_kind = str(
+            deep_get(
+                self._failure_context(tool, reason, observation) or {},
+                "kind",
+                "",
+            )
+        )
+        offered_item_names = (
+            sorted(self._sale_selected_item_names(arguments, observation))
+            if tool in {"sell", "sell_all"}
+            else []
+        )
+        merchant_identity = None
+        if failure_kind == "merchant_rejected_sale":
+            merchant_identity = {
+                "object_id": arguments.get("to"),
+                "live_name": self._merchant_speaker_name(reason),
+            }
+        required_mana = (
+            self._required_mana_from_refusal(reason) if tool == "cast" else None
+        )
         self._save_blocked_action(
             {
                 "goal_id": goal["id"],
@@ -20089,7 +24871,25 @@ class BotController:
                     "inventory_load_hash"
                 ),
                 "equipment_attempt_hash": self._equipment_attempt_hash(tool, observation),
+                **(
+                    {
+                        "observed_mana": self._vital_value(observation, "mana"),
+                        "required_mana": required_mana,
+                    }
+                    if tool == "cast" and required_mana is not None
+                    else {}
+                ),
                 "reason": reason[:500],
+                **(
+                    {"offered_item_names": offered_item_names}
+                    if offered_item_names
+                    else {}
+                ),
+                **(
+                    {"merchant_identity": merchant_identity}
+                    if merchant_identity is not None
+                    else {}
+                ),
                 "suppressed_count": 0,
                 "updated_at": timestamp(),
             }
@@ -20711,6 +25511,7 @@ class BotController:
             else []
         )
         exhaustion_checkpoint = self._phase_exhaustion_checkpoint(phase)
+        abandonment_checkpoint = self._phase_abandonment_checkpoint(phase)
         return {
             "run_id": run["id"],
             "status": run["status"],
@@ -20720,9 +25521,11 @@ class BotController:
                 self._phase_completion_checkpoint(phase) is not None
             ),
             "phase_exhaustion_latched": exhaustion_checkpoint is not None,
+            "phase_abandonment_latched": abandonment_checkpoint is not None,
             "safe_return_pending": (
                 self._phase_completion_checkpoint(phase) is not None
                 or exhaustion_checkpoint is not None
+                or abandonment_checkpoint is not None
             ),
             "phase_exhaustion": (
                 None
@@ -20731,6 +25534,17 @@ class BotController:
                     "exhausted_at": exhaustion_checkpoint.get("exhausted_at"),
                     "budget": redact(exhaustion_checkpoint.get("budget")),
                     "safe_ending": redact(exhaustion_checkpoint.get("safe_ending")),
+                }
+            ),
+            "phase_abandonment": (
+                None
+                if abandonment_checkpoint is None
+                else {
+                    "abandoned_at": abandonment_checkpoint.get("abandoned_at"),
+                    "reason": abandonment_checkpoint.get("reason"),
+                    "safe_ending": redact(
+                        abandonment_checkpoint.get("safe_ending")
+                    ),
                 }
             ),
             "recent_phases": phases[-8:],
@@ -20786,6 +25600,25 @@ class BotController:
             if isinstance(self._foreground_action, dict)
             else None
         )
+        observed_room_id = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        verified_safe_room = self._verified_safe_staging(observed_room_id)
+        safety_owner = (
+            "controller_foreground_action"
+            if foreground_action is not None
+            else (
+                "keeper"
+                if self._keeper_owns_outside_safety(keeper)
+                else (
+                    "verified_safe_room"
+                    if verified_safe_room is not None
+                    else "unowned_unsafe_room"
+                )
+            )
+        )
         if keeper is not None and foreground_action is not None:
             keeper["control_owner"] = "controller_foreground_action"
             keeper["suspension_expected"] = not self._keeper_is_driving(keeper)
@@ -20830,6 +25663,7 @@ class BotController:
                 "version": self.VERSION,
                 "last_heartbeat_at": self.last_heartbeat_at,
                 "heartbeat_age_seconds": self._age_seconds(self.last_heartbeat_at),
+                "shutdown": self._shutdown_status_snapshot(),
                 "control_owner": (
                     "foreground_action"
                     if foreground_action is not None
@@ -20839,6 +25673,8 @@ class BotController:
                         else "controller"
                     )
                 ),
+                "safety_owner": safety_owner,
+                "safety_covered": safety_owner != "unowned_unsafe_room",
                 "foreground_action": foreground_action,
             },
             "game": {
@@ -20847,7 +25683,14 @@ class BotController:
                 else "disconnected",
                 "character_name": self._character_name(observation),
                 "location": deep_get(observation, "look.room.name", deep_get(observation, "look.room")),
-                "room_id": deep_get(observation, "look.room.num", deep_get(observation, "look.room_id")),
+                "room_id": observed_room_id,
+                "room_properties": self._room_properties(
+                    deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    )
+                ),
                 "position": deep_get(observation, "status.position"),
                 "vitals": deep_get(observation, "status.vitals", deep_get(observation, "look.vitals", {})),
                 "risk": self._risk(observation),
@@ -21187,6 +26030,13 @@ class BotController:
                         "look.room.num",
                         deep_get(observation, "look.room_id"),
                     ),
+                    "room_properties": self._room_properties(
+                        deep_get(
+                            observation,
+                            "look.room.num",
+                            deep_get(observation, "look.room_id"),
+                        )
+                    ),
                     "position": deep_get(observation, "status.position"),
                     "vitals": deep_get(
                         observation,
@@ -21221,6 +26071,53 @@ class BotController:
                 },
             }
         )
+
+    def conversation_history(self, *, limit: int = 60) -> dict[str, Any]:
+        """Return recent persisted in-game dialogue for authenticated local clients."""
+
+        limit = max(1, min(int(limit), 200))
+        saved = self.storage.get_runtime("conversation_history_v1", {})
+        history = saved if isinstance(saved, dict) else self._conversation_history
+        messages: list[dict[str, Any]] = []
+        for speaker_key, entries in history.items():
+            if not isinstance(entries, list):
+                continue
+            key = str(speaker_key)
+            key_kind, separator, key_value = key.partition(":")
+            if separator and key_kind == "name":
+                speaker = key_value or "unknown speaker"
+            elif separator and key_kind == "object":
+                speaker = f"object {key_value}" if key_value else "unknown speaker"
+            else:
+                speaker = key or "unknown speaker"
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                content = " ".join(str(entry.get("content") or "").split())
+                if not content:
+                    continue
+                messages.append(
+                    {
+                        "speaker_key": key,
+                        "speaker": " ".join(
+                            str(entry.get("speaker") or speaker).split()
+                        ),
+                        "role": str(entry.get("role") or "speaker"),
+                        "speaker_kind": str(
+                            entry.get("speaker_kind") or "unknown_in_game_speaker"
+                        ),
+                        "content": content,
+                        "occurred_at": str(entry.get("at") or ""),
+                    }
+                )
+        messages.sort(key=lambda item: item["occurred_at"])
+        observation = self.last_observation or {}
+        return {
+            "messages": messages[-limit:],
+            "timezone": self.config.deployment.timezone,
+            "character_name": self._character_name(observation)
+            or self.config.game.agent,
+        }
 
     def status(self, *, detail: str = "summary", include_recent_events: int = 3) -> dict[str, Any]:
         if detail not in {"supervision", "summary", "goal", "diagnostic"}:
@@ -21272,6 +26169,7 @@ class BotController:
                 "since": self.started_at,
                 "version": self.VERSION,
                 "last_heartbeat_at": self.last_heartbeat_at,
+                "shutdown": self._shutdown_status_snapshot(),
                 "control_owner": "foreground_action" if foreground_action else "controller",
                 "foreground_action": foreground_action,
             },
@@ -21280,6 +26178,18 @@ class BotController:
                 "server": f"{self.config.game.host}:{self.config.game.port}",
                 "character_name": self._character_name(observation),
                 "location": deep_get(observation, "look.room.name", deep_get(observation, "look.room")),
+                "room_id": deep_get(
+                    observation,
+                    "look.room.num",
+                    deep_get(observation, "look.room_id"),
+                ),
+                "room_properties": self._room_properties(
+                    deep_get(
+                        observation,
+                        "look.room.num",
+                        deep_get(observation, "look.room_id"),
+                    )
+                ),
                 "vitals": deep_get(observation, "status.vitals", deep_get(observation, "look.vitals", {})),
                 "risk": self._risk(observation),
                 "finances": self._financial_context(observation),
@@ -21322,14 +26232,583 @@ class BotController:
             return "critical" if ratio < 0.4 else "elevated" if ratio < 0.7 else "low"
         return "unknown"
 
-    def safe_stop(self) -> None:
-        self._mark_planned_phase_stop()
-        self.state = "stopping"
-        self.stop_event.set()
+    def _shutdown_status_snapshot(self) -> dict[str, Any] | None:
+        with self._shutdown_lock:
+            return (
+                dict(self._shutdown_status)
+                if isinstance(self._shutdown_status, dict)
+                else None
+            )
+
+    def _set_shutdown_stage(self, stage: str, **updates: Any) -> dict[str, Any]:
+        with self._shutdown_lock:
+            value = dict(self._shutdown_status or {})
+            value.update(updates)
+            value["stage"] = stage
+            value["updated_at"] = timestamp()
+            self._shutdown_status = value
+            return dict(value)
+
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, Any]:
+        """Request a controller-owned pause, safe return, logout, and stop.
+
+        The API thread only records intent and wakes the controller loop. The
+        loop itself drains the request after any in-flight game action returns,
+        preserving the single broker-mutation owner. Repeated requests are
+        idempotent while a drain is active.
+        """
+
+        if destination_room_id is not None:
+            if (
+                not isinstance(destination_room_id, int)
+                or isinstance(destination_room_id, bool)
+                or destination_room_id <= 0
+            ):
+                raise ValueError(
+                    "shutdown destination_room_id must be a positive integer"
+                )
+            if self._verified_safe_staging(destination_room_id) is None:
+                raise ValueError(
+                    f"shutdown destination room {destination_room_id} is not "
+                    "source-verified as a sanctuary or no-combat room"
+                )
+
+        with self._shutdown_lock:
+            existing = self._shutdown_status
+            if (
+                isinstance(existing, dict)
+                and existing.get("stage")
+                not in {"failed", "complete"}
+            ):
+                return dict(existing)
+            requested = {
+                "request_id": uuid7(),
+                "stage": "requested",
+                "requested_at": timestamp(),
+                "updated_at": timestamp(),
+                "requested_destination_room_id": destination_room_id,
+                "paused_goal_ids": [],
+                "safe_room": None,
+                "logged_out": False,
+                "error": None,
+            }
+            self._shutdown_status = requested
+
+        self.state = "shutdown_requested"
+        self._shutdown_requested.set()
+        self._wake_event.set()
+        self.storage.emit_event(
+            "runtime.shutdown_requested",
+            "Coordinated pause, safe return, logout, and shutdown requested",
+            severity="notice",
+            interesting=True,
+            data={
+                "request_id": requested["request_id"],
+                "requested_destination_room_id": destination_room_id,
+            },
+        )
+        return dict(requested)
+
+    @staticmethod
+    def _shutdown_full_health(observation: dict[str, Any]) -> bool:
+        health = deep_get(
+            observation,
+            "status.vitals.health",
+            deep_get(observation, "look.vitals.health"),
+        )
+        if not isinstance(health, dict):
+            return False
+        current = health.get("current", health.get("value"))
+        maximum = health.get("max")
         try:
-            self._set_fallback()
+            return float(current) > 0 and float(current) >= float(maximum)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _shutdown_keeper_threat_clear(status: Any) -> bool:
+        if not isinstance(status, dict):
+            return True
+        threat = status.get("threat")
+        if not isinstance(threat, dict):
+            return True
+        for key in ("could_reach_us", "camped_on_us", "in_swing_range"):
+            try:
+                if float(threat.get(key, 0) or 0) > 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        try:
+            return float(threat.get("landing_damage", 0) or 0) <= 0
+        except (TypeError, ValueError):
+            return False
+
+    def _refresh_shutdown_observation(self) -> dict[str, Any]:
+        observation = self._reconcile_recent_inventory_creation(
+            self._reconcile_recent_room_transition(self.broker.observe())
+        )
+        self.last_observation = observation
+        self._remember_safe_staging(observation)
+        self.storage.record_snapshot(redact(observation))
+        self.last_heartbeat_at = timestamp()
+        return observation
+
+    def _pause_all_runnable_goals_for_shutdown(self) -> list[str]:
+        paused: list[str] = []
+        # Storage promotes the next queued goal whenever an active goal is
+        # paused. Looping therefore atomically drains every runnable goal into
+        # the durable paused state before broker ownership changes.
+        for _ in range(200):
+            active = self.storage.active_goal()
+            if active is None:
+                return paused
+            result = self.manage_goal(
+                {
+                    "request_id": f"shutdown-pause-{uuid7()}",
+                    "goal_id": active["id"],
+                    "expected_version": active.get("version"),
+                    "action": "pause",
+                    "reason": (
+                        "Coordinated shutdown paused all runnable work before "
+                        "safe return and logout"
+                    ),
+                }
+            )
+            goal = result.get("goal") if isinstance(result, dict) else None
+            if not isinstance(goal, dict) or goal.get("status") != "paused":
+                raise RuntimeError(
+                    f"shutdown could not verify paused goal {active['id']}"
+                )
+            paused.append(str(goal["id"]))
+        raise RuntimeError("shutdown refused to drain more than 200 runnable goals")
+
+    def _shutdown_safe_candidates(
+        self,
+        observation: dict[str, Any],
+        requested_room_id: int | None,
+    ) -> list[dict[str, Any]]:
+        current_room = deep_get(
+            observation,
+            "look.room.num",
+            deep_get(observation, "look.room_id"),
+        )
+        current = self._verified_safe_staging(current_room)
+        if current is not None and requested_room_id is None:
+            return [{**current, "basis": "already_in_verified_safe_room"}]
+
+        candidates: list[dict[str, Any]] = []
+        if requested_room_id is not None:
+            requested = self._verified_safe_staging(requested_room_id)
+            if requested is not None:
+                candidates.append(
+                    {**requested, "basis": "operator_requested_safe_room"}
+                )
+
+        finder = getattr(self.knowledge, "safe_location_candidates", None)
+        if callable(finder) and current_room is not None:
+            try:
+                found = finder(
+                    int(current_room),
+                    preferred_room_id=(
+                        requested_room_id
+                        if requested_room_id is not None
+                        else FAMILIARS_ROOM_ID
+                    ),
+                    limit=12,
+                )
+            except (TypeError, ValueError):
+                found = None
+            raw = found.get("candidates") if isinstance(found, dict) else None
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                verified = self._verified_safe_staging(item.get("room_id"))
+                if verified is not None:
+                    candidates.append(
+                        {
+                            **verified,
+                            "distance": item.get("distance"),
+                            "basis": item.get("basis") or "source_safe_candidate",
+                        }
+                    )
+
+        remembered = self.storage.get_runtime(SAFE_STAGING_RUNTIME_KEY, {})
+        if isinstance(remembered, dict):
+            verified = self._verified_safe_staging(remembered.get("room_id"))
+            if verified is not None:
+                candidates.append(
+                    {
+                        **verified,
+                        "basis": "source_revalidated_last_observed_safe_room",
+                    }
+                )
+
+        unique: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for item in candidates:
+            room_id = int(item["room_id"])
+            if room_id in seen:
+                continue
+            seen.add(room_id)
+            unique.append(item)
+        return unique[:SHUTDOWN_MAX_SAFE_CANDIDATES]
+
+    def _stop_keeper_for_shutdown(self) -> dict[str, Any]:
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if not self._keeper_is_driving(status):
+            return status if isinstance(status, dict) else {"running": False}
+        result = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "stop",
+                "hard": True,
+                "why": (
+                    "coordinated shutdown is transferring movement ownership "
+                    "to verified safe return"
+                ),
+            },
+            timeout=30,
+            mutation=True,
+        )
+        # Upstream hard-stop is intentionally asynchronous: it marks the keeper
+        # as stopping and returns its current status, which can still have
+        # running=true until the in-flight pass reaches its cancellation
+        # boundary. Poll the authoritative state instead of mistaking that
+        # acknowledgement for a refusal and immediately reviving the keeper.
+        deadline = time.monotonic() + SHUTDOWN_KEEPER_STOP_TIMEOUT_SECONDS
+        status = result
+        while self._keeper_is_driving(status) and time.monotonic() < deadline:
+            time.sleep(0.25)
+            status = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+        if self._keeper_is_driving(status):
+            raise RuntimeError(
+                "keeper did not release control before the shutdown timeout"
+            )
+        return status if isinstance(status, dict) else {"running": False}
+
+    def _recover_for_shutdown(
+        self, observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        current_room = deep_get(observation, "look.room.num")
+        if self._verified_safe_staging(current_room) is not None:
+            return observation
+        keeper = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if self._shutdown_full_health(observation) and self._shutdown_keeper_threat_clear(
+            keeper
+        ):
+            return observation
+
+        self._set_shutdown_stage(
+            "recovering",
+            detail="survival keeper is recovering or withdrawing before safe travel",
+        )
+        self._ensure_survival_keeper()
+        deadline = time.monotonic() + SHUTDOWN_RECOVERY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(2.0)
+            observation = self._refresh_shutdown_observation()
+            current_room = deep_get(observation, "look.room.num")
+            if self._verified_safe_staging(current_room) is not None:
+                return observation
+            keeper = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+                mutation=False,
+            )
+            if self._shutdown_full_health(
+                observation
+            ) and self._shutdown_keeper_threat_clear(keeper):
+                return observation
+        raise RuntimeError(
+            "survival keeper did not establish full-health, threat-clear travel "
+            "readiness before the shutdown recovery timeout"
+        )
+
+    def _travel_to_shutdown_safety(
+        self,
+        observation: dict[str, Any],
+        requested_room_id: int | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._begin_foreground_action("shutdown_safe_return")
+        try:
+            return self._travel_to_shutdown_safety_owned(
+                observation,
+                requested_room_id,
+            )
+        finally:
+            try:
+                if self._safety_enforcement_active:
+                    self._restore_safety_after_foreground(
+                        tool="shutdown_safe_return"
+                    )
+            finally:
+                self._end_foreground_action()
+
+    def _travel_to_shutdown_safety_owned(
+        self,
+        observation: dict[str, Any],
+        requested_room_id: int | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Perform safe-return travel while the controller owns the foreground."""
+
+        current_room = deep_get(observation, "look.room.num")
+        current_safe = self._verified_safe_staging(current_room)
+        if current_safe is not None and (
+            requested_room_id is None
+            or str(current_room) == str(requested_room_id)
+        ):
+            return observation, {
+                **current_safe,
+                "basis": "already_in_verified_safe_room",
+            }
+
+        candidates = self._shutdown_safe_candidates(
+            observation, requested_room_id
+        )
+        if not candidates:
+            raise RuntimeError(
+                f"no source-verified shutdown sanctuary is available from room {current_room}"
+            )
+
+        capabilities = self.broker.capabilities()
+        self._stop_keeper_for_shutdown()
+        failures: list[dict[str, Any]] = []
+        for candidate in candidates:
+            destination = int(candidate["room_id"])
+            self._set_shutdown_stage(
+                "travelling",
+                destination_room_id=destination,
+                destination_name=candidate.get("name"),
+                route_failures=failures,
+            )
+            self._begin_foreground_action("shutdown_safe_return")
+            try:
+                if "rest" in capabilities:
+                    self.broker.call_tool(
+                        "rest",
+                        {"agent": self.config.game.agent, "stand": True},
+                        timeout=10,
+                        mutation=True,
+                    )
+                if "look" in capabilities:
+                    self.broker.call_tool(
+                        "look",
+                        {"agent": self.config.game.agent},
+                        timeout=20,
+                        mutation=False,
+                    )
+                arguments: dict[str, Any] = {
+                    "agent": self.config.game.agent,
+                    "to": destination,
+                }
+                travel_tool = capabilities.get("travel")
+                if travel_tool is not None and travel_tool.accepts("max_hops"):
+                    arguments["max_hops"] = 50
+                result = self.broker.call_tool(
+                    "travel",
+                    arguments,
+                    timeout=SHUTDOWN_TRAVEL_TIMEOUT_SECONDS,
+                    mutation=True,
+                )
+            except (BrokerError, ValueError) as exc:
+                result = {"error": str(exc)[:500]}
+            finally:
+                self._end_foreground_action()
+
+            observation = self._refresh_shutdown_observation()
+            arrived_room = deep_get(observation, "look.room.num")
+            verified = self._verified_safe_staging(arrived_room)
+            if verified is not None and str(arrived_room) == str(destination):
+                return observation, {
+                    **verified,
+                    "basis": candidate.get("basis"),
+                }
+            failures.append(
+                {
+                    "destination_room_id": destination,
+                    "result": redact(result),
+                    "observed_room_id": arrived_room,
+                }
+            )
+            observation = self._recover_for_shutdown(observation)
+            self._stop_keeper_for_shutdown()
+
+        raise RuntimeError(
+            "every source-verified shutdown sanctuary route failed: "
+            + "; ".join(
+                f"room {item['destination_room_id']} left us in "
+                f"{item.get('observed_room_id')}"
+                for item in failures
+            )
+        )
+
+    def _logout_for_shutdown(self) -> dict[str, Any]:
+        capabilities = self.broker.capabilities()
+        leave = capabilities.get("leave")
+        if leave is None:
+            raise RuntimeError("broker does not expose the controller-owned leave tool")
+        arguments: dict[str, Any] = {"agent": self.config.game.agent}
+        if leave.accepts("forget"):
+            # FR-CHAR-006: ordinary shutdown must preserve the credential roster.
+            arguments["forget"] = False
+        result = self.broker.call_tool(
+            "leave", arguments, timeout=30, mutation=True
+        )
+        if not isinstance(result, dict) or result.get("left") is not True:
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError:
+                health = None
+            sessions = health.get("sessions") if isinstance(health, dict) else None
+            if not isinstance(sessions, list) or self.config.game.agent in sessions:
+                raise RuntimeError(
+                    "broker did not affirm that the character logged out"
+                )
+        if not isinstance(result, dict):
+            result = {"left": True}
+        if result.get("forgotten") is True:
+            raise RuntimeError(
+                "broker unexpectedly removed the character from its credential roster"
+            )
+
+        deadline = time.monotonic() + SHUTDOWN_SESSION_EXIT_TIMEOUT_SECONDS
+        session_absent = False
+        while time.monotonic() < deadline:
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError:
+                # The affirmative leave receipt is enough if the broker begins
+                # shutting down before its next health response.
+                session_absent = True
+                break
+            sessions = health.get("sessions")
+            if isinstance(sessions, list) and self.config.game.agent not in sessions:
+                session_absent = True
+                break
+            time.sleep(0.25)
+        if not session_absent:
+            raise RuntimeError(
+                "character remained in the broker session list after logout"
+            )
+        return result
+
+    def _fail_safe_shutdown(self, exc: Exception) -> None:
+        message = str(exc)[:1000]
+        try:
+            health = self.broker.health(timeout=3)
+            joined = self.config.game.agent in health.get("sessions", [])
         except BrokerError:
-            pass
+            joined = False
+        if joined:
+            try:
+                self._ensure_survival_keeper()
+            except (BrokerError, ValueError):
+                pass
+        self._shutdown_requested.clear()
+        self.state = "shutdown_failed"
+        self.warnings = [*self.warnings[-9:], f"shutdown: {message}"]
+        self._set_shutdown_stage(
+            "failed",
+            error=message,
+            logged_out=not joined,
+            fail_safe=(
+                "controller remains running with goals paused; survival keeper "
+                "was retained or restarted when the session was still joined"
+            ),
+        )
+        self.storage.emit_event(
+            "runtime.shutdown_failed",
+            "Coordinated shutdown failed safe; controller remains running",
+            severity="error",
+            interesting=True,
+            data={"error": message, "joined": joined},
+        )
+
+    def _perform_safe_shutdown(self) -> dict[str, Any]:
+        request = self._shutdown_status_snapshot() or {}
+        requested_room_id = request.get("requested_destination_room_id")
+        self._mark_planned_phase_stop()
+        self.state = "draining"
+        self._set_shutdown_stage("pausing", error=None)
+        try:
+            paused_goal_ids = self._pause_all_runnable_goals_for_shutdown()
+            self._set_shutdown_stage(
+                "securing", paused_goal_ids=paused_goal_ids
+            )
+            try:
+                health = self.broker.health(timeout=3)
+            except BrokerError as exc:
+                raise RuntimeError(
+                    "cannot verify the broker session before shutdown"
+                ) from exc
+            if self.config.game.agent not in health.get("sessions", []):
+                final = self._set_shutdown_stage(
+                    "complete",
+                    paused_goal_ids=paused_goal_ids,
+                    logged_out=True,
+                    safe_room=None,
+                    detail="character was already absent from the broker session list",
+                )
+            else:
+                observation = self._refresh_shutdown_observation()
+                observation = self._recover_for_shutdown(observation)
+                observation, safe_room = self._travel_to_shutdown_safety(
+                    observation,
+                    int(requested_room_id)
+                    if requested_room_id is not None
+                    else None,
+                )
+                current_room = deep_get(observation, "look.room.num")
+                if self._verified_safe_staging(current_room) is None:
+                    raise RuntimeError(
+                        "shutdown safe-room verification was lost before logout"
+                    )
+                self._set_shutdown_stage(
+                    "logging_out", safe_room=redact(safe_room)
+                )
+                self._stop_keeper_for_shutdown()
+                leave_result = self._logout_for_shutdown()
+                final = self._set_shutdown_stage(
+                    "complete",
+                    paused_goal_ids=paused_goal_ids,
+                    safe_room=redact(safe_room),
+                    logged_out=True,
+                    leave_result=redact(leave_result),
+                )
+            self.storage.emit_event(
+                "runtime.shutdown_complete",
+                "Paused runnable work, verified safety, logged out, and completed shutdown",
+                severity="notice",
+                interesting=True,
+                data=redact(final),
+            )
+            self.state = "stopping"
+            self._shutdown_requested.clear()
+            self.stop_event.set()
+            self._wake_event.set()
+            return final
+        except Exception as exc:
+            self._fail_safe_shutdown(exc)
+            return self._shutdown_status_snapshot() or {"stage": "failed"}
 
     def _active_campaign_phase_identity(self) -> tuple[str, str, str] | None:
         goal = self.storage.active_goal()

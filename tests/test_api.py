@@ -71,6 +71,25 @@ class ApiTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(goals_request, timeout=2) as response:
                     self.assertEqual({"goals": []}, json.load(response))
+                for index in range(5):
+                    controller.storage.emit_event(
+                        "test.activity",
+                        f"Recent activity {index}",
+                        interesting=False,
+                    )
+                events_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/events?latest=true&interesting_only=false&limit=3",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(events_request, timeout=2) as response:
+                    latest = json.load(response)
+                self.assertEqual(
+                    ["Recent activity 2", "Recent activity 3", "Recent activity 4"],
+                    [event["summary"] for event in latest["events"]],
+                )
+                self.assertEqual(
+                    controller.config.deployment.timezone, latest["timezone"]
+                )
                 character_request = urllib.request.Request(
                     f"http://127.0.0.1:{control_port}/v1/character",
                     headers={"authorization": "Bearer test-token"},
@@ -81,6 +100,27 @@ class ApiTests(unittest.TestCase):
                     self.assertIn("abilities", character_status)
                     self.assertIn("inventory", character_status)
                     self.assertIn("equipment", character_status)
+                controller._remember_conversation(
+                    "name:bunsen", "speaker", "Good morning.", speaker_kind="npc"
+                )
+                controller._remember_conversation(
+                    "name:bunsen", "assistant", "Good morning!", speaker_kind="npc"
+                )
+                conversation_request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/conversations?limit=1",
+                    headers={"authorization": "Bearer test-token"},
+                )
+                with urllib.request.urlopen(conversation_request, timeout=2) as response:
+                    conversations = json.load(response)
+                    self.assertEqual(200, response.status)
+                self.assertEqual(1, len(conversations["messages"]))
+                self.assertEqual("assistant", conversations["messages"][0]["role"])
+                self.assertEqual("Good morning!", conversations["messages"][0]["content"])
+                self.assertEqual("bunsen", conversations["messages"][0]["speaker"])
+                self.assertEqual(
+                    controller.config.deployment.timezone,
+                    conversations["timezone"],
+                )
                 draft_status, draft = self.request_json(
                     f"http://127.0.0.1:{control_port}/v1/goals/draft",
                     body={"prompt": "Do something useful."},
@@ -89,6 +129,13 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(
                     "Meet the operator's request", draft["goal"]["title"]
                 )
+                shutdown_status, shutdown = self.request_json(
+                    f"http://127.0.0.1:{control_port}/v1/runtime/safe-stop",
+                    body={},
+                )
+                self.assertEqual(202, shutdown_status)
+                self.assertTrue(shutdown["stopping"])
+                self.assertEqual("requested", shutdown["shutdown"]["stage"])
                 mutation = urllib.request.Request(
                     f"http://127.0.0.1:{dashboard_port}/goals",
                     data=b"{}",

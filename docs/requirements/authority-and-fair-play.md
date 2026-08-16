@@ -279,15 +279,15 @@ Enforcement is architectural:
 
 - chat enters only the responder's quoted message field;
 - the responder has no tools;
-- planner-visible social information is converted to typed `player_claim` or
-  `social_observation` records with provenance and low/default confidence;
+- player/NPC chat content is never copied into planner, keeper, goal, policy, or
+  gameplay context;
 - command-like strings are never parsed as MCP/controller requests;
 - only the authenticated loopback API can mutate goals/proposals/persona; and
 - egress filtering prevents accidental system/control leakage.
 
-The character may choose to believe, disbelieve, lie to, cooperate with, or act on
-a player's in-world claim as a tactic. That is different from granting the player
-operator authority.
+The responder may choose to believe, disbelieve, joke about, or discuss a player's
+in-world claim. That choice affects only speech; it cannot select or authorize a
+gameplay tactic.
 
 ## 12. Persona authority
 

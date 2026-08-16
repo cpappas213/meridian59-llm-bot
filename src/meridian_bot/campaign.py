@@ -11,6 +11,7 @@ from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 
 CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
+CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY = "campaign_phase_progress_lease_v1"
 
 
 PHASE_KINDS = {
@@ -219,6 +220,8 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
 
 PHASE_ACTION_SUCCEEDED = "phase_action_succeeded"
 PHASE_ACTION_CRITERION_FIELDS = frozenset({"id", "kind", "tools"})
+RESEARCH_RETRY_UNLOCKED = "research_retry_unlocked"
+RESEARCH_RETRY_CRITERION_FIELDS = frozenset({"id", "kind"})
 
 # Campaign-manager output uses this small semantic vocabulary. The controller
 # compiles targets into verifier criteria, so an LLM can select an outcome but
@@ -233,10 +236,14 @@ PHASE_TARGET_FIELDS: dict[str, frozenset[str]] = {
         {"id", "type", "dimension", "value"}
     ),
     "item_count_at_least": frozenset({"id", "type", "item", "count"}),
+    "equipment_count_at_least": frozenset(
+        {"id", "type", "category", "count"}
+    ),
     "inventory_not_full": frozenset({"id", "type"}),
     "location_reached": frozenset({"id", "type", "room_id", "name"}),
     "equipment_known": frozenset({"id", "type"}),
     "wielding_equals": frozenset({"id", "type", "items"}),
+    "wielding_contains": frozenset({"id", "type", "item", "category"}),
     "ability_at_least": frozenset(
         {"id", "type", "ability_kind", "name", "value"}
     ),
@@ -485,10 +492,43 @@ class CampaignCoordinator:
                     raise ValueError(
                         "item_count_at_least requires a non-empty item and positive integer count"
                     )
+                equipment_category = {
+                    "weapon": "weapon",
+                    "weapons": "weapon",
+                    "armor": "armor",
+                    "armour": "armor",
+                }.get(item.casefold())
+                criterion = (
+                    {
+                        "id": target_id,
+                        "kind": "equipment_count",
+                        "category": equipment_category,
+                        "count": count,
+                    }
+                    if equipment_category is not None
+                    else {
+                        "id": target_id,
+                        "kind": "inventory_contains",
+                        "item": item,
+                        "count": count,
+                    }
+                )
+            elif target_type == "equipment_count_at_least":
+                category = str(target.get("category") or "").strip().casefold()
+                count = target.get("count")
+                if (
+                    category not in {"weapon", "armor"}
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                ):
+                    raise ValueError(
+                        "equipment_count_at_least requires category=weapon|armor and a positive integer count"
+                    )
                 criterion = {
                     "id": target_id,
-                    "kind": "inventory_contains",
-                    "item": item,
+                    "kind": "equipment_count",
+                    "category": category,
                     "count": count,
                 }
             elif target_type == "inventory_not_full":
@@ -531,11 +571,45 @@ class CampaignCoordinator:
                     raise ValueError(
                         "wielding_equals.items must be null or an array of canonical names"
                     )
+                if (
+                    isinstance(items, list)
+                    and len(items) == 1
+                    and " ".join(items[0].split()).casefold() in {"weapon", "weapons"}
+                ):
+                    item = " ".join(items[0].split())
+                    category = {
+                        "weapon": "weapon",
+                        "weapons": "weapon",
+                    }.get(item.casefold())
+                    criterion = {
+                        "id": target_id,
+                        "kind": "equipment_wielding",
+                        **(
+                            {"category": category}
+                            if category is not None
+                            else {"item": item}
+                        ),
+                    }
+                else:
+                    criterion = {
+                        "id": target_id,
+                        "kind": "state_equals",
+                        "path": "equipment.wielding",
+                        "value": items,
+                    }
+            elif target_type == "wielding_contains":
+                item = " ".join(str(target.get("item") or "").split())
+                category = str(target.get("category") or "").strip().casefold()
+                has_item = bool(item)
+                has_category = category == "weapon"
+                if has_item == has_category:
+                    raise ValueError(
+                        "wielding_contains requires exactly one canonical item or category=weapon"
+                    )
                 criterion = {
                     "id": target_id,
-                    "kind": "state_equals",
-                    "path": "equipment.wielding",
-                    "value": items,
+                    "kind": "equipment_wielding",
+                    **({"item": item} if has_item else {"category": category}),
                 }
             elif target_type == "ability_at_least":
                 ability_kind = str(target.get("ability_kind") or "").casefold()
@@ -633,6 +707,8 @@ class CampaignCoordinator:
             criteria, phase_kind=kind, migrate_legacy=True
         )
         self._validate_phase_success_criteria(kind, criteria, goal, phase)
+        if observation is not None:
+            self._validate_material_equipment_targets(kind, criteria, observation)
         abandon_predicates = phase.get("abandon_predicates", [])
         if not isinstance(abandon_predicates, list):
             raise ValueError("campaign phase abandon_predicates must be an array")
@@ -667,8 +743,25 @@ class CampaignCoordinator:
             if isinstance(phase.get("context"), dict)
             else {}
         )
+        unverified_preferences: dict[str, Any] = {}
+        for field in ("avoid_rooms", "avoid_targets"):
+            proposed = phase_context.pop(field, None)
+            if proposed not in (None, []):
+                unverified_preferences[field] = redact(proposed)
+        if unverified_preferences:
+            # An LLM phase is allowed to choose work, not to manufacture durable
+            # negative evidence. Exact route failures, farm quarantines, and
+            # empirical room outcomes are controller-owned elsewhere. Persist
+            # this only as an audit note; compact manager context deliberately
+            # does not replay it into the next decision.
+            phase_context["ignored_unverified_tactic_preferences"] = (
+                unverified_preferences
+            )
         if raw_targets is not None:
-            phase_context["phase_targets"] = redact(raw_targets)
+            # Replay only the compiled contract. Keeping a repaired raw target
+            # such as item="weapon" in planner context can resurrect the exact
+            # invalid literal interpretation the compiler just removed.
+            phase_context["phase_targets"] = redact(criteria)
         if ignored_abandon_predicates:
             phase_context["ignored_invalid_abandon_predicates"] = (
                 ignored_abandon_predicates
@@ -749,9 +842,54 @@ class CampaignCoordinator:
                 isinstance(value, dict)
                 and value.get("kind") == "state_equals"
                 and value.get("path") == "equipment.wielding"
-                and isinstance(value.get("value"), str)
             ):
-                value["value"] = [value["value"]]
+                expected = value.get("value")
+                if isinstance(expected, str):
+                    expected = [expected]
+                if (
+                    isinstance(expected, list)
+                    and len(expected) == 1
+                    and " ".join(str(expected[0] or "").split()).casefold()
+                    in {"weapon", "weapons"}
+                ):
+                    item = " ".join(str(expected[0] or "").split())
+                    category = (
+                        "weapon" if item.casefold() in {"weapon", "weapons"} else None
+                    )
+                    value = {
+                        "id": value.get("id"),
+                        "kind": "equipment_wielding",
+                        **(
+                            {"category": category}
+                            if category is not None
+                            else {"item": item}
+                        ),
+                    }
+                elif isinstance(expected, list) and isinstance(value, dict):
+                    value["value"] = expected
+            if (
+                isinstance(value, dict)
+                and value.get("kind") == "inventory_contains"
+                and " ".join(str(value.get("item") or "").split()).casefold()
+                in {"weapon", "weapons", "armor", "armour"}
+            ):
+                raw_item = " ".join(str(value.get("item") or "").split()).casefold()
+                value = {
+                    "id": value.get("id"),
+                    "kind": "equipment_count",
+                    "category": "weapon" if raw_item.startswith("weapon") else "armor",
+                    "count": value.get("count", 1),
+                }
+            if (
+                isinstance(value, dict)
+                and value.get("kind") == "inventory_contains"
+                and " ".join(str(value.get("item") or "").split()).casefold()
+                in {"gear", "equipment"}
+            ):
+                raise ValueError(
+                    "inventory_contains cannot verify a generic gear/equipment category; "
+                    "use equipment_count_at_least with category=weapon or armor"
+                )
             if (
                 isinstance(value, dict)
                 and phase_kind == "prepare_combat"
@@ -803,6 +941,41 @@ class CampaignCoordinator:
             normalized.append(value)
         return normalized
 
+    @staticmethod
+    def _validate_material_equipment_targets(
+        phase_kind: str,
+        criteria: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> None:
+        """Reject support milestones that are already true when proposed."""
+
+        if phase_kind != "prepare_combat":
+            return
+        for criterion in criteria:
+            if not isinstance(criterion, dict):
+                continue
+            kind = criterion.get("kind")
+            if kind == "equipment_count":
+                category = str(criterion.get("category") or "")
+                required = int(criterion.get("count", 1) or 1)
+                current = CriteriaEvaluator.equipment_count(observation, category)
+                if required <= current:
+                    raise ValueError(
+                        f"prepare_combat equipment target is already true: verified {category} "
+                        f"count is {current}, so the target must exceed {current} or select a "
+                        "different observable improvement; do not create gear merely to reopen research"
+                    )
+            elif kind == "equipment_wielding" and CriteriaEvaluator.equipment_wielding(
+                observation,
+                item=criterion.get("item"),
+                category=criterion.get("category"),
+            ):
+                target = criterion.get("item") or criterion.get("category")
+                raise ValueError(
+                    f"prepare_combat wielding target {target!r} is already verified; select a "
+                    "different concrete item or another observable capability improvement"
+                )
+
     def _validate_phase_success_criteria(
         self,
         phase_kind: str,
@@ -820,6 +993,20 @@ class CampaignCoordinator:
             if criterion_id in ids:
                 raise ValueError(f"duplicate criterion id: {criterion_id}")
             ids.add(criterion_id)
+            if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
+                has_internal = True
+                unknown = set(criterion) - RESEARCH_RETRY_CRITERION_FIELDS
+                if unknown:
+                    raise ValueError(
+                        "unknown research_retry_unlocked criterion field(s): "
+                        + ", ".join(sorted(unknown))
+                    )
+                if phase_kind != "prepare_combat":
+                    raise ValueError(
+                        "research_retry_unlocked is reserved for controller-owned "
+                        "prepare_combat recovery phases"
+                    )
+                continue
             if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
                 self._validate_public_phase_criterion(criterion)
                 public_criteria.append(criterion)
@@ -875,7 +1062,7 @@ class CampaignCoordinator:
                 "prepare_combat cannot use mutating action success alone for "
                 + ", ".join(sorted(preparation_mutations))
                 + "; require an observable target such as item_count_at_least, "
-                "wielding_equals, equipment_known, or inventory_not_full"
+                "equipment_count_at_least, wielding_contains, equipment_known, or inventory_not_full"
             )
         max_health_goal = any(
             isinstance(criterion, dict)
@@ -935,6 +1122,8 @@ class CampaignCoordinator:
             return
         if kind in {
             "inventory_contains",
+            "equipment_count",
+            "equipment_wielding",
             "location_reached",
             "event_occurred",
             "composite_all",
@@ -963,7 +1152,8 @@ class CampaignCoordinator:
         public = [
             criterion
             for criterion in annotated
-            if criterion.get("kind") != PHASE_ACTION_SUCCEEDED
+            if criterion.get("kind")
+            not in {PHASE_ACTION_SUCCEEDED, RESEARCH_RETRY_UNLOCKED}
         ]
         public_results: dict[str, dict[str, Any]] = {}
         if public:
@@ -982,6 +1172,23 @@ class CampaignCoordinator:
         evidence_event_ids: list[str] = []
         for criterion in annotated:
             criterion_id = str(criterion["id"])
+            if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
+                # The CampaignCoordinator deliberately has no access to the
+                # controller's retained research-exhaustion evidence.  The
+                # controller evaluates this internal criterion against the
+                # phase's durable baseline before calling ordinary completion.
+                results.append(
+                    {
+                        "id": criterion_id,
+                        "kind": RESEARCH_RETRY_UNLOCKED,
+                        "met": False,
+                        "detail": (
+                            "awaiting a controller-verified material capability "
+                            "or world-evidence change"
+                        ),
+                    }
+                )
+                continue
             if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
                 result = public_results.get(criterion_id)
                 if result is not None:
@@ -1056,6 +1263,7 @@ class CampaignCoordinator:
         observation: dict[str, Any],
         *,
         allow_completion: bool = True,
+        allow_abandonment: bool = True,
     ) -> PhaseOutcome:
         if phase is None:
             return PhaseOutcome(False, False, None, {"reason": "no_active_phase"})
@@ -1112,6 +1320,22 @@ class CampaignCoordinator:
                     str(item.get("detail") or item.get("id") or item.get("kind"))
                     for item in triggered[:5]
                 )
+                if not allow_abandonment:
+                    # A keeper-owned combat phase may still be outside safety
+                    # when an abandonment predicate becomes true.  Report the
+                    # verified outcome without terminalizing the phase so the
+                    # controller can retain survival ownership until a source-
+                    # verified sanctuary is reached.
+                    return PhaseOutcome(
+                        False,
+                        False,
+                        phase,
+                        {
+                            "reason": reason,
+                            "abandonment": abandonment,
+                            "abandonment_deferred": True,
+                        },
+                    )
                 finished = self.storage.transition_campaign_phase(
                     phase["id"], "failed", reason=reason, resume_parent=False
                 )
@@ -1168,6 +1392,9 @@ class CampaignCoordinator:
         activated_at = str(phase.get("activated_at") or phase.get("created_at") or "")
         elapsed_minutes = 0.0
         downtime_seconds = 0.0
+        downtime_at_lease_seconds = 0.0
+        elapsed_basis = "phase_activation"
+        last_verified_progress_at: str | None = None
         downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
         if (
             isinstance(downtime, dict)
@@ -1177,8 +1404,41 @@ class CampaignCoordinator:
                 downtime_seconds = max(0.0, float(downtime.get("seconds", 0.0) or 0.0))
             except (TypeError, ValueError):
                 downtime_seconds = 0.0
+        reference_at = activated_at
+        if str(phase.get("kind") or "") == "farm":
+            leases = self.storage.get_runtime(
+                CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+            )
+            lease = (
+                leases.get(str(phase.get("id") or ""))
+                if isinstance(leases, dict)
+                else None
+            )
+            if isinstance(lease, dict):
+                renewed_at = str(lease.get("renewed_at") or "")
+                try:
+                    activated_value = datetime.fromisoformat(
+                        activated_at.replace("Z", "+00:00")
+                    )
+                    renewed_value = datetime.fromisoformat(
+                        renewed_at.replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if renewed_value >= activated_value:
+                        reference_at = renewed_at
+                        elapsed_basis = "last_verified_keeper_progress"
+                        last_verified_progress_at = renewed_at
+                        try:
+                            downtime_at_lease_seconds = max(
+                                0.0,
+                                float(lease.get("downtime_seconds", 0.0) or 0.0),
+                            )
+                        except (TypeError, ValueError):
+                            downtime_at_lease_seconds = 0.0
         try:
-            activated = datetime.fromisoformat(activated_at.replace("Z", "+00:00"))
+            activated = datetime.fromisoformat(reference_at.replace("Z", "+00:00"))
             elapsed_minutes = max(
                 0.0,
                 (
@@ -1186,7 +1446,7 @@ class CampaignCoordinator:
                         datetime.now(timezone.utc)
                         - activated.astimezone(timezone.utc)
                     ).total_seconds()
-                    - downtime_seconds
+                    - max(0.0, downtime_seconds - downtime_at_lease_seconds)
                 )
                 / 60.0,
             )
@@ -1199,6 +1459,8 @@ class CampaignCoordinator:
                 "limit": max_actions,
                 "elapsed_minutes": round(elapsed_minutes, 1),
                 "downtime_minutes": round(downtime_seconds / 60.0, 1),
+                "elapsed_basis": elapsed_basis,
+                "last_verified_progress_at": last_verified_progress_at,
             }
         if elapsed_minutes >= max_minutes:
             return {
@@ -1207,6 +1469,8 @@ class CampaignCoordinator:
                 "limit": max_minutes,
                 "attempts": attempts,
                 "downtime_minutes": round(downtime_seconds / 60.0, 1),
+                "elapsed_basis": elapsed_basis,
+                "last_verified_progress_at": last_verified_progress_at,
             }
         return None
 
@@ -1312,6 +1576,7 @@ class CampaignCoordinator:
         result: Any = None,
         verification: Any = None,
         reason: str = "",
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if phase is None or phase_attempt_id is None:
             return {"breaker_tripped": False}
@@ -1337,6 +1602,7 @@ class CampaignCoordinator:
             semantic_action=attempt["semantic_action"],
             failure_count=len(failures),
             reason=reason,
+            failure_context=failure_context,
         )
 
     def trip_breaker(
@@ -1348,6 +1614,7 @@ class CampaignCoordinator:
         semantic_action: str,
         failure_count: int,
         reason: str = "",
+        failure_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if phase is None:
             return {"breaker_tripped": False}
@@ -1360,6 +1627,7 @@ class CampaignCoordinator:
                 "failed",
                 reason=reason or "two equivalent semantic actions failed in unchanged state",
                 resume_parent=False,
+                failure_context=redact(failure_context),
             )
             self.storage.emit_event(
                 "campaign.breaker.tripped",
@@ -1373,6 +1641,7 @@ class CampaignCoordinator:
                     "signature": signature,
                     "failure_count": failure_count,
                     "reason": reason[:1000],
+                    "failure_context": redact(failure_context),
                     "strategic_goal_preserved": True,
                 },
             )
@@ -1411,9 +1680,20 @@ class CampaignCoordinator:
         compact: dict[str, Any] = {
             "room": value.get("room", blocker.get("assigned_room")),
             "target": value.get("target", blocker.get("hunt")),
+            "use_safe_spots": value.get(
+                "use_safe_spots", blocker.get("use_safe_spots")
+            ),
+            "tactic_id": value.get("tactic_id"),
             "reason": blocker.get("kind") or "unknown",
         }
-        for key in ("danger_limit", "use_safe_spots"):
+        disposition = value.get("disposition")
+        if isinstance(disposition, dict):
+            compact["disposition"] = {
+                key: disposition.get(key)
+                for key in ("class", "scope")
+                if disposition.get(key) is not None
+            }
+        for key in ("danger_limit",):
             if blocker.get(key) is not None:
                 compact[key] = blocker.get(key)
         reasons = deep_get(blocker, "evidence.reasons", blocker.get("reasons"))
@@ -1444,6 +1724,8 @@ class CampaignCoordinator:
                 "use_safe_spots",
                 "flee_below",
                 "fight_above_vigor",
+                "eat_before_fighting",
+                "buy_food",
                 "next_hp_milestone",
                 "selection_basis",
                 "deterministic_fallback",
@@ -1452,9 +1734,6 @@ class CampaignCoordinator:
             )
             if value.get(key) is not None
         }
-        avoid_rooms = value.get("avoid_rooms")
-        if isinstance(avoid_rooms, list):
-            compact["avoid_rooms"] = avoid_rooms[:24]
         constraints = value.get("constraints")
         if isinstance(constraints, dict):
             compact["constraints"] = {
@@ -1472,6 +1751,8 @@ class CampaignCoordinator:
                     "use_safe_spots",
                     "flee_below",
                     "fight_above_vigor",
+                    "eat_before_fighting",
+                    "buy_food",
                     "selection_basis",
                 )
                 if recipe.get(key) is not None
@@ -1480,7 +1761,15 @@ class CampaignCoordinator:
         if isinstance(validation, dict):
             compact_validation: dict[str, Any] = {
                 key: validation.get(key)
-                for key in ("status", "fingerprint", "candidate_count")
+                for key in (
+                    "status",
+                    "fingerprint",
+                    "candidate_count",
+                    "candidate_set_fingerprint",
+                    "disposition_fingerprint",
+                    "tactic_count",
+                    "progress",
+                )
                 if validation.get(key) is not None
             }
             selected = validation.get("recipe")
@@ -1501,6 +1790,34 @@ class CampaignCoordinator:
                 compact_validation["rejection_reasons"] = rejection_counts
             compact["recipe_validation"] = compact_validation
         return compact
+
+    @staticmethod
+    def _compact_failure_context(value: Any) -> dict[str, Any] | None:
+        """Keep exact causal action identity without replaying arbitrary payloads."""
+
+        if not isinstance(value, dict):
+            return None
+        compact = {
+            key: value.get(key)
+            for key in (
+                "stage",
+                "tool",
+                "plan_step_id",
+                "phase_kind",
+                "origin_room",
+                "destination_room",
+                "phase_work_implicated",
+            )
+            if value.get(key) is not None
+        }
+        arguments = value.get("arguments")
+        if isinstance(arguments, dict):
+            compact["arguments"] = {
+                str(key): item
+                for key, item in list(arguments.items())[:16]
+                if isinstance(item, (str, int, float, bool)) or item is None
+            }
+        return compact or None
 
     @classmethod
     def _compact_phase(cls, phase: Any) -> dict[str, Any] | None:
@@ -1553,6 +1870,9 @@ class CampaignCoordinator:
                 "reason": str(failure.get("reason") or "")[:500],
                 "recorded_at": failure.get("recorded_at"),
             }
+            cause = cls._compact_failure_context(failure.get("cause"))
+            if cause is not None:
+                compact["last_failure"]["cause"] = cause
         return compact
 
     @classmethod
@@ -1567,6 +1887,10 @@ class CampaignCoordinator:
                 "fingerprint",
                 "repeat_count",
                 "candidate_count",
+                "candidate_set_fingerprint",
+                "disposition_fingerprint",
+                "tactic_count",
+                "progress",
                 "recorded_at",
                 "retry_state_fingerprint",
             )
@@ -1590,7 +1914,7 @@ class CampaignCoordinator:
     ) -> dict[str, Any]:
         successful: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
-        unique_rejections: dict[tuple[str, str, str], dict[str, Any]] = {}
+        unique_rejections: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         research_fingerprints: dict[str, dict[str, Any]] = {}
         for phase in history:
             context = phase.get("context") if isinstance(phase.get("context"), dict) else {}
@@ -1628,6 +1952,7 @@ class CampaignCoordinator:
                 key = (
                     str(projected.get("room") or ""),
                     str(projected.get("target") or "").casefold(),
+                    str(projected.get("use_safe_spots")),
                     str(projected.get("reason") or ""),
                 )
                 unique_rejections[key] = projected
@@ -1638,6 +1963,7 @@ class CampaignCoordinator:
                 key = (
                     str(rejected.get("room") or ""),
                     str(rejected.get("target") or "").casefold(),
+                    str(rejected.get("use_safe_spots")),
                     str(rejected.get("reason") or ""),
                 )
                 unique_rejections[key] = rejected

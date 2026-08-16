@@ -7,6 +7,13 @@ and intends to use semantic versioning after its first public release.
 
 ### Added
 
+- An explicitly confirmed `X` safe-shutdown action on the TUI main screen,
+  including live drain-stage, paused-goal, verified-safe-room, logout, and
+  failure reporting while `Q` remains a detach-only operation.
+- A coordinated runtime shutdown sequence that pauses all runnable goals,
+  recovers and routes to fresh source-verified safety, releases the keeper, logs
+  out without forgetting the character, and fails safe without terminating when
+  any required boundary cannot be verified.
 - First-run onboarding driven by an operator-defined name/persona and a
   configured OpenAI-compatible model.
 - A local installer persona wizard and JSON-input path that do not require a
@@ -32,6 +39,14 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Imported structured compendium item values into financial planning and split
+  source-estimated liquidation value from exact live merchant quotes. A zero
+  confirmed quote now means sale-eligible loot still needs quoting rather than
+  incorrectly implying that the inventory is worthless.
+- Made exhausted progression-research support phases complete only after a
+  material equipment, ability, inventory, route, quarantine, max-health, or
+  knowledge change. Read-only equipment/ability calls no longer manufacture
+  progress or recreate the same phase loop.
 - Added authenticated `status` and graceful `stop` CLI commands plus a supported
   scheduled-controller restart script, preventing raw Task Scheduler stops from
   orphaning the Python controller or its owned Node broker on Windows.

@@ -77,6 +77,8 @@ Supported criterion kinds in MVP:
 - `numeric_threshold`: an observed metric crosses a threshold;
 - `numeric_delta`: a metric changes from a captured baseline;
 - `inventory_contains`: verified inventory has matching item/count;
+- `equipment_count`: verified carried/equipped equipment reaches a semantic weapon/armor count;
+- `equipment_wielding`: a concrete item or semantic equipment category is currently wielded;
 - `location_reached`: verified room/coordinate/area is reached;
 - `event_occurred`: a matching durable event exists after activation;
 - `composite_all` or `composite_any`: references other criterion IDs; and
@@ -91,6 +93,8 @@ Hermes-visible criterion fields are closed by kind; unknown fields are rejected:
 | `numeric_threshold` | `kind`, `metric`, `value` | `id`, `operator` | The observed numeric metric satisfies `operator` (`>=` by default) against `value`. `metric` may be an observation dot path or `ability.skill.<canonical name>` / `ability.spell.<canonical name>`. |
 | `numeric_delta` | `kind`, `metric`, `value`, `baseline` | `id`, `operator` | Observed metric minus `baseline` satisfies the comparison against `value`; named ability metrics use the same syntax. |
 | `inventory_contains` | `kind`, `item` | `id`, `count` | Case-insensitive item-name substring appears at least `count` times; count defaults to 1. |
+| `equipment_count` | `kind`, `category`, `count` | `id` | Distinct verified carried and equipped objects in category `weapon` or `armor` reach `count`; wielded objects are deduplicated against inventory/equipment ids and names. |
+| `equipment_wielding` | `kind`, and exactly one of `item` or `category="weapon"` | `id` | Live wielding state contains the exact canonical item, or any weapon for the semantic category. |
 | `location_reached` | `kind`, and one of `location`, `room`, or `room_id` | `id` and either other locator | Room name contains `location`/`room`, or its exact id equals `room_id`. |
 | `event_occurred` | `kind`, `event_kind` | `id`, `after_cursor` | A goal-scoped durable event of the exact kind exists after the controller-supplied activation cursor. Submission reanchors omitted, stale, or future values to the current durable tail. |
 | `composite_all` | `kind`, and `criteria` or `criterion_ids` | `id` | Every referenced criterion id is verified. |
@@ -128,7 +132,7 @@ Farm execution guidance inside `operator_notes` is a deliberately small
 machine-readable contract. If the notes mention `hunt`, `assigned_room`, or
 `use_safe_spots`, those fields use exact `key=value` syntax, for example
 `hunt=groundworm larva; assigned_room=567; use_safe_spots=true;
-flee_below=0.60; hold_resume_above=0.90; fight_above_vigor=100;
+flee_below=0.60; hold_resume_above=0.90; fight_above_vigor=80;
 bank_above=0; break_out_via_logoff=false`. A positive value deliberately enables
 special keeper banking trips; omission and zero both disable them. Narrative mentions of these field
 names are rejected as `INVALID_FARM_OPERATOR_NOTES`; this prevents a validated
@@ -676,7 +680,7 @@ The MCP facade maps to a versioned local API. Recommended routes:
 | `GET /v1/consequences` | Read-only consequential-action assessments and outcomes. |
 | `GET /v1/persona` / `PUT /v1/persona` | Persona versioning. |
 | `GET /v1/events` | Cursor-based event retrieval. |
-| `POST /v1/runtime/safe-stop` | Graceful operations stop; not exposed as Hermes MCP in MVP. |
+| `POST /v1/runtime/safe-stop` | Begin coordinated pause, safe return, logout, and process stop; accepts optional `destination_room_id`; not exposed as Hermes MCP in MVP. |
 | `GET /v1/knowledge/metadata` | Corpus version, build timestamp, source count, entity count, index version, and harness revision. |
 | `GET /v1/knowledge/search` | Read-only full-text/entity search. |
 | `GET /v1/knowledge/resolve` | Exact name, alias, class, slug, or numeric room-id resolution. |
@@ -687,6 +691,19 @@ The MCP facade maps to a versioned local API. Recommended routes:
 All non-health routes require a random local bearer secret even though the
 listener binds to loopback. The MCP facade reads it from its private environment.
 State changes use the same `request_id` semantics as MCP.
+
+`POST /v1/runtime/safe-stop` returns `202` after recording the shutdown request;
+the controller loop remains the sole gameplay-mutation owner and performs the
+sequence asynchronously. It pauses every active or queued goal, lets any current
+foreground mutation settle, recovers while exposed, and either remains in the
+freshly observed current safe room or routes to the optional exact destination
+or another source-verified safe candidate. Only after a fresh room observation,
+keeper release, `leave(forget=false)`, and confirmation that the broker session
+is absent does it terminate the controller and owned broker. A failed recovery,
+route, safety check, keeper stop, or logout leaves the controller running with
+goals paused and survival mode retained. Repeated requests are idempotent. The
+`controller.shutdown` status object exposes the requested target, stage, result,
+and error while the API remains available.
 
 ### 9.1 Goal drafting
 

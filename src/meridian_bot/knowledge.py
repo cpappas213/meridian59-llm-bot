@@ -21,7 +21,7 @@ from .utils import canonical_json, deep_get, timestamp
 
 
 KNOWLEDGE_TOOL_NAME = "knowledge_search"
-INDEX_VERSION = 6
+INDEX_VERSION = 8
 ENTITY_KINDS = (
     "location",
     "region",
@@ -146,12 +146,16 @@ class _PageText(HTMLParser):
         self.description = ""
         self.text: list[str] = []
         self.citations: list[str] = []
+        self.facts: dict[str, str] = {}
         self._main = 0
         self._ignored = 0
         self._capture_title = False
         self._capture_h1 = False
         self._capture_cite = False
         self._buffer: list[str] = []
+        self._fact_capture: str | None = None
+        self._fact_buffer: list[str] = []
+        self._pending_fact_label: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -171,8 +175,24 @@ class _PageText(HTMLParser):
         if "cite" in classes and self._main and not self._ignored:
             self._capture_cite = True
             self._buffer = []
+        if tag == "div" and self._main and not self._ignored:
+            if "lbl" in classes:
+                self._fact_capture = "label"
+                self._fact_buffer = []
+            elif "val" in classes:
+                self._fact_capture = "value"
+                self._fact_buffer = []
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self._fact_capture:
+            value = " ".join("".join(self._fact_buffer).split())
+            if self._fact_capture == "label":
+                self._pending_fact_label = value or None
+            elif value and self._pending_fact_label:
+                self.facts[normalize(self._pending_fact_label)] = value
+                self._pending_fact_label = None
+            self._fact_capture = None
+            self._fact_buffer = []
         if tag == "title" and self._capture_title:
             self.title = " ".join("".join(self._buffer).split())
             self._capture_title = False
@@ -192,6 +212,8 @@ class _PageText(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._capture_title or self._capture_h1 or self._capture_cite:
             self._buffer.append(data)
+        if self._fact_capture:
+            self._fact_buffer.append(data)
         if self._main and not self._ignored:
             clean = " ".join(data.split())
             if clean:
@@ -766,6 +788,26 @@ class KnowledgeBase:
         source_ref = str(path.relative_to(self.root)).replace("\\", "/")
         if parser.citations:
             source_ref += " | " + " | ".join(parser.citations[:8])
+        payload: dict[str, Any] = {
+            "slug": slug,
+            "page": str(path.relative_to(self.root)).replace("\\", "/"),
+        }
+        raw_value = parser.facts.get("value")
+        if kind in {"item", "weapon", "armor", "reagent"} and raw_value:
+            match = re.fullmatch(
+                r"\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:sh|shillings?)\s*",
+                raw_value,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                numeric_value = float(match.group(1).replace(",", ""))
+                payload["value"] = (
+                    int(numeric_value) if numeric_value.is_integer() else numeric_value
+                )
+                payload["value_basis"] = (
+                    "source-derived base item value from the compendium Value fact; "
+                    "live merchant resale value may differ"
+                )
         self._upsert_entity(
             connection,
             entity_id=entity_id,
@@ -774,7 +816,7 @@ class KnowledgeBase:
             aliases=aliases,
             summary=summary,
             content=content,
-            payload={"slug": slug, "page": str(path.relative_to(self.root)).replace("\\", "/")},
+            payload=payload,
             source_ref=source_ref,
             source_hash=hashlib.sha256(raw).hexdigest(),
         )
@@ -824,6 +866,7 @@ class KnowledgeBase:
                 instances.append(
                     {
                         "seller_id_at_build": record.get("id"),
+                        "name": str(record.get("name") or "").strip() or None,
                         "room_id": room_id,
                         "room_name": room_name,
                         "seen": seen,
@@ -1180,7 +1223,8 @@ class KnowledgeBase:
                 "canonical_name": row["canonical_name"],
                 "unit_value": value,
                 "source_ref": row["source_ref"],
-                "basis": "source-derived base item value; live resale value may differ",
+                "basis": payload.get("value_basis")
+                or "source-derived base item value; live resale value may differ",
             }
         finally:
             connection.close()
@@ -1238,6 +1282,18 @@ class KnowledgeBase:
                             "buying_categories": categories,
                             "verification": facts.get("sale_verification"),
                             "entity_id": merchant_row["id"],
+                            "instances": [
+                                {
+                                    "seller_id_at_build": instance.get(
+                                        "seller_id_at_build"
+                                    ),
+                                    "name": instance.get("name"),
+                                    "room_id": instance.get("room_id"),
+                                }
+                                for instance in facts.get("instances", [])
+                                if isinstance(instance, dict)
+                                and instance.get("placed") is True
+                            ],
                         }
                     )
                 values.append(
@@ -1253,6 +1309,66 @@ class KnowledgeBase:
                     }
                 )
             return values
+        finally:
+            connection.close()
+
+    def merchant_identity(
+        self,
+        *,
+        object_id: Any = None,
+        name: Any = None,
+    ) -> dict[str, Any] | None:
+        """Resolve a live merchant identity against every catalogue instance.
+
+        Buyer queries are deliberately bounded, so they cannot also serve as a
+        complete live-name/object-id alias index. This lookup is independent of
+        an item's alleged buying category and therefore still resolves a buyer
+        after live evidence disproves the catalogue's acceptance claim.
+        """
+
+        if not self.available:
+            return None
+        object_key = str(object_id).strip().casefold() if object_id is not None else ""
+        name_key = " ".join(str(name or "").split()).casefold()
+        if not object_key and not name_key:
+            return None
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id,canonical_name,payload_json FROM entities "
+                "WHERE kind='merchant' ORDER BY canonical_name"
+            ).fetchall()
+            for row in rows:
+                facts = json.loads(row["payload_json"])
+                for instance in facts.get("instances", []):
+                    if not isinstance(instance, dict):
+                        continue
+                    instance_id = instance.get("seller_id_at_build")
+                    instance_name = " ".join(
+                        str(instance.get("name") or "").split()
+                    )
+                    id_match = (
+                        object_key
+                        and instance_id is not None
+                        and str(instance_id).strip().casefold() == object_key
+                    )
+                    name_match = (
+                        name_key and instance_name.casefold() == name_key
+                    )
+                    if not id_match and not name_match:
+                        continue
+                    return {
+                        "merchant_class": facts.get("merchant_class")
+                        or row["canonical_name"],
+                        "entity_id": row["id"],
+                        "instance": {
+                            "seller_id_at_build": instance_id,
+                            "name": instance_name or None,
+                            "room_id": instance.get("room_id"),
+                        },
+                        "matched_by": "object_id" if id_match else "name",
+                    }
+            return None
         finally:
             connection.close()
 
@@ -2518,7 +2634,7 @@ class KnowledgeBase:
             malformed_farm_fields = []
             farm_note_patterns = {
                 "assigned_room": r"\bassigned_room\s*=\s*\d+\b",
-                "hunt": r"\bhunt\s*=\s*[a-z][a-z ]*?(?=[,;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+                "hunt": r"\bhunt\s*=\s*[a-z][a-z ]*?(?=[,;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
                 "use_safe_spots": r"\buse_safe_spots\s*=\s*(?:true|false)\b",
             }
             for field, pattern in farm_note_patterns.items():
@@ -2535,7 +2651,7 @@ class KnowledgeBase:
                             "Farm execution fields in operator_notes must use exact key=value syntax. "
                             "Example: hunt=groundworm larva; assigned_room=567; "
                             "use_safe_spots=true; flee_below=0.60; hold_resume_above=0.90; "
-                            "fight_above_vigor=100; bank_above=0; "
+                            "fight_above_vigor=80; bank_above=0; "
                             "break_out_via_logoff=false."
                         ),
                     }
@@ -2593,7 +2709,7 @@ class KnowledgeBase:
             }:
                 entities.append(assigned["entity"])
         hunt_match = re.search(
-            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
+            r"\bhunt\s*=\s*[\"']?([a-z][a-z ]*?)(?=[\"',;]|\s+(?:assigned_room|max_carry|use_safe_spots|flee_below|hold_resume_above|rest_below|fight_above_vigor|eat_before_fighting|buy_food|bank_above|pull_within|break_out_via_logoff)\s*=|$)",
             operator_notes,
             re.IGNORECASE,
         )

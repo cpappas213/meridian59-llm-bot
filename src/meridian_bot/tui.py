@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import shutil
 import sys
@@ -11,7 +12,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import BotConfig
 from .utils import uuid7
@@ -112,11 +115,34 @@ class ControllerApi:
             "GET", "/v1/status?detail=supervision&include_recent_events=0"
         )
 
-    def safe_stop(self) -> dict[str, Any]:
-        return self.request("POST", "/v1/runtime/safe-stop", {})
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, Any]:
+        payload = (
+            {}
+            if destination_room_id is None
+            else {"destination_room_id": destination_room_id}
+        )
+        return self.request("POST", "/v1/runtime/safe-stop", payload)
 
     def character_status(self) -> dict[str, Any]:
         return self.request("GET", "/v1/character")
+
+    def conversations(self, *, limit: int = 60) -> dict[str, Any]:
+        limit = max(1, min(limit, 200))
+        value = self.request("GET", f"/v1/conversations?limit={limit}")
+        timezone_name = str(value.get("timezone") or "UTC")
+        messages = value.get("messages")
+        result: list[dict[str, Any]] = []
+        for item in messages if isinstance(messages, list) else []:
+            if not isinstance(item, dict):
+                continue
+            message = dict(item)
+            message["display_occurred_at"] = _event_display_timestamp(
+                message.get("occurred_at"), timezone_name
+            )
+            result.append(message)
+        return {**value, "messages": result, "timezone": timezone_name}
 
     def goals(self) -> list[dict[str, Any]]:
         value = self.request("GET", "/v1/goals")
@@ -124,11 +150,25 @@ class ControllerApi:
         return [item for item in goals if isinstance(item, dict)] if isinstance(goals, list) else []
 
     def events(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 20))
         value = self.request(
-            "GET", f"/v1/events?interesting_only=true&limit={max(1, min(limit, 20))}"
+            "GET",
+            f"/v1/events?latest=true&interesting_only=false&limit={limit}",
         )
         events = value.get("events")
-        return [item for item in events if isinstance(item, dict)] if isinstance(events, list) else []
+        timezone_name = str(value.get("timezone") or "UTC")
+        if not isinstance(events, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            event = dict(item)
+            event["display_occurred_at"] = _event_display_timestamp(
+                event.get("occurred_at"), timezone_name
+            )
+            result.append(event)
+        return result
 
     def submit_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/v1/goals", payload)
@@ -168,6 +208,7 @@ def _state_style(value: Any) -> str:
         "ready",
         "active",
         "succeeded",
+        "complete",
         "low",
         "known",
     }:
@@ -176,6 +217,12 @@ def _state_style(value: Any) -> str:
         "starting",
         "reconciling",
         "degraded",
+        "shutdown_requested",
+        "draining",
+        "requested",
+        "pausing",
+        "securing",
+        "logging_out",
         "queued",
         "paused",
         "elevated",
@@ -222,6 +269,20 @@ def _one_line(value: Any, *, limit: int = 100) -> str:
     return textwrap.shorten(text, width=max(8, limit), placeholder="...")
 
 
+def _event_display_timestamp(value: Any, timezone_name: str = "UTC") -> str:
+    """Render an event in the operator-selected deployment timezone."""
+
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return text[:20]
+        local = parsed.astimezone(ZoneInfo(timezone_name))
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    except (ValueError, OverflowError, ZoneInfoNotFoundError):
+        return text[:20]
+
+
 def _meter(vitals: dict[str, Any], name: str) -> str:
     value = vitals.get(name)
     if isinstance(value, dict):
@@ -236,6 +297,107 @@ def _meter(vitals: dict[str, Any], name: str) -> str:
 
 def _human_label(value: Any) -> str:
     return str(value).replace("_", " ").strip().title()
+
+
+ROOM_PROPERTY_LABELS = {
+    "ROOM_GUEST_AREA": "guest area",
+    "ROOM_GUILD_PK_ONLY": "guild PvP only",
+    "ROOM_HARD_LEARN": "hard learning",
+    "ROOM_HOMETOWN": "hometown",
+    "ROOM_LAMPS": "lamps",
+    "ROOM_NO_COMBAT": "no combat",
+    "ROOM_NO_PK": "no PvP",
+    "ROOM_OVERRIDE_DEPTH1": "depth override 1",
+    "ROOM_OVERRIDE_DEPTH2": "depth override 2",
+    "ROOM_SAFE_DEATH": "safe death",
+    "ROOM_SAFELOGOFF": "safe logoff",
+    "ROOM_SANCTUARY": "sanctuary",
+    "ROOM_TRIPLE_HEAL": "triple healing",
+}
+
+
+def _room_property_labels(game: dict[str, Any]) -> list[str]:
+    properties = game.get("room_properties")
+    if not isinstance(properties, dict):
+        return []
+    if properties.get("known") is not True:
+        return ["properties unknown"]
+
+    labels: list[str] = []
+    if properties.get("safe") is True:
+        labels.append("safe")
+    flags = properties.get("flags")
+    flag_values = (
+        [str(value) for value in flags]
+        if isinstance(flags, list)
+        else []
+    )
+    flag_priority = {
+        "ROOM_SANCTUARY": 0,
+        "ROOM_NO_COMBAT": 1,
+        "ROOM_NO_PK": 2,
+        "ROOM_SAFELOGOFF": 3,
+        "ROOM_SAFE_DEATH": 4,
+        "ROOM_TRIPLE_HEAL": 5,
+    }
+    for value in sorted(flag_values, key=lambda item: (flag_priority.get(item, 20), item)):
+        labels.append(
+            ROOM_PROPERTY_LABELS.get(
+                value,
+                value.removeprefix("ROOM_").replace("_", " ").casefold(),
+            )
+        )
+    terrain = properties.get("terrain")
+    for value in terrain if isinstance(terrain, list) else []:
+        labels.append(
+            str(value).removeprefix("TERRAIN_").replace("_", " ").casefold()
+        )
+    if properties.get("region"):
+        labels.append(f"region: {' '.join(str(properties['region']).split())}")
+
+    unique: list[str] = []
+    for label in labels:
+        if label and label not in unique:
+            unique.append(label)
+    return unique or ["no special tags"]
+
+
+def _format_room_properties(
+    game: dict[str, Any], *, max_length: int, color: bool
+) -> str:
+    labels = _room_property_labels(game)
+    if not labels or max_length < 8:
+        return ""
+    for count in range(len(labels), 0, -1):
+        omitted = len(labels) - count
+        visible = labels[:count] + ([f"+{omitted}"] if omitted else [])
+        candidate = f"[{', '.join(visible)}]"
+        if len(candidate) <= max_length:
+            properties = game.get("room_properties")
+            style = (
+                "green"
+                if isinstance(properties, dict) and properties.get("safe") is True
+                else "dim"
+                if labels == ["properties unknown"]
+                else "cyan"
+            )
+            return _paint(candidate, style, color)
+    fallback = f"[+{len(labels)} tags]"
+    return _paint(fallback, "cyan", color) if len(fallback) <= max_length else ""
+
+
+def _format_location(game: dict[str, Any], *, width: int, color: bool) -> str:
+    room_id = game.get("room_id", "-")
+    suffix = f" (room {room_id})"
+    available = max(12, width - len("Location ") - len(suffix))
+    name_limit = min(42, max(12, available // 2))
+    name = _one_line(game.get("location"), limit=name_limit)
+    tag_budget = max(0, available - len(name) - 1)
+    tags = _format_room_properties(game, max_length=tag_budget, color=color)
+    return (
+        f"{_paint(name, 'cyan', color)}{suffix}"
+        + (f" {tags}" if tags else "")
+    )
 
 
 def _human_number(value: Any) -> str:
@@ -338,6 +500,11 @@ def render_dashboard(
     width = width or shutil.get_terminal_size((110, 32)).columns
     width = max(72, width)
     controller = status.get("controller") if isinstance(status.get("controller"), dict) else {}
+    shutdown = (
+        controller.get("shutdown")
+        if isinstance(controller.get("shutdown"), dict)
+        else None
+    )
     game = status.get("game") if isinstance(status.get("game"), dict) else {}
     onboarding = status.get("onboarding") if isinstance(status.get("onboarding"), dict) else {}
     campaign = status.get("campaign") if isinstance(status.get("campaign"), dict) else {}
@@ -354,6 +521,45 @@ def render_dashboard(
     development = campaign.get("development") if isinstance(campaign.get("development"), dict) else {}
     readiness = campaign.get("readiness") if isinstance(campaign.get("readiness"), dict) else {}
     vitals = game.get("vitals") if isinstance(game.get("vitals"), dict) else {}
+    finances = game.get("finances") if isinstance(game.get("finances"), dict) else {}
+    bank_accounts = (
+        finances.get("bank_accounts")
+        if isinstance(finances.get("bank_accounts"), list)
+        else []
+    )
+    session_started_at = str(controller.get("since") or "")
+    known_bank_balances = [
+        account.get("last_known_balance")
+        for account in bank_accounts
+        if isinstance(account, dict)
+        and isinstance(account.get("last_known_balance"), (int, float))
+        and not isinstance(account.get("last_known_balance"), bool)
+        and (
+            not session_started_at
+            or (
+                account.get("recorded_at") is not None
+                and str(account["recorded_at"]) >= session_started_at
+            )
+        )
+    ]
+    banked_shillings = sum(known_bank_balances) if known_bank_balances else None
+    inventory_value = _first_record_value(
+        finances,
+        "known_inventory_item_value",
+        "source_estimated_inventory_value",
+    )
+    banked_text = (
+        _human_number(banked_shillings)
+        if banked_shillings is not None
+        else "unknown"
+    )
+    inventory_value_text = (
+        _human_number(inventory_value)
+        if inventory_value is not None
+        else "unknown"
+    )
+    if inventory_value is not None and finances.get("valuation_complete") is False:
+        inventory_value_text += " (partial estimate)"
     active = next((goal for goal in goals if goal.get("status") == "active"), None)
     displayed_goal = status.get("goal") if isinstance(status.get("goal"), dict) else active
     queue = [goal for goal in goals if goal.get("status") == "queued"]
@@ -367,9 +573,9 @@ def render_dashboard(
         (
             f"Controller {_paint(controller.get('state', 'unknown'), _state_style(controller.get('state')), color)} | "
             f"Game {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
-            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
-            f"Location {_paint(_one_line(game.get('location'), limit=36), 'cyan', color)}"
+            f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)}"
         ),
+        f"Location {_format_location(game, width=width, color=color)}",
         (
             f"{_paint('HP ' + _meter(vitals, 'health'), _vital_style(vitals.get('health')), color)}  "
             f"{_paint('Mana ' + _meter(vitals, 'mana'), 'blue', color)}  "
@@ -378,13 +584,44 @@ def render_dashboard(
             f"Currency {_paint(game.get('carried_currency', '-'), 'yellow', color)}"
         ),
         (
+            f"Banked Shillings {_paint(banked_text, 'yellow' if banked_shillings is not None else 'dim', color)} | "
+            f"Total Inventory Value {_paint(inventory_value_text, 'yellow' if inventory_value is not None else 'dim', color)}"
+        ),
+        (
             f"Onboarding {_paint(onboarding.get('status', '-'), _state_style(onboarding.get('status')), color)} | "
             f"Control {controller.get('control_owner', '-')} | "
             f"Observation age {game.get('observation_age_seconds', '-')}s"
         ),
-        rule,
-        _paint("CURRENT GOAL", "bright_cyan", color),
     ]
+    if shutdown and shutdown.get("stage"):
+        shutdown_stage = str(shutdown.get("stage"))
+        shutdown_details: list[str] = []
+        paused_goal_ids = shutdown.get("paused_goal_ids")
+        if isinstance(paused_goal_ids, list) and paused_goal_ids:
+            shutdown_details.append(f"{len(paused_goal_ids)} goal(s) paused")
+        safe_room = shutdown.get("safe_room")
+        if isinstance(safe_room, dict):
+            safe_name = safe_room.get("name") or safe_room.get("canonical_name")
+            safe_id = safe_room.get("room_id")
+            if safe_name or safe_id is not None:
+                shutdown_details.append(
+                    "safe room "
+                    + str(safe_name or "verified")
+                    + (f" ({safe_id})" if safe_id is not None else "")
+                )
+        if shutdown.get("logged_out") is True:
+            shutdown_details.append("logged out")
+        if shutdown.get("error"):
+            shutdown_details.append(
+                "error " + _one_line(shutdown.get("error"), limit=width // 2)
+            )
+        lines.append(
+            (
+                f"Safe shutdown {_paint('[' + shutdown_stage + ']', _state_style(shutdown_stage), color)}"
+                + (f" | {' | '.join(shutdown_details)}" if shutdown_details else "")
+            )
+        )
+    lines.extend([rule, _paint("CURRENT GOAL", "bright_cyan", color)])
     if displayed_goal:
         lines.extend(
             [
@@ -507,9 +744,9 @@ def render_dashboard(
         for event in events[-5:]:
             severity = event.get("severity", "info")
             lines.append(
-                f"{str(event.get('occurred_at', ''))[11:19]} "
+                f"{event.get('display_occurred_at') or _event_display_timestamp(event.get('occurred_at'))} "
                 f"{_paint(f'{str(severity):>7}', _state_style(severity), color)}  "
-                f"{_one_line(event.get('summary'), limit=width - 20)}"
+                f"{_one_line(event.get('summary'), limit=max(20, width - 34))}"
             )
     else:
         lines.append("No interesting events yet.")
@@ -520,9 +757,13 @@ def render_dashboard(
                 f"{_paint('[N]', 'bright_cyan', color)} New goal   "
                 f"{_paint('[M]', 'bright_cyan', color)} Manage goal/queue   "
                 f"{_paint('[S]', 'bright_cyan', color)} Character status   "
+                f"{_paint('[C]', 'bright_cyan', color)} Recent chat"
+            ),
+            (
                 f"{_paint('[R]', 'bright_cyan', color)} Refresh   "
                 f"{_paint('[H]', 'bright_cyan', color)} Help   "
-                f"{_paint('[Q]', 'bright_cyan', color)} Quit"
+                f"{_paint('[X]', 'yellow', color)} Safe shutdown   "
+                f"{_paint('[Q]', 'bright_cyan', color)} Detach TUI"
             ),
         ]
     )
@@ -578,10 +819,9 @@ def render_character_status(
         heavy_rule,
         (
             f"Character {_paint(game.get('character_name') or '-', 'bright_white', color)} | "
-            f"Connection {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)} | "
-            f"Location {_paint(_one_line(game.get('location'), limit=42), 'cyan', color)} "
-            f"(room {game.get('room_id', '-')})"
+            f"Connection {_paint(game.get('connection', 'unknown'), _state_style(game.get('connection')), color)}"
         ),
+        f"Location {_format_location(game, width=width, color=color)}",
         (
             f"Observed {game.get('observation_age_seconds', '-')}s ago | "
             f"Risk {_paint(game.get('risk', '-'), _state_style(game.get('risk')), color)} | "
@@ -723,6 +963,80 @@ def render_character_status(
 
     append_abilities("skills", "SKILLS")
     append_abilities("spells", "SPELLS")
+    lines.extend(
+        [
+            heavy_rule,
+            _paint("Press Esc or Enter to return to the live console.", "dim", color),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _safe_chat_text(value: Any) -> str:
+    """Normalize chat text and strip terminal control characters."""
+
+    without_terminal_sequences = re.sub(
+        r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value or "")
+    )
+    collapsed = " ".join(without_terminal_sequences.split())
+    return "".join(character for character in collapsed if character.isprintable())
+
+
+def render_conversations(
+    history: dict[str, Any], *, width: int | None = None, color: bool = False
+) -> str:
+    """Render recent incoming and outgoing in-game dialogue."""
+
+    width = max(72, width or shutil.get_terminal_size((110, 32)).columns)
+    character_name = _safe_chat_text(history.get("character_name")) or "Character"
+    timezone_name = _safe_chat_text(history.get("timezone")) or "UTC"
+    messages = history.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    rule = _paint("-" * width, "blue", color)
+    heavy_rule = _paint("=" * width, "blue", color)
+    lines = [
+        _paint("RECENT CHAT".center(width), "bright_cyan", color),
+        heavy_rule,
+        (
+            f"Character {_paint(character_name, 'bright_white', color)} | "
+            f"Times shown in {_paint(timezone_name, 'cyan', color)} | "
+            f"{len(messages)} message{'s' if len(messages) != 1 else ''}"
+        ),
+        rule,
+    ]
+    if not messages:
+        lines.append(_paint("No recent in-game chat is stored.", "dim", color))
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "speaker").casefold()
+        speaker = _safe_chat_text(message.get("speaker")) or "unknown speaker"
+        speaker_kind = _safe_chat_text(message.get("speaker_kind"))
+        when = _safe_chat_text(
+            message.get("display_occurred_at") or message.get("occurred_at")
+        )
+        if role == "assistant":
+            direction = f"{character_name} -> {speaker}"
+            style = "green"
+        else:
+            direction = f"{speaker} -> {character_name}"
+            style = "yellow"
+        metadata = f" ({speaker_kind})" if speaker_kind else ""
+        lines.append(
+            f"{_paint(when or '-', 'dim', color)}  "
+            f"{_paint(direction, style, color)}{_paint(metadata, 'dim', color)}"
+        )
+        content = _safe_chat_text(message.get("content")) or "-"
+        wrapped = textwrap.wrap(
+            content,
+            width=max(20, width - 4),
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or ["-"]
+        lines.extend(f"  {_paint(line, style, color)}" for line in wrapped)
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
     lines.extend(
         [
             heavy_rule,
@@ -970,6 +1284,7 @@ def prompt_goal_command(
     goals: list[dict[str, Any]],
     *,
     input_fn: Callable[[str], str] = input,
+    color: bool = False,
 ) -> tuple[str, dict[str, Any]] | None:
     open_goals = [
         goal
@@ -977,17 +1292,29 @@ def prompt_goal_command(
         if goal.get("status") in {"active", "queued", "paused", "blocked"}
     ]
     if not open_goals:
-        print("There are no open goals to manage.")
+        print(_paint("There are no open goals to manage.", "dim", color))
         return None
-    print("\nManage a goal")
-    print("Press Esc at any prompt to cancel and return to the live console.")
+    print()
+    print(_paint("GOAL QUEUE MANAGEMENT", "bright_cyan", color))
+    print(_paint("-" * 76, "blue", color))
+    print(_paint(" #  STATUS       PRI  GOAL", "dim", color))
     for index, goal in enumerate(open_goals, 1):
+        status = str(goal.get("status", "-"))
+        status_label = f"[{status}]".ljust(12)
+        priority_label = f"P{goal.get('priority', '-')}".rjust(4)
         print(
-            f"{index:>2}. [{goal.get('status', '-')}] P{goal.get('priority', '-')} "
-            f"{goal.get('title', '?')}"
+            f"{_paint(f'{index:>2}.', 'bright_white', color)} "
+            f"{_paint(status_label, _state_style(status), color)} "
+            f"{_paint(priority_label, 'magenta', color)}  "
+            f"{_paint(goal.get('title', '?'), 'bright_white', color)}"
         )
+    print(_paint("-" * 76, "blue", color))
+    print(
+        _paint("Tip:", "cyan", color)
+        + " higher priority numbers run first; Esc returns without changing anything."
+    )
     selected = _prompt_integer(
-        "Goal number ([Esc] back): ",
+        f"{_paint('Goal number', 'bright_cyan', color)} ([Esc] back): ",
         input_fn,
         default=1,
         minimum=1,
@@ -997,6 +1324,16 @@ def prompt_goal_command(
         return None
     goal = open_goals[selected - 1]
     status = str(goal.get("status"))
+    print(
+        "\n"
+        + _paint("Selected:", "cyan", color)
+        + " "
+        + _paint(goal.get("title", "?"), "bright_white", color)
+        + " "
+        + _paint(f"[{status}]", _state_style(status), color)
+        + " "
+        + _paint(f"P{goal.get('priority', '-')}", "magenta", color)
+    )
     choices = ["reprioritize", "cancel"]
     if status in {"active", "queued"}:
         choices.insert(0, "pause")
@@ -1010,7 +1347,11 @@ def prompt_goal_command(
     ):
         choices.append("confirm_complete")
         print(
-            "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes."
+            _paint(
+                "This goal has a manual criterion. Confirmation is accepted only after every observable criterion passes.",
+                "yellow",
+                color,
+            )
         )
     action_keys = {
         "pause": "p",
@@ -1026,11 +1367,24 @@ def prompt_goal_command(
         "cancel": "[C]ancel",
         "confirm_complete": "Con[F]irm manual criterion",
     }
+    action_styles = {
+        "pause": "yellow",
+        "resume": "green",
+        "reprioritize": "magenta",
+        "cancel": "red",
+        "confirm_complete": "green",
+    }
     print(
-        "Actions: "
-        + ", ".join(action_labels[choice] for choice in choices)
+        _paint("Actions:", "cyan", color)
+        + " "
+        + ", ".join(
+            _paint(action_labels[choice], action_styles[choice], color)
+            for choice in choices
+        )
     )
-    raw_action = _prompt_required("Action ([Esc] back): ", input_fn)
+    raw_action = _prompt_required(
+        f"{_paint('Action', 'bright_cyan', color)} ([Esc] back): ", input_fn
+    )
     if raw_action is None:
         return None
     raw_action = raw_action.casefold()
@@ -1043,7 +1397,7 @@ def prompt_goal_command(
         None,
     )
     if action is None:
-        print("Unknown action.")
+        print(_paint("Unknown action.", "red", color))
         return None
     payload: dict[str, Any] = {
         "request_id": f"tui-goal-command-{uuid7()}",
@@ -1053,7 +1407,8 @@ def prompt_goal_command(
     }
     if action == "reprioritize":
         priority = _prompt_integer(
-            "New priority (0 lowest, 100 highest) [50; Esc to go back]: ",
+            f"{_paint('New priority', 'bright_cyan', color)} "
+            "(0 lowest, 100 highest) [50; Esc to go back]: ",
             input_fn,
             default=50,
             minimum=0,
@@ -1070,7 +1425,7 @@ def prompt_goal_command(
         if confirmation is None:
             return None
         if confirmation.strip() != "CANCEL":
-            print("Cancellation aborted.")
+            print(_paint("Cancellation aborted.", "yellow", color))
             return None
         payload["cause"] = "operator_requested"
     if action == "confirm_complete":
@@ -1081,7 +1436,7 @@ def prompt_goal_command(
         if confirmation is None:
             return None
         if confirmation.strip() != "CONFIRM":
-            print("Confirmation aborted.")
+            print(_paint("Confirmation aborted.", "yellow", color))
             return None
     return str(goal.get("id")), payload
 
@@ -1130,6 +1485,26 @@ def _form_screen() -> None:
     sys.stdout.flush()
 
 
+def prompt_safe_shutdown(
+    *, input_fn: Callable[[str], str] = input, color: bool = False
+) -> bool:
+    """Require an explicit operator confirmation for coordinated shutdown."""
+
+    print(_paint("COORDINATED SAFE SHUTDOWN", "bright_cyan", color))
+    print(
+        "This pauses every runnable goal, waits for foreground/keeper ownership, "
+        "routes the character to a source-verified safe room, logs out without "
+        "forgetting credentials, then stops the controller and owned broker."
+    )
+    confirmation = _form_input(
+        "Type SHUTDOWN to proceed ([Esc] back): ", input_fn
+    )
+    return bool(
+        confirmation is not None
+        and confirmation.strip().casefold() == "shutdown"
+    )
+
+
 def run_tui(
     api: ControllerApi,
     *,
@@ -1143,38 +1518,82 @@ def run_tui(
     goals: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     message = "Connecting to the controller..."
+    manual_refresh_requested = False
     try:
         while True:
             try:
                 status = api.status()
                 goals = api.goals()
                 events = api.events()
-                if message == "Connecting to the controller..." or message.startswith(
+                if manual_refresh_requested:
+                    message = (
+                        "Manual refresh complete at "
+                        + time.strftime("%H:%M:%S")
+                        + "."
+                    )
+                elif message == "Connecting to the controller..." or message.startswith(
                     "controller unavailable"
                 ):
                     message = "Controller connection restored."
             except ControllerApiError as exc:
                 message = str(exc)
+            manual_refresh_requested = False
             _draw(
                 render_dashboard(
                     status, goals, events, message=message, color=color
                 )
             )
             key = key_reader(refresh_seconds)
-            if key is None or key == "r":
+            if key is None:
+                continue
+            if key == "r":
+                manual_refresh_requested = True
                 continue
             if key == "\x1b":
                 message = "Main console already active."
                 continue
             if key == "q":
                 return 0
+            if key == "x":
+                _form_screen()
+                try:
+                    if not prompt_safe_shutdown(input_fn=input_fn, color=color):
+                        message = "Safe shutdown cancelled; the bot is still running."
+                    else:
+                        result = api.safe_stop()
+                        shutdown = (
+                            result.get("shutdown")
+                            if isinstance(result.get("shutdown"), dict)
+                            else {}
+                        )
+                        stage = shutdown.get("stage") or "requested"
+                        message = (
+                            f"Safe shutdown accepted [{stage}]. Keep this console "
+                            "open to watch progress, or press Q to detach the TUI."
+                        )
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Safe shutdown failed: {exc}"
+                continue
             if key == "h":
                 message = (
                     "N turns a plain-language request into a model-authored goal for your approval; "
                     "M manages goals (use F there to confirm a pending manual criterion); "
                     "S shows complete skills, spells, inventory, and equipment; "
+                    "C shows recent incoming and outgoing in-game chat; "
+                    "X requests coordinated pause, safe return, logout, and process shutdown; "
+                    "Q only detaches this TUI and leaves the bot running; "
                     "Esc cancels any subpage and returns here."
                 )
+                continue
+            if key == "c":
+                _form_screen()
+                try:
+                    history = api.conversations()
+                    print(render_conversations(history, color=color))
+                    _form_input("", input_fn)
+                    message = "Returned from recent chat."
+                except (ControllerApiError, ValueError, EOFError, KeyboardInterrupt) as exc:
+                    message = f"Recent chat failed: {exc}"
                 continue
             if key == "s":
                 _form_screen()
@@ -1202,7 +1621,9 @@ def run_tui(
             if key == "m":
                 _form_screen()
                 try:
-                    command = prompt_goal_command(goals, input_fn=input_fn)
+                    command = prompt_goal_command(
+                        goals, input_fn=input_fn, color=color
+                    )
                     if command is None:
                         message = "No goal change was made."
                     else:

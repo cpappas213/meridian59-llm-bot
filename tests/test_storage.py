@@ -9,6 +9,7 @@ from pathlib import Path
 
 from meridian_bot.campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
 )
 from meridian_bot.criteria import CriteriaEvaluator
@@ -18,6 +19,119 @@ from .helpers import goal_payload
 
 
 class StorageTests(unittest.TestCase):
+    def test_equipment_criteria_count_distinct_pack_and_loadout_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                result = CriteriaEvaluator(storage).evaluate(
+                    {
+                        "id": "equipment-contract",
+                        "success_criteria": [
+                            {
+                                "id": "two-weapons",
+                                "kind": "equipment_count",
+                                "category": "weapon",
+                                "count": 2,
+                            },
+                            {
+                                "id": "scimitar-wielded",
+                                "kind": "equipment_wielding",
+                                "item": "Scimitar",
+                            },
+                        ],
+                    },
+                    {
+                        "inventory": {
+                            "items": [
+                                {"id": 7532, "name": "scimitar"},
+                                {"id": 13509, "name": "mace"},
+                            ]
+                        },
+                        "equipment": {
+                            "equipped": [{"id": 7532, "name": "scimitar"}],
+                            "wielding": ["scimitar"],
+                        },
+                    },
+                )
+
+                self.assertTrue(result["all_met"])
+                self.assertEqual(
+                    "verified weapon count 2; required 2",
+                    result["criteria"][0]["detail"],
+                )
+
+    def test_manager_repairs_generic_weapon_target_and_requires_improvement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload(request_id="typed-equipment-phase"))["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                observation = {
+                    "inventory": {
+                        "items": [
+                            {"id": 7532, "name": "scimitar"},
+                            {"id": 13509, "name": "mace"},
+                        ]
+                    },
+                    "equipment": {
+                        "equipped": [{"id": 7532, "name": "scimitar"}],
+                        "wielding": ["scimitar"],
+                    },
+                }
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "prepare_combat",
+                            "objective": "Acquire one additional weapon.",
+                            "targets": [
+                                {
+                                    "id": "weapon-count",
+                                    "type": "item_count_at_least",
+                                    "item": "weapon",
+                                    "count": 3,
+                                }
+                            ],
+                        },
+                    },
+                    observation,
+                )
+
+                self.assertEqual(
+                    {
+                        "id": "weapon-count",
+                        "kind": "equipment_count",
+                        "category": "weapon",
+                        "count": 3,
+                    },
+                    phase["success_criteria"][0],
+                )
+                storage.transition_campaign_phase(
+                    phase["id"], "failed", reason="exercise material validation"
+                )
+                with self.assertRaisesRegex(ValueError, "already true.*verified weapon count is 2"):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "prepare_combat",
+                                "objective": "Create redundant equipment.",
+                                "targets": [
+                                    {
+                                        "id": "already-owned",
+                                        "type": "equipment_count_at_least",
+                                        "category": "weapon",
+                                        "count": 2,
+                                    }
+                                ],
+                            },
+                        },
+                        observation,
+                    )
+
     def test_inventory_food_category_counts_edible_items_not_reagents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:
@@ -548,6 +662,10 @@ class StorageTests(unittest.TestCase):
                                 "value": [],
                             }
                         ],
+                        "context": {
+                            "avoid_rooms": [544],
+                            "farm_recipe": {"room": 544, "target": "groundworm larva"},
+                        },
                     },
                     mode="start",
                 )
@@ -571,12 +689,74 @@ class StorageTests(unittest.TestCase):
                         attempt_id,
                         status="failed",
                         reason="merchant refused the item",
+                        failure_context={
+                            "stage": "safe_return",
+                            "tool": "travel",
+                            "arguments": {"agent": "primary", "to": 106},
+                            "origin_room": {"id": 104, "name": "Joguer's Herbs and Roots"},
+                            "destination_room": 106,
+                            "phase_work_implicated": False,
+                        },
                     )
                     self.assertEqual(attempt_number == 2, result["breaker_tripped"])
 
                 self.assertEqual("active", storage.goal(goal["id"])["status"])
                 self.assertIsNone(storage.active_campaign_phase(run["id"]))
-                self.assertEqual("failed", storage.campaign_phases(run["id"])[0]["status"])
+                failed = storage.campaign_phases(run["id"])[0]
+                self.assertEqual("failed", failed["status"])
+                self.assertEqual("safe_return", failed["last_failure"]["cause"]["stage"])
+                self.assertFalse(
+                    failed["last_failure"]["cause"]["phase_work_implicated"]
+                )
+                summary = coordinator.manager_context(run, None)[
+                    "recent_phase_summaries"
+                ][0]
+                self.assertEqual(
+                    106, summary["last_failure"]["cause"]["destination_room"]
+                )
+                self.assertNotIn("avoid_rooms", summary.get("context", {}))
+
+    def test_manager_phase_discards_unverified_room_and_target_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())[
+                    "goal"
+                ]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "research_progression",
+                            "objective": "Find one grounded candidate.",
+                            "targets": [
+                                {
+                                    "id": "research",
+                                    "type": "phase_action_succeeded",
+                                    "tools": ["hunting_grounds"],
+                                }
+                            ],
+                            "context": {
+                                "avoid_rooms": [544, 566],
+                                "avoid_targets": ["groundworm larva"],
+                            },
+                        },
+                    },
+                )
+
+                self.assertNotIn("avoid_rooms", phase["context"])
+                self.assertNotIn("avoid_targets", phase["context"])
+                self.assertEqual(
+                    {
+                        "avoid_rooms": [544, 566],
+                        "avoid_targets": ["groundworm larva"],
+                    },
+                    phase["context"]["ignored_unverified_tactic_preferences"],
+                )
 
     def test_campaign_breaker_signature_ignores_cache_freshness_noise(self) -> None:
         phase = {"kind": "prepare_combat"}
@@ -1050,6 +1230,64 @@ class StorageTests(unittest.TestCase):
                 self.assertIsNotNone(exhausted)
                 self.assertEqual("time_budget", exhausted["kind"])
 
+    def test_productive_farm_kill_renews_elapsed_time_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                phase = {
+                    "id": "long-productive-farm",
+                    "kind": "farm",
+                    "budget": {"max_actions": 120, "max_minutes": 180},
+                    "attempt_count": 1,
+                    "activated_at": (
+                        datetime.now(timezone.utc) - timedelta(hours=12)
+                    ).isoformat(),
+                }
+
+                stale = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(stale)
+                self.assertEqual("time_budget", stale["kind"])
+                self.assertEqual("phase_activation", stale["elapsed_basis"])
+
+                renewed_at = (
+                    datetime.now(timezone.utc) - timedelta(minutes=2)
+                ).isoformat()
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "renewed_at": renewed_at,
+                            "progress_kind": "verified_keeper_kill",
+                            "cumulative_kills": 150,
+                            "downtime_seconds": 0,
+                        }
+                    },
+                )
+
+                self.assertIsNone(coordinator.budget_exhausted(phase))
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "renewed_at": (
+                                datetime.now(timezone.utc) - timedelta(minutes=181)
+                            ).isoformat(),
+                            "progress_kind": "verified_keeper_kill",
+                            "cumulative_kills": 150,
+                            "downtime_seconds": 0,
+                        }
+                    },
+                )
+                idle = coordinator.budget_exhausted(phase)
+                self.assertIsNotNone(idle)
+                self.assertEqual("time_budget", idle["kind"])
+                self.assertEqual(
+                    "last_verified_keeper_progress", idle["elapsed_basis"]
+                )
+
     def test_campaign_manager_compiles_typed_currency_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:
@@ -1365,6 +1603,72 @@ class StorageTests(unittest.TestCase):
                     persisted["context"][
                         "ignored_initially_true_abandon_predicates"
                     ][0]["id"],
+                )
+
+    def test_campaign_phase_can_defer_verified_abandonment_until_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(
+                    goal_payload(request_id="campaign-deferred-abandonment")
+                )["goal"]
+                coordinator = CampaignCoordinator(storage, CriteriaEvaluator(storage))
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm until retreat becomes necessary.",
+                        "success_criteria": [
+                            {
+                                "id": "max-hp",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 27,
+                            }
+                        ],
+                        "abandon_predicates": [
+                            {
+                                "id": "critical-health",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.value",
+                                "operator": "<",
+                                "value": 10,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                attempt_id = storage.create_phase_attempt(
+                    phase["id"],
+                    semantic_action="autopilot",
+                    signature="keeper-launched",
+                    expected_effect={"keeper_running": True},
+                )
+                storage.update_phase_attempt(
+                    attempt_id, "succeeded", verification={"keeper_running": True}
+                )
+                phase = storage.active_campaign_phase(run["id"])
+
+                outcome = coordinator.evaluate_phase(
+                    goal,
+                    run,
+                    phase,
+                    {
+                        "status": {
+                            "vitals": {
+                                "health": {"value": 7, "max": 26}
+                            }
+                        }
+                    },
+                    allow_abandonment=False,
+                )
+
+                self.assertFalse(outcome.completed)
+                self.assertFalse(outcome.failed)
+                self.assertTrue(outcome.detail["abandonment_deferred"])
+                self.assertEqual(
+                    "active", storage.active_campaign_phase(run["id"])["status"]
                 )
 
     def test_unchanged_goal_completion_does_not_churn_version(self) -> None:

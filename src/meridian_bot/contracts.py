@@ -9,6 +9,8 @@ CRITERION_KINDS = (
     "numeric_threshold",
     "numeric_delta",
     "inventory_contains",
+    "equipment_count",
+    "equipment_wielding",
     "location_reached",
     "event_occurred",
     "composite_all",
@@ -33,12 +35,53 @@ CRITERION_FIELDS_BY_KIND = {
     "numeric_threshold": frozenset({"id", "kind", "metric", "operator", "value"}),
     "numeric_delta": frozenset({"id", "kind", "metric", "operator", "value", "baseline"}),
     "inventory_contains": frozenset({"id", "kind", "item", "count"}),
+    "equipment_count": frozenset({"id", "kind", "category", "count"}),
+    "equipment_wielding": frozenset({"id", "kind", "item", "category"}),
     "location_reached": frozenset({"id", "kind", "location", "room", "room_id"}),
     "event_occurred": frozenset({"id", "kind", "event_kind", "after_cursor"}),
     "composite_all": frozenset({"id", "kind", "criteria", "criterion_ids"}),
     "composite_any": frozenset({"id", "kind", "criteria", "criterion_ids"}),
     "operator_confirmed": frozenset({"id", "kind"}),
 }
+
+
+# One shared equipment vocabulary keeps goal verification, campaign contracts,
+# retry gating, and loadout summaries from disagreeing about ordinary item
+# names.  Wielded objects are intrinsically weapons even when a server-specific
+# name is absent from these markers; the list is used to classify pack items.
+WEAPON_NAME_MARKERS = (
+    "mace",
+    "hammer",
+    "sword",
+    "scimitar",
+    "sabre",
+    "saber",
+    "axe",
+    "dagger",
+    "bow",
+    "staff",
+    "club",
+    "blade",
+    "spear",
+)
+ARMOR_NAME_MARKERS = (
+    "armor",
+    "armour",
+    "shield",
+    "gauntlet",
+    "glove",
+    "pants",
+    "breeches",
+    "vest",
+    "mail",
+    "helm",
+    "helmet",
+    "robe",
+    "boot",
+    "breastplate",
+    "leggings",
+)
+EQUIPMENT_CATEGORIES = ("weapon", "armor")
 
 
 def parse_ability_metric(metric: Any) -> tuple[str, str] | None:
@@ -148,7 +191,19 @@ CRITERION_SCHEMA: dict[str, Any] = {
         },
         "value": {"description": "Expected JSON value for state_equals, or numeric target for numeric criteria."},
         "baseline": {"type": "number", "description": "Starting observed value subtracted by numeric_delta."},
-        "item": {"type": "string", "minLength": 1, "description": "Case-insensitive item-name substring."},
+        "item": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Case-insensitive inventory substring for inventory_contains, or exact "
+                "canonical wielded name for equipment_wielding."
+            ),
+        },
+        "category": {
+            "type": "string",
+            "enum": list(EQUIPMENT_CATEGORIES),
+            "description": "Trusted semantic equipment category.",
+        },
         "count": {"type": "integer", "minimum": 1, "default": 1, "description": "Minimum verified inventory count."},
         "location": {"type": "string", "minLength": 1, "description": "Case-insensitive room-name substring."},
         "room": {"type": "string", "minLength": 1, "description": "Alias for location."},
@@ -184,6 +239,16 @@ CRITERION_SCHEMA: dict[str, Any] = {
         {"if": {"properties": {"kind": {"const": "numeric_threshold"}}}, "then": {"required": ["metric", "value"]}},
         {"if": {"properties": {"kind": {"const": "numeric_delta"}}}, "then": {"required": ["metric", "value", "baseline"]}},
         {"if": {"properties": {"kind": {"const": "inventory_contains"}}}, "then": {"required": ["item"]}},
+        {"if": {"properties": {"kind": {"const": "equipment_count"}}}, "then": {"required": ["category", "count"]}},
+        {
+            "if": {"properties": {"kind": {"const": "equipment_wielding"}}},
+            "then": {
+                "oneOf": [
+                    {"required": ["item"]},
+                    {"required": ["category"], "properties": {"category": {"const": "weapon"}}},
+                ]
+            },
+        },
         {
             "if": {"properties": {"kind": {"const": "location_reached"}}},
             "then": {"anyOf": [{"required": ["location"]}, {"required": ["room"]}, {"required": ["room_id"]}]},

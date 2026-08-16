@@ -62,9 +62,11 @@ class ModelConfig:
     responder_timeout_seconds: int
     max_output_tokens: int
     temperature: float
+    chat_temperature: float = 0.7
     json_mode: bool = True
     disable_thinking: bool = False
     auth_mode: str = "auto"
+    tactical_prompt_protocol: str = "progressive"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,8 @@ class ControllerConfig:
     greeting_cooldown_seconds: float = 20 * 60
     greetings_per_minute: int = 20
     conversation_history_turns: int = 8
+    conversation_window_messages: int = 12
+    conversation_window_seconds: float = 30 * 60
     minimum_goal_commitment_seconds: int = 60 * 60
     minimum_stall_seconds: int = 5 * 60
 
@@ -222,9 +226,11 @@ class BotConfig:
                 "responder_timeout_seconds",
                 "max_output_tokens",
                 "temperature",
+                "chat_temperature",
                 "json_mode",
                 "disable_thinking",
                 "auth_mode",
+                "tactical_prompt_protocol",
             },
             "model",
         )
@@ -235,14 +241,26 @@ class BotConfig:
             responder_timeout_seconds=int(model_raw.get("responder_timeout_seconds", 45)),
             max_output_tokens=int(model_raw.get("max_output_tokens", 4096)),
             temperature=float(model_raw.get("temperature", 0.2)),
+            chat_temperature=float(model_raw.get("chat_temperature", 0.7)),
             json_mode=bool(model_raw.get("json_mode", True)),
             disable_thinking=bool(model_raw.get("disable_thinking", False)),
             auth_mode=str(model_raw.get("auth_mode", "auto")),
+            tactical_prompt_protocol=str(
+                model_raw.get("tactical_prompt_protocol", "progressive")
+            ),
         )
         if model.auth_mode not in {"auto", "none", "bearer", "anthropic"}:
             raise ValueError(
                 "model.auth_mode must be auto, none, bearer, or anthropic"
             )
+        if model.tactical_prompt_protocol not in {"legacy", "progressive"}:
+            raise ValueError(
+                "model.tactical_prompt_protocol must be legacy or progressive"
+            )
+        if not 0 <= model.temperature <= 2:
+            raise ValueError("model.temperature must be between 0 and 2")
+        if not 0 <= model.chat_temperature <= 2:
+            raise ValueError("model.chat_temperature must be between 0 and 2")
 
         ctl_raw = _section(raw, "controller")
         _unknown(
@@ -262,6 +280,8 @@ class BotConfig:
                 "greeting_cooldown_seconds",
                 "greetings_per_minute",
                 "conversation_history_turns",
+                "conversation_window_messages",
+                "conversation_window_seconds",
                 "minimum_goal_commitment_seconds",
                 "minimum_stall_seconds",
             },
@@ -282,6 +302,12 @@ class BotConfig:
             greeting_cooldown_seconds=float(ctl_raw.get("greeting_cooldown_seconds", 20 * 60)),
             greetings_per_minute=int(ctl_raw.get("greetings_per_minute", 20)),
             conversation_history_turns=int(ctl_raw.get("conversation_history_turns", 8)),
+            conversation_window_messages=int(
+                ctl_raw.get("conversation_window_messages", 12)
+            ),
+            conversation_window_seconds=float(
+                ctl_raw.get("conversation_window_seconds", 30 * 60)
+            ),
             minimum_goal_commitment_seconds=int(ctl_raw.get("minimum_goal_commitment_seconds", 60 * 60)),
             minimum_stall_seconds=int(ctl_raw.get("minimum_stall_seconds", 5 * 60)),
         )
@@ -295,6 +321,14 @@ class BotConfig:
             raise ValueError("controller.greetings_per_minute must be between 1 and 60")
         if not 1 <= controller.conversation_history_turns <= 20:
             raise ValueError("controller.conversation_history_turns must be between 1 and 20")
+        if not 2 <= controller.conversation_window_messages <= 40:
+            raise ValueError(
+                "controller.conversation_window_messages must be between 2 and 40"
+            )
+        if controller.conversation_window_seconds <= 0:
+            raise ValueError(
+                "controller.conversation_window_seconds must be greater than zero"
+            )
         if min(controller.minimum_goal_commitment_seconds, controller.minimum_stall_seconds) < 0:
             raise ValueError("controller goal commitment and stall durations cannot be negative")
 

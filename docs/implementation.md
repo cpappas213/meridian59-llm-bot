@@ -8,7 +8,7 @@ in the [operations runbook](requirements/operations.md).
 
 The controller is a companion process, not a harness fork. The harness is pinned
 to the public integration fork as a Git submodule at tested revision
-`8363f8582c154f00be5db13e7d6d7353e50868c8`.
+`4d12d69c94ce2974ff57d0525838a9b91bf282a6`.
 
 | Surface | Default | Access |
 |---|---:|---|
@@ -29,7 +29,9 @@ attempts, and serializes mutations.
 
 Conversation is an independent, tool-less LLM role. Player/NPC text is untrusted
 roleplay and cannot mutate goals or controller state. Bounded proactive greetings
-and per-speaker history are optional.
+and per-speaker history are optional. Chat generation uses a separate temperature
+from planning, and a deterministic rolling window limits each speaker conversation
+to 12 total incoming/outgoing lines in 30 minutes by default.
 
 ## First-run state machine
 

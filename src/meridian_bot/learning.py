@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .config import LearningConfig
+from .contracts import ARMOR_NAME_MARKERS, WEAPON_NAME_MARKERS
 from .storage import Storage
 from .utils import canonical_json, deep_get, json_hash, timestamp, uuid7
 
@@ -20,7 +21,7 @@ FAILURE_CLASSES = {
     "dependency_failure",
 }
 
-COMBAT_TOOLS = {"pvp_engage", "pvp_seek", "fight", "attack", "cast", "approach", "autopilot"}
+COMBAT_TOOLS = {"pvp_engage", "pvp_seek", "fight", "attack", "approach", "autopilot"}
 ROUTE_TOOLS = {"travel", "map", "exits", "walk_to", "go_through", "escape_underworld", "leave_raza"}
 RECOVERABLE_PREPARATION_TOOLS = {
     *ROUTE_TOOLS,
@@ -34,6 +35,12 @@ RECOVERABLE_PREPARATION_TOOLS = {
     "merchants",
     "sell",
     "sell_all",
+    # A cast is a capability/preparation attempt unless its concrete result
+    # contains combat or survival evidence.  Treating every cast as combat made
+    # an ambiguous Create Weapon inventory receipt look like proof that the
+    # character needed more HP or equipment, then locked the very tactic that
+    # could supply that equipment.
+    "cast",
     "equip_best",
     "rest",
     "look",
@@ -44,8 +51,8 @@ RECOVERABLE_PREPARATION_TOOLS = {
 }
 HOME_EVENT_KINDS = {"goal.home_reached"}
 COMBAT_MEMORY_KEY = "combat_outcomes_v1"
-WEAPON_WORDS = ("mace", "hammer", "sword", "axe", "dagger", "bow", "staff", "club")
-ARMOR_WORDS = ("armor", "armour", "shield", "gauntlet", "glove", "pants", "breeches", "vest", "mail", "helm")
+WEAPON_WORDS = WEAPON_NAME_MARKERS
+ARMOR_WORDS = ARMOR_NAME_MARKERS
 HEALING_SUPPLY_WORDS = ("flask", "healing potion")
 INVENTORY_CAPACITY_REFUSAL_MARKERS = (
     "carry too much",
@@ -58,11 +65,201 @@ INVENTORY_CAPACITY_REFUSAL_MARKERS = (
     "inventory is full",
     "inventory full",
 )
+FARM_RECOVERY_REASON_MARKERS = (
+    "health reached the keeper flee threshold",
+    "health crossed the keeper flee threshold",
+    "the keeper had to withdraw",
+    "repeated retreat episodes reached",
+    "repeated critical-health interrupts",
+)
+
+FARM_ROOM_HAZARD_MARKERS = (
+    "live overlevel hostile",
+    "live over-level hostile",
+    "overlevel hostile",
+    "over-level hostile",
+    "source room overlevel",
+    "source-room overlevel",
+    "spawn table hazard",
+    "room population hazard",
+)
+FARM_DEATH_EVIDENCE_MARKERS = (
+    "death",
+    "died",
+    "killed the character",
+    "failed lethally",
+    "lethal",
+)
+FARM_SAFE_SPOT_EVIDENCE_MARKERS = (
+    "safe spot",
+    "safe-spot",
+    "wall tactic",
+    "held wall",
+)
+
+
+def normalize_farm_target(value: Any) -> str:
+    """Return the stable prey spelling used by farm-tactic identities."""
+
+    return " ".join(str(value or "").casefold().split())
+
+
+def farm_tactic_identity(
+    room: Any, target: Any, use_safe_spots: Any
+) -> dict[str, Any]:
+    """Describe only controllable farm inputs, never their observed outcome."""
+
+    strategy = use_safe_spots if isinstance(use_safe_spots, bool) else None
+    return {
+        "room": str(room) if room is not None else None,
+        "target": normalize_farm_target(target),
+        "use_safe_spots": strategy,
+    }
+
+
+def farm_tactic_key(room: Any, target: Any, use_safe_spots: Any) -> str:
+    """Return a compact stable key for one room/prey/positioning tactic."""
+
+    return "farm:" + json_hash(
+        farm_tactic_identity(room, target, use_safe_spots)
+    )[:24]
+
+
+def farm_quarantine_evidence_class(record: dict[str, Any]) -> str:
+    """Classify durable farm evidence without timestamp/count fingerprint churn."""
+
+    explicit = str(record.get("evidence_class") or "").strip().casefold()
+    if explicit:
+        return explicit
+    reasons = " ".join(
+        str(item).casefold()
+        for item in record.get("reasons", [])
+        if item is not None
+    )
+    deltas = record.get("deltas") if isinstance(record.get("deltas"), dict) else {}
+    death_delta = False
+    for key in ("deaths", "deaths_in_safe_spot", "deaths_in_proven_safe_spot"):
+        try:
+            death_delta = death_delta or int(deltas.get(key, 0) or 0) > 0
+        except (TypeError, ValueError):
+            continue
+    if death_delta or any(marker in reasons for marker in FARM_DEATH_EVIDENCE_MARKERS):
+        return "death"
+    if record.get("live_overlevel_hostiles") or any(
+        marker in reasons for marker in FARM_ROOM_HAZARD_MARKERS
+    ):
+        return "room_hazard"
+    if any(marker in reasons for marker in FARM_SAFE_SPOT_EVIDENCE_MARKERS):
+        return "safe_spot_failure"
+    if record.get("use_safe_spots") is False:
+        return "open_field_failure"
+    return "survivability_failure"
+
+
+def farm_quarantine_scope(record: dict[str, Any]) -> str:
+    """Return the causal scope enforced for a retained farm failure."""
+
+    explicit = str(record.get("evidence_scope") or "").strip().casefold()
+    if explicit in {"room", "room_and_prey", "exact_tactic"}:
+        return explicit
+    evidence_class = farm_quarantine_evidence_class(record)
+    if evidence_class == "room_hazard":
+        return "room"
+    if evidence_class == "death":
+        # A lethal result is not evidence that removing the wall constraint is
+        # safe.  Retain it for this room/prey pairing until a capability or
+        # other explicit enabling change invalidates the quarantine.
+        return "room_and_prey"
+    if evidence_class == "safe_spot_failure":
+        return "exact_tactic"
+    if isinstance(record.get("use_safe_spots"), bool):
+        return "exact_tactic"
+    return "room_and_prey"
+
+
+def farm_quarantine_evidence_identity(record: dict[str, Any]) -> dict[str, Any]:
+    """Return stable decision evidence for research/disposition fingerprints."""
+
+    return {
+        "class": farm_quarantine_evidence_class(record),
+        "scope": farm_quarantine_scope(record),
+    }
+
+
+def farm_quarantine_entries(
+    raw: Any, *, room: Any | None = None
+) -> list[tuple[str, dict[str, Any]]]:
+    """Read both legacy room-keyed and exact-tactic quarantine records."""
+
+    if not isinstance(raw, dict):
+        return []
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        recorded_room = value.get("assigned_room", value.get("room"))
+        if room is not None and str(recorded_room) != str(room):
+            # Very old records sometimes had only their room dictionary key.
+            if not (str(key) == str(room) and not str(key).startswith("farm:")):
+                continue
+        entries.append((str(key), value))
+    return entries
+
+
+def farm_quarantine_matches(
+    record: dict[str, Any],
+    *,
+    room: Any,
+    target: Any,
+    use_safe_spots: Any,
+) -> bool:
+    """Whether one retained disposition applies to the proposed farm tactic."""
+
+    recorded_room = record.get("assigned_room", record.get("room"))
+    if recorded_room is not None and room is not None and str(recorded_room) != str(room):
+        return False
+    scope = farm_quarantine_scope(record)
+    if scope == "room":
+        return True
+    recorded_target = normalize_farm_target(record.get("target"))
+    requested_target = normalize_farm_target(target)
+    if recorded_target and requested_target and recorded_target != requested_target:
+        return False
+    if scope == "room_and_prey":
+        return True
+    recorded_strategy = record.get("use_safe_spots")
+    if (
+        not isinstance(recorded_strategy, bool)
+        and farm_quarantine_evidence_class(record) == "safe_spot_failure"
+    ):
+        recorded_strategy = True
+    if isinstance(recorded_strategy, bool) and isinstance(use_safe_spots, bool):
+        return recorded_strategy == use_safe_spots
+    return True
 
 
 def is_inventory_capacity_refusal(reason: Any) -> bool:
     text = str(reason or "").casefold()
     return any(marker in text for marker in INVENTORY_CAPACITY_REFUSAL_MARKERS)
+
+
+def is_obsolete_farm_recovery_failure(reason: Any) -> bool:
+    """Whether old evidence mislabeled a recoverable farm cycle as failure."""
+
+    text = " ".join(str(reason or "").casefold().split())
+    if not any(marker in text for marker in FARM_RECOVERY_REASON_MARKERS):
+        return False
+    return not any(
+        marker in text
+        for marker in (
+            "death",
+            "died",
+            "overlevel hostile",
+            "safe spot failed",
+            "disproved the safe spot",
+            "could not reach safety",
+        )
+    )
 
 
 class GoalDeferredError(ValueError):
@@ -479,6 +676,7 @@ class GoalLearning:
                     "deaths": 0,
                     "healing_supplies_used": 0,
                     "risk_samples": 0,
+                    "recovery_samples": 0,
                     "safe_spot_failure_count": 0,
                     "last_observed_at": None,
                 },
@@ -520,7 +718,23 @@ class GoalLearning:
                     for warning in warnings
                 ):
                     row["route_damage_samples"] += 1
-            if sample.get("risk_reasons"):
+            recovery_reasons = sample.get("recovery_reasons")
+            recovery_reasons = (
+                recovery_reasons if isinstance(recovery_reasons, list) else []
+            )
+            if recovery_reasons:
+                row["recovery_samples"] += 1
+            risk_reasons = sample.get("risk_reasons")
+            risk_reasons = risk_reasons if isinstance(risk_reasons, list) else []
+            material_risks = [
+                reason
+                for reason in risk_reasons
+                if not (
+                    sample.get("at_assigned_room") is True
+                    and is_obsolete_farm_recovery_failure(reason)
+                )
+            ]
+            if material_risks:
                 row["risk_samples"] += 1
             row["safe_spot_failure_count"] = max(
                 row["safe_spot_failure_count"],
@@ -546,7 +760,7 @@ class GoalLearning:
                 for item in quarantine_values
             )
             row["interpretation"] = (
-                "Empirical controller evidence; compare target_kill_share with the static spawn table and keep route failures separate from room combat."
+                "Empirical controller evidence; productive kill/rest/withdraw/resume cycles are recovery telemetry, not room failure. Compare target_kill_share with the static spawn table and keep route failures separate from room combat."
             )
         values.sort(
             key=lambda row: str(row.get("last_observed_at") or ""), reverse=True
@@ -557,9 +771,7 @@ class GoalLearning:
         """Disclose legacy quarantine scope the same way execution enforces it."""
         raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
         values = (
-            [dict(item) for item in raw.values() if isinstance(item, dict)]
-            if isinstance(raw, dict)
-            else []
+            [dict(item) for _key, item in farm_quarantine_entries(raw)]
         )
         for item in values:
             strategy = item.get("use_safe_spots")
@@ -576,12 +788,28 @@ class GoalLearning:
                 else:
                     strategy = None
             item["effective_use_safe_spots"] = strategy
+            item["tactic_id"] = item.get("tactic_id") or farm_tactic_key(
+                item.get("assigned_room", item.get("room")),
+                item.get("target"),
+                strategy,
+            )
+            evidence_identity = farm_quarantine_evidence_identity(item)
+            item["evidence_class"] = evidence_identity["class"]
+            item["evidence_scope"] = evidence_identity["scope"]
+            item["evidence_fingerprint"] = item.get(
+                "evidence_fingerprint"
+            ) or json_hash(
+                {
+                    "tactic_id": item["tactic_id"],
+                    "disposition": evidence_identity,
+                }
+            )
             item["quarantine_scope"] = (
                 "safe_spots"
-                if strategy is True
+                if evidence_identity["scope"] == "exact_tactic" and strategy is True
                 else "open_field"
-                if strategy is False
-                else "room_and_prey"
+                if evidence_identity["scope"] == "exact_tactic" and strategy is False
+                else evidence_identity["scope"]
             )
             if inferred:
                 item["scope_note"] = (
@@ -1146,6 +1374,30 @@ class GoalLearning:
         )
         quarantines_changed = False
         for lesson in self.storage.goal_lessons(statuses=["unlocked"], limit=200):
+            failed_state = lesson.get("failed_state")
+            failed_state = failed_state if isinstance(failed_state, dict) else {}
+            failed_tactic = failed_state.get("failed_tactic")
+            failed_tactic = failed_tactic if isinstance(failed_tactic, dict) else {}
+            if (
+                lesson.get("classification") == "ineffective_tactic"
+                and lesson.get("scope") == "tactic"
+                and is_obsolete_farm_recovery_failure(lesson.get("summary"))
+                and not self._farm_tactic_has_later_death(
+                    lesson, failed_state, failed_tactic
+                )
+            ):
+                self.storage.update_goal_lesson(
+                    lesson["id"],
+                    "resolved",
+                    evidence={
+                        "repair": (
+                            "ordinary farm recovery is not a capability failure "
+                            "and cannot re-quarantine the tactic"
+                        ),
+                        "at": timestamp(),
+                    },
+                )
+                continue
             predicate = lesson.get("retry_when")
             conditions = (
                 predicate.get("conditions", []) if isinstance(predicate, dict) else []
@@ -1180,7 +1432,21 @@ class GoalLearning:
             if identity is None:
                 continue
             room, target, safe_spots = identity
-            existing = quarantines.get(room)
+            existing = next(
+                (
+                    record
+                    for _key, record in farm_quarantine_entries(
+                        quarantines, room=room
+                    )
+                    if farm_quarantine_matches(
+                        record,
+                        room=room,
+                        target=target,
+                        use_safe_spots=safe_spots,
+                    )
+                ),
+                None,
+            )
             if isinstance(existing, dict):
                 continue
             failed_state = updated.get("failed_state")
@@ -1196,7 +1462,8 @@ class GoalLearning:
             at_assigned_room = (
                 failed_room_id is None or str(failed_room_id) == str(room)
             )
-            quarantines[room] = {
+            tactic_id = farm_tactic_key(room, target, safe_spots)
+            record = {
                 "room": int(room) if room.isdigit() else room,
                 "assigned_room": int(room) if room.isdigit() else room,
                 "at_assigned_room": at_assigned_room,
@@ -1212,6 +1479,14 @@ class GoalLearning:
                     "grounded room until combat readiness verifiably improves."
                 ),
             }
+            record["tactic_id"] = tactic_id
+            evidence_identity = farm_quarantine_evidence_identity(record)
+            record["evidence_class"] = evidence_identity["class"]
+            record["evidence_scope"] = evidence_identity["scope"]
+            record["evidence_fingerprint"] = json_hash(
+                {"tactic_id": tactic_id, "disposition": evidence_identity}
+            )
+            quarantines[tactic_id] = record
             quarantines_changed = True
         if quarantines_changed:
             self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
@@ -1273,24 +1548,7 @@ class GoalLearning:
         room, target, safe_spots = identity
         raw = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
         quarantines = dict(raw) if isinstance(raw, dict) else {}
-        record = quarantines.get(room)
-        if not isinstance(record, dict):
-            return None
-        recorded_target = " ".join(str(record.get("target") or "").casefold().split())
-        if target and recorded_target and target != recorded_target:
-            return None
-        recorded_safe_spots = record.get("use_safe_spots")
-        if (
-            isinstance(safe_spots, bool)
-            and isinstance(recorded_safe_spots, bool)
-            and safe_spots != recorded_safe_spots
-        ):
-            return None
-        record_goal_id = str(record.get("goal_id") or "")
         lesson_goal_id = str(lesson.get("goal_id") or "")
-        if record_goal_id and lesson_goal_id and record_goal_id != lesson_goal_id:
-            return None
-        quarantined_at = self._parse_time(str(record.get("quarantined_at") or ""))
         lesson_release_at = self._parse_time(
             str(
                 lesson.get("unlocked_at")
@@ -1299,18 +1557,41 @@ class GoalLearning:
                 or ""
             )
         )
-        if quarantined_at and lesson_release_at < quarantined_at:
-            # An older unlocked lesson cannot erase newer contradictory safety
-            # evidence for the same tactic.
+        matching: list[tuple[str, dict[str, Any]]] = []
+        for key, record in farm_quarantine_entries(quarantines, room=room):
+            if not farm_quarantine_matches(
+                record,
+                room=room,
+                target=target,
+                use_safe_spots=safe_spots,
+            ):
+                continue
+            record_goal_id = str(record.get("goal_id") or "")
+            if record_goal_id and lesson_goal_id and record_goal_id != lesson_goal_id:
+                continue
+            quarantined_at = self._parse_time(
+                str(record.get("quarantined_at") or "")
+            )
+            if quarantined_at and lesson_release_at < quarantined_at:
+                # An older unlocked lesson cannot erase newer contradictory
+                # safety evidence for the same exact tactic.
+                continue
+            matching.append((key, record))
+        if not matching:
             return None
 
-        released = {
-            **record,
-            "released_at": timestamp(),
-            "release_reason": reason,
-            "lesson_id": lesson.get("id"),
-        }
-        quarantines.pop(room, None)
+        released_records = []
+        for key, record in matching:
+            released_records.append(
+                {
+                    **record,
+                    "released_at": timestamp(),
+                    "release_reason": reason,
+                    "lesson_id": lesson.get("id"),
+                }
+            )
+            quarantines.pop(key, None)
+        released = released_records[-1]
         self.storage.set_runtime("farm_tactic_quarantine_v1", quarantines)
         raw_retreats = self.storage.get_runtime(
             "farm_tactic_retreat_incidents_v1", {}
@@ -1581,7 +1862,11 @@ class GoalLearning:
                     {"kind": "numeric_increase", "field": "carried_currency", "from": profile["carried_currency"]}
                 ],
             }
-        if retry_when is None and tool == "shop" and is_inventory_capacity_refusal(reason):
+        if (
+            retry_when is None
+            and tool in {"shop", "cast"}
+            and is_inventory_capacity_refusal(reason)
+        ):
             retry_when = {
                 "mode": "any",
                 "conditions": [

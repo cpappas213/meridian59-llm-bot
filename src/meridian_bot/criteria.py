@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import CRITERION_KINDS, ability_name_key, parse_ability_metric
+from .contracts import (
+    ARMOR_NAME_MARKERS,
+    CRITERION_KINDS,
+    WEAPON_NAME_MARKERS,
+    ability_name_key,
+    parse_ability_metric,
+)
 from .storage import Storage
 from .utils import deep_get
 
@@ -128,6 +134,78 @@ class CriteriaEvaluator:
                 count += 1
         return count
 
+    @staticmethod
+    def equipment_count(observation: dict[str, Any], category: Any) -> int:
+        """Count distinct verified equipment across the pack and loadout."""
+
+        wanted = " ".join(str(category or "").split()).casefold()
+        if wanted not in {"weapon", "armor"}:
+            return 0
+        markers = WEAPON_NAME_MARKERS if wanted == "weapon" else ARMOR_NAME_MARKERS
+        entries: list[tuple[dict[str, Any], bool]] = []
+        inventory = deep_get(observation, "inventory.items", [])
+        for entry in inventory if isinstance(inventory, list) else []:
+            if isinstance(entry, dict):
+                entries.append((entry, False))
+        equipped = deep_get(observation, "equipment.equipped", [])
+        for entry in equipped if isinstance(equipped, list) else []:
+            if isinstance(entry, dict):
+                entries.append((entry, True))
+
+        count = 0
+        seen_ids: set[str] = set()
+        counted_names: set[str] = set()
+        for entry, loadout_entry in entries:
+            name = " ".join(str(entry.get("name") or "").split()).casefold()
+            is_category = any(marker in name for marker in markers)
+            if not name or not is_category:
+                continue
+            raw_id = entry.get("id", entry.get("object_id"))
+            identity = str(raw_id) if raw_id is not None else ""
+            if identity and identity in seen_ids:
+                continue
+            if not identity and loadout_entry and name in counted_names:
+                continue
+            if identity:
+                seen_ids.add(identity)
+            amount = entry.get("amount", entry.get("quantity", entry.get("count", 1)))
+            try:
+                count += max(1, int(amount or 1))
+            except (TypeError, ValueError):
+                count += 1
+            counted_names.add(name)
+
+        if wanted == "weapon":
+            wielding = deep_get(observation, "equipment.wielding", [])
+            if isinstance(wielding, str):
+                wielding = [wielding]
+            for raw_name in wielding if isinstance(wielding, list) else []:
+                name = " ".join(str(raw_name or "").split()).casefold()
+                if name and name not in counted_names:
+                    # A wielding list may lack object ids, so only add a name not
+                    # already represented by a verified pack/equipment entry.
+                    count += 1
+                    counted_names.add(name)
+        return count
+
+    @staticmethod
+    def equipment_wielding(observation: dict[str, Any], *, item: Any = None, category: Any = None) -> bool:
+        wielding = deep_get(observation, "equipment.wielding", [])
+        if isinstance(wielding, str):
+            wielding = [wielding]
+        names = {
+            " ".join(str(value or "").split()).casefold()
+            for value in (wielding if isinstance(wielding, list) else [])
+            if str(value or "").strip()
+        }
+        requested = " ".join(str(item or "").split()).casefold()
+        if requested:
+            return requested in names
+        wanted_category = " ".join(str(category or "").split()).casefold()
+        if wanted_category == "weapon":
+            return bool(names)
+        return False
+
     def _simple(self, criterion_id: str, item: dict[str, Any], goal: dict[str, Any], observation: dict[str, Any]) -> CriterionResult:
         kind = item["kind"]
         if kind == "operator_confirmed":
@@ -165,6 +243,30 @@ class CriteriaEvaluator:
             wanted = int(item.get("count", 1))
             count = self.inventory_count(items, item.get("item"))
             return CriterionResult(criterion_id, kind, count >= wanted, f"verified count {count}; required {wanted}")
+        if kind == "equipment_count":
+            wanted = int(item.get("count", 1))
+            category = str(item.get("category") or "")
+            count = self.equipment_count(observation, category)
+            return CriterionResult(
+                criterion_id,
+                kind,
+                count >= wanted,
+                f"verified {category} count {count}; required {wanted}",
+            )
+        if kind == "equipment_wielding":
+            requested_item = item.get("item")
+            category = item.get("category")
+            met = self.equipment_wielding(
+                observation, item=requested_item, category=category
+            )
+            target = requested_item or category
+            wielding = deep_get(observation, "equipment.wielding", [])
+            return CriterionResult(
+                criterion_id,
+                kind,
+                met,
+                f"verified wielding {wielding!r}; required {target!r}",
+            )
         if kind == "location_reached":
             location = str(item.get("location", item.get("room", ""))).lower()
             room = str(deep_get(observation, "look.room.name", deep_get(observation, "look.room", ""))).lower()

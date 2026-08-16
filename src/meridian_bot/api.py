@@ -90,6 +90,13 @@ class ApiServers:
                         return self.send_json(200, controller.status(detail=_first(query, "detail", "summary"), include_recent_events=int(_first(query, "include_recent_events", "3"))))
                     if parsed.path == "/v1/character":
                         return self.send_json(200, controller.character_status())
+                    if parsed.path == "/v1/conversations":
+                        return self.send_json(
+                            200,
+                            controller.conversation_history(
+                                limit=int(_first(query, "limit", "60"))
+                            ),
+                        )
                     if parsed.path == "/v1/goals":
                         statuses = [
                             part
@@ -109,7 +116,34 @@ class ApiServers:
                         return self.send_json(200, controller.persona())
                     if parsed.path == "/v1/events":
                         kinds = [part for item in query.get("kinds", []) for part in item.split(",") if part]
-                        return self.send_json(200, controller.storage.events(after_cursor=int(_first(query, "after_cursor", "0")), limit=int(_first(query, "limit", "50")), interesting_only=_bool(_first(query, "interesting_only", "false")), kinds=kinds or None))
+                        limit = int(_first(query, "limit", "50"))
+                        interesting_only = _bool(
+                            _first(query, "interesting_only", "false")
+                        )
+                        if _bool(_first(query, "latest", "false")):
+                            events = controller.storage.latest_events(
+                                limit=limit,
+                                interesting_only=interesting_only,
+                                kinds=kinds or None,
+                            )
+                            result = {
+                                "events": events,
+                                "next_cursor": (
+                                    events[-1]["cursor"] if events else 0
+                                ),
+                                "has_more": False,
+                            }
+                        else:
+                            # Preserve the forward-pagination contract used by
+                            # event consumers and deterministic goal evidence.
+                            result = controller.storage.events(
+                                after_cursor=int(_first(query, "after_cursor", "0")),
+                                limit=limit,
+                                interesting_only=interesting_only,
+                                kinds=kinds or None,
+                            )
+                        result["timezone"] = controller.config.deployment.timezone
+                        return self.send_json(200, result)
                     if parsed.path == "/v1/knowledge/metadata":
                         return self.send_json(200, controller.knowledge.metadata())
                     if parsed.path == "/v1/knowledge/search":
@@ -164,8 +198,17 @@ class ApiServers:
                     if parsed.path == "/v1/knowledge/progression-context":
                         return self.send_json(200, controller.progression_context(body))
                     if parsed.path == "/v1/runtime/safe-stop":
-                        controller.safe_stop()
-                        return self.send_json(202, {"stopping": True})
+                        destination = body.get("destination_room_id")
+                        shutdown = controller.safe_stop(
+                            destination_room_id=destination
+                        )
+                        return self.send_json(
+                            202,
+                            {
+                                "stopping": True,
+                                "shutdown": shutdown,
+                            },
+                        )
                     return self.send_json(404, {"code": "NOT_FOUND", "message": "route not found"})
                 except Exception as exc:
                     status, response = _error(exc)

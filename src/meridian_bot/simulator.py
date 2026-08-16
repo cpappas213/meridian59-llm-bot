@@ -20,10 +20,11 @@ class SimulatedBroker:
         schema_agent = {"type": "object", "properties": {"agent": {"type": "string"}}, "required": ["agent"]}
         self.tools = {
             "join": Tool("join", "join", {"type": "object", "properties": {"agent": {}, "account": {}, "password": {}}, "required": ["agent", "account", "password"]}),
+            "leave": Tool("leave", "leave", {"type": "object", "properties": {"agent": {}, "forget": {"type": "boolean"}}, "required": ["agent"]}),
             "look": Tool("look", "look", {"type": "object", "properties": {"agent": {"type": "string"}, "cached": {"type": "boolean"}}, "required": ["agent"]}),
             "status": Tool("status", "status", {"type": "object", "properties": {"agent": {}, "brief": {}}, "required": ["agent"]}),
             "inventory": Tool("inventory", "inventory", schema_agent),
-            "autopilot": Tool("autopilot", "autopilot", {"type": "object", "properties": {"agent": {}, "action": {}, "mode": {}, "hunt": {}, "assigned_room": {}, "max_carry": {}, "rest_below": {}, "flee_below": {}, "fight_above_vigor": {}, "use_safe_spots": {}, "hold_resume_above": {}, "bank_above": {}, "pull_within": {}, "break_out_via_logoff": {}, "why": {}, "hard": {}}, "required": ["agent", "action"]}),
+            "autopilot": Tool("autopilot", "autopilot", {"type": "object", "properties": {"agent": {}, "action": {}, "mode": {}, "hunt": {}, "assigned_room": {}, "max_carry": {}, "rest_below": {}, "flee_below": {}, "fight_above_vigor": {}, "eat_before_fighting": {}, "buy_food": {}, "use_safe_spots": {}, "hold_resume_above": {}, "bank_above": {}, "pull_within": {}, "break_out_via_logoff": {}, "why": {}, "hard": {}}, "required": ["agent", "action"]}),
             "wait_for_event": Tool("wait_for_event", "wait", {"type": "object", "properties": {"agent": {}}, "required": ["agent"]}),
             "act": Tool("act", "act", {"type": "object", "properties": {"agent": {}, "verb": {"enum": ["use", "unuse", "get", "drop", "activate", "go"]}, "target": {}}, "required": ["agent", "verb"]}),
             "travel": Tool("travel", "travel", {"type": "object", "properties": {"agent": {}, "to": {}}, "required": ["agent", "to"]}),
@@ -72,6 +73,9 @@ class SimulatedBroker:
             return self.observe()["status"]
         if name == "inventory":
             return self.observe()["inventory"]
+        if name == "leave":
+            self.joined = False
+            return {"left": True, "forgotten": bool(arguments.get("forget", False))}
         if name == "inbox":
             return {"untrusted": True, "count": 0, "messages": []}
         if name == "act" and arguments.get("verb") == "drop":

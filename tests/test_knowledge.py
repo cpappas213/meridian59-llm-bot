@@ -50,6 +50,7 @@ def make_compendium(root: Path) -> Path:
                         "seen": True,
                         "id": 421,
                         "cls": "CorNothSergeant",
+                        "name": "Lieutenant Vale",
                         "room": 50,
                         "markup": None,
                         "sells": [{"id": 425, "cls": "LeatherArmor", "quantity": None}],
@@ -332,6 +333,20 @@ def make_compendium(root: Path) -> Path:
         '<body><main><h1>leather armor</h1></main></body></html>',
         encoding="utf-8",
     )
+    (compendium / "items" / "sapphire.html").write_text(
+        '<html><head><meta name="description" content="A valuable gem."></head>'
+        '<body><main><h1>sapphire</h1><div class="facts">'
+        '<div class="fact"><div class="lbl">Weight</div><div class="val">1</div></div>'
+        '<div class="fact"><div class="lbl">Value</div><div class="val">60 sh</div></div>'
+        '</div></main></body></html>',
+        encoding="utf-8",
+    )
+    (compendium / "items" / "storytrinket.html").write_text(
+        '<html><head><meta name="description" content="An unpriced trinket."></head>'
+        '<body><main><h1>story trinket</h1><p>A rumor claims its value is 999 sh.</p>'
+        '</main></body></html>',
+        encoding="utf-8",
+    )
     return harness
 
 
@@ -361,6 +376,18 @@ class KnowledgeTests(unittest.TestCase):
             self.assertEqual("valued", valuation["status"])
             self.assertEqual(100, valuation["unit_value"])
             self.assertIn("base item value", valuation["basis"])
+
+    def test_source_item_valuation_imports_only_structured_value_fact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            knowledge = self.knowledge(Path(temporary))
+
+            sapphire = knowledge.item_valuation("sapphire")
+            story = knowledge.item_valuation("story trinket")
+
+            self.assertEqual("valued", sapphire["status"])
+            self.assertEqual(60, sapphire["unit_value"])
+            self.assertIn("compendium Value fact", sapphire["basis"])
+            self.assertEqual("value_unknown", story["status"])
 
     def test_financial_context_totals_shillings_and_known_item_value(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -400,8 +427,147 @@ class KnowledgeTests(unittest.TestCase):
                 self.assertEqual(
                     "CorNothSergeant", leather_buyers["candidates"][0]["merchant"]
                 )
+                self.assertEqual(
+                    {
+                        "seller_id_at_build": 421,
+                        "name": "Lieutenant Vale",
+                        "room_id": 50,
+                    },
+                    leather_buyers["candidates"][0]["instances"][0],
+                )
                 self.assertIn("confirm=false", leather_buyers["next_evidence"])
                 self.assertTrue(finances["banking_policy"]["never_blocks_travel_or_combat"])
+            finally:
+                controller.storage.close()
+
+    def test_financial_context_separates_source_estimate_from_live_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = config(root)
+            harness = make_compendium(root)
+            value = replace(
+                value,
+                harness=replace(
+                    value.harness,
+                    root=harness,
+                    expected_revision="fixture-revision",
+                ),
+            )
+            controller = BotController(value)
+            try:
+                goal = {"id": "quote-goal"}
+                phase = {"id": "quote-phase", "kind": "liquidate_inventory"}
+                observation = {
+                    "look": {"room": {"num": 50, "name": "The Streets of Tos"}},
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "leather armor", "amount": 2}
+                        ]
+                    },
+                }
+
+                unquoted = controller._financial_context(observation)
+                self.assertEqual(
+                    200, unquoted["source_estimated_liquidatable_inventory_value"]
+                )
+                self.assertEqual(
+                    200, unquoted["known_liquidatable_inventory_value"]
+                )
+                self.assertEqual(
+                    0, unquoted["confirmed_live_quote_liquidatable_value"]
+                )
+                self.assertEqual(
+                    "quote_required", unquoted["liquidation_status"]["state"]
+                )
+                self.assertEqual(
+                    [77],
+                    [
+                        item["id"]
+                        for item in unquoted["unquoted_liquidatable_items"]
+                    ],
+                )
+                manager_context = controller._campaign_manager_financial_context(
+                    unquoted
+                )
+                self.assertEqual(
+                    200,
+                    manager_context[
+                        "source_estimated_liquidatable_inventory_value"
+                    ],
+                )
+                self.assertEqual(
+                    "quote_required",
+                    manager_context["liquidation_status"]["state"],
+                )
+
+                controller._record_prepare_combat_sell_quote(
+                    goal,
+                    phase,
+                    {"to": 421, "items": [77], "confirm": False},
+                    observation,
+                    {"sold": False, "offered_price": 75},
+                )
+                quoted = controller._financial_context(observation)
+                self.assertEqual(
+                    75, quoted["confirmed_live_quote_liquidatable_value"]
+                )
+                self.assertEqual(
+                    "live_quotes_available", quoted["liquidation_status"]["state"]
+                )
+                self.assertEqual([], quoted["unquoted_liquidatable_items"])
+                self.assertEqual(
+                    77,
+                    quoted["valid_live_sell_quotes"][0]["items"][0]["id"],
+                )
+
+                changed_inventory = {
+                    **observation,
+                    "inventory": {
+                        "items": [
+                            {"id": 77, "name": "leather armor", "amount": 3}
+                        ]
+                    },
+                }
+                invalidated = controller._financial_context(changed_inventory)
+                self.assertEqual(
+                    0, invalidated["confirmed_live_quote_liquidatable_value"]
+                )
+                self.assertEqual([], invalidated["valid_live_sell_quotes"])
+
+                controller._record_prepare_combat_sell_quote(
+                    goal,
+                    phase,
+                    {
+                        "to": 421,
+                        "items": [{"id": 77, "amount": 1}],
+                        "confirm": False,
+                    },
+                    changed_inventory,
+                    {"sold": False, "offered_price": 25},
+                )
+                partial_quote = controller._financial_context(changed_inventory)
+                self.assertEqual(
+                    25, partial_quote["confirmed_live_quote_liquidatable_value"]
+                )
+                self.assertEqual(
+                    1,
+                    partial_quote["valid_live_sell_quotes"][0]["items"][0][
+                        "quantity"
+                    ],
+                )
+                self.assertEqual(
+                    3,
+                    partial_quote["valid_live_sell_quotes"][0]["items"][0][
+                        "inventory_quantity"
+                    ],
+                )
+                self.assertEqual(
+                    [77],
+                    [
+                        item["id"]
+                        for item in partial_quote["unquoted_liquidatable_items"]
+                    ],
+                )
             finally:
                 controller.storage.close()
 
@@ -460,6 +626,53 @@ class KnowledgeTests(unittest.TestCase):
                 }
                 self.assertEqual({77: False, 78: True}, transferability)
                 self.assertEqual(1, len(finances["buyer_candidates"]))
+            finally:
+                controller.storage.close()
+
+    def test_financial_context_excludes_equipped_gear_from_liquidatable_wealth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = config(root)
+            harness = make_compendium(root)
+            value = replace(
+                value,
+                harness=replace(
+                    value.harness,
+                    root=harness,
+                    expected_revision="fixture-revision",
+                ),
+            )
+            controller = BotController(value)
+            try:
+                finances = controller._financial_context(
+                    {
+                        "inventory": {
+                            "items": [
+                                {"name": "shillings", "amount": 12},
+                                {"id": 77, "name": "leather armor", "amount": 1},
+                            ]
+                        },
+                        "equipment": {
+                            "equipped": [
+                                {"id": 77, "name": "leather armor"}
+                            ]
+                        },
+                    }
+                )
+
+                self.assertEqual(100, finances["known_inventory_item_value"])
+                self.assertEqual(0, finances["known_liquidatable_inventory_value"])
+                self.assertEqual(
+                    [{
+                        "id": 77,
+                        "name": "leather armor",
+                        "reason": "equipped or in-use active loadout",
+                    }],
+                    finances["protected_sale_items"],
+                )
+                self.assertTrue(finances["valued_items"][0]["sale_protected"])
+                self.assertFalse(finances["valued_items"][0]["liquidatable"])
+                self.assertEqual([], finances["buyer_candidates"])
             finally:
                 controller.storage.close()
 
@@ -624,6 +837,31 @@ class KnowledgeTests(unittest.TestCase):
             buyer = knowledge.resolve("CorNothSergeant", kinds=["merchant"])
             self.assertEqual(["Weapon", "Wearable"], buyer["entity"]["facts"]["buying_categories"])
             self.assertFalse(buyer["entity"]["facts"]["buys_anything"])
+            self.assertEqual(
+                "Lieutenant Vale",
+                buyer["entity"]["facts"]["instances"][0]["name"],
+            )
+            self.assertEqual(
+                {
+                    "merchant_class": "CorNothSergeant",
+                    "entity_id": "merchant:cor-noth-sergeant",
+                    "instance": {
+                        "seller_id_at_build": 421,
+                        "name": "Lieutenant Vale",
+                        "room_id": 50,
+                    },
+                    "matched_by": "object_id",
+                },
+                knowledge.merchant_identity(
+                    object_id=421, name="a stale display name"
+                ),
+            )
+            self.assertEqual(
+                "CorNothSergeant",
+                knowledge.merchant_identity(name="Lieutenant Vale")[
+                    "merchant_class"
+                ],
+            )
             self.assertIn("fresh in-room sell quote", buyer["entity"]["facts"]["sale_verification"])
             unplaced = knowledge.resolve("TosBlacksmith", kinds=["merchant"])
             self.assertEqual("found", unplaced["status"])

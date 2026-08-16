@@ -5,10 +5,13 @@ import io
 import unittest
 
 from meridian_bot.tui import (
+    ControllerApi,
     ControllerApiError,
     prompt_goal_command,
     prompt_new_goal,
+    prompt_safe_shutdown,
     render_character_status,
+    render_conversations,
     render_dashboard,
     run_tui,
 )
@@ -19,6 +22,8 @@ class FakeApi:
         self.draft_requests: list[dict[str, object]] = []
         self.submissions: list[dict[str, object]] = []
         self.character_status_requests = 0
+        self.conversation_requests = 0
+        self.safe_stop_requests = 0
         self.drafts: list[dict[str, object]] = [
             {
                 "title": "Reach the bank",
@@ -39,11 +44,23 @@ class FakeApi:
 
     def status(self) -> dict[str, object]:
         return {
-            "controller": {"state": "running", "control_owner": "keeper"},
+            "controller": {
+                "state": "running",
+                "since": "2026-08-16T12:00:00.000Z",
+                "control_owner": "keeper",
+            },
             "game": {
                 "connection": "joined",
                 "character_name": "Sable",
                 "location": "Tos",
+                "room_id": 50,
+                "room_properties": {
+                    "known": True,
+                    "safe": False,
+                    "flags": ["ROOM_GUILD_PK_ONLY"],
+                    "terrain": ["TERRAIN_CITY"],
+                    "region": "Tos",
+                },
                 "vitals": {
                     "health": {"current": 40, "max": 50},
                     "mana": {"current": 20, "max": 30},
@@ -51,6 +68,17 @@ class FakeApi:
                 },
                 "risk": "low",
                 "carried_currency": 12,
+                "finances": {
+                    "known_inventory_item_value": 345,
+                    "valuation_complete": True,
+                    "bank_accounts": [
+                        {
+                            "account": "shared mainland account",
+                            "last_known_balance": 1712,
+                            "recorded_at": "2026-08-16T12:30:00.000Z",
+                        }
+                    ],
+                },
                 "observation_age_seconds": 0.4,
             },
             "onboarding": {"status": "ready"},
@@ -131,6 +159,17 @@ class FakeApi:
                 "character_name": "Sable",
                 "location": "Tos Inn",
                 "room_id": 52,
+                "room_properties": {
+                    "known": True,
+                    "safe": True,
+                    "flags": [
+                        "ROOM_HOMETOWN",
+                        "ROOM_NO_COMBAT",
+                        "ROOM_SANCTUARY",
+                    ],
+                    "terrain": ["TERRAIN_CITY"],
+                    "region": "Tos",
+                },
                 "vitals": {
                     "health": {"value": 40, "max": 50, "pct": 80},
                     "mana": {"value": 20, "max": 30, "pct": 67},
@@ -197,6 +236,44 @@ class FakeApi:
             },
         }
 
+    def conversations(self) -> dict[str, object]:
+        self.conversation_requests += 1
+        return {
+            "character_name": "Sable",
+            "timezone": "America/Los_Angeles",
+            "messages": [
+                {
+                    "occurred_at": "2026-08-14T13:35:00Z",
+                    "display_occurred_at": "2026-08-14 06:35 PDT",
+                    "speaker": "bunsen",
+                    "speaker_kind": "npc",
+                    "role": "speaker",
+                    "content": "Can you help me with this particularly long request?",
+                },
+                {
+                    "occurred_at": "2026-08-14T13:35:02Z",
+                    "display_occurred_at": "2026-08-14 06:35 PDT",
+                    "speaker": "bunsen",
+                    "speaker_kind": "npc",
+                    "role": "assistant",
+                    "content": "Yes, I can help.",
+                },
+            ],
+        }
+
+    def safe_stop(
+        self, *, destination_room_id: int | None = None
+    ) -> dict[str, object]:
+        self.safe_stop_requests += 1
+        return {
+            "stopping": True,
+            "shutdown": {
+                "request_id": "shutdown-1",
+                "stage": "requested",
+                "requested_destination_room_id": destination_room_id,
+            },
+        }
+
     def draft_goal(
         self,
         prompt: str,
@@ -215,6 +292,72 @@ class FakeApi:
 
 
 class TuiTests(unittest.TestCase):
+    def test_controller_api_events_requests_latest_activity_in_setup_timezone(
+        self,
+    ) -> None:
+        api = object.__new__(ControllerApi)
+        requests: list[tuple[str, str]] = []
+
+        def request(method: str, path: str) -> dict[str, object]:
+            requests.append((method, path))
+            return {
+                "timezone": "America/Los_Angeles",
+                "events": [
+                    {
+                        "cursor": 12554,
+                        "occurred_at": "2026-08-14T12:38:04.144Z",
+                        "summary": "Newest event",
+                    }
+                ]
+            }
+
+        api.request = request
+
+        events = api.events(limit=5)
+
+        self.assertEqual(12554, events[0]["cursor"])
+        self.assertEqual(
+            "2026-08-14 05:38 PDT", events[0]["display_occurred_at"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "GET",
+                    "/v1/events?latest=true&interesting_only=false&limit=5",
+                )
+            ],
+            requests,
+        )
+
+    def test_controller_api_conversations_localizes_message_times(self) -> None:
+        api = object.__new__(ControllerApi)
+        requests: list[tuple[str, str]] = []
+
+        def request(method: str, path: str) -> dict[str, object]:
+            requests.append((method, path))
+            return {
+                "character_name": "Sable",
+                "timezone": "America/Los_Angeles",
+                "messages": [
+                    {
+                        "occurred_at": "2026-08-14T13:35:02Z",
+                        "speaker": "bunsen",
+                        "role": "assistant",
+                        "content": "Hello.",
+                    }
+                ],
+            }
+
+        api.request = request
+
+        result = api.conversations(limit=25)
+
+        self.assertEqual(
+            "2026-08-14 06:35 PDT",
+            result["messages"][0]["display_occurred_at"],
+        )
+        self.assertEqual([("GET", "/v1/conversations?limit=25")], requests)
+
     def test_dashboard_renders_goal_queue_vitals_and_abilities(self) -> None:
         api = FakeApi()
 
@@ -222,17 +365,75 @@ class TuiTests(unittest.TestCase):
 
         self.assertIn("Sable", rendered)
         self.assertIn("HP 40/50", rendered)
+        self.assertIn(
+            "Banked Shillings 1712 | Total Inventory Value 345", rendered
+        )
         self.assertIn("Reach the bank", rendered)
         self.assertIn("Buy bread", rendered)
         self.assertIn("Dodge 12", rendered)
         self.assertIn("Blink 8", rendered)
         self.assertIn("Controller started", rendered)
+        self.assertIn("2026-08-08 12:34 UTC", rendered)
         self.assertIn("[S] Character status", rendered)
+        self.assertIn("[C] Recent chat", rendered)
         self.assertIn("CURRENT PHASE", rendered)
         self.assertIn("#4 Return Home [active]", rendered)
         self.assertIn("Attempts 2", rendered)
         self.assertIn("Reach the First Royal Bank of Tos safely.", rendered)
         self.assertIn("Plan [verified]: Travel safely to the bank", rendered)
+        self.assertIn(
+            "Location Tos (room 50) [guild PvP only, city, region: Tos]",
+            rendered,
+        )
+        self.assertIn("[X] Safe shutdown", rendered)
+        self.assertIn("[Q] Detach TUI", rendered)
+
+    def test_dashboard_marks_unobserved_bank_balance_unknown(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["game"]["finances"]["bank_accounts"] = []
+        status["game"]["finances"]["valuation_complete"] = False
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Banked Shillings unknown", rendered)
+        self.assertIn(
+            "Total Inventory Value 345 (partial estimate)", rendered
+        )
+
+    def test_dashboard_does_not_present_a_prior_session_bank_balance(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["game"]["finances"]["bank_accounts"][0][
+            "recorded_at"
+        ] = "2026-08-15T12:30:00.000Z"
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Banked Shillings unknown", rendered)
+
+    def test_dashboard_renders_safe_shutdown_progress(self) -> None:
+        api = FakeApi()
+        status = api.status()
+        status["controller"]["state"] = "draining"
+        status["controller"]["shutdown"] = {
+            "stage": "securing",
+            "paused_goal_ids": ["goal-1", "goal-2"],
+            "safe_room": {"room_id": 52, "name": "Familiars"},
+            "logged_out": False,
+        }
+
+        rendered = render_dashboard(
+            status, api.goals(), api.events(), width=100
+        )
+
+        self.assertIn("Safe shutdown [securing]", rendered)
+        self.assertIn("2 goal(s) paused", rendered)
+        self.assertIn("safe room Familiars (52)", rendered)
 
     def test_dashboard_explains_when_campaign_is_between_phases(self) -> None:
         api = FakeApi()
@@ -289,7 +490,29 @@ class TuiTests(unittest.TestCase):
         self.assertIn("Health: 40 / 50 (80%)", rendered)
         self.assertIn("Vigor: 100 / 200 (50%; rested; rest threshold 80)", rendered)
         self.assertIn("Might: 25 (display scale 50; hard cap 70)", rendered)
+        self.assertIn(
+            "Location Tos Inn (room 52) "
+            "[safe, sanctuary, no combat, hometown, city, region: Tos]",
+            rendered,
+        )
         self.assertNotIn("{'value':", rendered)
+
+    def test_recent_chat_renders_directions_wraps_and_strips_controls(self) -> None:
+        api = FakeApi()
+        history = api.conversations()
+        history["messages"][0]["content"] = (
+            "Can you help me with this particularly long \x1b[31mrequest?"
+        )
+
+        rendered = render_conversations(history, width=72, color=True)
+
+        self.assertIn("RECENT CHAT", rendered)
+        self.assertIn("bunsen -> Sable", rendered)
+        self.assertIn("Sable -> bunsen", rendered)
+        self.assertIn("2026-08-14 06:35 PDT", rendered)
+        self.assertNotIn("\x1b[31mrequest", rendered)
+        self.assertNotIn("[31mrequest", rendered)
+        self.assertIn("\x1b[", rendered)
 
     def test_new_goal_flow_drafts_plain_language_and_approves(self) -> None:
         api = FakeApi()
@@ -488,6 +711,37 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(4, confirm["expected_version"])
         self.assertIn("only after every observable criterion passes", output.getvalue())
 
+    def test_goal_management_colorizes_queue_selection_and_actions(self) -> None:
+        answers = iter(["1", "p"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = prompt_goal_command(
+                FakeApi().goals(),
+                input_fn=lambda _: next(answers),
+                color=True,
+            )
+
+        rendered = output.getvalue()
+        self.assertIsNotNone(result)
+        self.assertIn("\x1b[1;36mGOAL QUEUE MANAGEMENT\x1b[0m", rendered)
+        self.assertIn("\x1b[32m[active]", rendered)
+        self.assertIn("\x1b[33m[queued]", rendered)
+        self.assertIn("\x1b[35m P50\x1b[0m", rendered)
+        self.assertIn("\x1b[31m[C]ancel\x1b[0m", rendered)
+        self.assertIn("\x1b[36mSelected:\x1b[0m", rendered)
+
+    def test_goal_management_default_output_remains_plain_text(self) -> None:
+        answers = iter(["1", "p"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            prompt_goal_command(
+                FakeApi().goals(), input_fn=lambda _: next(answers)
+            )
+
+        self.assertNotIn("\x1b[", output.getvalue())
+
     def test_escape_cancels_goal_creation_from_each_prompt_stage(self) -> None:
         initial = FakeApi()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -530,12 +784,86 @@ class TuiTests(unittest.TestCase):
                     )
 
     def test_tui_can_attach_and_quit_without_stopping_controller(self) -> None:
+        api = FakeApi()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = run_tui(FakeApi(), key_reader=lambda _: "q")
+            result = run_tui(api, key_reader=lambda _: "q")
 
         self.assertEqual(0, result)
+        self.assertEqual(0, api.safe_stop_requests)
         self.assertIn("MERIDIAN 59 BOT CONSOLE", output.getvalue())
+
+    def test_tui_safe_shutdown_requires_confirmation_and_calls_controller(self) -> None:
+        api = FakeApi()
+        keys = iter(["x", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "SHUTDOWN",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, api.safe_stop_requests)
+        self.assertIn("Safe shutdown accepted [requested]", output.getvalue())
+
+    def test_tui_safe_shutdown_escape_cancels_without_api_call(self) -> None:
+        api = FakeApi()
+        keys = iter(["x", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "\x1b",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(0, api.safe_stop_requests)
+        self.assertIn("Safe shutdown cancelled", output.getvalue())
+
+    def test_safe_shutdown_confirmation_requires_exact_keyword(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                prompt_safe_shutdown(input_fn=lambda _: "  shutdown  ")
+            )
+            self.assertFalse(prompt_safe_shutdown(input_fn=lambda _: "yes"))
+
+    def test_tui_manual_refresh_repolls_and_displays_acknowledgement(self) -> None:
+        class CountingApi(FakeApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status_requests = 0
+                self.goal_requests = 0
+                self.event_requests = 0
+
+            def status(self) -> dict[str, object]:
+                self.status_requests += 1
+                return super().status()
+
+            def goals(self) -> list[dict[str, object]]:
+                self.goal_requests += 1
+                return super().goals()
+
+            def events(self) -> list[dict[str, object]]:
+                self.event_requests += 1
+                return super().events()
+
+        api = CountingApi()
+        keys = iter(["r", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(api, key_reader=lambda _: next(keys))
+
+        self.assertEqual(0, result)
+        self.assertEqual(2, api.status_requests)
+        self.assertEqual(2, api.goal_requests)
+        self.assertEqual(2, api.event_requests)
+        self.assertIn("Manual refresh complete at", output.getvalue())
 
     def test_tui_submits_only_after_draft_approval(self) -> None:
         api = FakeApi()
@@ -580,6 +908,22 @@ class TuiTests(unittest.TestCase):
 
         self.assertEqual(0, result)
         self.assertEqual(1, api.character_status_requests)
+
+    def test_tui_c_opens_recent_chat_and_returns_to_dashboard(self) -> None:
+        api = FakeApi()
+        keys = iter(["c", "q"])
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = run_tui(
+                api,
+                key_reader=lambda _: next(keys),
+                input_fn=lambda _: "\x1b",
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, api.conversation_requests)
+        self.assertIn("RECENT CHAT", output.getvalue())
 
 
 if __name__ == "__main__":

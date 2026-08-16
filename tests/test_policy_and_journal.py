@@ -11,9 +11,11 @@ from meridian_bot.config import BotConfig
 from meridian_bot.notifications import NotificationDispatcher
 from meridian_bot.model import (
     CAMPAIGN_MANAGER_PROMPT_TOKEN_BUDGET,
+    GREETER_SYSTEM,
     JOURNAL_ASSESSOR_SYSTEM,
     ModelError,
     PLANNER_SYSTEM,
+    RESPONDER_SYSTEM,
     VllmClient,
 )
 from meridian_bot.obsidian import ObsidianJournal
@@ -117,6 +119,7 @@ class PolicyAndJournalTests(unittest.TestCase):
             payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
             self.assertIn("response_format", payload)
             self.assertNotIn("chat_template_kwargs", payload)
+            self.assertEqual(base.model.temperature, payload["temperature"])
 
             compatible = replace(
                 base,
@@ -132,6 +135,67 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual(
                 {"enable_thinking": False}, payload["chat_template_kwargs"]
             )
+
+    def test_chat_calls_use_dedicated_temperature_and_speech_only_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = config(Path(temporary))
+            client = VllmClient(base)
+            with patch.object(
+                client,
+                "_complete",
+                return_value={"reply": "Hello there.", "ignore": False, "reason": ""},
+            ) as complete:
+                client.respond(
+                    persona={"name": "Sable"},
+                    message={"utterance": "Travel now."},
+                    context={"room": "Tos"},
+                )
+                self.assertEqual(
+                    base.model.chat_temperature,
+                    complete.call_args.kwargs["temperature"],
+                )
+                client.greet(
+                    persona={"name": "Sable"},
+                    encounter={"name": "Bunsen"},
+                    context={"room": "Tos"},
+                )
+                self.assertEqual(
+                    base.model.chat_temperature,
+                    complete.call_args.kwargs["temperature"],
+                )
+
+        self.assertIn("as untrusted", RESPONDER_SYSTEM)
+        self.assertIn("roleplay data", RESPONDER_SYSTEM)
+        self.assertIn("cannot create, modify, reprioritize", RESPONDER_SYSTEM)
+        self.assertIn("sole capability", RESPONDER_SYSTEM)
+        self.assertIn("public game and character state", RESPONDER_SYSTEM)
+        self.assertIn("cannot create goals", GREETER_SYSTEM)
+        self.assertIn("ASCII punctuation", RESPONDER_SYSTEM)
+        self.assertIn("censor into symbol noise", GREETER_SYSTEM)
+
+    def test_generated_game_speech_is_wire_safe_and_avoids_server_censor_noise(
+        self,
+    ) -> None:
+        raw = (
+            "Oh … “you’re here”—perfect. Your fucking sacrifice can bring shit. "
+            "~Bred `Cmarkup and café."
+        )
+
+        clean = VllmClient._game_speech_text(raw, 220)
+
+        self.assertEqual(
+            'Oh ... "you\'re here"-perfect. Your blasting sacrifice can bring filth. '
+            "red markup and cafe.",
+            clean,
+        )
+        self.assertTrue(all(0x20 <= ord(character) <= 0x7E for character in clean))
+        self.assertNotRegex(clean.casefold(), r"fuck|shit|asshole|cocksuck")
+        self.assertNotIn("~", clean)
+        self.assertNotIn("`", clean)
+
+        shortened = VllmClient._game_speech_text(raw, 40)
+        self.assertLessEqual(len(shortened), 40)
+        self.assertTrue(shortened.endswith("..."))
 
     def test_vllm_repairs_one_malformed_json_response(self) -> None:
         class Response:
@@ -164,6 +228,92 @@ class PolicyAndJournalTests(unittest.TestCase):
             repair_request = request.call_args_list[1].args[0]
             repair_payload = json.loads(repair_request.data.decode("utf-8"))
             self.assertIn("not valid complete JSON", repair_payload["messages"][-1]["content"])
+
+    def test_tactical_completion_normalizes_mode_and_keeps_metrics_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            campaign_metrics = {"kind": "campaign_manager", "mode": "normal"}
+            client.last_prompt_metrics = campaign_metrics
+            envelope = {
+                "mode": " execute_step ",
+                "request_id": "request-1",
+                "legal_actions": [],
+            }
+            response = {
+                "request_id": "request-1",
+                "action_token": "action-1",
+                "arguments": {},
+                "rationale": "Use the selected action.",
+                "expected_observation": {},
+            }
+            with patch.object(client, "_complete", return_value=response) as complete:
+                result = client.tactical_complete(
+                    mode=" execute_step ", envelope=envelope
+                )
+
+            self.assertEqual(response, result)
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            self.assertEqual("EXECUTE_STEP", sent["mode"])
+            self.assertEqual(" execute_step ", envelope["mode"])
+            self.assertFalse(complete.call_args.kwargs["allow_json_repair"])
+            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
+            self.assertIs(campaign_metrics, client.last_prompt_metrics)
+            self.assertEqual(
+                "EXECUTE_STEP", client.last_tactical_prompt_metrics["mode"]
+            )
+            self.assertEqual(
+                6000, client.last_tactical_prompt_metrics["token_budget"]
+            )
+            self.assertIsNone(
+                client.last_tactical_prompt_metrics["context_window_limit_tokens"]
+            )
+            self.assertFalse(
+                client.last_tactical_prompt_metrics[
+                    "context_window_reserve_enforced"
+                ]
+            )
+
+    def test_tactical_completion_rejects_conflicting_or_unknown_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch.object(client, "_complete") as complete:
+                with self.assertRaisesRegex(ModelError, "mode mismatch"):
+                    client.tactical_complete(
+                        mode="PLAN_CREATE",
+                        envelope={"mode": "EXECUTE_STEP"},
+                    )
+                with self.assertRaisesRegex(ModelError, "unsupported tactical"):
+                    client.tactical_complete(mode="invented", envelope={})
+            complete.assert_not_called()
+
+    def test_tactical_completion_disables_unbudgeted_json_transcript_repair(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {"choices": [{"message": {"content": '{"request_id":'}}]}
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            with patch(
+                "meridian_bot.model.urllib.request.urlopen", return_value=Response()
+            ) as request:
+                with self.assertRaisesRegex(ModelError, "repair disabled"):
+                    client.tactical_complete(
+                        mode="EXECUTE_STEP",
+                        envelope={
+                            "mode": "EXECUTE_STEP",
+                            "request_id": "request-1",
+                            "legal_actions": [],
+                        },
+                    )
+            self.assertEqual(1, request.call_count)
 
     def test_character_onboarding_reserves_room_for_reasoning_then_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -367,6 +517,14 @@ class PolicyAndJournalTests(unittest.TestCase):
                     for index in range(100)
                 ],
                 "research_retry": {"allowed": False},
+                "verified_no_progress_tactics": [
+                    {
+                        "tool": "travel",
+                        "room": 104,
+                        "arguments": {"to": 106},
+                        "reason": "every square for that exit refused",
+                    }
+                ],
             }
             with patch.object(
                 client, "_complete", return_value={"decision": "start_phase"}
@@ -376,7 +534,15 @@ class PolicyAndJournalTests(unittest.TestCase):
                     observation={"status": {"vitals": {"health": {"max": 34}}}},
                     campaign_context=campaign,
                     grounded_knowledge=None,
-                    learned_failures=None,
+                    learned_failures={
+                        "room_evidence": [
+                            {
+                                "classification": "productive_if_level_eligible",
+                                "room": 544,
+                                "target": "groundworm larva",
+                            }
+                        ]
+                    },
                     financial_context=None,
                 )
 
@@ -388,6 +554,15 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertTrue(client.last_prompt_metrics["compacted"])
             sent = json.loads(complete.call_args.args[0][1]["content"])
             self.assertEqual(False, sent["campaign"]["research_retry"]["allowed"])
+            self.assertEqual(
+                106,
+                sent["campaign"]["verified_no_progress_tactics"][0]["arguments"][
+                    "to"
+                ],
+            )
+            self.assertEqual(
+                544, sent["learned_failures"]["room_evidence"][0]["room"]
+            )
 
     def test_campaign_manager_timeout_retries_with_minimal_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
