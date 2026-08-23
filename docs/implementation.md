@@ -7,8 +7,8 @@ in the [operations runbook](requirements/operations.md).
 ## Runtime topology
 
 The controller is a companion process, not a harness fork. The harness is pinned
-to the public integration fork as a Git submodule at tested revision
-`e6620d6b70a9e76feb7f5e2816b278f8a8ca946a`.
+directly to the authoritative public upstream as a Git submodule at tested revision
+`1cf3ac93da96f1a5c31b7c8463e73d1af97b534e`.
 
 | Surface | Default | Access |
 |---|---:|---|
