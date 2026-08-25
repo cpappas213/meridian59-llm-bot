@@ -74,6 +74,56 @@ def fungus_beast_knowledge() -> SimpleNamespace:
     )
 
 
+def creature_catalogue_knowledge(
+    *entities: dict[str, object],
+) -> SimpleNamespace:
+    """Catalogue double whose search exposes every literal creature candidate."""
+
+    catalogue = [dict(entity) for entity in entities]
+
+    def normalized(value: object) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+
+    def resolve(
+        query: str,
+        *,
+        kinds: object = None,
+        limit: int = 8,
+        allow_fuzzy: bool = False,
+    ) -> dict[str, object]:
+        del kinds, limit, allow_fuzzy
+        wanted = normalized(query)
+        for entity in catalogue:
+            names = [entity.get("canonical_name")]
+            aliases = entity.get("aliases")
+            if isinstance(aliases, list):
+                names.extend(aliases)
+            if wanted in {normalized(name) for name in names}:
+                return {
+                    "status": "found",
+                    "entity": entity,
+                    "matches": [entity],
+                }
+        return {"status": "not_found", "matches": []}
+
+    def search(
+        query: str, *, kinds: object = None, limit: int = 8
+    ) -> dict[str, object]:
+        del query, kinds, limit
+        return {
+            "status": "ok",
+            "matches": list(catalogue),
+            "count": len(catalogue),
+        }
+
+    return SimpleNamespace(
+        corpus_version="multi-creature-operator-target-test",
+        resolve=resolve,
+        search=search,
+        get=lambda _entity_id: {"status": "not_found"},
+    )
+
+
 def source_verify_safe_rooms(controller: BotController, *room_ids: int) -> None:
     """Give focused controller tests explicit source-derived room facts."""
 
@@ -7505,6 +7555,89 @@ class ControllerTests(unittest.TestCase):
                     "operator_contract.binding_farm_target",
                     CAMPAIGN_MANAGER_SYSTEM,
                 )
+            finally:
+                controller.storage.close()
+
+    def test_live_fungus_goal_ignores_roq_in_liquidation_clause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = creature_catalogue_knowledge(
+                    {
+                        "id": "creature:fungusbeast",
+                        "kind": "creature",
+                        "canonical_name": "Fungus Beast",
+                        "aliases": [
+                            "fungus beast",
+                            "fungusbeast",
+                            "puucmecmoch",
+                        ],
+                        "facts": {"role": "monster"},
+                    },
+                    {
+                        "id": "creature:assassin",
+                        "kind": "creature",
+                        "canonical_name": "Roq",
+                        "aliases": ["Roq", "assassin", "moch"],
+                        "facts": {"role": "teacher"},
+                    },
+                )
+                goal = goal_payload(
+                    request_id="live-fungus-target-with-roq",
+                    title=(
+                        "Bank 1,000,000 Shillings via Fungus Beast Farming"
+                    ),
+                    objective=(
+                        "Acquire over 1,000,000 banked shillings by farming "
+                        "fungus beasts, liquidating inventory with Roq when "
+                        "its value exceeds 2,000 shillings, and banking the "
+                        "proceeds."
+                    ),
+                    constraints={
+                        "operator_notes": (
+                            "Farm fungus beasts. When inventory value exceeds "
+                            "2000 shillings, liquidate with Roq and bank the "
+                            "proceeds. Repeat until banked shillings exceed "
+                            "1,000,000."
+                        )
+                    },
+                )
+
+                self.assertEqual(
+                    "fungus beast", controller._goal_bound_farm_target(goal)
+                )
+            finally:
+                controller.storage.close()
+
+    def test_two_prey_combat_prose_does_not_guess_binding_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = creature_catalogue_knowledge(
+                    {
+                        "id": "creature:fungusbeast",
+                        "kind": "creature",
+                        "canonical_name": "Fungus Beast",
+                        "aliases": ["fungus beast", "fungus beasts"],
+                        "facts": {"role": "monster"},
+                    },
+                    {
+                        "id": "creature:duskrat",
+                        "kind": "creature",
+                        "canonical_name": "Dusk Rat",
+                        "aliases": ["dusk rat", "dusk rats"],
+                        "facts": {"role": "monster"},
+                    },
+                )
+                goal = goal_payload(
+                    request_id="ambiguous-two-prey-combat",
+                    title="Fight Fungus Beasts and Dusk Rats",
+                    objective=(
+                        "Farm fungus beasts and dusk rats for their loot."
+                    ),
+                )
+
+                self.assertIsNone(controller._goal_bound_farm_target(goal))
             finally:
                 controller.storage.close()
 

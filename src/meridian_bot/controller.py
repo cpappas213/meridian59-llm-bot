@@ -12260,7 +12260,7 @@ class BotController:
         """Recover one operator-required prey from syntax or explicit goal prose.
 
         The public goal is the authority boundary. Narrative recognition accepts
-        only a creature name or alias that literally occurs in farm/combat prose;
+        only a monster name or alias that literally occurs in farm/combat prose;
         fuzzy search results alone never become operator intent.
         """
 
@@ -12306,6 +12306,14 @@ class BotController:
             ):
                 if not isinstance(entity, dict):
                     continue
+                facts = entity.get("facts")
+                role = (
+                    normalize(facts.get("role"))
+                    if isinstance(facts, dict)
+                    else ""
+                )
+                if role and role != "monster":
+                    continue
                 identity = str(
                     entity.get("id") or entity.get("canonical_name") or ""
                 ).casefold()
@@ -12316,8 +12324,6 @@ class BotController:
         corpus = f" {normalized_prose} "
         mentioned: set[str] = set()
         for entity in matches:
-            if not isinstance(entity, dict):
-                continue
             canonical = self._canonical_farm_target(entity.get("canonical_name"))
             if not canonical:
                 continue
