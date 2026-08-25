@@ -15,6 +15,7 @@ from meridian_bot.tactical_protocol import (
     PLAN_REVISE,
     REPAIR_ACTION,
     REPAIR_PLAN,
+    compile_plan_response,
 )
 
 from .helpers import config, goal_payload
@@ -539,6 +540,217 @@ class ProgressiveControllerTests(unittest.TestCase):
                 )
             finally:
                 controller.close()
+
+    def test_tactical_phase_contract_preserves_criteria_and_typed_context(self) -> None:
+        success_criteria = [
+            {
+                "id": "hp-gain",
+                "kind": "numeric_delta",
+                "metric": "status.vitals.health.max",
+                "operator": ">=",
+                "value": 2,
+                "baseline": 20,
+            },
+            {
+                "id": "has-bread",
+                "kind": "inventory_contains",
+                "item": "bread",
+                "count": 4,
+            },
+            {
+                "id": "two-weapons",
+                "kind": "equipment_count",
+                "category": "weapon",
+                "count": 2,
+            },
+            {
+                "id": "at-inn",
+                "kind": "location_reached",
+                "location": "Tos Inn",
+                "room_id": 52,
+            },
+            {
+                "id": "spoke",
+                "kind": "event_occurred",
+                "event_kind": "conversation.responded",
+                "after_cursor": 177,
+            },
+            {
+                "id": "all-done",
+                "kind": "composite_all",
+                "criterion_ids": ["has-bread", "at-inn"],
+            },
+            *[
+                {
+                    "id": f"checkpoint-{index}",
+                    "kind": "location_reached",
+                    "room_id": 100 + index,
+                }
+                for index in range(8)
+            ],
+        ]
+        abandon_predicates = [
+            {
+                "id": f"low-health-{index}",
+                "kind": "numeric_threshold",
+                "metric": "status.vitals.health.current",
+                "operator": "<",
+                "value": index + 1,
+            }
+            for index in range(13)
+        ]
+        huge = "source material that must not reach the tactical prompt " * 200
+        phase = {
+            "id": "phase-projection",
+            "kind": "farm",
+            "objective": "Farm safely and return to Tos Inn.",
+            "success_criteria": success_criteria,
+            "abandon_predicates": abandon_predicates,
+            "budget": {"max_actions": 40, "max_minutes": 90},
+            "source_ref": huge,
+            "context": {
+                "target": "giant rat",
+                "room": 535,
+                "use_safe_spots": True,
+                "flee_below": 0.7,
+                "fight_above_vigor": 80,
+                "keep_candidates": ["rat tail", "healing herb"],
+                "constraints": {"maximum_price": 200, "allow_pvp": False},
+                "farm_recipe": {
+                    "target": "giant rat",
+                    "room": 535,
+                    "buy_food": True,
+                    "source_ref": huge,
+                },
+                "route": {
+                    "from": 52,
+                    "via": [
+                        {
+                            "to": 535,
+                            "kind": "go",
+                            "name": "Rat Warrens",
+                            "source_ref": huge,
+                        }
+                    ],
+                    "evidence": huge,
+                },
+                "source_ref": huge,
+                "source_evidence": {"raw": huge},
+                "ignored_unverified_tactic_preferences": [{"raw": huge}],
+                "ignored_invalid_abandon_predicates": [{"raw": huge}],
+                "phase_targets": [{"raw": huge}],
+                "retry_state_baseline": {"raw": huge},
+            },
+        }
+        original = copy.deepcopy(phase)
+
+        contract = BotController._tactical_phase_contract(phase)
+
+        self.assertIsNotNone(contract)
+        assert contract is not None
+        self.assertEqual(success_criteria, contract["success_criteria"])
+        self.assertEqual(abandon_predicates, contract["abandon_predicates"])
+        self.assertIsNot(success_criteria, contract["success_criteria"])
+        self.assertIsNot(abandon_predicates, contract["abandon_predicates"])
+        self.assertEqual(
+            {
+                "target": "giant rat",
+                "room": 535,
+                "use_safe_spots": True,
+                "flee_below": 0.7,
+                "fight_above_vigor": 80,
+                "keep_candidates": ["rat tail", "healing herb"],
+                "constraints": {"maximum_price": 200, "allow_pvp": False},
+                "farm_recipe": {
+                    "target": "giant rat",
+                    "room": 535,
+                    "buy_food": True,
+                },
+                "route": {
+                    "from": 52,
+                    "via": [
+                        {"to": 535, "kind": "go", "name": "Rat Warrens"}
+                    ],
+                },
+            },
+            contract["context"],
+        )
+        self.assertNotIn("source_ref", contract)
+        self.assertEqual(original, phase)
+
+    def test_safe_ending_projection_keeps_evidence_only_in_compiler_map(self) -> None:
+        safe_context = {
+            "status": "found",
+            "candidates": [
+                {
+                    "room_id": 100,
+                    "name": "First Refuge",
+                    "region": "Tos",
+                    "flags": ["safe", "inn"],
+                    "distance": 1,
+                    "basis": "verified map",
+                    "source_ref": "map:room:100",
+                    "evidence": {"source_ref": "world.json:100", "safe": True},
+                },
+                {
+                    "room_id": 106,
+                    "name": "Second Sanctuary",
+                    "region": "Barloque",
+                    "flags": ["safe", "sanctuary"],
+                    "distance": 3,
+                    "basis": "verified map",
+                    "source_ref": "map:room:106",
+                    "evidence": {"source_ref": "world.json:106", "safe": True},
+                },
+            ],
+        }
+        original = copy.deepcopy(safe_context)
+
+        prompt_candidates, candidate_map = (
+            BotController._tactical_safe_ending_candidates(safe_context)
+        )
+
+        self.assertEqual(["safe:100", "safe:106"], list(candidate_map))
+        for candidate in prompt_candidates:
+            self.assertNotIn("source_ref", candidate)
+            self.assertNotIn("evidence", candidate)
+        self.assertEqual("map:room:100", candidate_map["safe:100"]["source_ref"])
+        self.assertEqual(
+            {"source_ref": "world.json:106", "safe": True},
+            candidate_map["safe:106"]["evidence"],
+        )
+        self.assertEqual(original, safe_context)
+
+        compiled = compile_plan_response(
+            {
+                "request_id": "select-second-safe-room",
+                "summary": "Observe current state, then return safely.",
+                "steps": [
+                    {
+                        "id": "observe",
+                        "outcome": "Observe current state.",
+                        "tool": "look",
+                        "verification": "Fresh room state is observed.",
+                    }
+                ],
+                "safe_ending": {
+                    "candidate_id": "safe:106",
+                    "rationale": "The second verified sanctuary is preferred.",
+                },
+                "assumptions": [],
+                "revision_reason": None,
+            },
+            candidate_map,
+            request_id="select-second-safe-room",
+        )
+
+        self.assertEqual(106, compiled["safe_ending"]["room_id"])
+        self.assertEqual(compiled["steps"][-1]["id"], compiled["safe_ending"]["step_id"])
+        self.assertEqual("travel", compiled["steps"][-1]["tool"])
+        self.assertEqual(
+            "Travel to source-verified safe room 106 (Second Sanctuary).",
+            compiled["steps"][-1]["outcome"],
+        )
 
 
 if __name__ == "__main__":

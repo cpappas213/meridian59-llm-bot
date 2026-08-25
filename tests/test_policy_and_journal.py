@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,8 @@ from meridian_bot.model import (
     ModelError,
     PLANNER_SYSTEM,
     RESPONDER_SYSTEM,
+    TACTICAL_EXECUTE_PROMPT_TOKEN_BUDGET,
+    TACTICAL_PLAN_PROMPT_TOKEN_BUDGET,
     VllmClient,
 )
 from meridian_bot.obsidian import ObsidianJournal
@@ -314,6 +317,346 @@ class PolicyAndJournalTests(unittest.TestCase):
                         },
                     )
             self.assertEqual(1, request.call_count)
+
+    def test_tactical_plan_incident_shape_fits_after_provenance_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            goal_contract = {
+                "id": "goal-bank-items",
+                "version": 7,
+                "title": "Bank carried items",
+                "objective": "Deposit the selected carried items in a verified bank.",
+                "success_criteria": [
+                    {"id": "banked", "kind": "inventory_absent", "item": "mace"}
+                ],
+                "constraints": {"preserve": ["food", "reagents"]},
+            }
+            phase_contract = {
+                "id": "phase-bank-items",
+                "kind": "general",
+                "objective": "Reach a bank and deposit the selected items.",
+                "success_criteria": deepcopy(goal_contract["success_criteria"]),
+                "abandon_predicates": [],
+                "budget": {"max_actions": 24, "max_minutes": 45},
+                "context": {"research_exhaustion_support": True},
+            }
+            tools = [
+                {
+                    "name": f"tool_{index:02d}",
+                    "description": (
+                        f"Exact planning semantics for tool {index:02d}. "
+                        + (chr(65 + index % 26) * 420)
+                    ),
+                }
+                for index in range(17)
+            ]
+            candidates = []
+            for index in range(12):
+                source_ref = f"safe-room-{index}-" + ("P" * 1180)
+                candidates.append(
+                    {
+                        "candidate_id": f"safe:{100 + index}",
+                        "room_id": 100 + index,
+                        "name": f"Safe room {index}",
+                        "flags": ["ROOM_NO_COMBAT"],
+                        "distance": index,
+                        "basis": "source_connection_graph",
+                        "source_ref": source_ref,
+                        "evidence": {
+                            "source_tier": "source-derived",
+                            "source_ref": source_ref,
+                            "corpus_version": "fixture-v1",
+                        },
+                    }
+                )
+            ranked_facts = [
+                {
+                    "rank": index,
+                    "fact": f"grounded-fact-{index}-" + ("F" * 980),
+                    "source_ref": f"grounding-source-{index}",
+                }
+                for index in range(19)
+            ]
+            envelope = {
+                "protocol_version": "tactical/v2",
+                "mode": "PLAN_CREATE",
+                "request_id": "incident-plan-request",
+                "state_token": "state-v2-incident",
+                "goal_contract": goal_contract,
+                "phase_contract": phase_contract,
+                "strategy_options": [],
+                "available_tools": tools,
+                "plan_constraints": {
+                    "max_model_steps": 9,
+                    "allowed_tools": [tool["name"] for tool in tools],
+                    "must_cover": ["banked"],
+                    "required_rule_codes": ["BANK_LOCATION_PREREQUISITE"],
+                    "safe_ending_candidates": candidates,
+                },
+                "relevant_facts": {
+                    "live_state": {"room_id": 52, "vigor": 100},
+                    "grounding": {"ranked_facts": ranked_facts},
+                    "source_ref": "aggregate-grounding-provenance",
+                },
+                "relevant_failures": [],
+                "planning_persona": {"name": "MANIAC"},
+                "rule_cards": [],
+            }
+            original = deepcopy(envelope)
+
+            with patch.object(
+                client, "_complete", return_value={"accepted": True}
+            ) as complete:
+                result = client.tactical_complete(
+                    mode="PLAN_CREATE", envelope=envelope
+                )
+
+            self.assertEqual({"accepted": True}, result)
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            metrics = client.last_tactical_prompt_metrics
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertGreater(
+                metrics["original_estimated_tokens"],
+                TACTICAL_PLAN_PROMPT_TOKEN_BUDGET,
+            )
+            self.assertLessEqual(
+                metrics["estimated_tokens"], TACTICAL_PLAN_PROMPT_TOKEN_BUDGET
+            )
+            self.assertTrue(metrics["supporting_context_compacted"])
+            self.assertEqual("routing-and-provenance", metrics["compaction_profile"])
+            self.assertEqual(goal_contract, sent["goal_contract"])
+            self.assertEqual(phase_contract, sent["phase_contract"])
+            self.assertEqual(tools, sent["available_tools"])
+            self.assertEqual(
+                [
+                    (candidate["candidate_id"], candidate["room_id"])
+                    for candidate in candidates
+                ],
+                [
+                    (candidate["candidate_id"], candidate["room_id"])
+                    for candidate in sent["plan_constraints"][
+                        "safe_ending_candidates"
+                    ]
+                ],
+            )
+            serialized = complete.call_args.args[0][1]["content"]
+            self.assertNotIn("source_ref", serialized)
+            self.assertNotIn('"evidence"', serialized)
+            self.assertEqual(19, len(sent["relevant_facts"]["grounding"]["ranked_facts"]))
+            self.assertEqual(original, envelope)
+
+    def test_tactical_plan_compacts_ranked_supporting_lists_but_keeps_core_exact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            goal_contract = {
+                "id": "goal-ranked-facts",
+                "objective": "Use the highest-ranked grounded option.",
+                "success_criteria": [{"id": "done", "kind": "location_reached", "room_id": 54}],
+                "constraints": {},
+            }
+            phase_contract = {
+                "id": "phase-ranked-facts",
+                "kind": "general",
+                "objective": "Choose from ranked supporting facts.",
+                "success_criteria": deepcopy(goal_contract["success_criteria"]),
+                "abandon_predicates": [],
+                "budget": {"max_actions": 12, "max_minutes": 30},
+            }
+            tools = [
+                {
+                    "name": "travel",
+                    "description": "Travel to an exact grounded numeric room destination.",
+                }
+            ]
+            candidates = [
+                {
+                    "candidate_id": "safe:100",
+                    "room_id": 100,
+                    "name": "Safe staging",
+                    "flags": ["ROOM_NO_COMBAT"],
+                }
+            ]
+            ranked = [
+                {"rank": index, "fact": f"ranked-{index}-" + ("R" * 900)}
+                for index in range(70)
+            ]
+            live_inventory = [
+                {"id": index, "name": f"carried item {index}"}
+                for index in range(18)
+            ]
+            live_hostiles = [
+                {"id": index, "name": f"hostile {index}", "level": index + 1}
+                for index in range(15)
+            ]
+            envelope = {
+                "protocol_version": "tactical/v2",
+                "mode": "PLAN_CREATE",
+                "request_id": "ranked-plan-request",
+                "state_token": "state-v2-ranked",
+                "goal_contract": goal_contract,
+                "phase_contract": phase_contract,
+                "available_tools": tools,
+                "plan_constraints": {
+                    "max_model_steps": 9,
+                    "allowed_tools": ["travel"],
+                    "must_cover": ["done"],
+                    "required_rule_codes": [],
+                    "safe_ending_candidates": candidates,
+                },
+                "relevant_facts": {
+                    "live_state": {"inventory": live_inventory},
+                    "live_overlevel_hostiles": live_hostiles,
+                    "ranked_options": ranked,
+                },
+                "relevant_failures": [],
+                "planning_persona": {"name": "MANIAC"},
+                "rule_cards": [],
+            }
+
+            with patch.object(
+                client, "_complete", return_value={"accepted": True}
+            ) as complete:
+                client.tactical_complete(mode="PLAN_CREATE", envelope=envelope)
+
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            metrics = client.last_tactical_prompt_metrics
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertLessEqual(
+                metrics["estimated_tokens"], TACTICAL_PLAN_PROMPT_TOKEN_BUDGET
+            )
+            self.assertEqual("ranked-context-12", metrics["compaction_profile"])
+            self.assertEqual(goal_contract, sent["goal_contract"])
+            self.assertEqual(phase_contract, sent["phase_contract"])
+            self.assertEqual(tools, sent["available_tools"])
+            self.assertEqual(candidates, sent["plan_constraints"]["safe_ending_candidates"])
+            retained = sent["relevant_facts"]["ranked_options"]
+            self.assertEqual(ranked[:12], retained[:12])
+            self.assertEqual({"omitted_ranked_items": 58}, retained[12])
+            self.assertEqual(
+                live_inventory, sent["relevant_facts"]["live_state"]["inventory"]
+            )
+            self.assertEqual(
+                live_hostiles, sent["relevant_facts"]["live_overlevel_hostiles"]
+            )
+
+    def test_tactical_plan_rejects_irreducible_oversized_goal_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            oversized_goal = {
+                "id": "goal-irreducible",
+                "objective": "G" * 60_000,
+                "success_criteria": [],
+                "constraints": {},
+            }
+            envelope = {
+                "protocol_version": "tactical/v2",
+                "mode": "PLAN_CREATE",
+                "request_id": "irreducible-plan-request",
+                "state_token": "state-v2-irreducible",
+                "goal_contract": oversized_goal,
+                "phase_contract": None,
+                "available_tools": [],
+                "plan_constraints": {
+                    "max_model_steps": 9,
+                    "allowed_tools": [],
+                    "must_cover": [],
+                    "required_rule_codes": [],
+                    "safe_ending_candidates": [
+                        {"candidate_id": "safe:100", "room_id": 100}
+                    ],
+                },
+                "relevant_facts": {},
+                "relevant_failures": [],
+                "rule_cards": [],
+            }
+
+            with patch.object(client, "_complete") as complete:
+                with self.assertRaisesRegex(ModelError, "required context exceeds"):
+                    client.tactical_complete(mode="PLAN_CREATE", envelope=envelope)
+
+            complete.assert_not_called()
+            self.assertEqual(60_000, len(envelope["goal_contract"]["objective"]))
+            metrics = client.last_tactical_prompt_metrics
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertTrue(metrics["over_budget"])
+            self.assertGreater(
+                metrics["estimated_tokens"], TACTICAL_PLAN_PROMPT_TOKEN_BUDGET
+            )
+
+    def test_tactical_action_compaction_preserves_nested_legal_action_schema(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            client = VllmClient(config(Path(temporary)))
+            active_step = {
+                "id": "drop-selected-item",
+                "outcome": "Drop the selected inventory item.",
+                "tool": "act",
+                "verification": "The selected item is absent from inventory.",
+            }
+            legal_actions = [
+                {
+                    "action_token": "action-v2-drop-selected-item",
+                    "step_id": "drop-selected-item",
+                    "tool": "act",
+                    "locked_arguments": {"verb": "drop"},
+                    "free_argument_schema": {
+                        "type": "object",
+                        "properties": {
+                            "target": {
+                                "type": ["integer", "string"],
+                                "description": "Exact inventory object id or visible name.",
+                                "examples": [17, "rusty sword"],
+                            }
+                        },
+                        "required": ["target"],
+                        "additionalProperties": False,
+                        "examples": [{"target": 17}, {"target": "rusty sword"}],
+                    },
+                    "expected_observation": {"inventory_absent": "rusty sword"},
+                }
+            ]
+            recent_history = [
+                f"historical-observation-{index}-" + ("H" * 700)
+                for index in range(64)
+            ]
+            envelope = {
+                "protocol_version": "tactical/v2",
+                "mode": "EXECUTE_STEP",
+                "request_id": "execute-schema-request",
+                "state_token": "state-v2-execute-schema",
+                "active_step": active_step,
+                "legal_actions": legal_actions,
+                "relevant_live_state": {"room_id": 52},
+                "recent_history": recent_history,
+                "rule_cards": [],
+            }
+
+            with patch.object(
+                client, "_complete", return_value={"accepted": True}
+            ) as complete:
+                client.tactical_complete(mode="EXECUTE_STEP", envelope=envelope)
+
+            sent = json.loads(complete.call_args.args[0][1]["content"])
+            metrics = client.last_tactical_prompt_metrics
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertGreater(
+                metrics["original_estimated_tokens"],
+                TACTICAL_EXECUTE_PROMPT_TOKEN_BUDGET,
+            )
+            self.assertLessEqual(
+                metrics["estimated_tokens"], TACTICAL_EXECUTE_PROMPT_TOKEN_BUDGET
+            )
+            self.assertTrue(metrics["optional_context_compacted"])
+            self.assertEqual(active_step, sent["active_step"])
+            self.assertEqual(legal_actions, sent["legal_actions"])
+            self.assertEqual(recent_history[-12:], sent["recent_history"])
 
     def test_character_onboarding_reserves_room_for_reasoning_then_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

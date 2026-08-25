@@ -42,6 +42,25 @@ TACTICAL_REPAIR_PROMPT_TOKEN_BUDGET = 8_000
 TACTICAL_PLAN_PROMPT_TOKEN_BUDGET = 12_000
 TACTICAL_ACTION_OUTPUT_TOKEN_BUDGET = 1_024
 PROMPT_ESTIMATED_CHARS_PER_TOKEN = 4
+TACTICAL_CONTEXT_PROVENANCE_KEYS = frozenset(
+    {
+        "citation",
+        "citations",
+        "source_evidence",
+        "source_hash",
+        "source_ref",
+    }
+)
+TACTICAL_RANKED_CONTEXT_LIST_KEYS = frozenset(
+    {
+        "hunt_room_options",
+        "ranked_facts",
+        "ranked_options",
+        "relevant_entities",
+        "room_spawn_tables",
+        "rules",
+    }
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -1007,6 +1026,125 @@ class VllmClient:
 
         return visit(deepcopy(envelope))
 
+    @classmethod
+    def _compact_tactical_supporting_sections(
+        cls,
+        envelope: dict[str, Any],
+        *,
+        max_fact_list: int | None,
+        include_persona: bool,
+    ) -> dict[str, Any]:
+        """Project non-contract planning context without weakening invariants.
+
+        Full provenance stays in controller storage and the safe-ending compiler's
+        out-of-band candidate map. It is routing/audit metadata, not a planning
+        input. Ranked context lists may be shortened only after the complete
+        projected prompt still exceeds its mode budget; retained values are
+        copied whole and the omitted count is explicit.
+
+        Goal and phase contracts, available tool descriptions, action schemas,
+        violations, state tokens, and every other controller-owned invariant are
+        deliberately outside this projection.
+        """
+
+        def project_context(
+            value: Any,
+            *,
+            depth: int = 0,
+            ranked_list: bool = False,
+        ) -> Any:
+            if depth >= 10:
+                return deepcopy(value)
+            if isinstance(value, list):
+                selected = value
+                omitted = 0
+                if (
+                    ranked_list
+                    and max_fact_list is not None
+                    and len(value) > max_fact_list
+                ):
+                    selected = value[:max_fact_list]
+                    omitted = len(value) - max_fact_list
+                projected = [
+                    project_context(item, depth=depth + 1) for item in selected
+                ]
+                if omitted:
+                    projected.append({"omitted_ranked_items": omitted})
+                return projected
+            if isinstance(value, dict):
+                return {
+                    str(key): project_context(
+                        item,
+                        depth=depth + 1,
+                        ranked_list=(
+                            str(key).casefold().replace("-", "_")
+                            in TACTICAL_RANKED_CONTEXT_LIST_KEYS
+                        ),
+                    )
+                    for key, item in value.items()
+                    if str(key).casefold().replace("-", "_")
+                    not in TACTICAL_CONTEXT_PROVENANCE_KEYS
+                }
+            return deepcopy(value)
+
+        projected = deepcopy(envelope)
+        if "relevant_facts" in projected:
+            projected["relevant_facts"] = project_context(
+                projected["relevant_facts"]
+            )
+        if include_persona:
+            if "planning_persona" in projected:
+                projected["planning_persona"] = project_context(
+                    projected["planning_persona"]
+                )
+        else:
+            projected.pop("planning_persona", None)
+
+        constraints = projected.get("plan_constraints")
+        if isinstance(constraints, dict):
+            candidates = constraints.get("safe_ending_candidates")
+            if isinstance(candidates, list):
+                compact_candidates: list[Any] = []
+                for raw in candidates:
+                    if not isinstance(raw, dict):
+                        compact_candidates.append(deepcopy(raw))
+                        continue
+                    candidate = {
+                        str(key): deepcopy(item)
+                        for key, item in raw.items()
+                        if str(key).casefold().replace("-", "_")
+                        not in TACTICAL_CONTEXT_PROVENANCE_KEYS
+                        and str(key).casefold() != "evidence"
+                    }
+                    compact_candidates.append(candidate)
+                constraints["safe_ending_candidates"] = compact_candidates
+
+        for section in ("rule_cards", "matched_rule_cards"):
+            cards = projected.get(section)
+            if not isinstance(cards, list):
+                continue
+            projected[section] = [
+                {
+                    str(key): deepcopy(item)
+                    for key, item in card.items()
+                    if str(key).casefold() != "selectors"
+                }
+                if isinstance(card, dict)
+                else deepcopy(card)
+                for card in cards
+            ]
+        return projected
+
+    @staticmethod
+    def _serialize_tactical_envelope(envelope: dict[str, Any]) -> str:
+        """Serialize deterministic compact JSON; whitespace is not model context."""
+
+        return json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     def _budget_tactical_envelope(
         self,
         mode: str,
@@ -1024,10 +1162,30 @@ class VllmClient:
             tactical_system_prompt(normalized_mode) if system is None else system
         )
         candidate = deepcopy(normalized_envelope)
-        user = json.dumps(candidate, ensure_ascii=False)
+        user = self._serialize_tactical_envelope(candidate)
         original_estimated = self._estimated_prompt_tokens(system, user)
         estimated = original_estimated
         compacted = False
+        optional_context_compacted = False
+        supporting_context_compacted = False
+        compaction_profile = "none"
+        if estimated > token_budget:
+            # First remove only routing/audit metadata that the controller keeps
+            # out of band. In the common case this preserves all ranked facts and
+            # all optional feedback while eliminating duplicated provenance.
+            projected_base = self._compact_tactical_supporting_sections(
+                normalized_envelope,
+                max_fact_list=None,
+                include_persona=True,
+            )
+            candidate = projected_base
+            user = self._serialize_tactical_envelope(candidate)
+            estimated = self._estimated_prompt_tokens(system, user)
+            supporting_context_compacted = candidate != normalized_envelope
+            compacted = supporting_context_compacted
+            if supporting_context_compacted:
+                compaction_profile = "routing-and-provenance"
+
         if estimated > token_budget:
             stages = (
                 (12, 16, 800, False),
@@ -1038,15 +1196,50 @@ class VllmClient:
             )
             for max_list, max_dict, max_string, drop in stages:
                 candidate = self._compact_tactical_optional_sections(
-                    normalized_envelope,
+                    projected_base,
                     max_list=max_list,
                     max_dict=max_dict,
                     max_string=max_string,
                     drop=drop,
                 )
-                user = json.dumps(candidate, ensure_ascii=False)
+                user = self._serialize_tactical_envelope(candidate)
                 estimated = self._estimated_prompt_tokens(system, user)
                 compacted = True
+                optional_context_compacted = True
+                compaction_profile = (
+                    "optional-drop"
+                    if drop
+                    else f"optional-{max_list}-{max_dict}-{max_string}"
+                )
+                if estimated <= token_budget:
+                    break
+
+        if estimated > token_budget:
+            # At this point dispensable history/evidence/examples are already
+            # absent. Bound only ranked contextual lists, retaining each selected
+            # fact byte-for-byte and recording how many lower-ranked items were
+            # omitted. The protected contracts remain exact and can still force a
+            # fail-closed rejection below.
+            optional_base = candidate
+            for max_fact_list, include_persona in (
+                (12, True),
+                (6, True),
+                (3, False),
+                (1, False),
+            ):
+                candidate = self._compact_tactical_supporting_sections(
+                    optional_base,
+                    max_fact_list=max_fact_list,
+                    include_persona=include_persona,
+                )
+                user = self._serialize_tactical_envelope(candidate)
+                estimated = self._estimated_prompt_tokens(system, user)
+                compacted = True
+                supporting_context_compacted = True
+                compaction_profile = (
+                    f"ranked-context-{max_fact_list}"
+                    + ("" if include_persona else "-no-persona")
+                )
                 if estimated <= token_budget:
                     break
 
@@ -1062,6 +1255,9 @@ class VllmClient:
             "token_budget": token_budget,
             "user_context_characters": len(user),
             "compacted": compacted,
+            "optional_context_compacted": optional_context_compacted,
+            "supporting_context_compacted": supporting_context_compacted,
+            "compaction_profile": compaction_profile,
             "over_budget": over_budget,
             "output_token_budget": target_output,
             "effective_max_output_tokens": effective_output,
@@ -1076,13 +1272,15 @@ class VllmClient:
         }
         LOG.info(
             "tactical prompt mode=%s estimated_tokens=%s original_tokens=%s budget=%s "
-            "context_chars=%s compacted=%s over_budget=%s output_target=%s output_max=%s",
+            "context_chars=%s compacted=%s profile=%s over_budget=%s "
+            "output_target=%s output_max=%s",
             normalized_mode,
             estimated,
             original_estimated,
             token_budget,
             len(user),
             compacted,
+            compaction_profile,
             over_budget,
             target_output,
             effective_output,
@@ -1090,7 +1288,7 @@ class VllmClient:
         if over_budget:
             raise ModelError(
                 f"tactical {normalized_mode} required context exceeds its {token_budget}-token "
-                f"prompt budget ({estimated} estimated tokens after optional-context compaction)"
+                f"prompt budget ({estimated} estimated tokens after bounded-context compaction)"
             )
         return candidate, user
 

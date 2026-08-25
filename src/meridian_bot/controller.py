@@ -241,6 +241,7 @@ LIVE_HOSTILITY_RELATIONS = frozenset({"enemy", "hostile", "aggressive"})
 EXECUTION_PLAN_RUNTIME_KEY = "goal_execution_plans_v1"
 EXECUTION_PLAN_SCHEMA_VERSION = 5
 EXECUTION_PLAN_MAX_STEPS = 10
+TACTICAL_SAFE_ENDING_CANDIDATE_LIMIT = 12
 # Execution progress is controller-owned state rather than part of the authored
 # plan contract.  Keeping it in a sidecar preserves schema-v5 fingerprints while
 # giving the controller an honest ordered cursor for progressive action choices.
@@ -7890,11 +7891,202 @@ class BotController:
             max_string=800,
         )
 
-    @staticmethod
+    @classmethod
+    def _tactical_phase_context(cls, value: Any) -> dict[str, Any]:
+        """Project only typed phase intent; raw manager notes are not a contract."""
+
+        if not isinstance(value, dict):
+            return {}
+
+        def scalar(item: Any, *, max_string: int = 240) -> Any:
+            if isinstance(item, str):
+                return item if len(item) <= max_string else item[:max_string] + "..."
+            if item is None or isinstance(item, (bool, int, float)):
+                return item
+            return None
+
+        projected: dict[str, Any] = {}
+        scalar_fields = (
+            "target",
+            "hunt",
+            "prey",
+            "room",
+            "room_id",
+            "assigned_room",
+            "start_room",
+            "first_exit_room",
+            "use_safe_spots",
+            "break_out_via_logoff",
+            "max_carry",
+            "flee_below",
+            "hold_resume_above",
+            "rest_below",
+            "fight_above_vigor",
+            "eat_before_fighting",
+            "buy_food",
+            "bank_above",
+            "pull_within",
+            "training_method",
+            "teacher",
+            "merchant",
+            "merchant_class",
+            "offering_kind",
+            "spell",
+            "item",
+            "next_hp_milestone",
+            "selection_basis",
+            "deterministic_fallback",
+            "deterministic_research_handoff",
+            "compatibility_phase",
+            "research_exhaustion_support",
+            "reason",
+            "required_vigor",
+        )
+        for key in scalar_fields:
+            if key not in value:
+                continue
+            item = scalar(value.get(key))
+            if item is not None:
+                projected[key] = item
+
+        for key, limit in (("keep_candidates", 32), ("retry_requires", 12)):
+            items = value.get(key)
+            if not isinstance(items, list):
+                continue
+            selected = [
+                str(item).strip()[:120]
+                for item in items[:limit]
+                if item is not None and str(item).strip()
+            ]
+            if selected:
+                projected[key] = selected
+
+        constraints = value.get("constraints")
+        if isinstance(constraints, dict):
+            compact_constraints: dict[str, Any] = {}
+            for key, item in list(constraints.items())[:16]:
+                compact = scalar(item)
+                if compact is not None:
+                    compact_constraints[str(key)[:80]] = compact
+            if compact_constraints:
+                projected["constraints"] = compact_constraints
+
+        recipe = value.get("farm_recipe")
+        if isinstance(recipe, dict):
+            compact_recipe: dict[str, Any] = {}
+            for key in (
+                "target",
+                "room",
+                "use_safe_spots",
+                "flee_below",
+                "fight_above_vigor",
+                "eat_before_fighting",
+                "buy_food",
+                "selection_basis",
+            ):
+                if key not in recipe:
+                    continue
+                item = scalar(recipe.get(key))
+                if item is not None:
+                    compact_recipe[key] = item
+            if compact_recipe:
+                projected["farm_recipe"] = compact_recipe
+
+        route = value.get("route")
+        if isinstance(route, dict):
+            compact_route: dict[str, Any] = {}
+            origin = scalar(route.get("from"), max_string=120)
+            if origin is not None:
+                compact_route["from"] = origin
+            hops: list[dict[str, Any]] = []
+            raw_hops = route.get("via")
+            raw_hops = raw_hops if isinstance(raw_hops, list) else []
+            for raw_hop in raw_hops[:16]:
+                if not isinstance(raw_hop, dict):
+                    continue
+                hop: dict[str, Any] = {}
+                for key in ("to", "toRid", "kind", "id", "name"):
+                    if key not in raw_hop:
+                        continue
+                    item = scalar(raw_hop.get(key), max_string=120)
+                    if item is not None:
+                        hop[key] = item
+                if hop:
+                    hops.append(hop)
+            if hops:
+                compact_route["via"] = hops
+            if compact_route:
+                projected["route"] = compact_route
+
+        validation = value.get("recipe_validation")
+        if isinstance(validation, dict):
+            manager_projection = CampaignCoordinator._compact_phase_context(
+                {"recipe_validation": validation}
+            ).get("recipe_validation")
+            if isinstance(manager_projection, dict):
+                projected["recipe_validation"] = cls._compact_tactical_value(
+                    manager_projection,
+                    max_list=12,
+                    max_dict=20,
+                    max_string=240,
+                )
+
+        support_policy = value.get("research_support_skill_policy")
+        if isinstance(support_policy, list):
+            compact_policy: list[dict[str, Any]] = []
+            for raw in support_policy[:8]:
+                if not isinstance(raw, dict):
+                    continue
+                item: dict[str, Any] = {}
+                for key in (
+                    "kind",
+                    "name",
+                    "baseline",
+                    "requested_target",
+                    "normalized_target",
+                    "minimum_gain",
+                    "cap",
+                ):
+                    if key not in raw:
+                        continue
+                    compact = scalar(raw.get(key), max_string=120)
+                    if compact is not None:
+                        item[key] = compact
+                if item:
+                    compact_policy.append(item)
+            if compact_policy:
+                projected["research_support_skill_policy"] = compact_policy
+        return redact(projected)
+
+    @classmethod
+    def _tactical_phase_contract(cls, phase: Any) -> dict[str, Any] | None:
+        """Keep authoritative phase fields exact and semantically project context."""
+
+        if not isinstance(phase, dict):
+            return None
+        contract = {
+            key: deepcopy(phase.get(key))
+            for key in (
+                "id",
+                "kind",
+                "objective",
+                "success_criteria",
+                "abandon_predicates",
+                "budget",
+            )
+            if phase.get(key) is not None
+        }
+        context = cls._tactical_phase_context(phase.get("context"))
+        if context:
+            contract["context"] = context
+        return contract
+
+    @classmethod
     def _tactical_safe_ending_candidates(
+        cls,
         safe_context: Any,
     ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-        """Assign stable candidate ids to controller-verified safe rooms."""
+        """Separate concise model choices from full controller evidence."""
 
         candidates = (
             safe_context.get("candidates")
@@ -7902,7 +8094,13 @@ class BotController:
             else None
         )
         candidate_map: dict[str, dict[str, Any]] = {}
-        for raw in candidates if isinstance(candidates, list) else []:
+        model_candidates: list[dict[str, Any]] = []
+        selected = (
+            candidates[:TACTICAL_SAFE_ENDING_CANDIDATE_LIMIT]
+            if isinstance(candidates, list)
+            else []
+        )
+        for raw in selected:
             if not isinstance(raw, dict):
                 continue
             try:
@@ -7912,14 +8110,37 @@ class BotController:
             if room_id <= 0:
                 continue
             candidate_id = f"safe:{room_id}"
-            candidate_map.setdefault(
-                candidate_id,
-                {
-                    **deepcopy(raw),
-                    "candidate_id": candidate_id,
-                    "room_id": room_id,
-                },
-            )
+            if candidate_id in candidate_map:
+                continue
+            candidate_map[candidate_id] = {
+                **deepcopy(raw),
+                "candidate_id": candidate_id,
+                "room_id": room_id,
+            }
+            model_candidate: dict[str, Any] = {
+                "candidate_id": candidate_id,
+                "room_id": room_id,
+            }
+            name = str(raw.get("name") or "").strip()
+            if name:
+                model_candidate["name"] = name[:160]
+            region = str(raw.get("region") or "").strip()
+            if region:
+                model_candidate["region"] = region[:80]
+            flags = raw.get("flags")
+            if isinstance(flags, list):
+                compact_flags = [
+                    str(flag)[:64] for flag in flags[:8] if str(flag).strip()
+                ]
+                if compact_flags:
+                    model_candidate["flags"] = compact_flags
+            distance = raw.get("distance")
+            if isinstance(distance, (int, float)) and not isinstance(distance, bool):
+                model_candidate["distance"] = distance
+            basis = str(raw.get("basis") or "").strip()
+            if basis:
+                model_candidate["basis"] = basis[:80]
+            model_candidates.append(model_candidate)
         if not candidate_map:
             raise TacticalProtocolError(
                 "NO_SAFE_ENDING_CANDIDATE",
@@ -7932,7 +8153,7 @@ class BotController:
                     )
                 },
             )
-        return list(candidate_map.values()), candidate_map
+        return model_candidates, candidate_map
 
     @staticmethod
     def _tactical_tool_contracts(
@@ -8128,23 +8349,7 @@ class BotController:
             )
             if grounded_context.get(key) is not None
         }
-        phase_contract = (
-            {
-                key: campaign_phase.get(key)
-                for key in (
-                    "id",
-                    "kind",
-                    "objective",
-                    "success_criteria",
-                    "abandon_predicates",
-                    "budget",
-                    "context",
-                )
-                if campaign_phase.get(key) is not None
-            }
-            if isinstance(campaign_phase, dict)
-            else None
-        )
+        phase_contract = self._tactical_phase_contract(campaign_phase)
         envelope: dict[str, Any] = {
             "protocol_version": TACTICAL_PROTOCOL_VERSION,
             "mode": mode,
