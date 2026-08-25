@@ -39,6 +39,9 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Initialized the keeper's current vigor before its hostile-room provisioning
+  refusal reports it, preventing a fresh field keeper from aborting with a
+  JavaScript temporal-dead-zone error before combat can begin.
 - Counted campaign phase time only while its goal is active. Operator pauses,
   coordinated restarts, and repeated/interleaved pause cycles now accumulate
   per-phase downtime without instantly exhausting a resumed farming phase.
@@ -77,7 +80,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `fc5627e042038626d030f71a77d08fcb0ce7760e`, based on official upstream revision
+  `1485107a797e97b0d9dbcc8d9629fd719e20ef17`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
