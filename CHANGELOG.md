@@ -39,6 +39,13 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Kept low-health recovery aimed at one bounded refuge instead of alternating
+  between adjacent hostile rooms. Emergency travel now closes the 70-75% health
+  deadband, times out motionless and cyclic walks, honors confinement across
+  replans and every landing path, preserves local-wall fallbacks, and treats
+  player/operator cancellation as terminal for the current pass. The controller
+  reconciles the same canonical recovery thresholds without repeatedly hammering
+  an older partial status shape.
 - Initialized the keeper's current vigor before its hostile-room provisioning
   refusal reports it, preventing a fresh field keeper from aborting with a
   JavaScript temporal-dead-zone error before combat can begin.
@@ -80,7 +87,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `1485107a797e97b0d9dbcc8d9629fd719e20ef17`, based on official upstream revision
+  `761ff07b6697471df14053341b1e34248e687281`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.

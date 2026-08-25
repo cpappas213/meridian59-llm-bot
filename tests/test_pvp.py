@@ -4,6 +4,7 @@ import copy
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -423,7 +424,29 @@ class PvpCoordinatorTests(unittest.TestCase):
             restored = [args for name, args in broker.calls if name == "autopilot"][-1]
             self.assertEqual("", restored["hunt"])
             self.assertIsNone(restored["assigned_room"])
+            self.assertEqual(0, restored["bank_above"])
+            self.assertEqual(0.95, restored["rest_below"])
+            self.assertEqual(0.75, restored["flee_below"])
             self.assertFalse(restored["break_out_via_logoff"])
+            self.assertFalse(restored["automated_pleas"])
+
+    def test_fallback_preserves_stricter_rest_and_critical_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg = config(Path(temporary))
+            cfg = replace(
+                cfg,
+                policy=replace(
+                    cfg.policy,
+                    rest_health_fraction=0.98,
+                    critical_health_fraction=0.90,
+                ),
+            )
+            coordinator = PvpCoordinator(cfg, lambda: PvpBroker())
+
+            restored = coordinator._fallback_arguments("primary")
+
+            self.assertEqual(0.98, restored["rest_below"])
+            self.assertEqual(0.90, restored["flee_below"])
 
     def test_low_health_after_a_swing_triggers_spell_and_room_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

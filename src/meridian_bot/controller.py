@@ -23,7 +23,7 @@ from .campaign import (
     PhaseOutcome,
     RESEARCH_RETRY_UNLOCKED,
 )
-from .config import BotConfig
+from .config import BotConfig, survival_keeper_thresholds
 from .criteria import CriteriaEvaluator, EDIBLE_FOOD_NAME_MARKERS
 from .knowledge import KNOWLEDGE_TOOL_NAME, KnowledgeBase, KnowledgeValidationError, normalize
 from .contracts import parse_ability_metric
@@ -123,6 +123,7 @@ FAMILIARS_ROOM_ID = 52
 RAZA_EXIT_SAFE_ROOM_ID = FAMILIARS_ROOM_ID
 SALE_BUYER_REFUSAL_LIMIT = 3
 RESTED_VIGOR_FLOOR = 80
+SURVIVAL_POLICY_RECONCILE_RETRY_SECONDS = 30.0
 # The controller configures ordinary keeper farms at the game's natural rested
 # floor. Combat safety comes from the health/flee envelope. The pinned keeper
 # may enforce a higher internal floor while food is available and owns consuming
@@ -340,6 +341,8 @@ class BotController:
         self._social_thread: threading.Thread | None = None
         self._notification_thread: threading.Thread | None = None
         self._last_conversation_reconcile_at = 0.0
+        self._last_survival_policy_reconcile_at = 0.0
+        self._last_survival_policy_fingerprint: str | None = None
         self._last_executive_refresh_at = 0.0
         self._visible_players: set[str] = set()
         self._pending_greetings: dict[str, dict[str, Any]] = {}
@@ -2628,6 +2631,74 @@ class BotController:
             "keeper": redact(release_result),
         }
 
+    def _survival_recovery_arguments(self) -> dict[str, float]:
+        rest_below, flee_below = survival_keeper_thresholds(
+            self.config.policy.rest_health_fraction,
+            self.config.policy.critical_health_fraction,
+        )
+        return {
+            "rest_below": rest_below,
+            "flee_below": flee_below,
+        }
+
+    def _survival_keeper_start_arguments(self) -> dict[str, Any]:
+        # ``use_safe_spots`` is deliberately absent. The keeper retains policy
+        # across mode changes, and an open-field farm switch records current
+        # evidence that its wall tactic was not working. Survival may still
+        # route to a refuge; retasking it must not silently revive that wall
+        # search or discard a currently enabled safe-spot policy.
+        return {
+            "mode": "survive",
+            "hunt": "",
+            "assigned_room": None,
+            "bank_above": 0,
+            **self._survival_recovery_arguments(),
+            "break_out_via_logoff": False,
+            "automated_pleas": self.config.policy.automated_help_pleas,
+        }
+
+    def _survival_keeper_policy_matches(self, status: dict[str, Any]) -> bool:
+        policy = status.get("policy")
+        if not isinstance(policy, dict):
+            return False
+        required = {
+            "restBelow",
+            "fleeBelow",
+            "hunt",
+            "assignedRoom",
+            "bankAbove",
+            "breakOutViaLogoff",
+            "automatedPleas",
+        }
+        # ``useSafeSpots`` is intentionally not reconciled; see the start
+        # argument comment above. Whichever live value is present is preserved.
+        if not required.issubset(policy):
+            return False
+        expected = self._survival_recovery_arguments()
+        try:
+            thresholds_match = (
+                float(policy.get("restBelow")) == expected["rest_below"]
+                and float(policy.get("fleeBelow"))
+                == expected["flee_below"]
+            )
+        except (TypeError, ValueError):
+            thresholds_match = False
+        bank_value = policy.get("bankAbove")
+        bank_matches = (
+            isinstance(bank_value, (int, float))
+            and not isinstance(bank_value, bool)
+            and float(bank_value) == 0.0
+        )
+        return bool(
+            thresholds_match
+            and policy.get("hunt") == ""
+            and policy.get("assignedRoom") is None
+            and bank_matches
+            and policy.get("breakOutViaLogoff") is False
+            and bool(policy.get("automatedPleas"))
+            == self.config.policy.automated_help_pleas
+        )
+
     def _set_fallback(self) -> None:
         mode = self.config.controller.fallback_mode
         # A controller restart must not clobber a healthy, goal-owned farming
@@ -2711,7 +2782,14 @@ class BotController:
                 # across mode changes. A retained farm hunt/assignment can make
                 # survive mode continue routing toward a hazardous room, so a
                 # non-farming fallback must clear both explicitly.
-                args.update({"hunt": "", "assigned_room": None, "bank_above": 0})
+                args.update(
+                    {
+                        "hunt": "",
+                        "assigned_room": None,
+                        "bank_above": 0,
+                        **self._survival_recovery_arguments(),
+                    }
+                )
         self.broker.call_tool("autopilot", args, timeout=20, mutation=True)
 
     def _start_conversation_listener(self) -> None:
@@ -10071,6 +10149,7 @@ class BotController:
                     # in bank travel.  Survival is for recovery, not special
                     # money runs; ordinary incidental banking still works.
                     "bank_above": 0,
+                    **self._survival_recovery_arguments(),
                     "break_out_via_logoff": False,
                 }
             )
@@ -10652,12 +10731,27 @@ class BotController:
             and health_fraction < self.config.policy.critical_health_fraction
         )
         if keeper_owns_safety and not critical_farm_owner:
+            policy_reconciliation = None
+            if (
+                str(status.get("mode") or "").casefold() == "survive"
+                and not self._survival_keeper_policy_matches(status)
+            ):
+                policy_reconciliation = self._ensure_survival_keeper(status=status)
             return {
                 "covered": True,
                 "owner": "keeper",
                 "mode": status.get("mode"),
                 "activity": status.get("activity"),
                 "room_id": room_id,
+                "survival_policy_reconciled": bool(
+                    isinstance(policy_reconciliation, dict)
+                    and policy_reconciliation.get("survival_policy_reconciled")
+                ),
+                **(
+                    {"policy_reconciliation": redact(policy_reconciliation)}
+                    if policy_reconciliation is not None
+                    else {}
+                ),
             }
 
         self._begin_foreground_action("restore_safety_keeper")
@@ -15701,6 +15795,14 @@ class BotController:
             # until a later status call proves the loop has exited.
             health_fraction = self._vital_fraction(observation, "health")
             activity = str(status.get("activity") or "").strip().casefold()
+            survival_policy_reconciliation = None
+            if (
+                keeper_mode == "survive"
+                and not self._survival_keeper_policy_matches(status)
+            ):
+                survival_policy_reconciliation = self._ensure_survival_keeper(
+                    status=status
+                )
             safe_ending_pending = bool(
                 force_stop_reason
                 and outside_safety
@@ -15728,7 +15830,8 @@ class BotController:
                 and health_fraction is not None
                 and health_fraction < 1.0
                 and (
-                    health_fraction < self.config.policy.rest_health_fraction
+                    health_fraction
+                    < self._survival_recovery_arguments()["rest_below"]
                     or not quiescent
                 )
             ):
@@ -15737,6 +15840,21 @@ class BotController:
                     "activity": status.get("activity"),
                     "health_fraction": health_fraction,
                     "safe_ending_pending": safe_ending_pending,
+                    "survival_policy_reconciled": bool(
+                        isinstance(survival_policy_reconciliation, dict)
+                        and survival_policy_reconciliation.get(
+                            "survival_policy_reconciled"
+                        )
+                    ),
+                    **(
+                        {
+                            "policy_reconciliation": redact(
+                                survival_policy_reconciliation
+                            )
+                        }
+                        if survival_policy_reconciliation is not None
+                        else {}
+                    ),
                     "completion": completion,
                 }
             if outside_safety:
@@ -16327,16 +16445,7 @@ class BotController:
             {
                 "agent": self.config.game.agent,
                 "action": "start",
-                "mode": "survive",
-                "hunt": "",
-                "assigned_room": None,
-                "bank_above": 0,
-                "rest_below": self.config.policy.rest_health_fraction,
-                "flee_below": self.config.policy.rest_health_fraction,
-                # Reconnecting while a just-entered sanctuary has not yet been
-                # durably saved can restore the prior dangerous room.
-                "break_out_via_logoff": False,
-                "automated_pleas": self.config.policy.automated_help_pleas,
+                **self._survival_keeper_start_arguments(),
             },
             timeout=20,
             mutation=True,
@@ -16399,21 +16508,72 @@ class BotController:
             "quarantine": quarantine,
         }
 
-    def _ensure_survival_keeper(self) -> dict[str, Any]:
+    def _ensure_survival_keeper(
+        self, status: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Start foreground emergency recovery unless it already owns the turn."""
-        status = self.broker.call_tool(
-            "autopilot",
-            {"agent": self.config.game.agent, "action": "status"},
-            timeout=20,
-        )
+        desired_arguments = self._survival_keeper_start_arguments()
+        desired_fingerprint = json_hash(desired_arguments)
+        if status is None:
+            status = self.broker.call_tool(
+                "autopilot",
+                {"agent": self.config.game.agent, "action": "status"},
+                timeout=20,
+            )
         if (
             self._keeper_is_driving(status)
             and status.get("mode") == "survive"
         ):
+            if self._survival_keeper_policy_matches(status):
+                self._last_survival_policy_reconcile_at = 0.0
+                self._last_survival_policy_fingerprint = None
+                return {
+                    "survival_keeper_running": True,
+                    "already_running": True,
+                    "activity": status.get("activity"),
+                    "survival_policy_reconciled": False,
+                }
+            now = time.monotonic()
+            retry_after = (
+                SURVIVAL_POLICY_RECONCILE_RETRY_SECONDS
+                - (now - self._last_survival_policy_reconcile_at)
+                if self._last_survival_policy_fingerprint == desired_fingerprint
+                else 0.0
+            )
+            if retry_after > 0:
+                return {
+                    "survival_keeper_running": True,
+                    "already_running": True,
+                    "activity": status.get("activity"),
+                    "survival_policy_reconciled": False,
+                    "survival_policy_reconcile_throttled": True,
+                    "desired_policy_fingerprint": desired_fingerprint,
+                    "retry_after_seconds": round(retry_after, 3),
+                }
+            # ``autopilot start`` is idempotent in the broker and applies policy
+            # to an already-running keeper. Reconcile stale state once, then
+            # bound retries by the desired-policy fingerprint. That prevents an
+            # older status shape which omits a required field from causing three
+            # mutations in one turn and another mutation every active cadence.
+            result = self.broker.call_tool(
+                "autopilot",
+                {
+                    "agent": self.config.game.agent,
+                    "action": "start",
+                    **desired_arguments,
+                },
+                timeout=20,
+                mutation=True,
+            )
+            self._last_survival_policy_reconcile_at = time.monotonic()
+            self._last_survival_policy_fingerprint = desired_fingerprint
             return {
                 "survival_keeper_running": True,
                 "already_running": True,
                 "activity": status.get("activity"),
+                "survival_policy_reconciled": True,
+                "desired_policy_fingerprint": desired_fingerprint,
+                "result": redact(result),
             }
 
         result = self.broker.call_tool(
@@ -16421,26 +16581,17 @@ class BotController:
             {
                 "agent": self.config.game.agent,
                 "action": "start",
-                "mode": "survive",
-                # The upstream keeper retains farm policy fields across mode
-                # changes. Clear them so emergency recovery cannot route back
-                # toward a hunting room or make a special banking trip.
-                "hunt": "",
-                "assigned_room": None,
-                "bank_above": 0,
-                "rest_below": self.config.policy.rest_health_fraction,
-                "flee_below": max(
-                    0.75, self.config.policy.rest_health_fraction
-                ),
-                "break_out_via_logoff": False,
-                "automated_pleas": self.config.policy.automated_help_pleas,
+                **desired_arguments,
             },
             timeout=20,
             mutation=True,
         )
+        self._last_survival_policy_reconcile_at = time.monotonic()
+        self._last_survival_policy_fingerprint = desired_fingerprint
         return {
             "survival_keeper_started": True,
             "already_running": False,
+            "desired_policy_fingerprint": desired_fingerprint,
             "result": redact(result),
         }
 

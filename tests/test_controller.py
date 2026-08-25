@@ -1055,7 +1055,11 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_safe_spot: object = False
         self.farm_journal: list[object] = []
         self.farm_recent: list[object] = []
+        self.farm_rest_below = 0.7
         self.farm_flee_below = 0.75
+        self.farm_assigned_room: int | None = self.farm_room
+        self.farm_bank_above = 0
+        self.farm_break_out_via_logoff = False
         self.farm_fight_above_vigor = 80
         self.farm_buy_food = False
         self.farm_use_safe_spots = True
@@ -1082,7 +1086,11 @@ class BackgroundFarmBroker(SimulatedBroker):
                 "last_death": self.last_death,
                 "policy": {
                     "hunt": self.farm_hunt,
+                    "restBelow": self.farm_rest_below,
                     "fleeBelow": self.farm_flee_below,
+                    "assignedRoom": self.farm_assigned_room,
+                    "bankAbove": self.farm_bank_above,
+                    "breakOutViaLogoff": self.farm_break_out_via_logoff,
                     "fightAboveVigor": self.farm_fight_above_vigor,
                     "buyFood": self.farm_buy_food,
                     "useSafeSpots": self.farm_use_safe_spots,
@@ -1109,13 +1117,36 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_running = True
             self.farm_inert = None
             self.farm_mode = str(arguments.get("mode") or self.farm_mode)
-            self.farm_room = int(arguments.get("assigned_room") or self.farm_room)
-            self.farm_hunt = str(arguments.get("hunt") or self.farm_hunt)
+            if "assigned_room" in arguments:
+                assigned = arguments.get("assigned_room")
+                self.farm_assigned_room = (
+                    int(assigned) if assigned is not None else None
+                )
+                if assigned is not None:
+                    self.farm_room = int(assigned)
+            if "hunt" in arguments:
+                self.farm_hunt = str(arguments.get("hunt") or "")
+            self.farm_rest_below = float(
+                arguments.get("rest_below", self.farm_rest_below)
+            )
+            self.farm_flee_below = float(
+                arguments.get("flee_below", self.farm_flee_below)
+            )
+            self.farm_bank_above = int(
+                arguments.get("bank_above", self.farm_bank_above)
+            )
+            self.farm_break_out_via_logoff = bool(
+                arguments.get(
+                    "break_out_via_logoff", self.farm_break_out_via_logoff
+                )
+            )
             self.farm_fight_above_vigor = int(
                 arguments.get("fight_above_vigor")
                 or self.farm_fight_above_vigor
             )
-            self.farm_buy_food = bool(arguments.get("buy_food", False))
+            self.farm_buy_food = bool(
+                arguments.get("buy_food", self.farm_buy_food)
+            )
             self.farm_use_safe_spots = bool(
                 arguments.get("use_safe_spots", self.farm_use_safe_spots)
             )
@@ -12804,6 +12835,35 @@ class ControllerTests(unittest.TestCase):
                 self.assertFalse(call["automated_pleas"])
                 self.assertEqual(len(broker.inventory_items) + 6, call["max_carry"])
 
+                survival, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "survive",
+                        "rest_below": 0.7,
+                        "flee_below": 0.75,
+                    },
+                    broker.observe(),
+                )
+                self.assertEqual(0.95, survival["rest_below"])
+                self.assertEqual(0.75, survival["flee_below"])
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        rest_health_fraction=0.98,
+                        critical_health_fraction=0.90,
+                    ),
+                )
+                stricter_survival, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {"action": "start", "mode": "survive"},
+                    broker.observe(),
+                )
+                self.assertEqual(0.98, stricter_survival["rest_below"])
+                self.assertEqual(0.90, stricter_survival["flee_below"])
+
                 explicit_unlimited, _ = controller._normalize_combat_arguments(
                     "autopilot",
                     {
@@ -12880,30 +12940,180 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_waiting_survival_keeper_above_rest_floor_protects_unsafe_room(self) -> None:
+    def test_waiting_survival_keeper_below_recovery_floor_reconciles_without_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = BackgroundFarmBroker()
                 broker.farm_mode = "survive"
                 broker.farm_activity = "waiting"
+                broker.farm_use_safe_spots = False
                 broker.vitals["health"] = {"value": 25, "max": 28}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
-                    goal_payload(request_id="quiescent-survival-yields")
+                    goal_payload(request_id="quiescent-survival-recovers")
                 )["goal"]
 
-                result = controller._manage_background_farm(
+                first = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                second = controller._manage_background_farm(
                     goal, broker.observe(), {"all_met": False}
                 )
 
-                self.assertIsNone(result)
+                self.assertTrue(first["background_survival_monitoring"])
+                self.assertTrue(first["survival_policy_reconciled"])
+                self.assertTrue(second["background_survival_monitoring"])
+                self.assertFalse(second["survival_policy_reconciled"])
+                self.assertEqual(0.95, broker.farm_rest_below)
+                self.assertEqual(0.75, broker.farm_flee_below)
+                self.assertFalse(broker.farm_use_safe_spots)
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertNotIn("use_safe_spots", starts[0])
                 self.assertFalse(
                     any(
                         name == "autopilot" and arguments.get("action") == "stop"
                         for name, arguments in broker.calls
                     )
                 )
+            finally:
+                controller.storage.close()
+
+    def test_live_27_of_38_survival_policy_converges_without_critical_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_mode = "survive"
+                broker.farm_activity = "waiting"
+                broker.vitals["health"] = {"value": 27, "max": 38}
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="live-27-of-38-survival")
+                )["goal"]
+
+                self.assertNotIn(
+                    "survival_interrupt",
+                    {
+                        item["kind"]
+                        for item in controller.policy.advisories(broker.observe())
+                    },
+                )
+                first = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                second = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+
+                self.assertTrue(first["background_survival_monitoring"])
+                self.assertTrue(first["survival_policy_reconciled"])
+                self.assertTrue(second["background_survival_monitoring"])
+                self.assertFalse(second["survival_policy_reconciled"])
+                self.assertEqual(0.95, broker.farm_rest_below)
+                self.assertEqual(0.75, broker.farm_flee_below)
+                self.assertEqual(
+                    1,
+                    sum(
+                        1
+                        for name, arguments in broker.calls
+                        if name == "autopilot"
+                        and arguments.get("action") == "start"
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_incomplete_survival_status_is_throttled_by_desired_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.farm_mode = "survive"
+                broker.farm_activity = "waiting"
+                broker.farm_reports_automated_pleas = False
+                broker.vitals["health"] = {"value": 27, "max": 38}
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="throttle-incomplete-survival-status")
+                )["goal"]
+
+                entry = controller._ensure_outside_safety_owner(
+                    broker.observe(), reason="test turn entry"
+                )
+                managed = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                exit_coverage = controller._ensure_outside_safety_owner(
+                    broker.observe(), reason="test turn exit"
+                )
+
+                self.assertTrue(entry["survival_policy_reconciled"])
+                self.assertFalse(managed["survival_policy_reconciled"])
+                self.assertTrue(
+                    managed["policy_reconciliation"][
+                        "survival_policy_reconcile_throttled"
+                    ]
+                )
+                self.assertFalse(exit_coverage["survival_policy_reconciled"])
+                self.assertTrue(
+                    exit_coverage["policy_reconciliation"][
+                        "survival_policy_reconcile_throttled"
+                    ]
+                )
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        rest_health_fraction=0.90,
+                        critical_health_fraction=0.85,
+                    ),
+                )
+                changed = controller._ensure_survival_keeper(
+                    status=broker.call_tool(
+                        "autopilot", {"agent": "primary", "action": "status"}
+                    )
+                )
+                self.assertTrue(changed["survival_policy_reconciled"])
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(2, len(starts))
+                self.assertEqual(0.85, starts[-1]["flee_below"])
+            finally:
+                controller.storage.close()
+
+    def test_survival_policy_match_rejects_fractional_bank_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_mode = "survive"
+                broker.farm_hunt = ""
+                broker.farm_assigned_room = None
+                broker.farm_rest_below = 0.95
+                broker.farm_flee_below = 0.75
+                broker.farm_bank_above = 0.5  # type: ignore[assignment]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+
+                self.assertFalse(controller._survival_keeper_policy_matches(status))
             finally:
                 controller.storage.close()
 
@@ -14218,6 +14428,8 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("", arguments["hunt"])
                 self.assertIsNone(arguments["assigned_room"])
                 self.assertEqual(0, arguments["bank_above"])
+                self.assertEqual(0.95, arguments["rest_below"])
+                self.assertEqual(0.75, arguments["flee_below"])
                 self.assertFalse(arguments["break_out_via_logoff"])
                 self.assertFalse(arguments["automated_pleas"])
             finally:
@@ -18622,12 +18834,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_foreground_critical_health_starts_survival_keeper_once(self) -> None:
+    def test_foreground_critical_health_reconciles_survival_keeper_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = BackgroundFarmBroker()
-                broker.farm_running = False
+                broker.farm_mode = "survive"
                 broker.vitals["health"] = {"current": 20, "max": 100}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
@@ -18638,21 +18850,30 @@ class ControllerTests(unittest.TestCase):
                 second = controller.turn()
 
                 self.assertTrue(first["survival_interrupt"])
-                self.assertTrue(first["background_farm"]["survival_keeper_started"])
+                self.assertTrue(first["background_farm"]["already_running"])
+                self.assertTrue(
+                    first["background_farm"]["survival_policy_reconciled"]
+                )
                 self.assertTrue(second["survival_interrupt"])
                 self.assertTrue(second["background_farm"]["already_running"])
+                self.assertFalse(
+                    second["background_farm"]["survival_policy_reconciled"]
+                )
                 starts = [
                     arguments
                     for name, arguments in broker.calls
                     if name == "autopilot" and arguments.get("action") == "start"
                 ]
                 self.assertEqual(1, len(starts))
-                self.assertEqual("survive", starts[0]["mode"])
-                self.assertEqual("", starts[0]["hunt"])
-                self.assertIsNone(starts[0]["assigned_room"])
-                self.assertEqual(0, starts[0]["bank_above"])
-                self.assertFalse(starts[0]["break_out_via_logoff"])
-                self.assertFalse(starts[0]["automated_pleas"])
+                for start in starts:
+                    self.assertEqual("survive", start["mode"])
+                    self.assertEqual("", start["hunt"])
+                    self.assertIsNone(start["assigned_room"])
+                    self.assertEqual(0, start["bank_above"])
+                    self.assertEqual(0.95, start["rest_below"])
+                    self.assertEqual(0.75, start["flee_below"])
+                    self.assertFalse(start["break_out_via_logoff"])
+                    self.assertFalse(start["automated_pleas"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
                 events = controller.storage.goal_events(
                     goal["id"], kinds=["survival.interrupt"], limit=20

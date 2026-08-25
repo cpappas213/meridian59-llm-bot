@@ -8,7 +8,7 @@ in the [operations runbook](requirements/operations.md).
 
 The controller is a companion process. The harness submodule is pinned to the
 public integration fork at tested revision
-`1485107a797e97b0d9dbcc8d9629fd719e20ef17`, based directly on upstream main
+`761ff07b6697471df14053341b1e34248e687281`, based directly on upstream main
 revision `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Controller-managed launches use
 the harness's explicit `--in-process` mode so ordinary synchronous broker tools
 retain their direct-session contract.

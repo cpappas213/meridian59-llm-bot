@@ -10,6 +10,21 @@ from typing import Any
 from .utils import expand_path
 
 
+SURVIVAL_RECOVERY_THRESHOLD = 0.95
+SURVIVAL_FLEE_FLOOR = 0.75
+
+
+def survival_keeper_thresholds(
+    configured_rest: float,
+    configured_critical: float,
+) -> tuple[float, float]:
+    """Return the recovery target and emergency withdraw floor for survive mode."""
+
+    rest = max(SURVIVAL_RECOVERY_THRESHOLD, float(configured_rest))
+    flee = max(SURVIVAL_FLEE_FLOOR, float(configured_critical))
+    return rest, min(rest, flee)
+
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
     if not isinstance(value, dict):
