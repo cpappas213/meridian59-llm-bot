@@ -39,6 +39,11 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Made an out-of-reach open-field quarry advance along at most four exact,
+  guarded path steps instead of entering the wall-only pull loop. Policy-off or
+  stale holds no longer influence farm combat, obstacle detours count as
+  progress, and the legacy and behavior-tree paths now share exact-target pull
+  conversion and cancellation semantics.
 - Kept low-health recovery aimed at one bounded refuge instead of alternating
   between adjacent hostile rooms. Emergency travel now closes the 70-75% health
   deadband, times out motionless and cyclic walks, honors confinement across
@@ -87,7 +92,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `761ff07b6697471df14053341b1e34248e687281`, based on official upstream revision
+  `ffcde659bb7809b4fdb39123571bc02e5a3cb11e`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
