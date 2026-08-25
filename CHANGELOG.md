@@ -39,6 +39,9 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Made `tui.bat` start a stopped scheduled controller or a hidden standalone
+  controller when no task is installed, and wait for the broker to join the
+  game before opening the console instead of racing startup.
 - Imported structured compendium item values into financial planning and split
   source-estimated liquidation value from exact live merchant quotes. A zero
   confirmed quote now means sale-eligible loot still needs quoting rather than

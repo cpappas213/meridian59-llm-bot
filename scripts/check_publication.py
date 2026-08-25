@@ -17,6 +17,7 @@ TEXT_SUFFIXES = {".md", ".py", ".ps1", ".toml", ".yml", ".yaml", ".txt"}
 EXCLUDED_PREFIXES = (
     ".git/",
     ".venv/",
+    ".worktrees/",
     "build/",
     "runtime/",
     "vendor/",

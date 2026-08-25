@@ -11704,6 +11704,19 @@ class BotController:
             )
         return compact
 
+    def _recover_broker_dependency(self) -> None:
+        """Restore the managed broker and game session after a transient failure."""
+
+        self.broker.ensure_started()
+        self.broker.capabilities(refresh=True)
+        if self.config.game.autojoin:
+            self.broker.ensure_joined()
+        self._set_fallback()
+        if self.config.controller.conversation_enabled:
+            self._start_conversation_listener()
+            self._start_social_worker()
+        self.dependencies["broker"] = "healthy"
+
     def run_forever(self) -> None:
         backoff = 1.0
         while not self.stop_event.is_set():
@@ -11711,7 +11724,14 @@ class BotController:
             if self._shutdown_requested.is_set():
                 self._perform_safe_shutdown()
                 continue
+            broker_recovery_attempted = False
             try:
+                if (
+                    not self.offline_diagnostics
+                    and self.dependencies.get("broker") == "unhealthy"
+                ):
+                    broker_recovery_attempted = True
+                    self._recover_broker_dependency()
                 self.turn()
                 backoff = 1.0
                 onboarding_ready = self._onboarding_status().get("ready_for_goals")
@@ -11723,18 +11743,11 @@ class BotController:
             except BrokerError as exc:
                 self.dependencies["broker"] = "unhealthy"
                 self._degrade("broker", exc)
-                try:
-                    self.broker.ensure_started()
-                    self.broker.capabilities(refresh=True)
-                    if self.config.game.autojoin:
-                        self.broker.ensure_joined()
-                    self._set_fallback()
-                    if self.config.controller.conversation_enabled:
-                        self._start_conversation_listener()
-                        self._start_social_worker()
-                    self.dependencies["broker"] = "healthy"
-                except BrokerError:
-                    pass
+                if not broker_recovery_attempted:
+                    try:
+                        self._recover_broker_dependency()
+                    except BrokerError:
+                        pass
                 cadence = backoff
                 backoff = min(backoff * 2, self.config.controller.error_backoff_max_seconds)
             except ModelError as exc:

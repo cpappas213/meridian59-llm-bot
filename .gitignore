@@ -8,6 +8,7 @@ build/
 *.egg-info/
 .mypy_cache/
 .ruff_cache/
+/.worktrees/
 
 # Runtime state and secrets never belong in the repository.
 bot.toml

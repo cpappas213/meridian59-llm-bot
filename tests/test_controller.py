@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from meridian_bot.broker import Tool, ToolCallError
+from meridian_bot.broker import BrokerError, Tool, ToolCallError
 from meridian_bot.campaign import (
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
@@ -14776,6 +14776,86 @@ class ControllerTests(unittest.TestCase):
                     "complete", controller._shutdown_status_snapshot()["stage"]
                 )
                 self.assertFalse(broker.joined)
+            finally:
+                controller.stop_event.set()
+                controller.storage.close()
+
+    def test_controller_loop_retries_degraded_broker_before_idle_turn(self) -> None:
+        class InitiallyUnavailableGameBroker(SimulatedBroker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = 0
+                self.join_attempts = 0
+                self.capability_refreshes: list[bool] = []
+
+            def ensure_started(self) -> dict[str, object]:
+                self.started += 1
+                return super().ensure_started()
+
+            def capabilities(self, *, refresh: bool = False) -> dict[str, Tool]:
+                self.capability_refreshes.append(refresh)
+                return super().capabilities(refresh=refresh)
+
+            def ensure_joined(self) -> dict[str, object]:
+                self.join_attempts += 1
+                if self.join_attempts < 3:
+                    raise BrokerError("game session is temporarily unavailable")
+                return super().ensure_joined()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = config(Path(temporary))
+            controller = BotController(
+                replace(
+                    base,
+                    controller=replace(
+                        base.controller,
+                        conversation_enabled=False,
+                    ),
+                )
+            )
+            try:
+                broker = InitiallyUnavailableGameBroker()
+                broker.joined = False
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="broker-recovery-paused-goal")
+                )["goal"]
+                controller.storage.manage_goal(
+                    {
+                        "request_id": "pause-before-broker-recovery",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                        "reason": "operator paused this goal before restart",
+                    }
+                )
+
+                with self.assertRaises(BrokerError):
+                    controller.startup(connect_game=True)
+                controller.dependencies["broker"] = "unhealthy"
+                controller._degrade(
+                    "broker", BrokerError("initial game session startup failed")
+                )
+
+                turns = 0
+
+                def idle_turn() -> dict[str, object]:
+                    nonlocal turns
+                    turns += 1
+                    controller.stop_event.set()
+                    return {"idle": True}
+
+                controller.turn = idle_turn  # type: ignore[method-assign]
+                # Avoid sleeping through the first failed recovery attempt.
+                controller._wake_event.set()
+                controller.run_forever()
+
+                self.assertEqual(3, broker.started)
+                self.assertEqual(3, broker.join_attempts)
+                self.assertEqual([True, True, True], broker.capability_refreshes)
+                self.assertEqual(1, turns)
+                self.assertTrue(broker.joined)
+                self.assertEqual("healthy", controller.dependencies["broker"])
+                self.assertEqual("paused", controller.storage.goal(goal["id"])["status"])
             finally:
                 controller.stop_event.set()
                 controller.storage.close()
