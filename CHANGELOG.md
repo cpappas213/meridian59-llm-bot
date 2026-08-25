@@ -42,6 +42,9 @@ and intends to use semantic versioning after its first public release.
 - Counted campaign phase time only while its goal is active. Operator pauses,
   coordinated restarts, and repeated/interleaved pause cycles now accumulate
   per-phase downtime without instantly exhausting a resumed farming phase.
+- Let coordinated shutdown depart from a full-health proven wall even when
+  harmless adjacent monsters remain camped there, instead of waiting forever
+  for a threat-clear condition the survival keeper cannot create while holding.
 - Made operator safe-spot verification an evidence checkpoint instead of
   permanent immunity: a later observed hit retires the square again. Selection,
   keeper status, and broker reporting now consistently reject failed verified

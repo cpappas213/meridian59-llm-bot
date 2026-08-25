@@ -15632,6 +15632,73 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_safe_shutdown_can_leave_a_full_health_proven_spot_with_camped_monsters(self) -> None:
+        class CampedShutdownBroker(ShutdownBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                result = super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+                if name == "autopilot" and arguments.get("action") == "status":
+                    return {
+                        **result,
+                        "safe_spot": {
+                            "standing_here": True,
+                            "works": True,
+                        },
+                        "threat": {
+                            "could_reach_us": 2,
+                            "camped_on_us": 2,
+                            "in_swing_range": 2,
+                            "landing_damage": 0,
+                        },
+                    }
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = CampedShutdownBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop(destination_room_id=52)
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("complete", result["stage"])
+                self.assertFalse(broker.joined)
+                self.assertIn("travel", [name for name, _ in broker.calls])
+                self.assertNotEqual("recovering", result.get("stage"))
+            finally:
+                controller.storage.close()
+
+        unsafe = {
+            "safe_spot": {"standing_here": True, "works": False},
+            "threat": {
+                "could_reach_us": 2,
+                "camped_on_us": 2,
+                "in_swing_range": 2,
+                "landing_damage": 0,
+            },
+        }
+        taking_damage = {
+            **unsafe,
+            "safe_spot": {"standing_here": True, "works": True},
+            "threat": {**unsafe["threat"], "landing_damage": 1},
+        }
+        self.assertFalse(BotController._shutdown_keeper_travel_ready(unsafe))
+        self.assertFalse(
+            BotController._shutdown_keeper_travel_ready(taking_damage)
+        )
+
     def test_safe_shutdown_in_verified_room_skips_travel_before_logout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))

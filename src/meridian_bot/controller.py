@@ -27791,6 +27791,25 @@ class BotController:
         except (TypeError, ValueError):
             return False
 
+    @classmethod
+    def _shutdown_keeper_travel_ready(cls, status: Any) -> bool:
+        """Allow departure from stable shelter even when monsters remain camped."""
+
+        if cls._shutdown_keeper_threat_clear(status):
+            return True
+        if not isinstance(status, dict):
+            return False
+        safe_spot = status.get("safe_spot")
+        threat = status.get("threat")
+        if not isinstance(safe_spot, dict) or not isinstance(threat, dict):
+            return False
+        if safe_spot.get("works") is not True or safe_spot.get("standing_here") is False:
+            return False
+        try:
+            return float(threat.get("landing_damage", 0) or 0) <= 0
+        except (TypeError, ValueError):
+            return False
+
     def _refresh_shutdown_observation(self) -> dict[str, Any]:
         observation = self._reconcile_recent_inventory_creation(
             self._reconcile_recent_room_transition(self.broker.observe())
@@ -27957,7 +27976,7 @@ class BotController:
             timeout=20,
             mutation=False,
         )
-        if self._shutdown_full_health(observation) and self._shutdown_keeper_threat_clear(
+        if self._shutdown_full_health(observation) and self._shutdown_keeper_travel_ready(
             keeper
         ):
             return observation
@@ -27982,7 +28001,7 @@ class BotController:
             )
             if self._shutdown_full_health(
                 observation
-            ) and self._shutdown_keeper_threat_clear(keeper):
+            ) and self._shutdown_keeper_travel_ready(keeper):
                 return observation
         raise RuntimeError(
             "survival keeper did not establish full-health, threat-clear travel "
