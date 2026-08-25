@@ -462,14 +462,14 @@ omits or contradicts these facts before any action is permitted.
 If the HP/progression criterion is already met, omit every farm/autopilot launch step and plan only the
 remaining recovery and explicit finish criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
-Before starting, compare live numeric vigor with fight_above_vigor. Resting reaches the ordinary 80-vigor
-keeper floor, so food and spending are never implicit launch requirements. The controller will not insert a
-food, reagent, or food-funding phase. At the ordinary 80-vigor floor, omitted eat_before_fighting lets the
-keeper consume carried or self-created food opportunistically; set it false only when the phase must preserve
-food. Set eat_before_fighting=true with an explicit fight_above_vigor above 80 only when you deliberately make
-that higher, food-dependent launch floor part of the tactic. Set buy_food=true only when you deliberately want
-paid food acquisition and current financial evidence makes that route viable; it remains false when omitted.
-Buying, creating, carrying, and eating food are separate choices. Carried herbs and
+Before starting, compare live numeric vigor with fight_above_vigor. The controller's ordinary configured floor is
+the rest-reachable 80, so paid food is never an implicit launch requirement. The controller will not insert a food,
+reagent, or food-funding phase. The keeper consumes carried or self-created food opportunistically and currently
+enforces its own 100-vigor minimum while food is available; that is not a planner switch, and it falls back when
+supply is absent. Set fight_above_vigor above 100 only when you deliberately make a higher, food-dependent launch
+floor part of the tactic. Set buy_food=true only when you deliberately want paid food acquisition and current
+financial evidence makes that route viable; it remains false when omitted.
+Buying food remains separate from creating, carrying, and eating it. Carried herbs and
 elderberries are usable only when the verified spell list says the character knows Create Food. If a retreat
 happens before the assigned room is reached, treat it as hazardous-route evidence and do not condemn
 the destination room.
@@ -632,9 +632,9 @@ are usable capability evidence, while acquiring supplies remains a deliberate, f
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
 name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
-and fight_above_vigor (80 by default). Optional eat_before_fighting uses available food when omitted and may be
-set false to preserve it; buy_food is false when omitted. Set eat_before_fighting=true explicitly when choosing
-an above-80 food-dependent floor. The controller persists and enforces these fields across planning turns. If choosing
+and fight_above_vigor (80 by default). The keeper owns opportunistic food consumption and currently applies an
+internal 100-vigor minimum while food is available; an explicit floor above 100 is the deliberate higher-food
+tactic. buy_food is false when omitted. The controller persists and enforces these fields across planning turns. If choosing
 open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
 it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey

@@ -965,7 +965,6 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_recent: list[object] = []
         self.farm_flee_below = 0.75
         self.farm_fight_above_vigor = 80
-        self.farm_eat_before_fighting = True
         self.farm_buy_food = False
         self.farm_use_safe_spots = True
         self.farm_inert: dict[str, object] | None = None
@@ -991,7 +990,6 @@ class BackgroundFarmBroker(SimulatedBroker):
                     "hunt": self.farm_hunt,
                     "fleeBelow": self.farm_flee_below,
                     "fightAboveVigor": self.farm_fight_above_vigor,
-                    "eatBeforeFighting": self.farm_eat_before_fighting,
                     "buyFood": self.farm_buy_food,
                     "useSafeSpots": self.farm_use_safe_spots,
                 },
@@ -1017,9 +1015,6 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_fight_above_vigor = int(
                 arguments.get("fight_above_vigor")
                 or self.farm_fight_above_vigor
-            )
-            self.farm_eat_before_fighting = bool(
-                arguments.get("eat_before_fighting", True)
             )
             self.farm_buy_food = bool(arguments.get("buy_food", False))
             self.farm_use_safe_spots = bool(
@@ -11434,10 +11429,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_available_food_is_used_without_raising_default_vigor_floor(self) -> None:
+    def test_current_keeper_uses_vigor_floor_without_legacy_food_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                self.assertNotIn("eat_before_fighting", PLANNER_SYSTEM)
+                self.assertNotIn("eat_before_fighting", CAMPAIGN_MANAGER_SYSTEM)
                 observation = {"inventory": {"items": []}}
                 ordinary, _changes = controller._normalize_combat_arguments(
                     "autopilot",
@@ -11448,11 +11445,11 @@ class ControllerTests(unittest.TestCase):
                     },
                     observation,
                 )
-                self.assertEqual(80, ordinary["fight_above_vigor"])
-                self.assertTrue(ordinary["eat_before_fighting"])
+                self.assertEqual(140, ordinary["fight_above_vigor"])
+                self.assertNotIn("eat_before_fighting", ordinary)
                 self.assertFalse(ordinary["buy_food"])
 
-                preserving, _changes = controller._normalize_combat_arguments(
+                preserving, preserving_changes = controller._normalize_combat_arguments(
                     "autopilot",
                     {
                         "action": "start",
@@ -11463,7 +11460,11 @@ class ControllerTests(unittest.TestCase):
                     observation,
                 )
                 self.assertEqual(80, preserving["fight_above_vigor"])
-                self.assertFalse(preserving["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", preserving)
+                self.assertEqual(
+                    {"requested": False, "applied": None},
+                    preserving_changes["eat_before_fighting"],
+                )
                 self.assertFalse(preserving["buy_food"])
 
                 planned, _changes = controller._normalize_combat_arguments(
@@ -11478,18 +11479,21 @@ class ControllerTests(unittest.TestCase):
                     observation,
                 )
                 self.assertEqual(140, planned["fight_above_vigor"])
-                self.assertTrue(planned["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", planned)
                 self.assertTrue(planned["buy_food"])
             finally:
                 controller.storage.close()
 
-    def test_background_farm_uses_available_food_at_rested_floor(self) -> None:
+    def test_background_farm_uses_current_food_dependent_vigor_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = CombatBroker()
                 broker.vitals["vigor"] = {"value": 93, "scale_max": 200, "rested": True}
                 controller.broker = broker
+                self.assertFalse(
+                    broker.tools["autopilot"].accepts("eat_before_fighting")
+                )
                 goal = controller.storage.submit_goal(goal_payload(request_id="farm-vigor-gate"))["goal"]
                 run = controller.storage.ensure_campaign_run(goal)
                 farm = controller.storage.create_campaign_phase(
@@ -11541,8 +11545,8 @@ class ControllerTests(unittest.TestCase):
                     for name, arguments in broker.calls
                     if name == "autopilot" and arguments.get("action") == "start"
                 )
-                self.assertEqual(80, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertEqual(140, call["fight_above_vigor"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(farm["id"], active["id"])
@@ -11812,7 +11816,7 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.active_campaign_phase(run["id"])["id"],
                 )
                 self.assertEqual(
-                    80,
+                    100,
                     controller.storage.active_campaign_phase(run["id"])["context"][
                         "fight_above_vigor"
                     ],
@@ -11821,7 +11825,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_active_legacy_farm_vigor_recipe_normalizes_without_child(self) -> None:
+    def test_legacy_food_preservation_request_uses_lowest_configured_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -11847,6 +11851,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 575,
                             "target": "giant rat",
                             "fight_above_vigor": 100,
+                            "eat_before_fighting": False,
                             "use_safe_spots": True,
                         },
                     },
@@ -11863,7 +11868,47 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_explicit_food_recipe_survives_campaign_reconciliation(self) -> None:
+    def test_legacy_food_fields_do_not_rewrite_noncombat_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="preserve-noncombat-phase")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Acquire a working mace.",
+                        "success_criteria": [
+                            {
+                                "id": "have-mace",
+                                "kind": "inventory_contains",
+                                "item": "mace",
+                                "count": 1,
+                            }
+                        ],
+                        "context": {
+                            "fight_above_vigor": 100,
+                            "eat_before_fighting": False,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(
+                    goal, {"inventory": {"items": []}}
+                )
+
+                self.assertIsNone(result)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active["id"])
+                self.assertEqual(100, active["context"]["fight_above_vigor"])
+            finally:
+                controller.storage.close()
+
+    def test_explicit_high_vigor_recipe_survives_campaign_reconciliation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -11889,7 +11934,6 @@ class ControllerTests(unittest.TestCase):
                             "room": 575,
                             "target": "giant rat",
                             "fight_above_vigor": 140,
-                            "eat_before_fighting": True,
                             "buy_food": False,
                             "use_safe_spots": True,
                         },
@@ -11903,7 +11947,7 @@ class ControllerTests(unittest.TestCase):
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(farm["id"], active["id"])
                 self.assertEqual(140, active["context"]["fight_above_vigor"])
-                self.assertTrue(active["context"]["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", active["context"])
                 self.assertFalse(active["context"]["buy_food"])
                 self.assertEqual(140, controller._farm_fight_vigor(goal))
             finally:
@@ -11945,7 +11989,7 @@ class ControllerTests(unittest.TestCase):
                     if name == "autopilot" and arguments.get("action") == "start"
                 )
                 self.assertEqual(140, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
             finally:
                 controller.storage.close()
@@ -11982,7 +12026,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(0.7, call["rest_below"])
                 self.assertEqual(0.60, call["flee_below"])
                 self.assertEqual(80, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
                 self.assertTrue(call["use_safe_spots"])
                 self.assertEqual(0.9, call["hold_resume_above"])
@@ -13350,6 +13394,41 @@ class ControllerTests(unittest.TestCase):
                     submitted["id"], kinds=["background_farm.recovered"], limit=5
                 )
                 self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_current_keeper_status_without_food_switch_matches_owned_farm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        "current-keeper-farm-match",
+                        constraints={
+                            "operator_notes": (
+                                "hunt='giant rat'; assigned_room=586; "
+                                "use_safe_spots=true; fight_above_vigor=80; "
+                                "buy_food=false"
+                            )
+                        },
+                    )
+                )["goal"]
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "assigned_room": 586,
+                        "hunt": "giant rat",
+                    },
+                )
+                status = broker.call_tool(
+                    "autopilot", {"action": "status", "agent": "primary"}
+                )
+
+                self.assertNotIn("eatBeforeFighting", status["policy"])
+                self.assertIsNone(controller._background_farm_mismatch(goal, status))
             finally:
                 controller.storage.close()
 

@@ -124,12 +124,11 @@ FAMILIARS_ROOM_ID = 52
 RAZA_EXIT_SAFE_ROOM_ID = FAMILIARS_ROOM_ID
 SALE_BUYER_REFUSAL_LIMIT = 3
 RESTED_VIGOR_FLOOR = 80
-# Ordinary keeper farms may start at the game's natural rested floor. Combat
-# safety comes from the health/flee envelope.  The keeper should use food it
-# already carries (or can create) as optional endurance, without making food or
-# spending a prerequisite that can deadlock an empty-handed character.
+# The controller configures ordinary keeper farms at the game's natural rested
+# floor. Combat safety comes from the health/flee envelope. The pinned keeper
+# may enforce a higher internal floor while food is available and owns consuming
+# or creating it, without making paid acquisition a prerequisite.
 FARM_FIGHT_VIGOR = RESTED_VIGOR_FLOOR
-FARM_EAT_AVAILABLE_FOOD = True
 # The keeper reports a stall after five unsuccessful internal passes.  That is
 # useful telemetry, but the first report can be only a couple of seconds old
 # and a wandering monster or a break-off can still resolve it.  Give the live
@@ -7922,7 +7921,6 @@ class BotController:
             "hold_resume_above",
             "rest_below",
             "fight_above_vigor",
-            "eat_before_fighting",
             "buy_food",
             "bank_above",
             "pull_within",
@@ -7980,7 +7978,6 @@ class BotController:
                 "use_safe_spots",
                 "flee_below",
                 "fight_above_vigor",
-                "eat_before_fighting",
                 "buy_food",
                 "selection_basis",
             ):
@@ -9819,6 +9816,11 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         normalized = dict(arguments)
         before = dict(arguments)
+        legacy_food_policy = (
+            normalized.pop("eat_before_fighting", None)
+            if tool == "autopilot"
+            else None
+        )
         if tool == "fight":
             # The harness checks health between rounds, not between swings. One
             # swing per one-round call makes the controller's next observation
@@ -9848,16 +9850,13 @@ class BotController:
             effective_bank_above = int(requested_bank_above)
             if 0 < effective_bank_above < BROKER_WALKING_MONEY:
                 effective_bank_above = BROKER_WALKING_MONEY
-            # Eating carried or self-created food is useful routine vigor
-            # maintenance and does not widen the controller's spending authority.
-            # A caller may still explicitly preserve food with ``false``.  Raising
-            # the launch floor above the rest-reachable 80 remains separately
-            # opt-in so an empty larder can never retire the farm by accident.
-            explicit_food_floor = arguments.get("eat_before_fighting") is True
-            eat_before_fighting = (
-                arguments.get("eat_before_fighting", FARM_EAT_AVAILABLE_FOOD)
-                is not False
-            )
+            # The pinned keeper owns opportunistic consumption and does not
+            # expose the side-branch ``eat_before_fighting`` switch.  Preserve
+            # the only safe part of a legacy ``false`` instruction by avoiding
+            # the configured food demand, then remove the unsupported wire
+            # argument. This cannot preserve food: the current keeper owns
+            # consumption and may enforce a higher internal minimum.
+            minimize_food_floor_legacy = legacy_food_policy is False
             buy_food = arguments.get("buy_food") is True
             try:
                 requested_fight_vigor = float(
@@ -9865,11 +9864,10 @@ class BotController:
                 )
             except (TypeError, ValueError):
                 requested_fight_vigor = float(FARM_FIGHT_VIGOR)
-            # Rested vigor is the viable default. A higher target is accepted
-            # only as part of an explicit planner-owned eating tactic; routine
-            # use of available food never raises the keeper's launch floor.
+            # Rested vigor is the viable default.  In the current harness the
+            # threshold itself is the deliberate food-dependent tactic.
             effective_fight_vigor: int | float = FARM_FIGHT_VIGOR
-            if explicit_food_floor:
+            if not minimize_food_floor_legacy:
                 effective_fight_vigor = min(
                     200, max(FARM_FIGHT_VIGOR, requested_fight_vigor)
                 )
@@ -9886,9 +9884,8 @@ class BotController:
                     # 75-80% as well as overly aggressive lower proposals.
                     "flee_below": FARM_FLEE_THRESHOLD,
                     "fight_above_vigor": effective_fight_vigor,
-                    # Available-food consumption defaults on. Paid acquisition
-                    # remains opt-in and an explicit false still preserves food.
-                    "eat_before_fighting": eat_before_fighting,
+                    # Paid acquisition remains separate and opt-in. The keeper
+                    # itself owns consumption of carried or self-created food.
                     "buy_food": buy_food,
                     # Open-field farming is permitted only when durable state
                     # chose it as a materially different tactic: either an
@@ -9939,6 +9936,11 @@ class BotController:
             for key, value in normalized.items()
             if before.get(key) != value
         }
+        if tool == "autopilot" and "eat_before_fighting" in before:
+            changes["eat_before_fighting"] = {
+                "requested": before["eat_before_fighting"],
+                "applied": None,
+            }
         return normalized, changes
 
     @staticmethod
@@ -10142,8 +10144,9 @@ class BotController:
                 {
                     "kind": "recover_vigor",
                     "guidance": (
-                        "rest until the game reports rested; food is an optional "
-                        "planner-owned tactic, never a controller prerequisite"
+                        "rest until the game reports rested; the keeper owns "
+                        "opportunistic food use and paid acquisition is never "
+                        "a controller prerequisite"
                     ),
                 }
             )
@@ -12268,19 +12271,16 @@ class BotController:
 
     def _farm_fight_vigor(self, goal: dict[str, Any]) -> int:
         intent = self._effective_farm_intent(goal)
-        if intent.get("eat_before_fighting") is not True:
+        # A legacy explicit preservation request cannot be represented by the
+        # pinned keeper. Minimize its configured floor while otherwise treating
+        # a higher threshold as the current food-tactic control.
+        if intent.get("eat_before_fighting") is False:
             return FARM_FIGHT_VIGOR
         try:
             requested = int(intent.get("fight_above_vigor") or FARM_FIGHT_VIGOR)
         except (TypeError, ValueError):
             return FARM_FIGHT_VIGOR
         return min(200, max(FARM_FIGHT_VIGOR, requested))
-
-    def _farm_eat_before_fighting(self, goal: dict[str, Any]) -> bool:
-        """Use available food by default without implying a higher vigor gate."""
-
-        intent = self._effective_farm_intent(goal)
-        return intent.get("eat_before_fighting", FARM_EAT_AVAILABLE_FOOD) is not False
 
     def _farm_launch_origin(
         self,
@@ -13137,9 +13137,12 @@ class BotController:
         owner = owner if isinstance(owner, dict) else {}
         intent = self._effective_farm_intent(goal)
         expected = {
-            **intent,
+            **{
+                key: value
+                for key, value in intent.items()
+                if key != "eat_before_fighting"
+            },
             "fight_above_vigor": self._farm_fight_vigor(goal),
-            "eat_before_fighting": self._farm_eat_before_fighting(goal),
             "buy_food": intent.get("buy_food") is True,
         }
         actual = {
@@ -13150,11 +13153,6 @@ class BotController:
                 status,
                 "policy.fightAboveVigor",
                 deep_get(status, "policy.fight_above_vigor"),
-            ),
-            "eat_before_fighting": deep_get(
-                status,
-                "policy.eatBeforeFighting",
-                deep_get(status, "policy.eat_before_fighting"),
             ),
             "buy_food": deep_get(
                 status,
@@ -13179,7 +13177,6 @@ class BotController:
             "hunt",
             "use_safe_spots",
             "fight_above_vigor",
-            "eat_before_fighting",
             "buy_food",
         ):
             wanted = expected.get(field)
@@ -17984,7 +17981,7 @@ class BotController:
         policy_normalized = False
         if (
             combat_recipe_phase
-            and phase_context.get("eat_before_fighting") is not True
+            and phase_context.get("eat_before_fighting") is False
             and phase_context.get("fight_above_vigor") != FARM_FIGHT_VIGOR
             and deep_get(observation, "autopilot.running") is not True
         ):
@@ -17994,8 +17991,8 @@ class BotController:
                 abandon_predicates=phase.get("abandon_predicates", []),
                 context=phase_context,
                 reason=(
-                    "normalized persisted combat vigor policy to the natural "
-                    f"rested floor of {FARM_FIGHT_VIGOR}"
+                    "normalized a legacy food-preservation request to the lowest "
+                    f"controller-configured vigor floor of {FARM_FIGHT_VIGOR}"
                 ),
             )
             policy_normalized = True
@@ -18058,6 +18055,29 @@ class BotController:
             )
             phase = self.storage.active_campaign_phase(run["id"])
         if retired_phases:
+            resumed_required_vigor = FARM_FIGHT_VIGOR
+            if isinstance(phase, dict):
+                resumed_phase_context = (
+                    phase.get("context")
+                    if isinstance(phase.get("context"), dict)
+                    else {}
+                )
+                if resumed_phase_context.get("eat_before_fighting") is False:
+                    resumed_required_vigor = FARM_FIGHT_VIGOR
+                else:
+                    try:
+                        resumed_required_vigor = min(
+                            200,
+                            max(
+                                FARM_FIGHT_VIGOR,
+                                int(
+                                    resumed_phase_context.get("fight_above_vigor")
+                                    or FARM_FIGHT_VIGOR
+                                ),
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        resumed_required_vigor = FARM_FIGHT_VIGOR
             reason = (
                 (
                     "retired rest-reachable vigor provisioning; ordinary recovery "
@@ -18066,7 +18086,8 @@ class BotController:
                 if retired_rest_reachable_recovery
                 else (
                     "retired obsolete above-rest vigor recovery stack; ordinary farms "
-                    f"now start at the rested floor of {FARM_FIGHT_VIGOR}"
+                    "delegate food-backed recovery to the keeper for the resumed "
+                    f"{resumed_required_vigor}-vigor floor"
                 )
             )
             if isinstance(phase, dict) and phase.get("kind") in {
@@ -18079,7 +18100,7 @@ class BotController:
                     else {}
                 )
                 if (
-                    resumed_context.get("eat_before_fighting") is not True
+                    resumed_context.get("eat_before_fighting") is False
                     and resumed_context.get("fight_above_vigor")
                     != FARM_FIGHT_VIGOR
                 ):
@@ -18106,7 +18127,7 @@ class BotController:
                 data={
                     "retired_phase_ids": [item.get("id") for item in retired_phases],
                     "old_required_vigor": old_required_vigor,
-                    "new_required_vigor": FARM_FIGHT_VIGOR,
+                    "new_required_vigor": resumed_required_vigor,
                     "resumed_parent_phase_id": (
                         phase.get("id") if isinstance(phase, dict) else None
                     ),
@@ -18125,15 +18146,15 @@ class BotController:
             }
         if policy_normalized:
             reason = (
-                "normalized persisted combat vigor policy to the natural rested "
-                f"floor of {FARM_FIGHT_VIGOR}"
+                "normalized a legacy food-preservation request to the lowest "
+                f"controller-configured vigor floor of {FARM_FIGHT_VIGOR}"
             )
             self._invalidate_execution_plan(goal, reason)
             self._clear_safety_suppression(str(goal.get("id") or ""))
             self._clear_planner_feedback()
             self.storage.emit_event(
                 "campaign.combat_vigor_policy_migrated",
-                "Normalized an active combat phase to the rested vigor floor",
+                "Minimized the configured vigor floor for a legacy food policy",
                 severity="notice",
                 interesting=False,
                 goal_id=goal.get("id"),
