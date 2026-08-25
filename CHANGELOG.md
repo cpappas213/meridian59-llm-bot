@@ -39,6 +39,13 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Counted campaign phase time only while its goal is active. Operator pauses,
+  coordinated restarts, and repeated/interleaved pause cycles now accumulate
+  per-phase downtime without instantly exhausting a resumed farming phase.
+- Made operator safe-spot verification an evidence checkpoint instead of
+  permanent immunity: a later observed hit retires the square again. Selection,
+  keeper status, and broker reporting now consistently reject failed verified
+  spots rather than repeatedly resting on them as proven.
 - Preferred collision-proven baked room rails over learned coordinate tracks and
   bounded the remaining learned replay by one deadline and movement budget. Tight
   forest crossings no longer expand one stale waypoint into repeated fine-walk
@@ -67,7 +74,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `fd7cc092142561432473ae44d10f270e2abc34e0`, based on official upstream revision
+  `fc5627e042038626d030f71a77d08fcb0ce7760e`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.

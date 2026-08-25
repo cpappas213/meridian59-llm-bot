@@ -18,7 +18,6 @@ from .broker import (
     normalize_tool_arguments,
 )
 from .campaign import (
-    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
     PhaseOutcome,
@@ -15114,12 +15113,9 @@ class BotController:
             CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
         )
         leases = dict(leases) if isinstance(leases, dict) else {}
-        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
+        downtime = self.storage.campaign_phase_downtime(str(phase.get("id") or ""))
         downtime_seconds = 0.0
-        if (
-            isinstance(downtime, dict)
-            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
-        ):
+        if isinstance(downtime, dict):
             try:
                 downtime_seconds = max(
                     0.0, float(downtime.get("seconds", 0.0) or 0.0)
@@ -28316,25 +28312,13 @@ class BotController:
             return None
         goal_id, run_id, phase_id = identity
         added_seconds = max(0.0, time.time() - float(stopped_unix))
-        prior = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
-        prior_seconds = 0.0
-        if (
-            isinstance(prior, dict)
-            and str(prior.get("phase_id") or "") == phase_id
-        ):
-            try:
-                prior_seconds = max(0.0, float(prior.get("seconds", 0.0) or 0.0))
-            except (TypeError, ValueError):
-                prior_seconds = 0.0
-        total_seconds = prior_seconds + added_seconds
-        value = {
-            "goal_id": goal_id,
-            "run_id": run_id,
-            "phase_id": phase_id,
-            "seconds": total_seconds,
-            "updated_at": timestamp(),
-        }
-        self.storage.set_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, value)
+        value = self.storage.add_campaign_phase_downtime(
+            goal_id=goal_id,
+            run_id=run_id,
+            phase_id=phase_id,
+            seconds=added_seconds,
+        )
+        total_seconds = float(value.get("seconds", 0.0) or 0.0)
         self.storage.set_runtime(PLANNED_CONTROLLER_STOP_RUNTIME_KEY, None)
         self.storage.emit_event(
             "campaign.phase.downtime_accounted",

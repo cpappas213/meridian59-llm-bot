@@ -6,11 +6,10 @@ from typing import Any
 
 from .contracts import parse_ability_metric
 from .criteria import CriteriaEvaluator
-from .storage import Storage
+from .storage import CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, Storage
 from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 
-CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
 CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY = "campaign_phase_progress_lease_v1"
 
 
@@ -1394,11 +1393,10 @@ class CampaignCoordinator:
         downtime_at_lease_seconds = 0.0
         elapsed_basis = "phase_activation"
         last_verified_progress_at: str | None = None
-        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
-        if (
-            isinstance(downtime, dict)
-            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
-        ):
+        downtime = self.storage.campaign_phase_downtime(
+            str(phase.get("id") or "")
+        )
+        if isinstance(downtime, dict):
             try:
                 downtime_seconds = max(0.0, float(downtime.get("seconds", 0.0) or 0.0))
             except (TypeError, ValueError):

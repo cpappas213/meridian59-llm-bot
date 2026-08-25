@@ -453,6 +453,181 @@ class StorageTests(unittest.TestCase):
                     phase["id"], storage.active_campaign_phase(run["id"])["id"]
                 )
 
+    def test_operator_resume_excludes_a_long_paused_interval_from_phase_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("long-paused-phase"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Keep farming across a planned pause.",
+                        "success_criteria": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                    },
+                    mode="start",
+                )
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-long-phase",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+                activated_at = datetime.now(timezone.utc) - timedelta(minutes=181)
+                paused_at = datetime.now(timezone.utc) - timedelta(minutes=120)
+                with storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET activated_at=?,updated_at=? WHERE id=?",
+                        (activated_at.isoformat(), paused_at.isoformat(), phase["id"]),
+                    )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-long-phase",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                    }
+                )
+
+                downtime = storage.campaign_phase_downtime(phase["id"])
+                self.assertIsNotNone(downtime)
+                self.assertGreaterEqual(downtime["seconds"], 119 * 60)
+                self.assertLess(downtime["seconds"], 121 * 60)
+                current = storage.active_campaign_phase(run["id"])
+                self.assertIsNone(
+                    CampaignCoordinator(
+                        storage, CriteriaEvaluator(storage)
+                    ).budget_exhausted(current)
+                )
+                self.assertEqual(
+                    phase["id"],
+                    storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY)[
+                        "phase_id"
+                    ],
+                )
+
+    def test_paused_phase_downtime_accumulates_across_interleaved_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("repeated-paused-phase"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Accumulate only active farming time.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 30},
+                )
+                migrated = storage.add_campaign_phase_downtime(
+                    goal_id=goal["id"],
+                    run_id=run["id"],
+                    phase_id=phase["id"],
+                    seconds=30,
+                )
+                self.assertEqual(60, migrated["seconds"])
+                storage.add_campaign_phase_downtime(
+                    goal_id="other-goal",
+                    run_id="other-run",
+                    phase_id="other-phase",
+                    seconds=90,
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-repeated-phase",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+                with storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET updated_at=? WHERE id=?",
+                        (
+                            (
+                                datetime.now(timezone.utc) - timedelta(minutes=2)
+                            ).isoformat(),
+                            phase["id"],
+                        ),
+                    )
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-repeated-phase",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                    }
+                )
+
+                accumulated = storage.campaign_phase_downtime(phase["id"])
+                other = storage.campaign_phase_downtime("other-phase")
+                self.assertGreaterEqual(accumulated["seconds"], 179)
+                self.assertLess(accumulated["seconds"], 181)
+                self.assertEqual(90, other["seconds"])
+
+    def test_resume_ignores_malformed_and_future_phase_pause_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("invalid-pause-time"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Resume despite corrupt clock evidence.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                storage.add_campaign_phase_downtime(
+                    goal_id=goal["id"],
+                    run_id=run["id"],
+                    phase_id=phase["id"],
+                    seconds=37,
+                )
+
+                for suffix, paused_at in (
+                    ("malformed", "not-a-timestamp"),
+                    (
+                        "future",
+                        (
+                            datetime.now(timezone.utc) + timedelta(days=1)
+                        ).isoformat(),
+                    ),
+                ):
+                    storage.manage_goal(
+                        {
+                            "request_id": f"pause-{suffix}-time",
+                            "goal_id": goal["id"],
+                            "action": "pause",
+                        }
+                    )
+                    with storage.transaction() as connection:
+                        connection.execute(
+                            "UPDATE campaign_phases SET updated_at=? WHERE id=?",
+                            (paused_at, phase["id"]),
+                        )
+                    storage.manage_goal(
+                        {
+                            "request_id": f"resume-{suffix}-time",
+                            "goal_id": goal["id"],
+                            "action": "resume",
+                        }
+                    )
+                    self.assertEqual(
+                        37,
+                        storage.campaign_phase_downtime(phase["id"])["seconds"],
+                    )
+                    self.assertEqual(
+                        phase["id"], storage.active_campaign_phase(run["id"])["id"]
+                    )
+
     def test_migration_repairs_paused_goal_with_active_campaign_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "bot.sqlite3"

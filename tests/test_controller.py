@@ -1304,6 +1304,10 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual(phase["id"], accounted["phase_id"])
                 self.assertGreaterEqual(accounted["seconds"], 119)
+                self.assertEqual(
+                    accounted,
+                    controller.storage.campaign_phase_downtime(phase["id"]),
+                )
                 self.assertIsNone(
                     controller.storage.get_runtime(
                         PLANNED_CONTROLLER_STOP_RUNTIME_KEY
