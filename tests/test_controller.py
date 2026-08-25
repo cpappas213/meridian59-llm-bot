@@ -1059,6 +1059,8 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_fight_above_vigor = 80
         self.farm_buy_food = False
         self.farm_use_safe_spots = True
+        self.farm_automated_pleas = False
+        self.farm_reports_automated_pleas = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
 
@@ -1084,6 +1086,11 @@ class BackgroundFarmBroker(SimulatedBroker):
                     "fightAboveVigor": self.farm_fight_above_vigor,
                     "buyFood": self.farm_buy_food,
                     "useSafeSpots": self.farm_use_safe_spots,
+                    **(
+                        {"automatedPleas": self.farm_automated_pleas}
+                        if self.farm_reports_automated_pleas
+                        else {}
+                    ),
                 },
             }
         if name == "autopilot" and arguments.get("action") == "stop":
@@ -1111,6 +1118,9 @@ class BackgroundFarmBroker(SimulatedBroker):
             self.farm_buy_food = bool(arguments.get("buy_food", False))
             self.farm_use_safe_spots = bool(
                 arguments.get("use_safe_spots", self.farm_use_safe_spots)
+            )
+            self.farm_automated_pleas = bool(
+                arguments.get("automated_pleas", self.farm_automated_pleas)
             )
             return {"running": True, "mode": self.farm_mode}
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
@@ -1696,6 +1706,7 @@ class ControllerTests(unittest.TestCase):
                 controller._conversation_turn(look=broker.look())
 
                 self.assertEqual("npc", model.responses[0]["message"]["speaker_kind"])
+                self.assertFalse(controller.config.policy.automated_help_pleas)
                 second_history = model.responses[1]["history"]
                 self.assertEqual(["speaker", "assistant"], [entry["role"] for entry in second_history])
                 replies = [arguments for name, arguments in broker.calls if name == "inbox" and arguments.get("action") == "reply"]
@@ -12786,6 +12797,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(0.9, call["hold_resume_above"])
                 self.assertEqual(8, call["pull_within"])
                 self.assertFalse(call["break_out_via_logoff"])
+                self.assertFalse(call["automated_pleas"])
                 self.assertEqual(len(broker.inventory_items) + 6, call["max_carry"])
 
                 explicit_unlimited, _ = controller._normalize_combat_arguments(
@@ -12798,6 +12810,20 @@ class ControllerTests(unittest.TestCase):
                     broker.observe(),
                 )
                 self.assertEqual(0, explicit_unlimited["pull_within"])
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        automated_help_pleas=True,
+                    ),
+                )
+                opted_in, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {"action": "start", "mode": "farm"},
+                    broker.observe(),
+                )
+                self.assertTrue(opted_in["automated_pleas"])
             finally:
                 controller.storage.close()
 
@@ -14189,6 +14215,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(arguments["assigned_room"])
                 self.assertEqual(0, arguments["bank_above"])
                 self.assertFalse(arguments["break_out_via_logoff"])
+                self.assertFalse(arguments["automated_pleas"])
             finally:
                 controller.storage.close()
 
@@ -14235,6 +14262,37 @@ class ControllerTests(unittest.TestCase):
                     submitted["id"], kinds=["background_farm.recovered"], limit=5
                 )
                 self.assertEqual(1, len(events))
+
+                # Missing means an old/stale broker, not proof that the old
+                # keeper is silent. Fail closed by sending the policy anyway.
+                broker.calls.clear()
+                broker.farm_reports_automated_pleas = False
+                controller._set_fallback()
+                starts = [
+                    args
+                    for name, args in broker.calls
+                    if name == "autopilot"
+                    and args.get("action") == "start"
+                    and args.get("mode") == "farm"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertFalse(starts[0]["automated_pleas"])
+
+                # A persisted opt-in from an older configuration is corrected
+                # in place without otherwise retasking the recovered farm.
+                broker.calls.clear()
+                broker.farm_reports_automated_pleas = True
+                broker.farm_automated_pleas = True
+                controller._set_fallback()
+                starts = [
+                    args
+                    for name, args in broker.calls
+                    if name == "autopilot"
+                    and args.get("action") == "start"
+                    and args.get("mode") == "farm"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertFalse(starts[0]["automated_pleas"])
             finally:
                 controller.storage.close()
 
@@ -18523,6 +18581,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertIsNone(starts[0]["assigned_room"])
                 self.assertEqual(0, starts[0]["bank_above"])
                 self.assertFalse(starts[0]["break_out_via_logoff"])
+                self.assertFalse(starts[0]["automated_pleas"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
                 events = controller.storage.goal_events(
                     goal["id"], kinds=["survival.interrupt"], limit=20

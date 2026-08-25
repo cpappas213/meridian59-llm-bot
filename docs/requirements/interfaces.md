@@ -319,6 +319,16 @@ consequence assessment.
 Personality describes roleplay, not game authority. Persona text cannot relax
 fair-play rules, disclose secrets, alter consequence guidance, or modify goals.
 
+### 5.1 Deterministic help-plea policy
+
+`[policy].automated_help_pleas` is a boolean and defaults to `false`. The
+controller sends that value as the harness autopilot `automated_pleas` field on
+every keeper launch and when reconciling a persisted keeper whose value is
+missing or different. The harness stores it as `policy.automatedPleas` and gates
+only its canned post-death/low-health broadcast (and room-say fallback). Inventory
+refresh, equipping, Create Weapon, direct operator/model speech, model-decided
+greetings, and replies to incoming messages remain independent.
+
 ## 6. Event envelope
 
 ```json

@@ -39,6 +39,11 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Made deterministic post-death and low-health help pleas explicitly opt-in and
+  default-off without disabling self-rearming, LLM replies, or LLM-decided
+  greetings. Restart reconciliation now fails closed on missing/stale plea
+  policy, and the legacy templates no longer emit a mangled em-dash control
+  character when deliberately enabled.
 - Made `tui.bat` start a stopped scheduled controller or a hidden standalone
   controller when no task is installed, and wait for the broker to join the
   game before opening the console instead of racing startup.
@@ -58,7 +63,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `286912fbeb5eea378722d1f7f816c365ecda8970`, based on official upstream revision
+  `5fc12710dd2c23782c63077c2484c67f999b3649`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.

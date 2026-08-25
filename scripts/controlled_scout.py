@@ -35,6 +35,7 @@ def survive(broker: BrokerClient, agent: str) -> dict[str, Any]:
         {
             "agent": agent,
             "action": "start",
+            "automated_pleas": False,
             "mode": "survive",
             "rest_below": 0.7,
             "flee_below": 0.7,
@@ -114,6 +115,7 @@ def main() -> int:
         {
             "agent": agent,
             "action": "start",
+            "automated_pleas": False,
             "mode": "farm",
             "hunt": args.prey,
             "assigned_room": args.room,

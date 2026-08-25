@@ -2651,6 +2651,30 @@ class BotController:
                 and active
                 and self._background_farm_mismatch(active, running) is None
             ):
+                # Re-adoption normally avoids touching a healthy keeper. Apply a
+                # changed speech policy in place, however, so a previously opted-in
+                # persisted keeper cannot keep making canned pleas after config turns
+                # them off (and vice versa). Starting an already-running keeper is an
+                # idempotent policy update in the harness.
+                running_policy = running.get("policy")
+                current_pleas = (
+                    bool(running_policy["automatedPleas"])
+                    if isinstance(running_policy, dict)
+                    and "automatedPleas" in running_policy
+                    else None
+                )
+                if current_pleas != self.config.policy.automated_help_pleas:
+                    self.broker.call_tool(
+                        "autopilot",
+                        {
+                            "agent": self.config.game.agent,
+                            "action": "start",
+                            "mode": "farm",
+                            "automated_pleas": self.config.policy.automated_help_pleas,
+                        },
+                        timeout=20,
+                        mutation=True,
+                    )
                 self.storage.emit_event(
                     "background_farm.recovered",
                     "Re-adopted the active goal's farming keeper after controller restart",
@@ -2680,6 +2704,7 @@ class BotController:
                     "rest_below": self.config.policy.rest_health_fraction,
                     "flee_below": max(0.75, self.config.policy.rest_health_fraction),
                     "break_out_via_logoff": False,
+                    "automated_pleas": self.config.policy.automated_help_pleas,
                 }
             )
             if mode in {"survive", "idle"}:
@@ -9928,6 +9953,13 @@ class BotController:
             if tool == "autopilot"
             else None
         )
+        if tool == "autopilot" and arguments.get("action") == "start":
+            # Canned keeper speech is an operator policy, never a tactical model
+            # choice. Send it on every launch so an old persisted true value cannot
+            # leak into a new goal after the local configuration disables it.
+            normalized["automated_pleas"] = (
+                self.config.policy.automated_help_pleas
+            )
         if tool == "fight":
             # The harness checks health between rounds, not between swings. One
             # swing per one-round call makes the controller's next observation
@@ -16308,6 +16340,7 @@ class BotController:
                 # Reconnecting while a just-entered sanctuary has not yet been
                 # durably saved can restore the prior dangerous room.
                 "break_out_via_logoff": False,
+                "automated_pleas": self.config.policy.automated_help_pleas,
             },
             timeout=20,
             mutation=True,
@@ -16404,6 +16437,7 @@ class BotController:
                     0.75, self.config.policy.rest_health_fraction
                 ),
                 "break_out_via_logoff": False,
+                "automated_pleas": self.config.policy.automated_help_pleas,
             },
             timeout=20,
             mutation=True,

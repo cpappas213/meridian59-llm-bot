@@ -152,6 +152,7 @@ real vault.
 | AT-CONV-008 | P0 | Configure planning temperature 0.2 and chat temperature 0.7. Responder and greeter requests use 0.7 while all non-chat model requests remain at 0.2. | FR-CONV-009 |
 | AT-CONV-009 | P0 | Exchange 12 total lines with one speaker inside 30 minutes. Further lines are retained for private chat display but invoke no model and send no reply; capacity returns after the rolling window expires. | FR-CONV-010 |
 | AT-CONV-010 | P0 | A player message requests a new goal and immediate game actions. The responder may discuss public game/character state, but no goal, planner, keeper, or gameplay mutation is called. | FR-GOAL-012, FR-CONV-001, FR-CONV-005 |
+| AT-CONV-011 | P0 | Leave `automated_help_pleas` absent/false, trigger post-death recovery in an inn and low-health recovery in the field, and observe inventory/equip/Create Weapon recovery with no broadcast or room speech. Reconcile a keeper whose policy omits or retains true and verify the controller sends false. Explicitly enable the option and verify only the canned plea is restored; incoming responder replies and model-decided greetings still operate when it is false. | FR-CONV-001, FR-CONV-011 |
 
 ## 8. Hermes and API tests
 

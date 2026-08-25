@@ -101,6 +101,7 @@ class PolicyConfig:
     protected_item_value_threshold: int
     protected_item_names: tuple[str, ...]
     consequential_action_guidance: str
+    automated_help_pleas: bool = False
 
 
 @dataclass(frozen=True)
@@ -333,7 +334,7 @@ class BotConfig:
             raise ValueError("controller goal commitment and stall durations cannot be negative")
 
         policy_raw = _section(raw, "policy")
-        _unknown(policy_raw, {"avoid_death", "bank_before_hazard", "rest_health_fraction", "critical_health_fraction", "carried_currency_bank_threshold", "protected_item_value_threshold", "protected_item_names", "consequential_action_guidance"}, "policy")
+        _unknown(policy_raw, {"avoid_death", "bank_before_hazard", "rest_health_fraction", "critical_health_fraction", "carried_currency_bank_threshold", "protected_item_value_threshold", "protected_item_names", "consequential_action_guidance", "automated_help_pleas"}, "policy")
         policy = PolicyConfig(
             avoid_death=bool(policy_raw.get("avoid_death", True)),
             bank_before_hazard=bool(policy_raw.get("bank_before_hazard", True)),
@@ -343,6 +344,7 @@ class BotConfig:
             protected_item_value_threshold=int(policy_raw.get("protected_item_value_threshold", 5000)),
             protected_item_names=tuple(str(item) for item in policy_raw.get("protected_item_names", [])),
             consequential_action_guidance=str(policy_raw.get("consequential_action_guidance", "strongly_avoid_unnecessary_loss")),
+            automated_help_pleas=bool(policy_raw.get("automated_help_pleas", False)),
         )
         if not 0 < policy.critical_health_fraction <= policy.rest_health_fraction <= 1:
             raise ValueError("health fractions must satisfy 0 < critical <= rest <= 1")

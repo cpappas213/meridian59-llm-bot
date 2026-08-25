@@ -101,6 +101,18 @@ class PolicyAndJournalTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "model.auth_mode"):
                 BotConfig.load(path)
 
+    def test_automated_help_pleas_are_default_off_and_explicitly_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bot.toml"
+            path.write_text("", encoding="utf-8")
+            self.assertFalse(BotConfig.load(path).policy.automated_help_pleas)
+
+            path.write_text(
+                "[policy]\nautomated_help_pleas = true\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(BotConfig.load(path).policy.automated_help_pleas)
+
     def test_openai_payload_uses_only_configured_compatibility_extensions(self) -> None:
         class Response:
             def __enter__(self) -> "Response":

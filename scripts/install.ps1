@@ -484,7 +484,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "d469565be0beada820ea9177f65e9851d2aebb1f"
+expected_revision = "5fc12710dd2c23782c63077c2484c67f999b3649"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -537,6 +537,7 @@ carried_currency_bank_threshold = 1
 protected_item_value_threshold = 5000
 protected_item_names = []
 consequential_action_guidance = "strongly_avoid_unnecessary_loss"
+automated_help_pleas = false
 
 [learning]
 enabled = true

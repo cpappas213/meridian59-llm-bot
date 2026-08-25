@@ -28,7 +28,17 @@ def config(root: Path, *, obsidian: bool = False) -> BotConfig:
         harness=HarnessConfig(root, "test", "http://127.0.0.1:8901", 8902, "external", "node", data / "fleet.json"),
         model=ModelConfig("http://127.0.0.1:8000/v1", "test-model", 5, 5, 100, 0),
         controller=ControllerConfig("127.0.0.1", 0, "127.0.0.1", 0, 0.01, 0.01, 1, "survive", True),
-        policy=PolicyConfig(True, True, 0.7, 0.4, 500, 5000, ("artifact",), "strongly_avoid_unnecessary_loss"),
+        policy=PolicyConfig(
+            True,
+            True,
+            0.7,
+            0.4,
+            500,
+            5000,
+            ("artifact",),
+            "strongly_avoid_unnecessary_loss",
+            automated_help_pleas=False,
+        ),
         notifications=NotificationConfig(False, "notice", obsidian, root / "vault" if obsidian else None, "01 Projects/Meridian 59 Bot", "Meridian 59 Bot.md", "Journal"),
         secrets={"M59_BOT_CONTROL_TOKEN": "test-token"},
         # Most controller tests target goal execution. Onboarding behavior has
