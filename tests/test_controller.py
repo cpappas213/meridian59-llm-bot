@@ -5338,8 +5338,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_pause_keeps_keeper_ownership_when_survival_handoff_fails(self) -> None:
+    def test_pause_retries_retained_keeper_ownership_on_next_turn(self) -> None:
         class FailingHandoffBroker(BackgroundFarmBroker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.handoff_failures_remaining = 1
+
             def call_tool(
                 self,
                 name: str,
@@ -5348,7 +5352,12 @@ class ControllerTests(unittest.TestCase):
                 timeout: float = 180,
                 mutation: bool = False,
             ) -> object:
-                if name == "autopilot" and arguments.get("action") == "start":
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and self.handoff_failures_remaining > 0
+                ):
+                    self.handoff_failures_remaining -= 1
                     raise ToolCallError("keeper handoff failed")
                 return super().call_tool(
                     name, arguments, timeout=timeout, mutation=mutation
@@ -5357,7 +5366,8 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
-                controller.broker = FailingHandoffBroker()
+                broker = FailingHandoffBroker()
+                controller.broker = broker
                 goal = controller.storage.submit_goal(
                     goal_payload(request_id="pause-failed-handoff")
                 )["goal"]
@@ -5377,6 +5387,48 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     owner,
                     controller.storage.get_runtime("background_farm_owner_v1", {}),
+                )
+
+                reconciled = controller.turn()
+
+                self.assertTrue(reconciled["idle"])
+                self.assertTrue(
+                    reconciled["keeper_reconciliation"][
+                        "inactive_goal_keeper_handoff"
+                    ]
+                )
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("background_farm_owner_v1", {})
+                )
+                events = controller.storage.events(
+                    kinds=["background_farm.inactive_owner_handoff"]
+                )["events"]
+                self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_idle_turn_retasks_unowned_farm_keeper_to_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+
+                result = controller.turn()
+
+                self.assertTrue(result["idle"])
+                self.assertTrue(
+                    result["keeper_reconciliation"][
+                        "inactive_goal_keeper_handoff"
+                    ]
+                )
+                self.assertIsNone(
+                    result["keeper_reconciliation"]["previous_goal_id"]
+                )
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("background_farm_owner_v1", {})
                 )
             finally:
                 controller.storage.close()
@@ -11834,6 +11886,91 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_supervision_flags_critical_or_unverified_safe_spot_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_activity = "fighting from a proven safe spot"
+                broker.farm_safe_spot = {
+                    "works": True,
+                    "room": 544,
+                    "col": 44,
+                    "row": 32,
+                }
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                controller.storage.submit_goal(
+                    goal_payload(request_id="critical-wall-status")
+                )
+
+                critical = controller.status(
+                    detail="supervision", include_recent_events=0
+                )
+
+                critical_keeper = critical["attention"]["liveness"][
+                    "broker_keeper"
+                ]
+                self.assertEqual(
+                    "critical_health_during_farm",
+                    critical_keeper["safety_conflict"]["kind"],
+                )
+                self.assertEqual(
+                    "fighting from a proven safe spot",
+                    critical_keeper["safety_conflict"]["reported_activity"],
+                )
+                self.assertEqual(
+                    "critical", critical["attention"]["liveness"]["state"]
+                )
+                self.assertEqual(
+                    "keeper_conflict", critical["controller"]["safety_owner"]
+                )
+                self.assertFalse(critical["controller"]["safety_covered"])
+
+                broker.vitals["health"] = {"current": 39, "max": 39}
+                broker.farm_safe_spot = False
+                controller.last_observation = broker.observe()
+                off_wall = controller.status(
+                    detail="supervision", include_recent_events=0
+                )
+
+                off_wall_keeper = off_wall["attention"]["liveness"][
+                    "broker_keeper"
+                ]
+                self.assertEqual(
+                    "unverified_proven_safe_spot_activity",
+                    off_wall_keeper["safety_conflict"]["kind"],
+                )
+                self.assertEqual(
+                    "critical", off_wall["attention"]["liveness"]["state"]
+                )
+                self.assertFalse(off_wall["controller"]["safety_covered"])
+
+                for activity in (
+                    "pulling quarry back to a proven safe spot",
+                    "away from a proven safe spot — fighting",
+                ):
+                    with self.subTest(activity=activity):
+                        broker.farm_activity = activity
+                        pulling = controller.status(
+                            detail="supervision", include_recent_events=0
+                        )
+                        pulling_keeper = pulling["attention"]["liveness"][
+                            "broker_keeper"
+                        ]
+                        self.assertNotIn("safety_conflict", pulling_keeper)
+                        self.assertNotEqual(
+                            "critical", pulling["attention"]["liveness"]["state"]
+                        )
+                        self.assertEqual(
+                            "keeper", pulling["controller"]["safety_owner"]
+                        )
+                        self.assertTrue(pulling["controller"]["safety_covered"])
+            finally:
+                controller.storage.close()
+
     def test_paused_goal_supervision_uses_latest_global_recovery_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -12647,8 +12784,20 @@ class ControllerTests(unittest.TestCase):
                 self.assertFalse(call["buy_food"])
                 self.assertTrue(call["use_safe_spots"])
                 self.assertEqual(0.9, call["hold_resume_above"])
+                self.assertEqual(8, call["pull_within"])
                 self.assertFalse(call["break_out_via_logoff"])
                 self.assertEqual(len(broker.inventory_items) + 6, call["max_carry"])
+
+                explicit_unlimited, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "pull_within": 0,
+                    },
+                    broker.observe(),
+                )
+                self.assertEqual(0, explicit_unlimited["pull_within"])
             finally:
                 controller.storage.close()
 
@@ -12807,6 +12956,81 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(broker.farm_running)
                 self.assertIsNone(broker.farm_inert)
                 self.assertEqual("survive", broker.farm_mode)
+                self.assertFalse(controller._game_action_active.is_set())
+            finally:
+                controller.storage.close()
+
+    def test_outside_safety_invariant_retasks_critical_farm_before_yield(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_mode = "farm"
+                controller.broker = broker
+
+                coverage = controller._ensure_outside_safety_owner(
+                    broker.observe(),
+                    reason="test critical farm boundary",
+                )
+
+                self.assertTrue(coverage["covered"])
+                self.assertEqual("keeper", coverage["owner"])
+                self.assertTrue(coverage["restored"])
+                self.assertTrue(coverage["critical_farm_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertTrue(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "survive"
+                        for name, arguments in broker.calls
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_outside_safety_invariant_rejects_unacknowledged_critical_handoff(
+        self,
+    ) -> None:
+        class IgnoredSurvivalStartBroker(BackgroundFarmBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "survive"
+                ):
+                    self.calls.append((name, dict(arguments)))
+                    return {"running": True, "mode": "farm"}
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = IgnoredSurvivalStartBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                controller.broker = broker
+
+                with self.assertRaisesRegex(
+                    ToolCallError, "survival keeper did not acknowledge"
+                ):
+                    controller._ensure_outside_safety_owner(
+                        broker.observe(),
+                        reason="test ignored critical handoff",
+                    )
+
+                self.assertEqual("farm", broker.farm_mode)
                 self.assertFalse(controller._game_action_active.is_set())
             finally:
                 controller.storage.close()
@@ -18394,7 +18618,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_critical_farm_recovery_preserves_active_phase_and_tactic(self) -> None:
+    def test_critical_farm_retasks_to_survival_without_quarantining_tactic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -18404,7 +18628,14 @@ class ControllerTests(unittest.TestCase):
                     "num": 535,
                     "name": "West Merchant Way through Ilerian Woods",
                 }
-                broker.vitals["health"] = {"current": 10, "max": 26}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_activity = "fighting from a proven safe spot"
+                broker.farm_safe_spot = {
+                    "works": True,
+                    "room": 535,
+                    "col": 44,
+                    "row": 32,
+                }
                 broker.farm_did.update({"kills": 4, "withdrawals": 0})
                 broker.farm_placement = {
                     "assigned_room": 535,
@@ -18471,9 +18702,11 @@ class ControllerTests(unittest.TestCase):
                 result = controller.turn()
 
                 self.assertTrue(result["survival_interrupt"])
-                self.assertTrue(result["background_farm"]["farm_recovery_preserved"])
-                self.assertFalse(result["background_farm"]["switched_to_survival"])
-                self.assertEqual("farm", broker.farm_mode)
+                self.assertTrue(
+                    result["background_farm"]["critical_recovery_handoff"]
+                )
+                self.assertTrue(result["background_farm"]["switched_to_survival"])
+                self.assertEqual("survive", broker.farm_mode)
                 self.assertTrue(broker.farm_running)
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(phase["id"], active["id"])
@@ -18500,11 +18733,12 @@ class ControllerTests(unittest.TestCase):
                 )
                 events = controller.storage.goal_events(
                     goal["id"],
-                    kinds=["background_farm.critical_recovery_monitored"],
+                    kinds=["background_farm.critical_recovery_handoff"],
                     limit=10,
                 )
                 self.assertEqual(1, len(events))
                 self.assertTrue(events[0]["data"]["campaign_phase_preserved"])
+                self.assertTrue(events[0]["data"]["ownership_preserved"])
             finally:
                 controller.storage.close()
 

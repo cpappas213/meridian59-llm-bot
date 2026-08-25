@@ -190,6 +190,9 @@ BROKER_WALKING_MONEY = 400
 # begins earlier, and the separate emergency survival fallback remains more
 # conservative. This is the operator-approved combat-risk boundary for farms.
 FARM_FLEE_THRESHOLD = 0.60
+# Pulling leaves the verified wall. Always overwrite a legacy persisted
+# unlimited policy unless a durable recipe explicitly supplies an override.
+FARM_PULL_WITHIN = 8
 # Foreground fights are reduced to one observable swing and re-evaluated on
 # every controller turn. Requiring exactly 100% health before each swing makes
 # combat impossible in rooms where ambient aggression lands during model
@@ -9998,6 +10001,17 @@ class BotController:
                     # value is still normalized to the wall strategy.
                     "use_safe_spots": False if allow_open_field else True,
                     "hold_resume_above": max(0.9, float(arguments.get("hold_resume_above", 0.9))),
+                    # The harness constructor now defaults to eight, but its
+                    # roster persists the complete prior policy. An older
+                    # saved ``null`` would otherwise override that new default
+                    # after every broker restart. Send the safe ceiling on
+                    # every farm launch while preserving an explicit durable
+                    # 0/null override.
+                    "pull_within": (
+                        arguments["pull_within"]
+                        if "pull_within" in arguments
+                        else FARM_PULL_WITHIN
+                    ),
                     # max_carry counts occupied inventory entries, not only new
                     # loot.  A well-supplied character can already exceed the
                     # broker default before the keeper starts, causing an
@@ -10598,7 +10612,15 @@ class BotController:
             timeout=20,
             mutation=False,
         )
-        if self._keeper_owns_outside_safety(status):
+        keeper_owns_safety = self._keeper_owns_outside_safety(status)
+        health_fraction = self._vital_fraction(observation, "health")
+        critical_farm_owner = bool(
+            keeper_owns_safety
+            and str(status.get("mode") or "").casefold() == "farm"
+            and health_fraction is not None
+            and health_fraction < self.config.policy.critical_health_fraction
+        )
+        if keeper_owns_safety and not critical_farm_owner:
             return {
                 "covered": True,
                 "owner": "keeper",
@@ -10616,7 +10638,10 @@ class BotController:
                 timeout=20,
                 mutation=False,
             )
-            if not self._keeper_owns_outside_safety(verified):
+            if not (
+                self._keeper_is_driving(verified)
+                and str(verified.get("mode") or "").casefold() == "survive"
+            ):
                 raise ToolCallError(
                     "outside-safe-room safety invariant failed: survival keeper "
                     "did not acknowledge active ownership"
@@ -10643,6 +10668,7 @@ class BotController:
                 "activity": verified.get("activity"),
                 "room_id": room_id,
                 "restored": True,
+                "critical_farm_handoff": critical_farm_owner,
             }
         finally:
             self._end_foreground_action()
@@ -11667,6 +11693,126 @@ class BotController:
             data=response,
         )
         return response
+
+    def _reconcile_inactive_goal_keeper(self) -> dict[str, Any] | None:
+        """Retask a farm keeper whose durable owner is no longer runnable.
+
+        A pause commits durable state before attempting its synchronous keeper
+        handoff. If that broker mutation fails, the ownership record is kept so
+        a later controller turn can retry. Do that retry here, including the
+        legacy/no-owner case where a farm loop is still driving with no active
+        goal. Never leave an autonomous farm running merely because the goal
+        that launched it is now paused or absent.
+        """
+
+        active = self.storage.active_goal()
+        owner = self.storage.get_runtime("background_farm_owner_v1", {})
+        owner = owner if isinstance(owner, dict) else {}
+        owner_goal_id = str(owner.get("goal_id") or "")
+        active_goal_id = str((active or {}).get("id") or "")
+        # An active replacement goal already has a mismatch-aware keeper
+        # reconciliation path in _manage_background_farm. Restrict this retry
+        # to the otherwise-unhandled idle boundary so we do not consume the
+        # replacement goal's turn before it can record that exact mismatch.
+        if active is not None:
+            return None
+
+        status = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        farm_is_driving = bool(
+            self._keeper_is_driving(status)
+            and str(status.get("mode") or "").casefold() == "farm"
+        )
+        if not farm_is_driving:
+            if owner_goal_id:
+                self.storage.set_runtime("background_farm_owner_v1", {})
+            return None
+
+        switched = self._ensure_survival_keeper()
+        verified = self.broker.call_tool(
+            "autopilot",
+            {"agent": self.config.game.agent, "action": "status"},
+            timeout=20,
+            mutation=False,
+        )
+        if not (
+            self._keeper_is_driving(verified)
+            and str(verified.get("mode") or "").casefold() == "survive"
+        ):
+            raise ToolCallError(
+                "inactive-goal keeper handoff failed: survival keeper did not "
+                "acknowledge active ownership"
+            )
+        self.storage.set_runtime("background_farm_owner_v1", {})
+        result = {
+            "inactive_goal_keeper_handoff": True,
+            "previous_goal_id": owner_goal_id or None,
+            "active_goal_id": active_goal_id or None,
+            "previous_activity": status.get("activity"),
+            "verified_activity": verified.get("activity"),
+            "result": redact(switched),
+        }
+        self.storage.emit_event(
+            "background_farm.inactive_owner_handoff",
+            "Retasked a farm keeper whose durable goal was no longer active",
+            severity="warning",
+            interesting=True,
+            goal_id=owner_goal_id or None,
+            data=result,
+        )
+        return result
+
+    def _handoff_critical_farm_at_turn_entry(
+        self, observation: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Yield a critically injured farm before any turn can return early.
+
+        Goal validation, completion reconciliation, and deterministic preflight
+        all have legitimate early-return branches. Waiting for the later goal
+        advisory therefore leaves a critically injured character under the
+        same farm recipe for an entire controller turn. Perform the existing
+        phase-preserving handoff immediately after observation instead.
+        """
+
+        health_fraction = self._vital_fraction(observation, "health")
+        if (
+            health_fraction is None
+            or health_fraction >= self.config.policy.critical_health_fraction
+        ):
+            return None
+        goal = self.storage.active_goal()
+        if goal is None:
+            return None
+        status = self.broker.call_tool(
+            "autopilot",
+            {
+                "agent": self.config.game.agent,
+                "action": "status",
+                "full_journal": True,
+            },
+            timeout=20,
+            mutation=False,
+        )
+        if not (
+            self._keeper_is_driving(status)
+            and str(status.get("mode") or "").casefold() == "farm"
+        ):
+            return None
+        # Retask immediately, but defer campaign/quarantine classification to
+        # the normal advisory point. Campaign evaluation above that point may
+        # latch a more specific completion or abandonment boundary, and a
+        # legacy farm with no active phase has its own existing disposition.
+        # Keeping the pre-handoff status lets that later classifier see the
+        # exact farm state even though safety already owns the character.
+        switched = self._ensure_survival_keeper()
+        return {
+            "previous_farm_status": status,
+            "safety_handoff": redact(switched),
+        }
 
     def _active_goal_cancellation_assessment(
         self, goal: dict[str, Any], payload: dict[str, Any]
@@ -15976,18 +16122,18 @@ class BotController:
                 "result": redact(switched),
             }
         if not evidence.get("quarantine_reasons") and matching_active_phase:
-            # The farm keeper already owns flee, withdrawal, and recovery. A
-            # global critical-health advisory can observe the same health dip
-            # one turn earlier than the farm supervisor, but that timing does
-            # not turn a first recoverable incident into proof that the room
-            # or phase failed. Keep the bounded phase and keeper recipe intact;
-            # a death or another precise structural quarantine reason will
-            # still take the terminal handoff below.
+            # Ordinary flee-threshold recovery remains farm-owned in
+            # _manage_background_farm. Reaching the controller's genuinely
+            # critical boundary is different: the farm keeper has already
+            # missed its earlier flee boundary, so merely trusting that same
+            # recipe is fail-open. Retask the live loop to survival without
+            # condemning the room, wall, prey, phase, or strategic goal.
+            switched = self._ensure_survival_keeper()
             self.storage.emit_event(
-                "background_farm.critical_recovery_monitored",
-                "Critical health remained under the active farm keeper's recovery control",
-                severity="notice",
-                interesting=False,
+                "background_farm.critical_recovery_handoff",
+                "Critical health forced the active farm keeper into survival recovery",
+                severity="warning",
+                interesting=True,
                 goal_id=goal["id"],
                 data={
                     "activity": status.get("activity"),
@@ -16001,18 +16147,22 @@ class BotController:
                         "retreat_incident_count", 0
                     ),
                     "campaign_phase_preserved": True,
+                    "ownership_preserved": True,
+                    "result": redact(switched),
                 },
             )
             return {
-                "farm_recovery_preserved": True,
-                "switched_to_survival": False,
+                "critical_recovery_handoff": True,
+                "switched_to_survival": True,
                 "campaign_phase_failed": None,
                 "strategic_goal_preserved": True,
+                "ownership_preserved": True,
                 "activity": status.get("activity"),
                 "reasons": evidence.get("recovery_reasons", []),
                 "retreat_incident_count": evidence.get(
                     "retreat_incident_count", 0
                 ),
+                "result": redact(switched),
             }
         if not evidence.get("quarantine_reasons"):
             # An unowned/legacy farm loop has no durable phase recipe to
@@ -19257,6 +19407,10 @@ class BotController:
             self.storage.record_snapshot(redact(observation))
             self._record_character_progress(observation)
             self.dependencies["broker"] = "healthy"
+            keeper_reconciliation = self._reconcile_inactive_goal_keeper()
+            entry_critical_farm_handoff = (
+                self._handoff_critical_farm_at_turn_entry(observation)
+            )
             if self._safety_enforcement_active:
                 self._ensure_outside_safety_owner(
                     observation,
@@ -19271,6 +19425,11 @@ class BotController:
                 onboarding = self._onboarding_turn(observation)
                 return {
                     "idle": True,
+                    **(
+                        {"keeper_reconciliation": keeper_reconciliation}
+                        if keeper_reconciliation is not None
+                        else {}
+                    ),
                     "reconciled_goal_ids": [item["id"] for item in reconciled],
                     "repaired_goal_block_ids": [
                         item["id"] for item in repaired_goal_blocks
@@ -19523,7 +19682,18 @@ class BotController:
                     }
             advisories = self._goal_advisories(goal, observation)
             if any(item["kind"] == "survival_interrupt" for item in advisories):
-                handoff = self._handoff_background_farm_to_survival(goal, observation)
+                if entry_critical_farm_handoff is not None:
+                    handoff = self._handoff_background_farm_to_survival(
+                        goal,
+                        observation,
+                        status=entry_critical_farm_handoff[
+                            "previous_farm_status"
+                        ],
+                    )
+                else:
+                    handoff = self._handoff_background_farm_to_survival(
+                        goal, observation
+                    )
                 # A foreground fight/travel goal has no farm keeper for the
                 # handoff helper to convert. Start recovery directly instead
                 # of repeatedly suppressing planning while nothing heals or
@@ -26201,6 +26371,8 @@ class BotController:
             marker in activity_text.casefold() for marker in ("stalled", "error")
         ):
             state = "stalled"
+        if isinstance((broker_activity or {}).get("safety_conflict"), dict):
+            state = "critical"
         compact_suppression = None
         if suppression:
             compact_suppression = {
@@ -26786,11 +26958,51 @@ class BotController:
                             "started_at",
                             "updated_at",
                             "error",
+                            "safe_spot",
                         )
                         if key in raw_keeper
                     }
             except (BrokerError, TypeError, ValueError):
                 keeper = {"status": "unavailable"}
+        health_fraction = self._vital_fraction(observation, "health")
+        keeper_activity = str((keeper or {}).get("activity") or "")
+        activity_casefold = keeper_activity.casefold()
+        claimed_proven_wall = activity_casefold.startswith(
+            (
+                "fighting from a proven safe spot",
+                "waiting at a proven safe spot",
+                "holding a proven safe spot",
+                "pulling quarry to a proven safe spot",
+                "resting at a proven safe spot",
+            )
+        )
+        safe_spot = (keeper or {}).get("safe_spot")
+        safe_spot_works = bool(
+            isinstance(safe_spot, dict) and safe_spot.get("works") is True
+        )
+        critical_farm_conflict = bool(
+            keeper
+            and self._keeper_is_driving(keeper)
+            and str(keeper.get("mode") or "").casefold() == "farm"
+            and health_fraction is not None
+            and health_fraction < self.config.policy.critical_health_fraction
+        )
+        off_wall_activity_conflict = bool(
+            claimed_proven_wall and not safe_spot_works
+        )
+        if keeper is not None and (
+            critical_farm_conflict or off_wall_activity_conflict
+        ):
+            keeper["safety_conflict"] = {
+                "kind": (
+                    "critical_health_during_farm"
+                    if critical_farm_conflict
+                    else "unverified_proven_safe_spot_activity"
+                ),
+                "health_fraction": health_fraction,
+                "reported_activity": keeper_activity,
+                "safe_spot_works": safe_spot_works,
+            }
         foreground_action = (
             dict(self._foreground_action)
             if isinstance(self._foreground_action, dict)
@@ -26802,16 +27014,23 @@ class BotController:
             deep_get(observation, "look.room_id"),
         )
         verified_safe_room = self._verified_safe_staging(observed_room_id)
+        keeper_safety_conflict = bool(
+            isinstance(keeper, dict) and keeper.get("safety_conflict")
+        )
         safety_owner = (
             "controller_foreground_action"
             if foreground_action is not None
             else (
-                "keeper"
-                if self._keeper_owns_outside_safety(keeper)
+                "keeper_conflict"
+                if keeper_safety_conflict
                 else (
-                    "verified_safe_room"
-                    if verified_safe_room is not None
-                    else "unowned_unsafe_room"
+                    "keeper"
+                    if self._keeper_owns_outside_safety(keeper)
+                    else (
+                        "verified_safe_room"
+                        if verified_safe_room is not None
+                        else "unowned_unsafe_room"
+                    )
                 )
             )
         )
@@ -26870,7 +27089,8 @@ class BotController:
                     )
                 ),
                 "safety_owner": safety_owner,
-                "safety_covered": safety_owner != "unowned_unsafe_room",
+                "safety_covered": safety_owner
+                not in {"unowned_unsafe_room", "keeper_conflict"},
                 "foreground_action": foreground_action,
             },
             "game": {
