@@ -39,6 +39,10 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Preferred collision-proven baked room rails over learned coordinate tracks and
+  bounded the remaining learned replay by one deadline and movement budget. Tight
+  forest crossings no longer expand one stale waypoint into repeated fine-walk
+  searches and wall oscillation.
 - Made deterministic post-death and low-health help pleas explicitly opt-in and
   default-off without disabling self-rearming, LLM replies, or LLM-decided
   greetings. Restart reconciliation now fails closed on missing/stale plea
@@ -63,7 +67,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `5fc12710dd2c23782c63077c2484c67f999b3649`, based on official upstream revision
+  `fd7cc092142561432473ae44d10f270e2abc34e0`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
