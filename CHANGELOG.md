@@ -57,11 +57,15 @@ and intends to use semantic versioning after its first public release.
   flows. Finish destinations now come only from approved goal criteria, while
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
-- Updated the bundled `m59-harness` pin to official upstream revision
-  `892d94d6b0361970100d39b1f6fb35eb4a9ea794`, retained direct-session semantics
-  for the synchronous controller, disabled the upstream travel-errand default,
-  and withheld experimental or death-retry keeper controls plus deliberate
-  jumps until the bot supports their lifecycle and movement policies.
+- Updated the bundled `m59-harness` pin to public integration revision
+  `286912fbeb5eea378722d1f7f816c365ecda8970`, based on official upstream revision
+  `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
+  exhausted wall-search denials while retaining spawn-cap and independent danger
+  evidence.
+- Kept operator-named farm prey binding across research, campaign phases, and
+  keeper launches. Exhausting only a safe-wall search now retries the same room
+  and prey in bounded open-field mode, while death, critical-health, room-hazard,
+  and spawn-cap evidence continues to block unsafe tactics.
 - Made `Esc` an immediate, consistent cancel/back control across character
   status, goal drafting/review, goal modification, goal management, priority
   editing, and destructive confirmations.

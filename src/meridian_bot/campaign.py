@@ -188,7 +188,6 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "map",
         "travel",
         "autopilot",
-        "fight",
         "knowledge_search",
     },
     "recover": {

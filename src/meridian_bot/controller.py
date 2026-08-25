@@ -152,6 +152,11 @@ FARM_STAGNATION_RETRY_SECONDS = 15 * 60
 # A hard keeper stop is cooperative: the current pass may take several seconds
 # to unwind. Do not reissue and relearn the same stop on every controller turn.
 FARM_STOP_RETRY_SECONDS = 2 * 60
+# A durable open-field fallback may outlive a lost broker reply. Retry it with
+# a short exponential delay, but never let an unavailable mutation endpoint
+# spin on every controller turn forever.
+FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS = 3
+FARM_OPEN_FIELD_FALLBACK_RETRY_SECONDS = 5
 # Keep a bounded audit trail of recovery episodes. These are ordinary work
 # cycles and never escalate to quarantine merely because they repeat.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
@@ -5692,16 +5697,25 @@ class BotController:
                 "invalid_farm_phase_outcome",
                 "invalid_combat_training_phase_outcome",
                 "invalid_prepare_combat_phase_outcome",
+                "operator_farm_target_mismatch",
             }
         ):
             # This guard must run before completion-checkpoint reconciliation.
-            # Older controller builds could persist and latch a farm whose sole
-            # outcome was "autopilot launched"; otherwise the checkpoint path
-            # keeps stopping the keeper before the normal grounding gate runs.
+            # Older controller builds could persist a farm with either an
+            # action-only outcome or substituted prey; otherwise a checkpoint
+            # or keeper owner can mask the invalid phase during resume.
             self._clear_phase_completion_checkpoint(str(phase["id"]))
+            target_mismatch = (
+                persisted_blocker.get("kind")
+                == "operator_farm_target_mismatch"
+            )
             reason = str(
                 persisted_blocker.get("guidance")
-                or "persisted keeper phase has no observable outcome"
+                or (
+                    "persisted farm phase conflicts with the operator-required prey"
+                    if target_mismatch
+                    else "persisted keeper phase has no observable outcome"
+                )
             )
             finished = self.storage.transition_campaign_phase(
                 str(phase["id"]),
@@ -5711,7 +5725,11 @@ class BotController:
             )
             self.storage.emit_event(
                 "campaign.phase.grounding_rejected",
-                "Retired a persisted phase whose action-only outcome was not observable",
+                (
+                    "Retired a persisted farm phase that substituted different prey"
+                    if target_mismatch
+                    else "Retired a persisted phase whose action-only outcome was not observable"
+                ),
                 severity="warning",
                 interesting=False,
                 goal_id=goal.get("id"),
@@ -5721,6 +5739,9 @@ class BotController:
                     "strategic_goal_preserved": True,
                 },
             )
+            if target_mismatch:
+                self._clear_safety_suppression(str(goal.get("id") or ""))
+                self._clear_planner_feedback()
             return PhaseOutcome(
                 False,
                 True,
@@ -6049,6 +6070,22 @@ class BotController:
                 ),
                 None,
             )
+            direct_rooms = result.get("rooms")
+            if direct_target is not None and isinstance(direct_rooms, list):
+                # Exact-creature hunting_grounds lookups return one canonical
+                # creature plus a top-level list of room records, unlike the
+                # generic for_level shape whose rooms are nested under prey.
+                for candidate_room in direct_rooms:
+                    add_candidate(
+                        target=direct_target,
+                        room=candidate_room,
+                        attempt=attempt,
+                        source=(
+                            candidate_room
+                            if isinstance(candidate_room, dict)
+                            else result
+                        ),
+                    )
             if direct_target is not None:
                 add_candidate(
                     target=direct_target,
@@ -6076,9 +6113,9 @@ class BotController:
                     )
         return candidates, attempts
 
-    @staticmethod
+    @classmethod
     def _research_rejection_disposition(
-        blocker: dict[str, Any] | None,
+        cls, blocker: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Project one blocker into stable, causal tactic evidence."""
 
@@ -6093,6 +6130,11 @@ class BotController:
         if kind in {"quarantined_farm_tactic", "quarantined_farm_phase"}:
             return farm_quarantine_evidence_identity(evidence)
         if kind in {"stagnated_farm_tactic", "stagnated_farm_phase"}:
+            if (
+                evidence.get("kind") == "farm_assignment_deferred"
+                and cls._farm_wall_search_only_deferral(evidence)
+            ):
+                return {"class": "safe_spot_failure", "scope": "exact_tactic"}
             deltas = evidence.get("deltas")
             deltas = deltas if isinstance(deltas, dict) else {}
             try:
@@ -6121,6 +6163,8 @@ class BotController:
         if blocker.get("kind") not in {
             "quarantined_farm_tactic",
             "quarantined_farm_phase",
+            "stagnated_farm_tactic",
+            "stagnated_farm_phase",
         }:
             return False
         disposition = cls._research_rejection_disposition(blocker)
@@ -6149,6 +6193,16 @@ class BotController:
         """
 
         candidates, attempts = self._research_farm_candidates(phase)
+        required_target = self._goal_bound_farm_target(goal)
+        unmatched_candidate_count = 0
+        if required_target:
+            matching_candidates = [
+                candidate
+                for candidate in candidates
+                if self._farm_targets_match(candidate.get("target"), required_target)
+            ]
+            unmatched_candidate_count = len(candidates) - len(matching_candidates)
+            candidates = matching_candidates
         context = phase.get("context")
         context = context if isinstance(context, dict) else {}
         avoid_rooms = self._recent_research_avoid_rooms(run)
@@ -6203,7 +6257,13 @@ class BotController:
             ],
             key=canonical_json,
         )
-        candidate_set_fingerprint = json_hash(candidate_set)
+        candidate_set_fingerprint = json_hash(
+            (
+                {"required_target": required_target, "candidates": candidate_set}
+                if required_target
+                else candidate_set
+            )
+        )
         exhaustion_values = self.storage.get_runtime(
             RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY, {}
         )
@@ -6301,7 +6361,9 @@ class BotController:
             "status": "selected" if selected is not None else (
                 "no_usable_candidate" if attempts else "awaiting_hunting_grounds"
             ),
+            "required_target": required_target,
             "candidate_count": len(candidates),
+            "unmatched_candidate_count": unmatched_candidate_count,
             "candidate_set_fingerprint": candidate_set_fingerprint,
             "tactic_count": len(rejected) + int(selected is not None),
             "rejected": [
@@ -6360,6 +6422,7 @@ class BotController:
         fingerprint = json_hash(
             {
                 "status": semantic_outcome["status"],
+                "required_target": required_target,
                 "candidate_set_fingerprint": candidate_set_fingerprint,
                 "tactic_count": semantic_outcome["tactic_count"],
                 "rejected": stable_rejections,
@@ -6404,9 +6467,11 @@ class BotController:
             self._clear_research_recipe_exhaustion(str(goal.get("id") or ""))
             return {
                 "status": "selected",
+                "required_target": required_target,
                 "fingerprint": fingerprint,
                 "recipe": selected,
                 "candidate_count": len(candidates),
+                "unmatched_candidate_count": unmatched_candidate_count,
                 "candidate_set_fingerprint": candidate_set_fingerprint,
                 "disposition_fingerprint": disposition_fingerprint,
                 "tactic_count": semantic_outcome["tactic_count"],
@@ -6415,8 +6480,10 @@ class BotController:
             }
         return {
             "status": semantic_outcome["status"],
+            "required_target": required_target,
             "fingerprint": fingerprint,
             "candidate_count": len(candidates),
+            "unmatched_candidate_count": unmatched_candidate_count,
             "candidate_set_fingerprint": candidate_set_fingerprint,
             "disposition_fingerprint": disposition_fingerprint,
             "tactic_count": semantic_outcome["tactic_count"],
@@ -6433,6 +6500,12 @@ class BotController:
             candidate_count = max(0, int(value.get("candidate_count", 0) or 0))
         except (TypeError, ValueError):
             candidate_count = 0
+        try:
+            unmatched_candidate_count = max(
+                0, int(value.get("unmatched_candidate_count", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            unmatched_candidate_count = 0
         rejected = sorted(
             [
                 {
@@ -6459,7 +6532,9 @@ class BotController:
             status = "no_usable_candidate"
         return {
             "status": status,
+            "required_target": normalize_farm_target(value.get("required_target")),
             "candidate_count": candidate_count,
+            "unmatched_candidate_count": unmatched_candidate_count,
             "candidate_set_fingerprint": value.get("candidate_set_fingerprint"),
             "disposition_fingerprint": value.get("disposition_fingerprint"),
             "rejected": rejected,
@@ -6477,8 +6552,10 @@ class BotController:
             key: validation.get(key)
             for key in (
                 "status",
+                "required_target",
                 "fingerprint",
                 "candidate_count",
+                "unmatched_candidate_count",
                 "candidate_set_fingerprint",
                 "disposition_fingerprint",
                 "tactic_count",
@@ -6564,7 +6641,11 @@ class BotController:
             "semantic_identity": semantic_identity,
             "repeat_count": len(phase_ids),
             "phase_ids": phase_ids[-10:],
+            "required_target": validation.get("required_target"),
             "candidate_count": validation.get("candidate_count", 0),
+            "unmatched_candidate_count": validation.get(
+                "unmatched_candidate_count", 0
+            ),
             "candidate_set_fingerprint": validation.get(
                 "candidate_set_fingerprint"
             ),
@@ -6579,10 +6660,19 @@ class BotController:
             "retry_state_fingerprint": retry_state_fingerprint,
             "recorded_at": timestamp(),
             "guidance": (
-                "Every source-derived room/prey/tactic candidate conflicts with "
-                "retained quarantine, stagnation, or route evidence. A changed "
-                "candidate set is research progress but is not executable success; "
-                "new enabling world, route, or survivability evidence is required."
+                (
+                    "Progression research produced no executable room for the "
+                    f"operator-required prey {validation.get('required_target')!r}; "
+                    "other creatures are not substitutes. New enabling world, route, "
+                    "or survivability evidence is required."
+                )
+                if validation.get("required_target")
+                else (
+                    "Every source-derived room/prey/tactic candidate conflicts with "
+                    "retained quarantine, stagnation, or route evidence. A changed "
+                    "candidate set is research progress but is not executable success; "
+                    "new enabling world, route, or survivability evidence is required."
+                )
             ),
         }
         values[goal_id] = record
@@ -6697,6 +6787,16 @@ class BotController:
         context = research_phase.get("context")
         context = context if isinstance(context, dict) else {}
         recipe = context.get("farm_recipe")
+        required_target = self._goal_bound_farm_target(goal)
+        if (
+            isinstance(recipe, dict)
+            and required_target
+            and not self._farm_targets_match(recipe.get("target"), required_target)
+        ):
+            # A pause/resume may expose a recipe cached by an older controller.
+            # Revalidate from source attempts instead of carrying that stale
+            # prey's room into the newly bound target.
+            recipe = None
         if not isinstance(recipe, dict):
             validation = self._research_farm_recipe_validation(
                 goal, run, research_phase, observation
@@ -6704,6 +6804,10 @@ class BotController:
             if validation.get("status") != "selected":
                 return None
             recipe = validation["recipe"]
+        if required_target and not self._farm_targets_match(
+            recipe.get("target"), required_target
+        ):
+            return None
         proposed = self._researched_farm_phase(
             goal, research_phase, recipe, observation
         )
@@ -10190,8 +10294,9 @@ class BotController:
                 f"{goal['id']}|{assigned_room}|{str(arguments.get('hunt') or '').strip().casefold()}"
             )
             stagnation = stagnations.get(stagnation_key)
-            if isinstance(stagnation, dict) and self._farm_stagnation_blocks(
-                stagnation
+            if isinstance(stagnation, dict) and self._farm_stagnation_blocks_strategy(
+                stagnation,
+                use_safe_spots=arguments.get("use_safe_spots"),
             ):
                 blockers.append(
                     {
@@ -12082,6 +12187,154 @@ class BotController:
         return intent
 
     @staticmethod
+    def _farm_target_name_variants(value: Any) -> set[str]:
+        """Return singular/plural spellings used only for exact phrase matching."""
+
+        target = normalize(value)
+        if not target:
+            return set()
+        variants = {target}
+        words = target.split()
+        last = words[-1]
+        if last.endswith("y") and len(last) > 1 and last[-2] not in "aeiou":
+            plural = last[:-1] + "ies"
+        elif last.endswith(("s", "x", "z", "ch", "sh")):
+            plural = last + "es"
+        else:
+            plural = last + "s"
+        variants.add(" ".join([*words[:-1], plural]))
+        return variants
+
+    def _canonical_farm_target(self, value: Any) -> str:
+        """Resolve one prey spelling to its source-canonical creature name."""
+
+        raw_target = " ".join(str(value or "").split())
+        target = normalize(value)
+        if not target:
+            return ""
+        resolver = getattr(self.knowledge, "resolve", None)
+        if not callable(resolver):
+            return target
+        try:
+            result = resolver(
+                raw_target,
+                kinds=["creature"],
+                limit=8,
+                allow_fuzzy=True,
+            )
+        except TypeError:
+            # Small test doubles and older knowledge adapters may not expose
+            # the fuzzy flag. Exact canonicalization remains useful there.
+            try:
+                result = resolver(raw_target, kinds=["creature"], limit=8)
+            except (TypeError, ValueError):
+                return target
+        except ValueError:
+            return target
+        if not isinstance(result, dict) or result.get("status") not in {
+            "found",
+            "found_fuzzy",
+        }:
+            return target
+        entity = result.get("entity")
+        if not isinstance(entity, dict):
+            return target
+        canonical = normalize_farm_target(entity.get("canonical_name"))
+        return canonical or target
+
+    def _farm_targets_match(self, left: Any, right: Any) -> bool:
+        """Compare prey through canonical knowledge with a plural-safe fallback."""
+
+        left_target = self._canonical_farm_target(left)
+        right_target = self._canonical_farm_target(right)
+        if not left_target or not right_target:
+            return False
+        if left_target == right_target:
+            return True
+        return bool(
+            self._farm_target_name_variants(left_target)
+            & self._farm_target_name_variants(right_target)
+        )
+
+    def _goal_bound_farm_target(self, goal: dict[str, Any] | None) -> str | None:
+        """Recover one operator-required prey from syntax or explicit goal prose.
+
+        The public goal is the authority boundary. Narrative recognition accepts
+        only a creature name or alias that literally occurs in farm/combat prose;
+        fuzzy search results alone never become operator intent.
+        """
+
+        if not isinstance(goal, dict):
+            return None
+        structured = self._goal_farm_intent(goal).get("hunt")
+        if structured:
+            return self._canonical_farm_target(structured) or None
+
+        constraints = goal.get("constraints")
+        notes = (
+            str(constraints.get("operator_notes") or "")
+            if isinstance(constraints, dict)
+            else ""
+        )
+        prose_segments = [
+            str(value or "")
+            for value in (goal.get("title"), goal.get("objective"), notes)
+            if str(value or "").strip()
+        ]
+        prose = " ".join(prose_segments)
+        normalized_prose = normalize(prose)
+        if not re.search(
+            r"\b(?:farm|farms|farming|hunt|hunts|hunting|kill|kills|killing|fight|fights|fighting|slay|slays|slaying|grind|grinding)\b",
+            normalized_prose,
+        ):
+            return None
+        search = getattr(self.knowledge, "search", None)
+        if not callable(search):
+            return None
+        matches: list[dict[str, Any]] = []
+        seen_entities: set[str] = set()
+        for segment in prose_segments:
+            try:
+                result = search(segment, kinds=["creature"], limit=20)
+            except (TypeError, ValueError):
+                continue
+            segment_matches = (
+                result.get("matches") if isinstance(result, dict) else None
+            )
+            for entity in (
+                segment_matches if isinstance(segment_matches, list) else []
+            ):
+                if not isinstance(entity, dict):
+                    continue
+                identity = str(
+                    entity.get("id") or entity.get("canonical_name") or ""
+                ).casefold()
+                if not identity or identity in seen_entities:
+                    continue
+                seen_entities.add(identity)
+                matches.append(entity)
+        corpus = f" {normalized_prose} "
+        mentioned: set[str] = set()
+        for entity in matches:
+            if not isinstance(entity, dict):
+                continue
+            canonical = self._canonical_farm_target(entity.get("canonical_name"))
+            if not canonical:
+                continue
+            names = [entity.get("canonical_name")]
+            aliases = entity.get("aliases")
+            if isinstance(aliases, list):
+                names.extend(aliases)
+            variants = {
+                variant
+                for name in names
+                for variant in self._farm_target_name_variants(name)
+            }
+            if any(f" {variant} " in corpus for variant in variants):
+                mentioned.add(canonical)
+        return next(iter(mentioned)) if len(mentioned) == 1 else None
+
+    @staticmethod
     def _train_ability_uses_combat_keeper(
         phase: dict[str, Any] | None,
     ) -> bool:
@@ -12228,6 +12481,29 @@ class BotController:
             return None
         return phase
 
+    @staticmethod
+    def _farm_open_field_fallback(
+        phase: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        context = phase.get("context") if isinstance(phase, dict) else None
+        context = context if isinstance(context, dict) else {}
+        fallback = context.get("safe_spot_fallback")
+        return fallback if isinstance(fallback, dict) else {}
+
+    @staticmethod
+    def _farm_open_field_fallback_matches(
+        phase: dict[str, Any] | None, intent: dict[str, Any]
+    ) -> bool:
+        fallback = BotController._farm_open_field_fallback(phase)
+        return bool(
+            fallback.get("kind") == "wall_search_exhausted"
+            and intent.get("use_safe_spots") is False
+            and str(fallback.get("assigned_room"))
+            == str(intent.get("assigned_room"))
+            and " ".join(str(fallback.get("hunt") or "").casefold().split())
+            == str(intent.get("hunt") or "")
+        )
+
     def _keeper_combat_work_remains(
         self,
         goal: dict[str, Any],
@@ -12256,18 +12532,46 @@ class BotController:
         that intentionally leave those hour-to-hour choices to the configured planner.
         """
         goal_intent = self._goal_farm_intent(goal)
+        bound_target = self._goal_bound_farm_target(goal)
+        if bound_target:
+            goal_intent["hunt"] = bound_target
         run = self.storage.campaign_run(str(goal.get("id") or ""))
         phase = self.storage.active_campaign_phase(run["id"]) if run else None
         phase_intent = self._campaign_phase_farm_intent(phase)
-        keys = set(goal_intent) | set(phase_intent)
-        return {
+        phase_kind = str(phase.get("kind") or "") if isinstance(phase, dict) else ""
+        phase_target_mismatch = bool(
+            phase_kind == "farm"
+            and bound_target
+            and not self._farm_targets_match(phase_intent.get("hunt"), bound_target)
+        )
+        merge_phase_intent = {} if phase_target_mismatch else phase_intent
+        keys = set(goal_intent) | set(merge_phase_intent)
+        intent = {
             key: (
                 goal_intent.get(key)
                 if goal_intent.get(key) is not None
-                else phase_intent.get(key)
+                else merge_phase_intent.get(key)
             )
             for key in keys
         }
+        if self._train_ability_uses_combat_keeper(phase):
+            # A capability-building detour owns its local prey/room recipe as a
+            # unit. The public farm target remains binding when the farm phase
+            # resumes, but must not hybridize with a support phase's room.
+            for key in ("assigned_room", "hunt"):
+                if phase_intent.get(key) is not None:
+                    intent[key] = phase_intent[key]
+        # An operator-authored safe-wall preference normally outranks an
+        # internal phase. Once the keeper has exhaustively disproved only the
+        # wall-placement strategy, however, the controller records a narrow
+        # same-room/same-prey fallback in that phase. Keep that evidence-backed
+        # override durable so the next status poll does not mistake the retasked
+        # open-field keeper for a stale job and stop it.
+        if not phase_target_mismatch and self._farm_open_field_fallback_matches(
+            phase, phase_intent
+        ):
+            intent["use_safe_spots"] = False
+        return intent
 
     def _farm_fight_vigor(self, goal: dict[str, Any]) -> int:
         intent = self._effective_farm_intent(goal)
@@ -12676,8 +12980,8 @@ class BotController:
             )
         return None
 
-    @staticmethod
     def _farm_quarantine_matches(
+        self,
         quarantine: dict[str, Any], arguments: dict[str, Any]
     ) -> bool:
         """Whether a quarantine applies to this exact room/prey/strategy.
@@ -12691,11 +12995,11 @@ class BotController:
             room=arguments.get("assigned_room"),
             target=arguments.get("hunt"),
             use_safe_spots=arguments.get("use_safe_spots"),
+            target_matches=self._farm_targets_match,
         )
 
-    @classmethod
     def _matching_farm_quarantine(
-        cls, raw: Any, arguments: dict[str, Any]
+        self, raw: Any, arguments: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Return the strongest retained disposition for one exact tactic."""
 
@@ -12704,7 +13008,7 @@ class BotController:
             for _key, record in farm_quarantine_entries(
                 raw, room=arguments.get("assigned_room")
             )
-            if cls._farm_quarantine_matches(record, arguments)
+            if self._farm_quarantine_matches(record, arguments)
         ]
         if not matching:
             return None
@@ -12808,6 +13112,19 @@ class BotController:
             return True
         age = self._age_seconds(stagnation.get("recorded_at"))
         return age is None or age < FARM_STAGNATION_RETRY_SECONDS
+
+    def _farm_stagnation_blocks_strategy(
+        self, stagnation: dict[str, Any], *, use_safe_spots: Any
+    ) -> bool:
+        """Keep legacy wall-search outcomes scoped to the wall strategy."""
+
+        if (
+            use_safe_spots is False
+            and stagnation.get("kind") == "farm_assignment_deferred"
+            and self._farm_wall_search_only_deferral(stagnation)
+        ):
+            return False
+        return self._farm_stagnation_blocks(stagnation)
 
     def _repair_transient_farm_stagnations(self) -> list[dict[str, Any]]:
         """Remove legacy permanent blocks created from a brand-new live stall."""
@@ -13172,6 +13489,12 @@ class BotController:
             )
         ):
             reasons.append("running keeper belongs to a different campaign phase")
+        phase_intent = self._campaign_phase_farm_intent(active_phase)
+        fallback = self._farm_open_field_fallback(active_phase)
+        fallback_pending = bool(
+            fallback.get("state") == "pending"
+            and self._farm_open_field_fallback_matches(active_phase, phase_intent)
+        )
         for field in (
             "assigned_room",
             "hunt",
@@ -13180,6 +13503,16 @@ class BotController:
             "buy_food",
         ):
             wanted = expected.get(field)
+            if (
+                field == "use_safe_spots"
+                and fallback_pending
+                and wanted is False
+                and actual.get(field) is True
+            ):
+                # Durable intent was committed before the broker effect. Let the
+                # assignment handler safely retry that one pending false policy
+                # instead of stopping the keeper as though it were stale.
+                continue
             if wanted is not None and str(actual.get(field)) != str(wanted):
                 reasons.append(f"{field} is {actual.get(field)!r}, expected {wanted!r}")
         if not reasons:
@@ -13660,6 +13993,56 @@ class BotController:
         }
 
     @staticmethod
+    def _farm_wall_search_only_deferral(value: dict[str, Any]) -> bool:
+        """Whether deferral evidence proves only safe-wall placement failed."""
+
+        records = [value]
+        records.extend(
+            nested
+            for key in ("farm_evidence", "safety_evidence")
+            if isinstance((nested := value.get(key)), dict)
+        )
+        for record in records:
+            deltas = record.get("deltas")
+            deltas = deltas if isinstance(deltas, dict) else {}
+            if any(
+                int(deltas.get(name, 0) or 0) > 0
+                for name in (
+                    "deaths",
+                    "deaths_in_safe_spot",
+                    "deaths_in_proven_safe_spot",
+                    "withdrawals",
+                )
+            ):
+                return False
+            if (
+                record.get("death_is_new") is True
+                or record.get("underworld") is True
+                or record.get("quarantined") is True
+                or str(record.get("last_error") or "").strip()
+                or record.get("quarantine_reasons")
+                or record.get("recovery_reasons")
+                or record.get("risk_reasons")
+                or record.get("live_overlevel_hostiles")
+                or str(record.get("evidence_class") or "").casefold()
+                in {"death", "room_hazard", "route_failure"}
+                or "underworld"
+                in str(record.get("room_name") or record.get("room") or "").casefold()
+            ):
+                return False
+        text = " ".join(canonical_json(value).casefold().split())
+        return bool(
+            "room wall search exhausted" in text
+            or "stopping the wall search" in text
+            or "bounded wall search exhausted" in text
+            or (
+                "top-ranked walls" in text
+                and "pull window" in text
+                and ("failed" in text or "exhaust" in text)
+            )
+        )
+
+    @staticmethod
     def _farm_assignment_deferral_evidence(
         status: dict[str, Any],
         *,
@@ -13745,19 +14128,361 @@ class BotController:
             ),
         )
 
+    def _update_farm_open_field_fallback(
+        self,
+        phase: dict[str, Any],
+        *,
+        changes: dict[str, Any],
+        reason: str,
+    ) -> dict[str, Any]:
+        fallback = self._farm_open_field_fallback(phase)
+        context = phase.get("context")
+        context = dict(context) if isinstance(context, dict) else {}
+        fallback = dict(fallback)
+        fallback.update(changes)
+        context["use_safe_spots"] = False
+        context["safe_spot_fallback"] = fallback
+        return self.storage.update_campaign_phase_guardrails(
+            str(phase["id"]),
+            abandon_predicates=list(phase.get("abandon_predicates", [])),
+            context=context,
+            reason=reason,
+        )
+
+    def _confirm_farm_open_field_fallback(
+        self, phase: dict[str, Any], *, reason: str
+    ) -> dict[str, Any]:
+        fallback = self._farm_open_field_fallback(phase)
+        if fallback.get("state") == "applied":
+            return phase
+        return self._update_farm_open_field_fallback(
+            phase,
+            changes={"state": "applied", "applied_at": timestamp()},
+            reason=reason,
+        )
+
+    def _fail_pending_farm_open_field_fallback(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any],
+        completion: dict[str, Any],
+        *,
+        assigned_room: Any,
+        target: str,
+        error: str,
+    ) -> dict[str, Any]:
+        reason = (
+            "Could not apply the persisted open-field farm fallback after "
+            f"{FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS} bounded attempts: {error}"
+        )
+        marked_phase = self._update_farm_open_field_fallback(
+            phase,
+            changes={
+                "state": "failed",
+                "failed_at": timestamp(),
+                "last_error": error[:500],
+            },
+            reason="bounded open-field keeper retask attempts were exhausted",
+        )
+        recovery = self._ensure_survival_keeper()
+        self.storage.set_runtime("background_farm_owner_v1", {})
+        failed_phase = self._fail_active_campaign_phase(goal, reason)
+        self.storage.emit_event(
+            "background_farm.safe_spot_fallback_failed",
+            "Handed the keeper to survival after bounded open-field retask failures",
+            severity="error",
+            interesting=True,
+            goal_id=goal["id"],
+            data={
+                "phase_id": phase["id"],
+                "assigned_room": assigned_room,
+                "target": target,
+                "attempt_count": FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS,
+                "error": error[:500],
+                "campaign_phase_failed": (
+                    failed_phase.get("id") if failed_phase else None
+                ),
+                "strategic_goal_preserved": True,
+                "recovery": redact(recovery),
+            },
+        )
+        return {
+            "background_farm_open_field_fallback_failed": True,
+            "phase": marked_phase,
+            "campaign_phase_failed": failed_phase,
+            "strategic_goal_preserved": True,
+            "goal_blocked": False,
+            "assigned_room": assigned_room,
+            "target": target,
+            "attempt_count": FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS,
+            "error": error[:500],
+            "recovery": recovery,
+            "completion": completion,
+        }
+
+    def _retask_farm_without_safe_spots(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        completion: dict[str, Any],
+        *,
+        phase: dict[str, Any],
+        assigned_room: Any,
+        target: str,
+        deferral_evidence: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Persist and apply the same tactic without its exhausted wall search."""
+
+        required_target = self._goal_bound_farm_target(goal)
+        if required_target and not self._farm_targets_match(target, required_target):
+            return None
+        fallback_intent = self._effective_farm_intent(goal)
+        fallback_intent.update(
+            {
+                "assigned_room": assigned_room,
+                "hunt": target,
+                "use_safe_spots": False,
+            }
+        )
+        arguments: dict[str, Any] = {
+            "agent": self.config.game.agent,
+            "action": "start",
+            "mode": "farm",
+            "bank_above": 0,
+        }
+        arguments.update(
+            {key: value for key, value in fallback_intent.items() if value is not None}
+        )
+        arguments, safety_changes = self._normalize_combat_arguments(
+            "autopilot",
+            arguments,
+            observation,
+            allow_open_field=True,
+        )
+
+        # A wall-placement failure is nonlethal, but the proposed open-field
+        # tactic can still have independent durable safety evidence. Never use
+        # this fallback to cross a death/live-hazard quarantine.
+        quarantines = self.storage.get_runtime("farm_tactic_quarantine_v1", {})
+        quarantines = quarantines if isinstance(quarantines, dict) else {}
+        if self._matching_farm_quarantine(quarantines, arguments) is not None:
+            return None
+
+        detail = str(
+            deferral_evidence.get("reason")
+            or "the keeper exhausted its bounded wall-placement search"
+        ).strip()
+        phase_intent = self._campaign_phase_farm_intent(phase)
+        fallback = self._farm_open_field_fallback(phase)
+        intent_already_persisted = self._farm_open_field_fallback_matches(
+            phase, phase_intent
+        )
+        if intent_already_persisted:
+            updated_phase = phase
+        else:
+            requested_at = timestamp()
+            fallback = {
+                "kind": "wall_search_exhausted",
+                "state": "pending",
+                "assigned_room": assigned_room,
+                "hunt": target.casefold(),
+                "recorded_at": requested_at,
+                "requested_at": requested_at,
+                "reason": detail,
+                "source": deferral_evidence.get("source"),
+            }
+            context = phase.get("context")
+            context = dict(context) if isinstance(context, dict) else {}
+            context["use_safe_spots"] = False
+            context["safe_spot_fallback"] = fallback
+            updated_phase = self.storage.update_campaign_phase_guardrails(
+                str(phase["id"]),
+                abandon_predicates=list(phase.get("abandon_predicates", [])),
+                context=context,
+                reason=(
+                    "retained the grounded farm room and prey after only the bounded "
+                    "safe-wall placement search was exhausted"
+                ),
+            )
+            self._invalidate_execution_plan(
+                goal,
+                (
+                    "safe-wall placement was exhausted; continue the same grounded "
+                    "farm phase using its persisted open-field fallback"
+                ),
+            )
+
+        owner = self.storage.get_runtime("background_farm_owner_v1", {})
+        owner = dict(owner) if isinstance(owner, dict) else {}
+        owner.update(
+            {
+                "goal_id": goal["id"],
+                "phase_id": phase["id"],
+                "phase_kind": phase.get("kind"),
+                "assigned_room": assigned_room,
+                "hunt": target.casefold(),
+                "use_safe_spots": False,
+            }
+        )
+        self.storage.set_runtime("background_farm_owner_v1", owner)
+        snapshot_key = f"background_farm_snapshot_v2:{goal['id']}"
+        snapshot = self.storage.get_runtime(snapshot_key, {})
+        snapshot = dict(snapshot) if isinstance(snapshot, dict) else {}
+        snapshot["use_safe_spots"] = False
+        self.storage.set_runtime(snapshot_key, snapshot)
+        if not intent_already_persisted:
+            self.storage.emit_event(
+                "background_farm.safe_spot_fallback_requested",
+                "Persisted an open-field farm fallback before retasking the keeper",
+                severity="notice",
+                interesting=False,
+                goal_id=goal["id"],
+                data={
+                    "phase_id": phase["id"],
+                    "assigned_room": assigned_room,
+                    "target": target,
+                    "use_safe_spots": False,
+                    "deferral_evidence": redact(deferral_evidence),
+                },
+            )
+
+        fallback = self._farm_open_field_fallback(updated_phase)
+        attempt_count = int(fallback.get("attempt_count", 0) or 0)
+        now_epoch = time.time()
+        next_retry_at = fallback.get("next_retry_at_epoch")
+        if (
+            attempt_count > 0
+            and isinstance(next_retry_at, (int, float))
+            and not isinstance(next_retry_at, bool)
+            and now_epoch < float(next_retry_at)
+        ):
+            return {
+                "background_farm_open_field_fallback_pending": True,
+                "phase": updated_phase,
+                "assigned_room": assigned_room,
+                "target": target,
+                "use_safe_spots": False,
+                "attempt_count": attempt_count,
+                "retry_in_seconds": round(float(next_retry_at) - now_epoch, 3),
+                "completion": completion,
+            }
+        if attempt_count >= FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS:
+            return self._fail_pending_farm_open_field_fallback(
+                goal,
+                updated_phase,
+                completion,
+                assigned_room=assigned_room,
+                target=target,
+                error=str(fallback.get("last_error") or "keeper retask remained unresolved"),
+            )
+
+        attempt_count += 1
+        retry_delay = min(
+            60,
+            FARM_OPEN_FIELD_FALLBACK_RETRY_SECONDS * (2 ** (attempt_count - 1)),
+        )
+        updated_phase = self._update_farm_open_field_fallback(
+            updated_phase,
+            changes={
+                "state": "pending",
+                "attempt_count": attempt_count,
+                "last_attempt_at": timestamp(),
+                "last_attempt_at_epoch": now_epoch,
+                "next_retry_at_epoch": now_epoch + retry_delay,
+            },
+            reason="recorded a bounded open-field keeper retask attempt",
+        )
+        try:
+            retasked = self.broker.call_tool(
+                "autopilot",
+                arguments,
+                timeout=20,
+                mutation=True,
+            )
+        except BrokerError as exc:
+            # The broker may have accepted the new policy before its reply was
+            # lost. Keep the durable marker pending; the next status poll either
+            # confirms false without another call or retries only that false
+            # policy. It can never reconstruct the superseded wall strategy.
+            updated_phase = self._update_farm_open_field_fallback(
+                updated_phase,
+                changes={
+                    "last_failure_at": timestamp(),
+                    "last_error": str(exc)[:500],
+                },
+                reason="keeper reply failed for a bounded open-field retask attempt",
+            )
+            if attempt_count >= FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS:
+                return self._fail_pending_farm_open_field_fallback(
+                    goal,
+                    updated_phase,
+                    completion,
+                    assigned_room=assigned_room,
+                    target=target,
+                    error=str(exc),
+                )
+            self.storage.emit_event(
+                "background_farm.safe_spot_fallback_pending",
+                "Open-field fallback remains pending after the keeper reply failed",
+                severity="warning",
+                interesting=True,
+                goal_id=goal["id"],
+                data={
+                    "phase_id": phase["id"],
+                    "assigned_room": assigned_room,
+                    "target": target,
+                    "attempt_count": attempt_count,
+                    "retry_in_seconds": retry_delay,
+                    "error": str(exc)[:500],
+                },
+            )
+            raise
+
+        updated_phase = self._confirm_farm_open_field_fallback(
+            updated_phase,
+            reason="keeper accepted the persisted open-field farm fallback",
+        )
+        self.storage.emit_event(
+            "background_farm.safe_spot_fallback",
+            "Retasked the same farm phase to fight without safe-wall placement",
+            severity="notice",
+            interesting=True,
+            goal_id=goal["id"],
+            data={
+                "phase_id": phase["id"],
+                "assigned_room": assigned_room,
+                "target": target,
+                "use_safe_spots": False,
+                "deferral_evidence": redact(deferral_evidence),
+                "safety_changes": redact(safety_changes),
+                "retask": redact(retasked),
+            },
+        )
+        return {
+            "background_farm_open_field_fallback": True,
+            "phase": updated_phase,
+            "assigned_room": assigned_room,
+            "target": target,
+            "use_safe_spots": False,
+            "deferral_evidence": redact(deferral_evidence),
+            "retask": retasked,
+            "completion": completion,
+        }
+
     def _handle_deferred_farm_assignment(
         self,
         goal: dict[str, Any],
         observation: dict[str, Any],
         status: dict[str, Any],
         completion: dict[str, Any],
+        farm_evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Retire only the active tactic when the keeper exhausts its room.
+        """Handle a bounded assignment outcome without overgeneralizing it.
 
-        ``assignment_deferred`` is an authoritative, bounded keeper outcome:
-        the requested prey/room combination has no remaining usable placement
-        candidate in this session. It is not a generic stall and must not leave
-        the campaign phase claiming ownership while the keeper relocates.
+        Exhausting wall placement disproves only the safe-wall strategy, so a
+        healthy, death-free keeper retains the phase, room, and prey and switches
+        to open-field combat. Other assignment outcomes keep the older terminal
+        tactic handling below.
         """
 
         phase = self._active_keeper_combat_phase(goal)
@@ -13772,6 +14497,93 @@ class BotController:
         target = str(intent.get("hunt") or self._farm_target(status)).strip()
         if assigned_room is None or not target:
             return None
+
+        farm_evidence = farm_evidence if isinstance(farm_evidence, dict) else {}
+        health_fraction = farm_evidence.get("health_fraction")
+        critical_health = bool(
+            isinstance(health_fraction, (int, float))
+            and not isinstance(health_fraction, bool)
+            and float(health_fraction) < self.config.policy.critical_health_fraction
+        )
+        deltas = farm_evidence.get("deltas")
+        deltas = deltas if isinstance(deltas, dict) else {}
+        death_evidence = bool(
+            farm_evidence.get("death_is_new")
+            or any(
+                int(deltas.get(name, 0) or 0) > 0
+                for name in (
+                    "deaths",
+                    "deaths_in_safe_spot",
+                    "deaths_in_proven_safe_spot",
+                )
+            )
+        )
+        safety_evidence = bool(
+            farm_evidence.get("quarantine_reasons")
+            or farm_evidence.get("recovery_reasons")
+            or farm_evidence.get("live_overlevel_hostiles")
+            or critical_health
+            or death_evidence
+            or self._underworld(observation)
+        )
+        fallback_marker = self._farm_open_field_fallback(phase)
+        fallback_pending = bool(
+            fallback_marker.get("state") == "pending"
+            and self._farm_open_field_fallback_matches(phase, intent)
+        )
+        if fallback_pending:
+            if safety_evidence:
+                return None
+            actual_safe_spots = deep_get(
+                status,
+                "policy.useSafeSpots",
+                deep_get(status, "policy.use_safe_spots"),
+            )
+            if actual_safe_spots is False:
+                updated_phase = self._confirm_farm_open_field_fallback(
+                    phase,
+                    reason=(
+                        "keeper status confirmed the pending open-field fallback "
+                        "after an unavailable mutation reply"
+                    ),
+                )
+                self.storage.emit_event(
+                    "background_farm.safe_spot_fallback",
+                    "Confirmed the pending open-field fallback from keeper status",
+                    severity="notice",
+                    interesting=True,
+                    goal_id=goal["id"],
+                    data={
+                        "phase_id": phase["id"],
+                        "assigned_room": assigned_room,
+                        "target": target,
+                        "use_safe_spots": False,
+                        "reconciled_from_status": True,
+                    },
+                )
+                return {
+                    "background_farm_open_field_fallback": True,
+                    "reconciled_from_status": True,
+                    "phase": updated_phase,
+                    "assigned_room": assigned_room,
+                    "target": target,
+                    "use_safe_spots": False,
+                    "completion": completion,
+                }
+            if actual_safe_spots is True:
+                return self._retask_farm_without_safe_spots(
+                    goal,
+                    observation,
+                    completion,
+                    phase=phase,
+                    assigned_room=assigned_room,
+                    target=target,
+                    deferral_evidence={
+                        "source": "persisted_phase",
+                        "record": fallback_marker,
+                        "reason": fallback_marker.get("reason"),
+                    },
+                )
 
         snapshot = self.storage.get_runtime(
             f"background_farm_snapshot_v2:{goal['id']}", {}
@@ -13791,6 +14603,29 @@ class BotController:
         )
         if deferral_evidence is None:
             return None
+
+        wall_search_only = self._farm_wall_search_only_deferral(deferral_evidence)
+        if wall_search_only and intent.get("use_safe_spots") is False:
+            # The compact keeper journal can retain the transition record after
+            # policy was changed. It no longer describes the active open-field
+            # tactic and must not repeatedly retire the preserved phase.
+            return None
+        if (
+            wall_search_only
+            and intent.get("use_safe_spots") is True
+            and not safety_evidence
+        ):
+            fallback = self._retask_farm_without_safe_spots(
+                goal,
+                observation,
+                completion,
+                phase=phase,
+                assigned_room=assigned_room,
+                target=target,
+                deferral_evidence=deferral_evidence,
+            )
+            if fallback is not None:
+                return fallback
 
         detail = str(
             deferral_evidence.get("reason")
@@ -14825,12 +15660,6 @@ class BotController:
                 "completion": completion,
             }
 
-        assignment_deferred = self._handle_deferred_farm_assignment(
-            goal, observation, status, completion
-        )
-        if assignment_deferred is not None:
-            return assignment_deferred
-
         evidence = self._farm_status_evidence(goal, observation, status)
         if evidence.get("at_assigned_room") is True:
             live_threats = self._live_overlevel_hostiles(observation)
@@ -14896,6 +15725,19 @@ class BotController:
                 "retreat_incident_count": evidence.get("retreat_incident_count"),
                 "completion": completion,
             }
+
+        # Death, critical recovery, and live hazards must win over a positioning
+        # fallback reported in the same keeper pass. Only a clean wall-search
+        # outcome reaches the open-field retask.
+        assignment_deferred = self._handle_deferred_farm_assignment(
+            goal,
+            observation,
+            status,
+            completion,
+            farm_evidence=evidence,
+        )
+        if assignment_deferred is not None:
+            return assignment_deferred
 
         health_criteria = self._health_progress_criteria(goal, completion)
         unmet_health = [item for item in health_criteria if item["result"].get("met") is not True]
@@ -17083,6 +17925,24 @@ class BotController:
                     + " instead of relying on rationale prose"
                 ),
             }
+        if phase_kind == "farm" and goal_id:
+            bound_goal = self.storage.goal(str(goal_id))
+            required_target = self._goal_bound_farm_target(bound_goal)
+            if required_target and not self._farm_targets_match(
+                target, required_target
+            ):
+                return {
+                    "kind": "operator_farm_target_mismatch",
+                    "assigned_room": assigned_room,
+                    "hunt": target,
+                    "required_target": required_target,
+                    "use_safe_spots": use_safe_spots,
+                    "guidance": (
+                        f"farm target {target!r} conflicts with the operator-required "
+                        f"prey {required_target!r}; research and start a room for the "
+                        "required prey without substituting another creature"
+                    ),
+                }
         if criteria and all(
             criterion.get("kind") == "phase_action_succeeded"
             for criterion in criteria
@@ -17125,8 +17985,9 @@ class BotController:
                 f"{goal_id}|{assigned_room}|{str(target).strip().casefold()}"
             )
             stagnation = stagnations.get(stagnation_key)
-            if isinstance(stagnation, dict) and self._farm_stagnation_blocks(
-                stagnation
+            if isinstance(stagnation, dict) and self._farm_stagnation_blocks_strategy(
+                stagnation,
+                use_safe_spots=use_safe_spots,
             ):
                 return {
                     "kind": "stagnated_farm_phase",
@@ -17308,6 +18169,7 @@ class BotController:
         phase: dict[str, Any] | None,
         observation: dict[str, Any],
         execution_plan: dict[str, Any] | None,
+        goal: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Advance an explicitly grounded first-exit research contract.
 
@@ -17365,12 +18227,35 @@ class BotController:
             "status.vitals.health.max",
             deep_get(observation, "look.vitals.health.max"),
         )
+        required_target = self._goal_bound_farm_target(goal)
+        if not required_target and context.get("required_target"):
+            required_target = self._canonical_farm_target(
+                context.get("required_target")
+            )
+
+        def hunting_grounds_arguments() -> dict[str, Any] | None:
+            if required_target:
+                arguments: dict[str, Any] = {
+                    "creature": required_target,
+                    "limit": 12,
+                }
+                if isinstance(max_health, (int, float)) and not isinstance(
+                    max_health, bool
+                ):
+                    arguments["max_danger"] = int(max_health) + FARM_DANGER_MARGIN
+                return arguments
+            if isinstance(max_health, (int, float)) and not isinstance(
+                max_health, bool
+            ):
+                return {"for_level": int(max_health), "limit": 6}
+            return None
+
+        lookup_arguments = hunting_grounds_arguments()
         if context.get("deterministic_fallback") is True:
             if (
                 requires_hunting_grounds
                 and "hunting_grounds" not in successful_tools
-                and isinstance(max_health, (int, float))
-                and not isinstance(max_health, bool)
+                and lookup_arguments is not None
             ):
                 # A model sometimes keeps rewriting this fallback plan between
                 # `prey` and farm preparation. The phase contract itself names
@@ -17379,7 +18264,7 @@ class BotController:
                 step_id = plan_step("hunting_grounds") or plan_step("prey")
                 action = {
                     "tool": "hunting_grounds",
-                    "arguments": {"for_level": int(max_health), "limit": 6},
+                    "arguments": lookup_arguments,
                     "rationale": (
                         "Collect the exact bounded progression evidence required by "
                         "the deterministic fallback phase."
@@ -17397,8 +18282,7 @@ class BotController:
             not isinstance(destination, int)
             and requires_hunting_grounds
             and "hunting_grounds" not in successful_tools
-            and isinstance(max_health, (int, float))
-            and not isinstance(max_health, bool)
+            and lookup_arguments is not None
         ):
             # Manager-created research phases do not always need a staging
             # exit. Their trusted criterion still names the only adapter whose
@@ -17409,7 +18293,7 @@ class BotController:
             if step_id is not None:
                 return {
                     "tool": "hunting_grounds",
-                    "arguments": {"for_level": int(max_health), "limit": 6},
+                    "arguments": lookup_arguments,
                     "rationale": (
                         "Collect the exact typed progression candidates required "
                         "by the active farm-recipe research phase."
@@ -17455,20 +18339,14 @@ class BotController:
             for criterion in phase.get("success_criteria", [])
         )
         step_id = plan_step("hunting_grounds")
-        max_health = deep_get(
-            observation,
-            "status.vitals.health.max",
-            deep_get(observation, "look.vitals.health.max"),
-        )
         if (
             needs_hunting_grounds
             and step_id is not None
-            and isinstance(max_health, (int, float))
-            and not isinstance(max_health, bool)
+            and lookup_arguments is not None
         ):
             return {
                 "tool": "hunting_grounds",
-                "arguments": {"for_level": int(max_health), "limit": 6},
+                "arguments": lookup_arguments,
                 "rationale": (
                     "The declared first exit is reached; collect the exact progression "
                     "evidence required by this phase once."
@@ -17905,13 +18783,31 @@ class BotController:
                     "a successful unrelated action, or a plan rewrite. Change the buyer, "
                     "offered item set, tool, or causal prerequisite."
                 ).strip()
-        value["operator_contract"] = {
+        operator_contract = {
             "primary": "Complete the active operator-supplied strategic goal through ordinary gameplay.",
             "pvp": (
                 "Use player combat only when the active goal or immediate direct-defense context calls for it."
             ),
             "finish": "Use the active goal's deterministic terminal criteria; do not add a default destination.",
         }
+        bound_goal = (
+            self.storage.goal(str(run.get("goal_id") or ""))
+            if run.get("goal_id")
+            else None
+        )
+        required_target = self._goal_bound_farm_target(bound_goal)
+        if required_target:
+            operator_contract["binding_farm_target"] = required_target
+            value["instructions"] = (
+                str(value.get("instructions") or "")
+                + " The operator-required farm prey is "
+                + repr(required_target)
+                + ". Farm-recipe research and farm phases must retain that exact "
+                "creature. Supporting capability, recovery, equipment, supply, or "
+                "route phases may improve readiness but must not replace it with "
+                "different prey."
+            ).strip()
+        value["operator_contract"] = operator_contract
         return value
 
     def _reconcile_existing_campaign_phase(
@@ -18983,6 +19879,7 @@ class BotController:
                     campaign_phase,
                     observation,
                     execution_plan,
+                    goal=goal,
                 )
             )
             if structured_research is not None:
@@ -20402,6 +21299,37 @@ class BotController:
             f"{target!r}, then map the returned numeric room id for route evidence"
         )
 
+    def _guard_research_farm_target(
+        self,
+        goal: dict[str, Any],
+        phase: dict[str, Any] | None,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        """Keep model-selected farm-recipe research on operator-required prey."""
+
+        if (
+            tool != "hunting_grounds"
+            or not self._research_phase_requires_farm_recipe(phase)
+        ):
+            return
+        required_target = self._goal_bound_farm_target(goal)
+        if not required_target:
+            return
+        supplied_target = arguments.get("creature")
+        if (
+            not self._farm_targets_match(supplied_target, required_target)
+            or arguments.get("for_level") is not None
+            or arguments.get("room") is not None
+        ):
+            raise ModelError(
+                "farm-recipe research is bound to the operator-required prey "
+                f"{required_target!r}; call hunting_grounds with creature="
+                f"{required_target!r} and do not substitute for_level, room, or "
+                "another creature"
+            )
+        arguments["creature"] = required_target
+
     def _record_prepare_combat_sell_quote(
         self,
         goal: dict[str, Any],
@@ -20605,6 +21533,18 @@ class BotController:
                     "phase's exact source-verified sanctuary travel"
                 )
         self._guard_map_semantics(campaign_phase, tool, arguments)
+        self._guard_research_farm_target(
+            goal, campaign_phase, tool, arguments
+        )
+        if (
+            tool == "fight"
+            and isinstance(campaign_phase, dict)
+            and campaign_phase.get("kind") == "farm"
+        ):
+            raise ModelError(
+                "foreground fight is not executable during a farm phase; sustained "
+                "combat must remain with the health-aware farm keeper via autopilot"
+            )
         if (
             tool == "fight"
             and isinstance(campaign_phase, dict)

@@ -42,20 +42,22 @@ flowchart LR
 
 ### 2.1 Harness checkout
 
-The deployment shall use an independent checkout of
-[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), pinned directly
-to an explicit tested commit. The preferred implementation is a Git submodule at
-`vendor/m59-harness`; a configured external checkout is also allowed for local
-development.
+The deployment shall use an independent checkout derived from
+[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), pinned to an
+explicit tested commit. The preferred implementation is the public integration
+fork as a Git submodule at `vendor/m59-harness`; a configured external checkout is
+also allowed for local development.
 
 Rules for the upstream boundary:
 
-- No copied source snapshot and no permanent private fork.
+- No copied source snapshot and no private fork; integration patches remain public
+  and retain the authoritative upstream as their base.
 - No controller behavior injected into the harness broker.
 - The controller consumes the broker's documented HTTP JSON-RPC/MCP contract and
   reads only documented status/event data.
-- If a required game primitive is missing, implement the generic primitive in the
-  upstream project with the maintainer, then advance the pinned revision here.
+- If a required game primitive is missing, implement the generic primitive on a
+  public integration branch, offer it upstream to the maintainer, then advance the
+  exact tested pin here without waiting on a moving branch.
 - Keep compatibility checks in an adapter so upstream changes do not spread
   through planner, policy, or goal code.
 - Never start a second broker for an account already owned by a broker. Attach to

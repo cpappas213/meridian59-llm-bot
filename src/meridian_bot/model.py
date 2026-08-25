@@ -152,7 +152,10 @@ Constraints may contain only avoid_death (boolean), bank_before_hazard (boolean)
 merchant_class, room_id, and maximum_price; do not create it unless grounded hints contain the exact
 offering and merchant placement. For paid training, use a complete purchase_plan_candidates entry
 from a training_options grounding hint verbatim; a location name is never a merchant_class, and prices
-must not be guessed. If multiple candidates exist, select only from that list. priority is an integer
+must not be guessed. If multiple candidates exist, select only from that list. When the operator
+explicitly requires farming, hunting, fighting, or killing a named creature, preserve its canonical
+singular name in operator_notes as hunt=<creature>; never substitute a progression-equivalent prey.
+priority is an integer
 from 0 (lowest) through 100 (highest), normally
 50. activation is queue unless the operator explicitly requests replacing the active goal; use
 replace_active_pause for ordinary replacement and replace_active_cancel only when cancellation is
@@ -637,6 +640,10 @@ internal 100-vigor minimum while food is available; an explicit floor above 100 
 tactic. buy_food is false when omitted. The controller persists and enforces these fields across planning turns. If choosing
 open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
 it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
+If campaign.operator_contract.binding_farm_target is present, it is an operator requirement: every
+farm-recipe hunting_grounds lookup and every farm phase must use that exact creature. A support phase
+may improve capability, recovery, equipment, supplies, or route knowledge, but it must return to the
+bound creature and must never replace it with progression-equivalent prey.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey
 (canonical creature name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below, and
 fight_above_vigor. Its observable target must be the intended ability milestone. The tactical planner will launch

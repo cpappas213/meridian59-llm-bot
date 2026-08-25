@@ -104,6 +104,33 @@ def normalize_farm_target(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def farm_target_spellings_match(left: Any, right: Any) -> bool:
+    """Compare ordinary creature spellings without collapsing distinct prey."""
+
+    def variants(value: Any) -> set[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        normalized = " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+        if not normalized:
+            return set()
+        values = {normalized}
+        words = normalized.split()
+        last = words[-1]
+        singular: str | None = None
+        if last.endswith("ies") and len(last) > 3:
+            singular = last[:-3] + "y"
+        elif last.endswith("es") and last[:-2].endswith(
+            ("s", "x", "z", "ch", "sh")
+        ):
+            singular = last[:-2]
+        elif last.endswith("s") and len(last) > 1:
+            singular = last[:-1]
+        if singular:
+            values.add(" ".join([*words[:-1], singular]))
+        return values
+
+    return bool(variants(left) & variants(right))
+
+
 def farm_tactic_identity(
     room: Any, target: Any, use_safe_spots: Any
 ) -> dict[str, Any]:
@@ -212,6 +239,7 @@ def farm_quarantine_matches(
     room: Any,
     target: Any,
     use_safe_spots: Any,
+    target_matches: Callable[[Any, Any], bool] | None = None,
 ) -> bool:
     """Whether one retained disposition applies to the proposed farm tactic."""
 
@@ -223,7 +251,12 @@ def farm_quarantine_matches(
         return True
     recorded_target = normalize_farm_target(record.get("target"))
     requested_target = normalize_farm_target(target)
-    if recorded_target and requested_target and recorded_target != requested_target:
+    target_matches = target_matches or farm_target_spellings_match
+    if (
+        recorded_target
+        and requested_target
+        and not target_matches(record.get("target"), target)
+    ):
         return False
     if scope == "room_and_prey":
         return True

@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_URL = "https://github.com/cpappas213/meridian59-llm-bot"
-HARNESS_URL = "https://github.com/tpeppers/m59-harness.git"
+HARNESS_URL = "https://github.com/cpappas213/m59-harness.git"
 TEXT_SUFFIXES = {".md", ".py", ".ps1", ".toml", ".yml", ".yaml", ".txt"}
 EXCLUDED_PREFIXES = (
     ".git/",
