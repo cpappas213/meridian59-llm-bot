@@ -65,6 +65,14 @@ Configuration is TOML and unknown keys fail closed. Important sections are:
 | `learning` | Failure budgets and deterministic retry cooldowns. |
 | `notifications` | Optional Windows/Obsidian sinks. |
 
+Keep `harness.lifecycle = "controller_managed"` for the supported deployment.
+If an operator deliberately supplies an external broker at the pinned harness
+revision, it must launch `m59-broker.mjs` with `--in-process`; the bot depends on
+the direct synchronous session contract. That revision's `/health` response does
+not report the keeper arrangement, so the bot cannot verify an external process's
+flag after attachment. Do not use the harness dashboard's broker-restart control
+for this deployment because it does not preserve `--in-process`.
+
 `secrets.env` supports `M59_ACCOUNT_USERNAME`, `M59_ACCOUNT_PASSWORD`,
 `M59_BOT_CONTROL_TOKEN`, `M59_LLM_API_KEY`, and
 `M59_OBSIDIAN_VAULT_PATH`. Do not quote values, print the file, or commit it.

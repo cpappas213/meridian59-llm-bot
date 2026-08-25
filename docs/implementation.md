@@ -8,7 +8,9 @@ in the [operations runbook](requirements/operations.md).
 
 The controller is a companion process, not a harness fork. The harness is pinned
 directly to the authoritative public upstream as a Git submodule at tested revision
-`1cf3ac93da96f1a5c31b7c8463e73d1af97b534e`.
+`892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Controller-managed launches use
+the harness's explicit `--in-process` mode so ordinary synchronous broker tools
+retain their direct-session contract.
 
 | Surface | Default | Access |
 |---|---:|---|

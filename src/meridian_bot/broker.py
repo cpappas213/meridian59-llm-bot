@@ -29,6 +29,9 @@ class ToolCallError(BrokerError):
     code = "TOOL_CALL_FAILED"
 
 
+UNSUPPORTED_AUTOPILOT_MODES = {"tick"}
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -40,6 +43,24 @@ class Tool:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         if isinstance(properties, dict):
             properties.pop("agent", None)
+            # Travel is scoped to the destination authorized by the bot. Newer
+            # harnesses otherwise run unrelated banking/provisioning errands by
+            # default before departure, so that switch stays controller-owned.
+            if self.name == "travel":
+                properties.pop("run_errands", None)
+            # The upstream tick driver is experimental and has lifecycle rules
+            # this controller does not implement. Keep supported keeper modes
+            # visible while withholding that one enum value.
+            if self.name == "autopilot":
+                properties.pop("travel_deaths_allowed", None)
+                mode = properties.get("mode")
+                enum = mode.get("enum") if isinstance(mode, dict) else None
+                if isinstance(enum, list):
+                    mode["enum"] = [
+                        value
+                        for value in enum
+                        if value not in UNSUPPORTED_AUTOPILOT_MODES
+                    ]
         required = schema.get("required") if isinstance(schema, dict) else None
         if isinstance(required, list):
             schema["required"] = [name for name in required if name != "agent"]
@@ -72,6 +93,29 @@ class Tool:
                 raise ValueError(f"{self.name}.{name} must be one of {enum}")
 
 
+def normalize_tool_arguments(tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Apply controller-owned defaults before policy, audit, and wire validation."""
+
+    normalized = dict(arguments)
+    if tool.name == "travel" and tool.accepts("run_errands"):
+        # A requested destination is the complete authority for this action;
+        # unrelated pre-trip errands require their own planned steps.
+        normalized["run_errands"] = False
+    if tool.name == "autopilot":
+        if normalized.get("mode") in UNSUPPORTED_AUTOPILOT_MODES:
+            raise ValueError(
+                f"unsupported experimental autopilot mode: {normalized['mode']}"
+            )
+        if tool.accepts("travel_deaths_allowed") and (
+            normalized.get("action") == "start"
+            or "travel_deaths_allowed" in normalized
+        ):
+            # Continuing a journey after death conflicts with the bot's
+            # no-cheating/survival contract and is not planner-authorized.
+            normalized["travel_deaths_allowed"] = 0
+    return normalized
+
+
 # Session lifecycle, credential-bearing, debugging, and conversation tools are
 # controller-owned. The planner sees every other ordinary-player capability.
 CONTROLLER_ONLY_TOOLS = {
@@ -94,6 +138,9 @@ CONTROLLER_ONLY_TOOLS = {
     "move_intent",
     "context_intent",
     "cancel_action",
+    # Upstream added this as an operator-measured ledge experiment. The bot has
+    # no policy, movement preflight, or recovery contract for deliberate falls.
+    "jump",
 }
 
 
@@ -156,6 +203,10 @@ class BrokerClient:
             str(control_port),
             "--dashboard",
             str(self.config.harness.dashboard_port),
+            # This bot is a synchronous commander. The newer harness defaults
+            # restored sessions to keeper proxies unless explicitly told to
+            # retain the direct in-process Session contract.
+            "--in-process",
         ]
 
     def _launch_environment(self) -> dict[str, str]:
@@ -255,6 +306,9 @@ class BrokerClient:
         tool = self.capabilities().get(name)
         if tool is None:
             raise HarnessIncompatible(f"unknown broker tool: {name}")
+        # Normalize again at the wire boundary so direct shutdown/PvP helpers
+        # receive the same guarantees as controller-planned calls.
+        arguments = normalize_tool_arguments(tool, arguments)
         tool.validate(arguments)
 
         def invoke() -> Any:

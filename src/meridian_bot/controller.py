@@ -9,7 +9,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-from .broker import BrokerClient, BrokerError, CONTROLLER_ONLY_TOOLS, Tool, ToolCallError
+from .broker import (
+    BrokerClient,
+    BrokerError,
+    CONTROLLER_ONLY_TOOLS,
+    Tool,
+    ToolCallError,
+    normalize_tool_arguments,
+)
 from .campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
@@ -20468,6 +20475,10 @@ class BotController:
         tool_spec = capabilities.get(tool)
         if tool_spec is None:
             raise ModelError(f"planner selected unknown broker tool {tool}")
+        # Normalize harness additions while the arguments are still upstream of
+        # policy evaluation and action-attempt persistence, so the audit record
+        # exactly matches what the broker adapter will send.
+        arguments = normalize_tool_arguments(tool_spec, arguments)
         if tool_spec.accepts("agent"):
             arguments["agent"] = self.config.game.agent
         if (

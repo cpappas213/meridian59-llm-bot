@@ -54,8 +54,11 @@ and intends to use semantic versioning after its first public release.
   flows. Finish destinations now come only from approved goal criteria, while
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
-- Updated the bundled `m59-harness` pin to the latest tested official upstream
-  revision and removed the stale integration-fork dependency.
+- Updated the bundled `m59-harness` pin to official upstream revision
+  `892d94d6b0361970100d39b1f6fb35eb4a9ea794`, retained direct-session semantics
+  for the synchronous controller, disabled the upstream travel-errand default,
+  and withheld experimental or death-retry keeper controls plus deliberate
+  jumps until the bot supports their lifecycle and movement policies.
 - Made `Esc` an immediate, consistent cancel/back control across character
   status, goal drafting/review, goal modification, goal management, priority
   editing, and destructive confirmations.

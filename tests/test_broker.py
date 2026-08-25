@@ -32,9 +32,115 @@ class BrokerTests(unittest.TestCase):
                     "8901",
                     "--dashboard",
                     "8902",
+                    "--in-process",
                 ],
                 command,
             )
+
+    def test_travel_hides_and_disables_upstream_errand_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "travel": Tool(
+                    "travel",
+                    "Travel to a room.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "to": {"type": ["string", "number"]},
+                            "run_errands": {"type": "boolean"},
+                        },
+                        "required": ["agent", "to"],
+                    },
+                )
+            }
+            sent: dict[str, object] = {}
+
+            def fake_rpc(
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 30,
+            ) -> dict[str, object]:
+                sent.update(params or {})
+                return {"content": [{"text": "{}"}]}
+
+            broker.rpc = fake_rpc  # type: ignore[method-assign]
+
+            view = broker._manifest["travel"].planner_view()
+            result = broker.call_tool(
+                "travel",
+                {"agent": "primary", "to": 42, "run_errands": True},
+                mutation=True,
+            )
+
+            self.assertNotIn("run_errands", view["input_schema"]["properties"])
+            self.assertEqual({}, result)
+            self.assertEqual(
+                {"agent": "primary", "to": 42, "run_errands": False},
+                sent["arguments"],
+            )
+
+    def test_experimental_upstream_controls_are_not_planner_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "jump": Tool(
+                    "jump",
+                    "Attempt a declared ledge jump.",
+                    {"type": "object", "properties": {}},
+                ),
+                "autopilot": Tool(
+                    "autopilot",
+                    "Configure the keeper.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["start", "stop"],
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["survive", "farm", "idle", "tick"],
+                            },
+                            "travel_deaths_allowed": {"type": "number"},
+                        },
+                    },
+                ),
+            }
+            sent: dict[str, object] = {}
+
+            def fake_rpc(
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 30,
+            ) -> dict[str, object]:
+                sent.update(params or {})
+                return {"content": [{"text": "{}"}]}
+
+            broker.rpc = fake_rpc  # type: ignore[method-assign]
+
+            visible = {tool["name"]: tool for tool in broker.planner_tools()}
+            autopilot_schema = visible["autopilot"]["input_schema"]["properties"]
+
+            self.assertNotIn("jump", visible)
+            self.assertNotIn("travel_deaths_allowed", autopilot_schema)
+            self.assertEqual(
+                ["survive", "farm", "idle"],
+                autopilot_schema["mode"]["enum"],
+            )
+            broker.call_tool(
+                "autopilot",
+                {
+                    "action": "start",
+                    "mode": "farm",
+                    "travel_deaths_allowed": 3,
+                },
+            )
+            self.assertEqual(0, sent["arguments"]["travel_deaths_allowed"])
+            with self.assertRaisesRegex(ValueError, "unsupported experimental"):
+                broker.call_tool("autopilot", {"mode": "tick"})
 
     def test_attach_refuses_broker_missing_configured_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
