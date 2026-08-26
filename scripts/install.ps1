@@ -484,7 +484,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "00b1c0c5cfb02c177cdb552469f0a213b98c554d"
+expected_revision = "6ce42e806f1d2941e9eaecdeaff4809964dce230"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
