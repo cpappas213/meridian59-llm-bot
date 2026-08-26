@@ -2364,6 +2364,7 @@ class BotController:
             self._repair_overbroad_safe_spot_quarantines()
             self._repair_disproved_farm_route_stagnations()
             self._repair_recovered_farm_route_evidence(self.last_observation)
+            self._repair_revision_obsolete_farm_stagnations()
             self._repair_transient_farm_stagnations()
             self._repair_ambiguous_breakoff_stagnations()
             self._repair_gentle_cap_stagnations(self.last_observation)
@@ -13366,6 +13367,13 @@ class BotController:
         last_error = str(stagnation.get("last_error") or "").strip()
         if self._transient_movement_failure_text(last_error) is not None:
             return False
+        # A JavaScript implementation fault proves only that the pinned keeper
+        # crashed; it says nothing about the room or prey. Keep it durable while
+        # that exact harness revision is installed so the controller cannot spin
+        # the same crash, but let a new exact pin retry once. Safety evidence is
+        # independent and always wins over this revision invalidation.
+        if self._obsolete_farm_implementation_fault(stagnation):
+            return False
         # An explicit non-transient keeper error remains durable. Ordinary
         # inactivity is different: rooms repopulate and transit conditions
         # change, so it receives a bounded cooldown instead of a quarantine.
@@ -13390,6 +13398,62 @@ class BotController:
         age = self._age_seconds(stagnation.get("recorded_at"))
         return age is None or age < FARM_STAGNATION_RETRY_SECONDS
 
+    @staticmethod
+    def _javascript_implementation_fault_text(value: Any) -> str | None:
+        """Recognize only explicit JavaScript implementation failures."""
+
+        reason = str(value or "").strip()
+        if not reason:
+            return None
+        if "referenceerror" in reason.casefold() or re.fullmatch(
+            r"[A-Za-z_$][A-Za-z0-9_$]* is not defined", reason,
+            flags=re.IGNORECASE,
+        ):
+            return reason[:500]
+        return None
+
+    @staticmethod
+    def _farm_stagnation_has_danger_evidence(stagnation: dict[str, Any]) -> bool:
+        """Retain launch-scoped danger evidence across every code revision."""
+
+        deltas = stagnation.get("deltas")
+        deltas = deltas if isinstance(deltas, dict) else {}
+        for name in (
+            "deaths",
+            "deaths_in_safe_spot",
+            "deaths_in_proven_safe_spot",
+            "withdrawals",
+            "mulligans",
+            "logoffs",
+        ):
+            try:
+                if int(deltas.get(name, 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                # Malformed safety evidence fails closed rather than being
+                # discarded as though it affirmatively reported zero.
+                return True
+        return False
+
+    def _obsolete_farm_implementation_fault(
+        self, stagnation: dict[str, Any]
+    ) -> str | None:
+        """Return an implementation fault invalidated by the current exact pin."""
+
+        fault = self._javascript_implementation_fault_text(
+            stagnation.get("last_error")
+        )
+        current_revision = self.config.harness.expected_revision.strip()
+        recorded_revision = str(stagnation.get("harness_revision") or "").strip()
+        if (
+            fault is None
+            or not current_revision
+            or recorded_revision == current_revision
+            or self._farm_stagnation_has_danger_evidence(stagnation)
+        ):
+            return None
+        return fault
+
     def _farm_stagnation_blocks_strategy(
         self, stagnation: dict[str, Any], *, use_safe_spots: Any
     ) -> bool:
@@ -13402,6 +13466,63 @@ class BotController:
         ):
             return False
         return self._farm_stagnation_blocks(stagnation)
+
+    def _repair_revision_obsolete_farm_stagnations(self) -> list[dict[str, Any]]:
+        """Remove code-crash tactic blocks invalidated by a new harness pin.
+
+        A ReferenceError is evidence about one implementation revision, not a
+        property of Meridian's room, prey, or route. Legacy records predate the
+        revision field and therefore receive one measurement under this build.
+        Launch-scoped danger evidence is deliberately retained unchanged.
+        """
+
+        raw = self.storage.get_runtime("farm_tactic_stagnation_v1", {})
+        stagnations = dict(raw) if isinstance(raw, dict) else {}
+        repaired: list[dict[str, Any]] = []
+        affected_goal_ids: set[str] = set()
+        for key, item in list(stagnations.items()):
+            if not isinstance(item, dict):
+                continue
+            fault = self._obsolete_farm_implementation_fault(item)
+            if fault is None:
+                continue
+            repaired.append(
+                {
+                    **item,
+                    "repair_reason": (
+                        "JavaScript implementation fault belongs to a prior "
+                        "harness revision"
+                    ),
+                    "implementation_fault": fault,
+                }
+            )
+            stagnations.pop(key, None)
+            goal_id = str(item.get("goal_id") or str(key).split("|", 1)[0])
+            if goal_id:
+                affected_goal_ids.add(goal_id)
+
+        if not repaired:
+            return []
+        self.storage.set_runtime("farm_tactic_stagnation_v1", stagnations)
+        # The legacy record has no stable id carried by planner feedback,
+        # suppression, route handling, or recipe exhaustion. Goal id alone is
+        # not enough linkage: each of those may describe another tactic under
+        # the same strategic goal. Remove only the evidence we can identify
+        # exactly and let ordinary reconciliation re-evaluate the remaining
+        # state on the next turn.
+        self.storage.emit_event(
+            "background_farm.implementation_stagnation_repaired",
+            "Removed farm stagnation caused only by code fixed in a newer harness revision",
+            severity="notice",
+            interesting=True,
+            data={
+                "count": len(repaired),
+                "goal_ids": sorted(affected_goal_ids),
+                "current_harness_revision": self.config.harness.expected_revision,
+                "tactics": redact(repaired),
+            },
+        )
+        return repaired
 
     def _repair_transient_farm_stagnations(self) -> list[dict[str, Any]]:
         """Remove legacy permanent blocks created from a brand-new live stall."""
@@ -14162,6 +14283,7 @@ class BotController:
         failure_kind = str(failure.get("kind") or "farm_route_failure")
         stagnation = {
             "kind": failure_kind,
+            "harness_revision": self.config.harness.expected_revision,
             "goal_id": goal["id"],
             "room": failure.get("current_room"),
             "assigned_room": assigned_room,
@@ -14932,6 +15054,7 @@ class BotController:
         count = int(prior.get("count", 0) or 0) + 1 if isinstance(prior, dict) else 1
         stagnation = {
             "kind": "farm_assignment_deferred",
+            "harness_revision": self.config.harness.expected_revision,
             "goal_id": goal["id"],
             "room": current_room,
             "assigned_room": assigned_room,
@@ -16116,6 +16239,7 @@ class BotController:
             prior = stagnations.get(stagnation_key)
             count = int(prior.get("count", 0) or 0) + 1 if isinstance(prior, dict) else 1
             stagnation = {
+                "harness_revision": self.config.harness.expected_revision,
                 "goal_id": goal["id"],
                 "room": room,
                 "assigned_room": tactic_room,
@@ -19597,6 +19721,7 @@ class BotController:
                     observation,
                     reason="controller turn entry",
                 )
+            self._repair_revision_obsolete_farm_stagnations()
             self.learning.refresh_unlocks(observation)
             repaired_goal_blocks = self._repair_controller_goal_blocks()
             farm_blockers = self._reconcile_blocked_farm_exhaustion(observation)

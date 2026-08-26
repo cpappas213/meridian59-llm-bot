@@ -18284,6 +18284,10 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(stopped["background_farm_survival_handoff"])
                 stagnations = controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
                 self.assertIn(f"{goal['id']}|575|giant rat", stagnations)
+                self.assertEqual(
+                    "test",
+                    stagnations[f"{goal['id']}|575|giant rat"]["harness_revision"],
+                )
                 phase_blocker = controller._campaign_phase_grounding_blocker(
                     {
                         "kind": "farm",
@@ -18681,6 +18685,136 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
                 )
                 self.assertFalse(controller._farm_stagnation_blocks(record))
+            finally:
+                controller.storage.close()
+
+    def test_new_harness_revision_repairs_only_safe_implementation_stagnations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="repair-implementation-stagnation")
+                )["goal"]
+                prefix = f"{goal['id']}|"
+                safe_prior = {
+                    "goal_id": goal["id"],
+                    "room": 562,
+                    "assigned_room": 562,
+                    "target": "fungus beast",
+                    "recorded_at": "2026-08-25T00:00:00.000Z",
+                    "last_error": "ReferenceError: near is not defined",
+                    "harness_revision": "prior-exact-revision",
+                    "deltas": {},
+                }
+                legacy = {
+                    **safe_prior,
+                    "room": 563,
+                    "assigned_room": 563,
+                    "last_error": "near is not defined",
+                }
+                legacy.pop("harness_revision")
+                same_revision = {
+                    **safe_prior,
+                    "room": 564,
+                    "assigned_room": 564,
+                    "last_error": "near is not defined",
+                    "harness_revision": controller.config.harness.expected_revision,
+                }
+                ordinary_fault = {
+                    **safe_prior,
+                    "room": 565,
+                    "assigned_room": 565,
+                    "last_error": "keeper route placement failed",
+                }
+                retained_danger = {}
+                for offset, field in enumerate(
+                    (
+                        "deaths",
+                        "deaths_in_safe_spot",
+                        "deaths_in_proven_safe_spot",
+                        "withdrawals",
+                        "mulligans",
+                        "logoffs",
+                    ),
+                    start=566,
+                ):
+                    retained_danger[f"{prefix}{offset}|fungus beast"] = {
+                        **safe_prior,
+                        "room": offset,
+                        "assigned_room": offset,
+                        "deltas": {field: 1},
+                    }
+                values = {
+                    f"{prefix}562|fungus beast": safe_prior,
+                    f"{prefix}563|fungus beast": legacy,
+                    f"{prefix}564|fungus beast": same_revision,
+                    f"{prefix}565|fungus beast": ordinary_fault,
+                    **retained_danger,
+                }
+                controller.storage.set_runtime("farm_tactic_stagnation_v1", values)
+                death_quarantine = {
+                    "goal_id": goal["id"],
+                    "room": 562,
+                    "target": "fungus beast",
+                    "quarantine_reasons": ["the keeper observed a death"],
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1", {"death": death_quarantine}
+                )
+                controller.storage.set_runtime(
+                    "research_recipe_exhaustion_v1", {goal["id"]: {"blocked": True}}
+                )
+                controller.storage.set_runtime(
+                    "safety_suppression_v1", {"goal_id": goal["id"]}
+                )
+                controller.storage.set_runtime(
+                    f"background_farm_route_failure_handled_v1:{goal['id']}", True
+                )
+                controller._set_planner_feedback(goal, "Use another farm room.")
+
+                repaired = controller._repair_revision_obsolete_farm_stagnations()
+
+                self.assertEqual(2, len(repaired))
+                retained = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(f"{prefix}562|fungus beast", retained)
+                self.assertNotIn(f"{prefix}563|fungus beast", retained)
+                self.assertIn(f"{prefix}564|fungus beast", retained)
+                self.assertIn(f"{prefix}565|fungus beast", retained)
+                self.assertTrue(set(retained_danger).issubset(retained))
+                self.assertFalse(controller._farm_stagnation_blocks(safe_prior))
+                self.assertTrue(controller._farm_stagnation_blocks(same_revision))
+                self.assertTrue(controller._farm_stagnation_blocks(ordinary_fault))
+                self.assertTrue(
+                    all(
+                        controller._farm_stagnation_blocks(record)
+                        for record in retained_danger.values()
+                    )
+                )
+                self.assertEqual(
+                    {goal["id"]: {"blocked": True}},
+                    controller.storage.get_runtime("research_recipe_exhaustion_v1", {}),
+                )
+                self.assertEqual(
+                    {"goal_id": goal["id"]},
+                    controller.storage.get_runtime("safety_suppression_v1"),
+                )
+                self.assertTrue(
+                    controller.storage.get_runtime(
+                        f"background_farm_route_failure_handled_v1:{goal['id']}"
+                    )
+                )
+                self.assertEqual(
+                    "Use another farm room.",
+                    controller._planner_feedback(goal)["message"],
+                )
+                self.assertEqual(
+                    {"death": death_quarantine},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
             finally:
                 controller.storage.close()
 

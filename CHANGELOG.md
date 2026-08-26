@@ -104,6 +104,10 @@ and intends to use semantic versioning after its first public release.
 - Fixed failed-heal recovery after a farm fight to re-read adjacent hostiles rather
   than referencing state from another behavior pass, eliminating the live
   `near is not defined` exception without misreporting a cornered character as safe.
+- Scoped JavaScript keeper-crash stagnation to the exact harness revision that
+  produced it. A newly pinned build may retry a death-free tactic once, while
+  same-revision crashes and any death, withdrawal, mulligan, logout, or quarantine
+  evidence remain durable.
 - Kept operator-named farm prey binding across research, campaign phases, and
   keeper launches. Exhausting only a safe-wall search now retries the same room
   and prey in bounded open-field mode, while death, critical-health, room-hazard,
