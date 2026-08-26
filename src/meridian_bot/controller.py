@@ -129,6 +129,18 @@ SURVIVAL_POLICY_RECONCILE_RETRY_SECONDS = 30.0
 # may enforce a higher internal floor while food is available and owns consuming
 # or creating it, without making paid acquisition a prerequisite.
 FARM_FIGHT_VIGOR = RESTED_VIGOR_FLOOR
+FARM_RECIPE_POLICY_FIELDS = (
+    "break_out_via_logoff",
+    "max_carry",
+    "flee_below",
+    "hold_resume_above",
+    "rest_below",
+    "fight_above_vigor",
+    "eat_before_fighting",
+    "buy_food",
+    "bank_above",
+    "pull_within",
+)
 # The keeper reports a stall after five unsuccessful internal passes.  That is
 # useful telemetry, but the first report can be only a couple of seconds old
 # and a wandering monster or a break-off can still resolve it.  Give the live
@@ -157,6 +169,7 @@ FARM_STOP_RETRY_SECONDS = 2 * 60
 # spin on every controller turn forever.
 FARM_OPEN_FIELD_FALLBACK_MAX_ATTEMPTS = 3
 FARM_OPEN_FIELD_FALLBACK_RETRY_SECONDS = 5
+FARM_OPEN_FIELD_FALLBACK_SAFETY_PROVENANCE = "controller_wall_search_only_v1"
 # Keep a bounded audit trail of recovery episodes. These are ordinary work
 # cycles and never escalate to quarantine merely because they repeat.
 FARM_RETREAT_INCIDENT_WINDOW_SECONDS = 30 * 60
@@ -6388,6 +6401,13 @@ class BotController:
         for candidate in ordered_candidates:
             room = candidate["room"]
             target = candidate["target"]
+            positioning_preference = self._farm_positioning_preference(
+                goal,
+                run,
+                assigned_room=room,
+                hunt=target,
+                exclude_phase_id=str(phase.get("id") or ""),
+            )
             successful_strategies = [
                 strategy
                 for strategy in (True, False)
@@ -6398,7 +6418,22 @@ class BotController:
                 )
                 in successful_tactics
             ]
-            strategies = list(dict.fromkeys([*successful_strategies, True, False]))
+            preferred_strategy = positioning_preference.get("use_safe_spots")
+            if positioning_preference.get("source") == "operator_goal":
+                # An explicit public-goal policy is not an exploratory hint. Do
+                # not silently replace it with the opposite positioning mode.
+                strategies = [preferred_strategy]
+            elif preferred_strategy is False:
+                # A prior controller-grounded open-field variant is more current
+                # than the legacy safe-first default retained in an old research
+                # receipt. Grounding below still gets the final say.
+                strategies = list(
+                    dict.fromkeys([False, *successful_strategies, True])
+                )
+            else:
+                strategies = list(
+                    dict.fromkeys([*successful_strategies, True, False])
+                )
             for strategy_index, use_safe_spots in enumerate(strategies):
                 if strategy_index > 0:
                     prior_blocker = deep_get(rejected[-1], "blocker") if rejected else None
@@ -6440,6 +6475,9 @@ class BotController:
                         "selection_basis": (
                             "recent_successful_tactic"
                             if exact_success
+                            else "operator_positioning_preference"
+                            if positioning_preference.get("source")
+                            == "operator_goal"
                             else "grounded_positioning_variant"
                             if use_safe_spots is False
                             else (
@@ -6449,6 +6487,10 @@ class BotController:
                             )
                         ),
                     }
+                    if positioning_preference:
+                        selected["positioning_preference"] = redact(
+                            positioning_preference
+                        )
                     break
                 rejected.append(
                     {
@@ -6893,6 +6935,7 @@ class BotController:
         context = research_phase.get("context")
         context = context if isinstance(context, dict) else {}
         recipe = context.get("farm_recipe")
+        cached_positioning_policy: dict[str, Any] = {}
         required_target = self._goal_bound_farm_target(goal)
         if (
             isinstance(recipe, dict)
@@ -6903,6 +6946,29 @@ class BotController:
             # Revalidate from source attempts instead of carrying that stale
             # prey's room into the newly bound target.
             recipe = None
+        if isinstance(recipe, dict):
+            positioning_preference = self._farm_positioning_preference(
+                goal,
+                run,
+                assigned_room=recipe.get("room"),
+                hunt=recipe.get("target"),
+                exclude_phase_id=str(research_phase.get("id") or ""),
+            )
+            preferred_strategy = positioning_preference.get("use_safe_spots")
+            if (
+                isinstance(preferred_strategy, bool)
+                and recipe.get("use_safe_spots") is not preferred_strategy
+            ):
+                # The cached receipt predates a public operator choice or a
+                # controller-grounded open-field variant for this exact tactic.
+                # Re-run ordinary validation so all retained safety gates apply,
+                # while retaining stricter non-positioning keeper policy below.
+                cached_positioning_policy = {
+                    field: recipe.get(field)
+                    for field in FARM_RECIPE_POLICY_FIELDS
+                    if recipe.get(field) is not None
+                }
+                recipe = None
         if not isinstance(recipe, dict):
             validation = self._research_farm_recipe_validation(
                 goal, run, research_phase, observation
@@ -6910,6 +6976,8 @@ class BotController:
             if validation.get("status") != "selected":
                 return None
             recipe = validation["recipe"]
+            if cached_positioning_policy:
+                recipe = {**recipe, **cached_positioning_policy}
         if required_target and not self._farm_targets_match(
             recipe.get("target"), required_target
         ):
@@ -6934,6 +7002,7 @@ class BotController:
                 "rationale": "Deterministic handoff from validated progression research.",
             },
             observation=observation,
+            controller_owned_context=True,
         )
         if next_phase is not None:
             self.storage.emit_event(
@@ -12768,19 +12837,77 @@ class BotController:
         fallback = context.get("safe_spot_fallback")
         return fallback if isinstance(fallback, dict) else {}
 
-    @staticmethod
+    @classmethod
     def _farm_open_field_fallback_matches(
-        phase: dict[str, Any] | None, intent: dict[str, Any]
+        cls, phase: dict[str, Any] | None, intent: dict[str, Any]
     ) -> bool:
-        fallback = BotController._farm_open_field_fallback(phase)
+        fallback = cls._farm_open_field_fallback(phase)
         return bool(
             fallback.get("kind") == "wall_search_exhausted"
+            and fallback.get("safety_provenance")
+            == FARM_OPEN_FIELD_FALLBACK_SAFETY_PROVENANCE
             and intent.get("use_safe_spots") is False
             and str(fallback.get("assigned_room"))
             == str(intent.get("assigned_room"))
             and " ".join(str(fallback.get("hunt") or "").casefold().split())
             == str(intent.get("hunt") or "")
         )
+
+    def _farm_positioning_preference(
+        self,
+        goal: dict[str, Any],
+        run: dict[str, Any] | None,
+        *,
+        assigned_room: Any,
+        hunt: Any,
+        exclude_phase_id: str = "",
+    ) -> dict[str, Any]:
+        """Resolve only authoritative or controller-grounded positioning intent."""
+
+        operator_strategy = self._goal_farm_intent(goal).get("use_safe_spots")
+        if isinstance(operator_strategy, bool):
+            return {
+                "use_safe_spots": operator_strategy,
+                "source": "operator_goal",
+            }
+        run_id = run.get("id") if isinstance(run, dict) else None
+        if not run_id or assigned_room is None or not normalize_farm_target(hunt):
+            return {}
+        for prior in reversed(self.storage.campaign_phases(str(run_id))):
+            if str(prior.get("id") or "") == exclude_phase_id:
+                continue
+            if prior.get("kind") != "farm":
+                continue
+            prior_intent = self._campaign_phase_farm_intent(prior)
+            if (
+                str(prior_intent.get("assigned_room")) != str(assigned_room)
+                or not self._farm_targets_match(prior_intent.get("hunt"), hunt)
+                or prior_intent.get("use_safe_spots") is not False
+            ):
+                continue
+            context = prior.get("context")
+            context = context if isinstance(context, dict) else {}
+            selection_basis = str(context.get("selection_basis") or "")
+            grounded_positioning_variant = bool(
+                selection_basis == "grounded_positioning_variant"
+                and context.get("deterministic_research_handoff") is True
+            )
+            durable_wall_fallback = self._farm_open_field_fallback_matches(
+                prior, prior_intent
+            )
+            if not grounded_positioning_variant and not durable_wall_fallback:
+                continue
+            return {
+                "use_safe_spots": False,
+                "source": (
+                    "grounded_positioning_variant"
+                    if grounded_positioning_variant
+                    else "wall_search_fallback"
+                ),
+                "phase_id": prior.get("id"),
+                "phase_status": prior.get("status"),
+            }
+        return {}
 
     def _keeper_combat_work_remains(
         self,
@@ -12839,14 +12966,13 @@ class BotController:
             for key in ("assigned_room", "hunt"):
                 if phase_intent.get(key) is not None:
                     intent[key] = phase_intent[key]
-        # An operator-authored safe-wall preference normally outranks an
-        # internal phase. Once the keeper has exhaustively disproved only the
-        # wall-placement strategy, however, the controller records a narrow
-        # same-room/same-prey fallback in that phase. Keep that evidence-backed
-        # override durable so the next status poll does not mistake the retasked
-        # open-field keeper for a stale job and stop it.
-        if not phase_target_mismatch and self._farm_open_field_fallback_matches(
-            phase, phase_intent
+        # A controller-owned wall-search fallback is durable only when the
+        # public goal leaves positioning unspecified. An explicit goal boolean
+        # is absolute and cannot be displaced by an older fallback receipt.
+        if (
+            not isinstance(goal_intent.get("use_safe_spots"), bool)
+            and not phase_target_mismatch
+            and self._farm_open_field_fallback_matches(phase, phase_intent)
         ):
             intent["use_safe_spots"] = False
         return intent
@@ -14392,27 +14518,52 @@ class BotController:
         }
 
     @staticmethod
-    def _farm_wall_search_only_deferral(value: dict[str, Any]) -> bool:
+    def _farm_danger_deltas_unsafe(value: dict[str, Any]) -> bool:
+        """Fail closed when any live danger counter is positive or malformed."""
+
+        if "deltas" not in value:
+            return False
+        deltas = value.get("deltas")
+        if not isinstance(deltas, dict):
+            return True
+        for name in (
+            "deaths",
+            "deaths_in_safe_spot",
+            "deaths_in_proven_safe_spot",
+            "withdrawals",
+            "mulligans",
+            "logoffs",
+        ):
+            raw_count = deltas.get(name, 0)
+            if isinstance(raw_count, bool):
+                return True
+            try:
+                count = int(raw_count or 0)
+            except (OverflowError, TypeError, ValueError):
+                return True
+            if (
+                count < 0
+                or (
+                    isinstance(raw_count, float)
+                    and not raw_count.is_integer()
+                )
+                or count > 0
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _farm_wall_search_only_deferral(cls, value: dict[str, Any]) -> bool:
         """Whether deferral evidence proves only safe-wall placement failed."""
 
         records = [value]
         records.extend(
             nested
-            for key in ("farm_evidence", "safety_evidence")
+            for key in ("record", "evidence", "farm_evidence", "safety_evidence")
             if isinstance((nested := value.get(key)), dict)
         )
         for record in records:
-            deltas = record.get("deltas")
-            deltas = deltas if isinstance(deltas, dict) else {}
-            if any(
-                int(deltas.get(name, 0) or 0) > 0
-                for name in (
-                    "deaths",
-                    "deaths_in_safe_spot",
-                    "deaths_in_proven_safe_spot",
-                    "withdrawals",
-                )
-            ):
+            if cls._farm_danger_deltas_unsafe(record):
                 return False
             if (
                 record.get("death_is_new") is True
@@ -14679,9 +14830,15 @@ class BotController:
         if intent_already_persisted:
             updated_phase = phase
         else:
+            # Only mint the durable receipt from the original, controller-read
+            # wall-exhaustion evidence. Later mutation failures belong to the
+            # bounded retry state and must not be reinterpreted as combat danger.
+            if not self._farm_wall_search_only_deferral(deferral_evidence):
+                return None
             requested_at = timestamp()
             fallback = {
                 "kind": "wall_search_exhausted",
+                "safety_provenance": FARM_OPEN_FIELD_FALLBACK_SAFETY_PROVENANCE,
                 "state": "pending",
                 "assigned_room": assigned_room,
                 "hunt": target.casefold(),
@@ -14890,6 +15047,9 @@ class BotController:
         placement = status.get("placement")
         placement = placement if isinstance(placement, dict) else {}
         intent = self._campaign_phase_farm_intent(phase)
+        operator_requires_safe_spots = (
+            self._goal_farm_intent(goal).get("use_safe_spots") is True
+        )
         assigned_room = placement.get("assigned_room") or intent.get(
             "assigned_room"
         )
@@ -14904,25 +15064,15 @@ class BotController:
             and not isinstance(health_fraction, bool)
             and float(health_fraction) < self.config.policy.critical_health_fraction
         )
-        deltas = farm_evidence.get("deltas")
-        deltas = deltas if isinstance(deltas, dict) else {}
-        death_evidence = bool(
-            farm_evidence.get("death_is_new")
-            or any(
-                int(deltas.get(name, 0) or 0) > 0
-                for name in (
-                    "deaths",
-                    "deaths_in_safe_spot",
-                    "deaths_in_proven_safe_spot",
-                )
-            )
-        )
+        danger_delta_evidence = self._farm_danger_deltas_unsafe(farm_evidence)
+        death_evidence = farm_evidence.get("death_is_new") is True
         safety_evidence = bool(
             farm_evidence.get("quarantine_reasons")
             or farm_evidence.get("recovery_reasons")
             or farm_evidence.get("live_overlevel_hostiles")
             or critical_health
             or death_evidence
+            or danger_delta_evidence
             or self._underworld(observation)
         )
         fallback_marker = self._farm_open_field_fallback(phase)
@@ -14930,7 +15080,7 @@ class BotController:
             fallback_marker.get("state") == "pending"
             and self._farm_open_field_fallback_matches(phase, intent)
         )
-        if fallback_pending:
+        if fallback_pending and not operator_requires_safe_spots:
             if safety_evidence:
                 return None
             actual_safe_spots = deep_get(
@@ -15004,7 +15154,11 @@ class BotController:
             return None
 
         wall_search_only = self._farm_wall_search_only_deferral(deferral_evidence)
-        if wall_search_only and intent.get("use_safe_spots") is False:
+        if (
+            wall_search_only
+            and intent.get("use_safe_spots") is False
+            and not operator_requires_safe_spots
+        ):
             # The compact keeper journal can retain the transition record after
             # policy was changed. It no longer describes the active open-field
             # tactic and must not repeatedly retire the preserved phase.
@@ -15013,6 +15167,7 @@ class BotController:
             wall_search_only
             and intent.get("use_safe_spots") is True
             and not safety_evidence
+            and not operator_requires_safe_spots
         ):
             fallback = self._retask_farm_without_safe_spots(
                 goal,
@@ -16868,8 +17023,9 @@ class BotController:
         self,
         goal: dict[str, Any],
         phase: dict[str, Any] | None,
+        observation: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Remove legacy model-authored exclusions from an active phase.
+        """Repair legacy tactic preferences without changing safety evidence.
 
         New manager decisions are normalized before persistence, but a live
         deployment may inherit an active phase written by an older controller.
@@ -16882,13 +17038,15 @@ class BotController:
         if not isinstance(phase, dict):
             return phase
         raw_context = phase.get("context")
-        if not isinstance(raw_context, dict) or not any(
-            field in raw_context for field in ("avoid_rooms", "avoid_targets")
-        ):
+        if not isinstance(raw_context, dict):
             return phase
 
         context = dict(raw_context)
+        repair_reasons: list[str] = []
         proposed: dict[str, Any] = {}
+        removed_legacy_exclusions = any(
+            field in raw_context for field in ("avoid_rooms", "avoid_targets")
+        )
         for field in ("avoid_rooms", "avoid_targets"):
             value = context.pop(field, None)
             if value not in (None, []):
@@ -16898,22 +17056,92 @@ class BotController:
             audit = dict(existing) if isinstance(existing, dict) else {}
             audit.update(proposed)
             context["ignored_unverified_tactic_preferences"] = audit
+        if removed_legacy_exclusions:
+            repair_reasons.append(
+                "discarded legacy model-authored room and target exclusions; "
+                "negative tactic evidence is controller-owned"
+            )
+
+        if phase.get("kind") == "farm":
+            intent = self._campaign_phase_farm_intent(phase)
+            if (
+                intent.get("assigned_room") is not None
+                and intent.get("hunt")
+                and isinstance(intent.get("use_safe_spots"), bool)
+            ):
+                run = self.storage.campaign_run(str(goal.get("id") or ""))
+                preference = self._farm_positioning_preference(
+                    goal,
+                    run,
+                    assigned_room=intent.get("assigned_room"),
+                    hunt=intent.get("hunt"),
+                    exclude_phase_id=str(phase.get("id") or ""),
+                )
+                preferred_strategy = preference.get("use_safe_spots")
+                operator_preference = preference.get("source") == "operator_goal"
+                grounded_open_field_preference = bool(
+                    preferred_strategy is False
+                    and intent.get("use_safe_spots") is True
+                )
+                if (
+                    isinstance(preferred_strategy, bool)
+                    and preferred_strategy != intent.get("use_safe_spots")
+                    and (operator_preference or grounded_open_field_preference)
+                ):
+                    proposed_context = {
+                        **context,
+                        "use_safe_spots": preferred_strategy,
+                    }
+                    proposed_variant = {**phase, "context": proposed_context}
+                    blocker = self._campaign_phase_grounding_blocker(
+                        proposed_variant,
+                        observation,
+                        avoid_rooms=self._recent_research_avoid_rooms(run or {}),
+                        goal_id=str(goal.get("id") or ""),
+                    )
+                    if blocker is None or operator_preference:
+                        context = proposed_context
+                        context["positioning_preference_repair"] = {
+                            "kind": (
+                                "operator_positioning_reconciled"
+                                if operator_preference
+                                else "legacy_safe_spot_recipe_overridden"
+                            ),
+                            "previous_use_safe_spots": intent.get(
+                                "use_safe_spots"
+                            ),
+                            "applied_use_safe_spots": preferred_strategy,
+                            "source": preference.get("source"),
+                            "source_phase_id": preference.get("phase_id"),
+                            "grounding_blocker": (
+                                redact(blocker) if blocker is not None else None
+                            ),
+                        }
+                        repair_reasons.append(
+                            (
+                                "aligned the active farm strategy with the explicit "
+                                "operator policy so ordinary grounding can retire it"
+                                if blocker is not None and operator_preference
+                                else "aligned the active farm strategy with the "
+                                "explicit operator policy after grounding"
+                                if operator_preference
+                                else "replaced a legacy safe-spot recipe with the "
+                                "current exact-tactic open-field preference after grounding"
+                            )
+                        )
+
+        if context == raw_context:
+            return phase
 
         repaired = self.storage.update_campaign_phase_guardrails(
             str(phase["id"]),
             abandon_predicates=list(phase.get("abandon_predicates", [])),
             context=context,
-            reason=(
-                "discarded legacy model-authored room and target exclusions; "
-                "negative tactic evidence is controller-owned"
-            ),
+            reason="; ".join(repair_reasons),
         )
         self._invalidate_execution_plan(
             goal,
-            (
-                "active phase contained legacy model-authored room or target "
-                "exclusions without controller evidence"
-            ),
+            "; ".join(repair_reasons),
         )
         return repaired
 
@@ -16925,7 +17153,9 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         """Reconcile the durable internal phase and select one when needed."""
         run, phase = self.campaign.ensure(goal)
-        phase = self._repair_persisted_phase_tactic_preferences(goal, phase)
+        phase = self._repair_persisted_phase_tactic_preferences(
+            goal, phase, observation
+        )
         outcome = self._evaluate_campaign_phase(goal, run, phase, observation)
         if outcome.completed or outcome.failed:
             handoff = (

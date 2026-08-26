@@ -108,6 +108,11 @@ and intends to use semantic versioning after its first public release.
   produced it. A newly pinned build may retry a death-free tactic once, while
   same-revision crashes and any death, withdrawal, mulligan, logout, or quarantine
   evidence remain durable.
+- Reused controller-grounded open-field positioning for the same farm room and
+  prey instead of reviving a cached safe-wall recipe. Explicit operator policy,
+  stricter flee and vigor thresholds, and all retained danger evidence remain
+  authoritative, while campaign-manager output cannot forge the controller's
+  tactic provenance.
 - Kept operator-named farm prey binding across research, campaign phases, and
   keeper launches. Exhausting only a safe-wall search now retries the same room
   and prey in bounded open-field mode, while death, critical-health, room-hazard,

@@ -12,6 +12,24 @@ from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY = "campaign_phase_progress_lease_v1"
 
+# These fields are written only after controller-owned validation or live keeper
+# evidence. A campaign-manager response may propose tactics, but it cannot mint
+# durable evidence that later outranks operator intent or recipe selection.
+CONTROLLER_OWNED_TACTIC_CONTEXT_FIELDS = frozenset(
+    {
+        "deterministic_research_handoff",
+        "farm_recipe",
+        "positioning_preference",
+        "positioning_preference_repair",
+        "recipe_validation",
+        "research_attempt_id",
+        "research_fingerprint",
+        "research_phase_id",
+        "safe_spot_fallback",
+        "selection_basis",
+    }
+)
+
 
 PHASE_KINDS = {
     "general",
@@ -673,6 +691,8 @@ class CampaignCoordinator:
         goal: dict[str, Any],
         phase: dict[str, Any],
         observation: dict[str, Any] | None,
+        *,
+        controller_owned_context: bool = False,
     ) -> dict[str, Any]:
         """Compile and normalize one manager-selected phase without persisting it."""
 
@@ -741,6 +761,18 @@ class CampaignCoordinator:
             if isinstance(phase.get("context"), dict)
             else {}
         )
+        if not controller_owned_context:
+            ignored_controller_fields = sorted(
+                field
+                for field in CONTROLLER_OWNED_TACTIC_CONTEXT_FIELDS
+                if field in phase_context
+            )
+            for field in ignored_controller_fields:
+                phase_context.pop(field, None)
+            if ignored_controller_fields:
+                phase_context["ignored_controller_owned_tactic_context"] = (
+                    ignored_controller_fields
+                )
         unverified_preferences: dict[str, Any] = {}
         for field in ("avoid_rooms", "avoid_targets"):
             proposed = phase_context.pop(field, None)
@@ -800,13 +832,20 @@ class CampaignCoordinator:
         goal: dict[str, Any],
         decision: dict[str, Any],
         observation: dict[str, Any] | None = None,
+        *,
+        controller_owned_context: bool = False,
     ) -> dict[str, Any] | None:
         action = str(decision.get("decision") or "").strip()
         if action in {"start_phase", "replace_phase", "push_support_phase"}:
             phase = decision.get("phase")
             if not isinstance(phase, dict):
                 raise ValueError(f"{action} requires a phase object")
-            phase = self._validated_manager_phase(goal, phase, observation)
+            phase = self._validated_manager_phase(
+                goal,
+                phase,
+                observation,
+                controller_owned_context=controller_owned_context,
+            )
             mode = "push" if action == "push_support_phase" else "replace"
             if self.storage.active_campaign_phase(run["id"]) is None:
                 mode = "start"
