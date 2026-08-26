@@ -1690,9 +1690,41 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.close()
 
-    def test_visible_player_gets_one_proactive_greeting_but_silent_npc_does_not(self) -> None:
+    def test_visible_player_is_not_greeted_when_proactive_greetings_are_default_off(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
+            try:
+                broker = SocialBroker()
+                model = SocialModel()
+                controller.broker = broker
+                controller.model = model  # type: ignore[assignment]
+                self._set_social_persona(controller)
+
+                controller._greeting_turn(broker.look())
+                controller._greeting_turn(broker.look())
+
+                self.assertFalse(
+                    controller.config.controller.proactive_greetings_enabled
+                )
+                self.assertEqual([], model.greetings)
+                self.assertEqual(
+                    [],
+                    [arguments for name, arguments in broker.calls if name == "say"],
+                )
+            finally:
+                controller.close()
+
+    def test_opted_in_visible_player_gets_one_proactive_greeting_but_silent_npc_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = config(Path(temporary))
+            value = replace(
+                value,
+                controller=replace(
+                    value.controller,
+                    proactive_greetings_enabled=True,
+                ),
+            )
+            controller = BotController(value)
             try:
                 broker = SocialBroker()
                 model = SocialModel()
@@ -1880,6 +1912,13 @@ class ControllerTests(unittest.TestCase):
     def test_conversation_window_is_durable_and_also_bounds_greetings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = config(Path(temporary))
+            value = replace(
+                value,
+                controller=replace(
+                    value.controller,
+                    proactive_greetings_enabled=True,
+                ),
+            )
             controller = BotController(value)
             speaker_key = "name:blackstone"
             try:

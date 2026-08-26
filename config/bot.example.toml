@@ -55,7 +55,7 @@ error_backoff_max_seconds = 60
 fallback_mode = "survive"
 conversation_enabled = true
 social_poll_seconds = 1
-proactive_greetings_enabled = true
+proactive_greetings_enabled = false
 greeting_cooldown_seconds = 1200
 # Generous enough for a busy room, while still bounding unthrottled room speech.
 greetings_per_minute = 20

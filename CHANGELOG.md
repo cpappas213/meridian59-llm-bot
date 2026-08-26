@@ -69,10 +69,13 @@ and intends to use semantic versioning after its first public release.
   forest crossings no longer expand one stale waypoint into repeated fine-walk
   searches and wall oscillation.
 - Made deterministic post-death and low-health help pleas explicitly opt-in and
-  default-off without disabling self-rearming, LLM replies, or LLM-decided
-  greetings. Restart reconciliation now fails closed on missing/stale plea
-  policy, and the legacy templates no longer emit a mangled em-dash control
-  character when deliberately enabled.
+  default-off without disabling self-rearming or LLM replies. Restart
+  reconciliation now fails closed on missing/stale plea policy, and the legacy
+  templates no longer emit a mangled em-dash control character when deliberately
+  enabled.
+- Made LLM-generated proactive greetings explicitly opt-in and default-off while
+  preserving responses to incoming player and NPC messages. Merely seeing a player
+  can no longer cause unsolicited speech under the shipped configuration.
 - Made `tui.bat` start a stopped scheduled controller or a hidden standalone
   controller when no task is installed, and wait for the broker to join the
   game before opening the console instead of racing startup.

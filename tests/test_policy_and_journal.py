@@ -113,6 +113,22 @@ class PolicyAndJournalTests(unittest.TestCase):
             )
             self.assertTrue(BotConfig.load(path).policy.automated_help_pleas)
 
+    def test_proactive_greetings_are_default_off_and_explicitly_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bot.toml"
+            path.write_text("", encoding="utf-8")
+            self.assertFalse(
+                BotConfig.load(path).controller.proactive_greetings_enabled
+            )
+
+            path.write_text(
+                "[controller]\nproactive_greetings_enabled = true\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                BotConfig.load(path).controller.proactive_greetings_enabled
+            )
+
     def test_openai_payload_uses_only_configured_compatibility_extensions(self) -> None:
         class Response:
             def __enter__(self) -> "Response":

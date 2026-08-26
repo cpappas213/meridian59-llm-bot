@@ -96,7 +96,7 @@ class ControllerConfig:
     fallback_mode: str
     conversation_enabled: bool
     social_poll_seconds: float = 1.0
-    proactive_greetings_enabled: bool = True
+    proactive_greetings_enabled: bool = False
     greeting_cooldown_seconds: float = 20 * 60
     greetings_per_minute: int = 20
     conversation_history_turns: int = 8
@@ -314,7 +314,7 @@ class BotConfig:
             fallback_mode=str(ctl_raw.get("fallback_mode", "survive")),
             conversation_enabled=bool(ctl_raw.get("conversation_enabled", True)),
             social_poll_seconds=float(ctl_raw.get("social_poll_seconds", 1.0)),
-            proactive_greetings_enabled=bool(ctl_raw.get("proactive_greetings_enabled", True)),
+            proactive_greetings_enabled=bool(ctl_raw.get("proactive_greetings_enabled", False)),
             greeting_cooldown_seconds=float(ctl_raw.get("greeting_cooldown_seconds", 20 * 60)),
             greetings_per_minute=int(ctl_raw.get("greetings_per_minute", 20)),
             conversation_history_turns=int(ctl_raw.get("conversation_history_turns", 8)),

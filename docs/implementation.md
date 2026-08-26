@@ -31,10 +31,11 @@ injects the configured agent identity, records policy decisions and prepared
 attempts, and serializes mutations.
 
 Conversation is an independent, tool-less LLM role. Player/NPC text is untrusted
-roleplay and cannot mutate goals or controller state. Bounded proactive greetings
-and per-speaker history are optional. Chat generation uses a separate temperature
-from planning, and a deterministic rolling window limits each speaker conversation
-to 12 total incoming/outgoing lines in 30 minutes by default.
+roleplay and cannot mutate goals or controller state. Replies and per-speaker
+history remain enabled, while proactive greetings are explicit opt-in and disabled
+by default. Chat generation uses a separate temperature from planning, and a
+deterministic rolling window limits each speaker conversation to 12 total
+incoming/outgoing lines in 30 minutes by default.
 
 ## First-run state machine
 
