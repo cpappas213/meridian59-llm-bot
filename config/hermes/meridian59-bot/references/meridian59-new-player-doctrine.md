@@ -133,7 +133,10 @@ Hermes retries the failed combat family.
 
 Treat a keeper safe spot as provisional until it holds for multiple live passes
 with an adjacent attacker. A `safe_spot.works` label based on a short or
-attack-free test is not enough. Any damage while resting, forced withdrawal,
-safe-spot failure journal message, or death disproves the spot for that tactic.
-Do not reuse a room listed in `farm_tactic_quarantines`; select another grounded
-room with a viable full spawn mix and begin from a sanctuary.
+attack-free test is not enough. Ordinary retaliation while resting, forced
+withdrawal, or death from the monster already engaged or pulled to the wall does
+not disprove the spot. Retire the exact coordinate only when live evidence shows
+a new, previously unengaged monster can acquire the character there, or an
+explicit placement/geometry failure is reported. Do not reuse a room listed in
+`farm_tactic_quarantines`; select another grounded room with a viable full spawn
+mix and begin from a sanctuary.

@@ -20,6 +20,7 @@ from .broker import (
 from .campaign import (
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
+    PHASE_KEEPER_TARGET_KILLS,
     PhaseOutcome,
     RESEARCH_RETRY_UNLOCKED,
 )
@@ -39,6 +40,7 @@ from .learning import (
     farm_quarantine_evidence_identity,
     farm_quarantine_matches,
     farm_quarantine_scope,
+    farm_positioning_strategy,
     farm_tactic_identity,
     farm_tactic_key,
     is_obsolete_farm_recovery_failure,
@@ -199,10 +201,11 @@ ABILITY_VALUE_CAP = 99
 # then repeat the trip forever after returning to the farm.
 BROKER_WALKING_MONEY = 400
 
-# The keeper may continue a bounded farm until 60% health. Rest/recovery still
-# begins earlier, and the separate emergency survival fallback remains more
-# conservative. This is the operator-approved combat-risk boundary for farms.
-FARM_FLEE_THRESHOLD = 0.60
+# The keeper may continue a bounded farm at exactly 17/40 health and withdraw
+# below it. Rest/recovery still begins earlier, and the separate emergency
+# survival fallback remains more conservative. Writing the ratio directly
+# keeps the operator-approved integer-HP boundary explicit.
+FARM_FLEE_THRESHOLD = 17 / 40
 # Pulling leaves the verified wall. Always overwrite a legacy persisted
 # unlimited policy unless a durable recipe explicitly supplies an override.
 FARM_PULL_WITHIN = 8
@@ -278,6 +281,8 @@ RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
 RECENT_INVENTORY_CREATION_RUNTIME_KEY = "recent_inventory_creation_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
 PLANNED_CONTROLLER_STOP_RUNTIME_KEY = "planned_controller_stop_v1"
+CHARACTER_DEATH_CURSOR_RUNTIME_KEY = "character_death_cursor_v1"
+PLANNER_FAILURE_CIRCUIT_RUNTIME_PREFIX = "planner_failure_circuit_v1"
 GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
 
 # A shutdown is deliberately much slower than a process stop. The keeper first
@@ -318,6 +323,9 @@ class BotController:
         self.policy = PolicyEngine(config.policy)
         self.criteria = CriteriaEvaluator(self.storage)
         self.campaign = CampaignCoordinator(self.storage, self.criteria)
+        self._legacy_initial_outcome_candidates = (
+            self._snapshot_legacy_initial_outcome_candidates()
+        )
         self.learning = GoalLearning(config.learning, self.storage, lambda: self.knowledge.corpus_version)
         self.started_at = timestamp()
         self.state = "starting"
@@ -1233,7 +1241,7 @@ class BotController:
             arguments = arguments if isinstance(arguments, dict) else {}
             room = arguments.get("assigned_room")
             target = " ".join(str(arguments.get("hunt") or "").casefold().split())
-            use_safe_spots = arguments.get("use_safe_spots")
+            use_safe_spots = farm_positioning_strategy(arguments)
             for item in released:
                 item_room = item.get("assigned_room", item.get("room"))
                 item_target = " ".join(
@@ -2935,7 +2943,11 @@ class BotController:
             return False
         outcome = " ".join(str(step.get("outcome") or "").split()).casefold()
         return bool(
-            re.search(r"\b(?:start|launch|begin|run|activate)\b", outcome)
+            re.search(
+                r"\b(?:start(?:s|ed|ing)?|launch(?:es|ed|ing)?|"
+                r"begin(?:s|ning)?|run|activat(?:e|es|ed|ing))\b",
+                outcome,
+            )
             or re.match(r"^farm\b", outcome)
         )
 
@@ -5105,10 +5117,12 @@ class BotController:
         if not isinstance(values, dict):
             return None
         value = values.get(str(goal.get("id") or ""))
+        completion = value.get("completion") if isinstance(value, dict) else None
         if (
             not isinstance(value, dict)
             or value.get("goal_contract") != self._goal_contract(goal)
-            or not isinstance(value.get("completion"), dict)
+            or not isinstance(completion, dict)
+            or completion.get("all_met") is not True
         ):
             return None
         return value
@@ -5180,10 +5194,12 @@ class BotController:
         if not isinstance(values, dict):
             return None
         value = values.get(str(phase.get("id") or ""))
+        completion = value.get("completion") if isinstance(value, dict) else None
         if (
             not isinstance(value, dict)
             or value.get("phase_contract") != self._phase_contract(phase)
-            or not isinstance(value.get("completion"), dict)
+            or not isinstance(completion, dict)
+            or completion.get("all_met") is not True
         ):
             return None
         return value
@@ -5816,6 +5832,7 @@ class BotController:
             isinstance(persisted_blocker, dict)
             and persisted_blocker.get("kind")
             in {
+                "initially_satisfied_phase_outcome",
                 "invalid_farm_phase_outcome",
                 "invalid_combat_training_phase_outcome",
                 "invalid_prepare_combat_phase_outcome",
@@ -5830,6 +5847,10 @@ class BotController:
             target_mismatch = (
                 persisted_blocker.get("kind")
                 == "operator_farm_target_mismatch"
+            )
+            initially_satisfied = (
+                persisted_blocker.get("kind")
+                == "initially_satisfied_phase_outcome"
             )
             reason = str(
                 persisted_blocker.get("guidance")
@@ -5850,7 +5871,11 @@ class BotController:
                 (
                     "Retired a persisted farm phase that substituted different prey"
                     if target_mismatch
-                    else "Retired a persisted phase whose action-only outcome was not observable"
+                    else (
+                        "Retired a pre-upgrade farm phase whose outcome was already satisfied"
+                        if initially_satisfied
+                        else "Retired a persisted phase whose outcome was not causally tied to its work"
+                    )
                 ),
                 severity="warning",
                 interesting=False,
@@ -7278,6 +7303,18 @@ class BotController:
             raise ModelError("execution_plan.assumptions must be an array of strings")
         run = self.storage.campaign_run(str(goal.get("id") or ""))
         phase = self.storage.active_campaign_phase(run["id"]) if run else None
+        goal_completion_pending = self._goal_completion_checkpoint(goal) is not None
+        phase_completion_pending = self._phase_completion_checkpoint(phase) is not None
+        phase_exhaustion_pending = self._phase_exhaustion_checkpoint(phase) is not None
+        phase_abandonment_pending = (
+            self._phase_abandonment_checkpoint(phase) is not None
+        )
+        phase_terminal_pending = (
+            goal_completion_pending
+            or phase_completion_pending
+            or phase_exhaustion_pending
+            or phase_abandonment_pending
+        )
         known_tools = {
             str(tool.get("name") or "") for tool in self._planner_tools(phase)
         }
@@ -7376,65 +7413,61 @@ class BotController:
             if repeat_count > 1:
                 normalized_step["repeat_count"] = repeat_count
             normalized_steps.append(normalized_step)
-        sale_recovery_error = self._sale_recovery_plan_error(
-            goal, normalized_steps
-        )
-        bank_error = self._bank_plan_error(
-            normalized_steps, self.last_observation or {}
-        )
-        if bank_error is not None:
-            raise ModelError(bank_error)
-        direct_capability_error = self._direct_capability_plan_error(
-            phase,
-            normalized_steps,
-            self.last_observation or {},
-            assumptions,
-        )
-        if direct_capability_error is not None:
-            raise ModelError(direct_capability_error)
-        phase_required_sale_error = self._phase_required_sale_plan_error(
-            phase, normalized_steps, self.last_observation or {}
-        )
-        if phase_required_sale_error is not None:
-            raise ModelError(phase_required_sale_error)
-        phase_inventory_error = self._phase_inventory_plan_error(
-            phase, normalized_steps, self.last_observation or {}
-        )
-        if phase_inventory_error is not None:
-            raise ModelError(phase_inventory_error)
-        sale_grounding_error = self._targeted_sale_grounding_error(
-            goal,
-            phase,
-            normalized_steps,
-            self.last_observation or {},
-        )
-        if sale_grounding_error is not None:
-            raise ModelError(sale_grounding_error)
-        if sale_recovery_error is not None:
-            raise ModelError(sale_recovery_error)
-        funding_error = self._plan_funding_error(
-            normalized_steps,
-            self.last_observation or {},
-        )
-        if funding_error is not None:
-            raise ModelError(funding_error)
-        affordability_error = self._shop_plan_affordability_error(
-            normalized_steps, self.last_observation or {}
-        )
-        if affordability_error is not None:
-            raise ModelError(affordability_error)
         purchase = grounding.get("purchase_verification")
-        if isinstance(purchase, dict) and not purchase.get("static_verified"):
-            raise ModelError("execution plan cannot be verified because purchase feasibility is invalid")
+        if not phase_terminal_pending:
+            sale_recovery_error = self._sale_recovery_plan_error(
+                goal, normalized_steps
+            )
+            bank_error = self._bank_plan_error(
+                normalized_steps, self.last_observation or {}
+            )
+            if bank_error is not None:
+                raise ModelError(bank_error)
+            direct_capability_error = self._direct_capability_plan_error(
+                phase,
+                normalized_steps,
+                self.last_observation or {},
+                assumptions,
+            )
+            if direct_capability_error is not None:
+                raise ModelError(direct_capability_error)
+            phase_required_sale_error = self._phase_required_sale_plan_error(
+                phase, normalized_steps, self.last_observation or {}
+            )
+            if phase_required_sale_error is not None:
+                raise ModelError(phase_required_sale_error)
+            phase_inventory_error = self._phase_inventory_plan_error(
+                phase, normalized_steps, self.last_observation or {}
+            )
+            if phase_inventory_error is not None:
+                raise ModelError(phase_inventory_error)
+            sale_grounding_error = self._targeted_sale_grounding_error(
+                goal,
+                phase,
+                normalized_steps,
+                self.last_observation or {},
+            )
+            if sale_grounding_error is not None:
+                raise ModelError(sale_grounding_error)
+            if sale_recovery_error is not None:
+                raise ModelError(sale_recovery_error)
+            funding_error = self._plan_funding_error(
+                normalized_steps,
+                self.last_observation or {},
+            )
+            if funding_error is not None:
+                raise ModelError(funding_error)
+            affordability_error = self._shop_plan_affordability_error(
+                normalized_steps, self.last_observation or {}
+            )
+            if affordability_error is not None:
+                raise ModelError(affordability_error)
+            if isinstance(purchase, dict) and not purchase.get("static_verified"):
+                raise ModelError(
+                    "execution plan cannot be verified because purchase feasibility is invalid"
+                )
         farm_intent = self._effective_farm_intent(goal)
         current_completion = self.criteria.evaluate(goal, self.last_observation or {})
-        phase_exhaustion_pending = self._phase_exhaustion_checkpoint(phase) is not None
-        phase_abandonment_pending = (
-            self._phase_abandonment_checkpoint(phase) is not None
-        )
-        phase_terminal_pending = (
-            phase_exhaustion_pending or phase_abandonment_pending
-        )
         if not phase_terminal_pending:
             self._validate_direct_pvp_plan(goal, normalized_steps, current_completion)
         farm_work_remains = (
@@ -7519,14 +7552,14 @@ class BotController:
                         "before its autopilot launch step"
                     )
         safe_ending = self._validated_safe_ending(raw_plan, normalized_steps)
-        if phase_exhaustion_pending and (
+        if phase_terminal_pending and (
             len(normalized_steps) != 1
             or str(normalized_steps[0].get("id") or "")
             != str(safe_ending.get("step_id") or "")
         ):
             raise ModelError(
-                "an exhausted campaign phase accepts only its one final "
-                "source-verified safe-ending travel step"
+                "a verified terminal goal or campaign-phase checkpoint accepts "
+                "only its one final source-verified safe-ending travel step"
             )
         if self._goal_requires_raza_exit(goal) and (
             "raza" in str(safe_ending.get("name") or "").casefold()
@@ -8458,6 +8491,134 @@ class BotController:
         return contracts
 
     @staticmethod
+    def _tactical_financial_context(
+        value: dict[str, Any],
+        *,
+        tool_names: list[str],
+    ) -> dict[str, Any]:
+        """Project economic facts to choices legal in the active phase.
+
+        The full financial context intentionally carries source provenance and
+        merchant discovery evidence for controller-side commerce. Tactical
+        planning needs the economic posture in every phase, but a sale catalogue
+        cannot support an executable step unless the phase exposes ``sell`` or
+        ``sell_all``. When selling is legal, retain current quote evidence and
+        exact item-to-merchant-room choices while removing repeated catalogue
+        metadata that the controller keeps out of band.
+        """
+
+        if not isinstance(value, dict):
+            return {}
+
+        summary_fields = (
+            "carried_shillings",
+            "source_estimated_inventory_value",
+            "source_estimated_liquidatable_inventory_value",
+            "confirmed_live_quote_liquidatable_value",
+            "known_inventory_item_value",
+            "known_liquidatable_inventory_value",
+            "known_total_carried_value",
+            "valuation_complete",
+            "liquidation_status",
+            "npc_transfer_restricted_items",
+            "protected_sale_items",
+            "npc_transfer_rules",
+            "bank_accounts",
+            "valuation_note",
+            "banking_policy",
+        )
+        projected = {
+            key: deepcopy(value[key])
+            for key in summary_fields
+            if value.get(key) is not None
+        }
+        if not {"sell", "sell_all"}.intersection(
+            {str(name).strip().casefold() for name in tool_names}
+        ):
+            return projected
+
+        for key in (
+            "valued_items",
+            "unknown_value_items",
+            "unquoted_liquidatable_items",
+            "valid_live_sell_quotes",
+            "rejected_buyer_candidates",
+            "merchant_sale_refusals",
+            "sale_exhausted_items",
+        ):
+            if value.get(key) is not None:
+                projected[key] = deepcopy(value[key])
+
+        buyers = value.get("buyer_candidates")
+        if not isinstance(buyers, list):
+            return projected
+
+        buyer_routes: dict[str, dict[str, list[int]]] = {}
+        buyer_route_context: dict[str, dict[str, Any]] = {}
+        instructions: list[str] = []
+        for raw in buyers:
+            if not isinstance(raw, dict):
+                continue
+            item_name = " ".join(str(raw.get("item") or "").split())
+            if not item_name:
+                continue
+            item_context = {
+                key: deepcopy(raw[key])
+                for key in (
+                    "item_kind",
+                    "inferred_source_category",
+                )
+                if raw.get(key) is not None
+            }
+            if item_context:
+                buyer_route_context[item_name] = item_context
+            item_routes = buyer_routes.setdefault(item_name, {})
+            raw_candidates = raw.get("candidates")
+            for raw_candidate in (
+                raw_candidates if isinstance(raw_candidates, list) else []
+            ):
+                if not isinstance(raw_candidate, dict):
+                    continue
+                merchant = " ".join(
+                    str(raw_candidate.get("merchant") or "").split()
+                )
+                if not merchant:
+                    continue
+                room_ids: list[int] = []
+                seen_rooms: set[int] = set()
+                raw_rooms = raw_candidate.get("room_ids")
+                for raw_room in raw_rooms if isinstance(raw_rooms, list) else []:
+                    if isinstance(raw_room, bool):
+                        continue
+                    if isinstance(raw_room, float) and not raw_room.is_integer():
+                        continue
+                    try:
+                        room_id = int(raw_room)
+                    except (TypeError, ValueError):
+                        continue
+                    if room_id <= 0 or room_id in seen_rooms:
+                        continue
+                    seen_rooms.add(room_id)
+                    room_ids.append(room_id)
+                if not room_ids:
+                    continue
+                known_rooms = item_routes.setdefault(merchant, [])
+                known_rooms.extend(
+                    room_id for room_id in room_ids if room_id not in known_rooms
+                )
+            if not item_routes:
+                buyer_routes.pop(item_name, None)
+            instruction = " ".join(str(raw.get("next_evidence") or "").split())
+            if instruction and instruction not in instructions:
+                instructions.append(instruction)
+        projected["buyer_routes"] = buyer_routes
+        if buyer_route_context:
+            projected["buyer_route_context"] = buyer_route_context
+        if instructions:
+            projected["buyer_candidate_instructions"] = instructions
+        return projected
+
+    @staticmethod
     def _tactical_destination_argument_name(schema: dict[str, Any]) -> str:
         properties = schema.get("properties")
         properties = properties if isinstance(properties, dict) else {}
@@ -8661,7 +8822,10 @@ class BotController:
                 {
                     "live_state": live_state,
                     "policy": policy_summary,
-                    "financial": financial_context,
+                    "financial": self._tactical_financial_context(
+                        financial_context,
+                        tool_names=tool_names,
+                    ),
                     "grounding": grounding_projection,
                 },
                 max_list=20,
@@ -8800,6 +8964,7 @@ class BotController:
         *,
         goal: dict[str, Any],
         observation: dict[str, Any],
+        completion: dict[str, Any],
         campaign_phase: dict[str, Any] | None,
         tools: list[dict[str, Any]],
         planner_feedback: dict[str, Any] | None,
@@ -8877,6 +9042,23 @@ class BotController:
                 locked_arguments[destination_name] = destination
                 expected_observation = {"room_id": destination}
                 fixed = True
+        elif self._autopilot_launch_step(step):
+            structured_launch = self._structured_farm_launch_plan(
+                goal,
+                observation,
+                completion,
+            )
+            if isinstance(structured_launch, dict):
+                launch_arguments = structured_launch.get("arguments")
+                launch_observation = structured_launch.get("expected_observation")
+                if isinstance(launch_arguments, dict):
+                    locked_arguments = dict(launch_arguments)
+                    expected_observation = (
+                        dict(launch_observation)
+                        if isinstance(launch_observation, dict)
+                        else {}
+                    )
+                    fixed = True
         free_schema = self._tactical_free_argument_schema(
             raw_schema,
             locked_arguments=locked_arguments,
@@ -10098,6 +10280,12 @@ class BotController:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         normalized = dict(arguments)
         before = dict(arguments)
+        if tool == "autopilot":
+            # A planner response or persisted recipe created against a newer
+            # harness must remain executable during a rollback. Re-add this
+            # controller-owned switch below only when the live schema accepts
+            # it; the legacy keeper has only the combined use_safe_spots flag.
+            normalized.pop("require_safe_wall", None)
         legacy_food_policy = (
             normalized.pop("eat_before_fighting", None)
             if tool == "autopilot"
@@ -10169,19 +10357,21 @@ class BotController:
                         float(arguments.get("rest_below", self.config.policy.rest_health_fraction)),
                     ),
                     # This is an operator policy, not a model-selected risk
-                    # preference. Normalize old queued recipes that still say
-                    # 75-80% as well as overly aggressive lower proposals.
+                    # preference. Normalize every queued recipe to the current
+                    # exact boundary (continue at 17/40, withdraw below it).
                     "flee_below": FARM_FLEE_THRESHOLD,
                     "fight_above_vigor": effective_fight_vigor,
                     # Paid acquisition remains separate and opt-in. The keeper
                     # itself owns consumption of carried or self-created food.
                     "buy_food": buy_food,
                     # Open-field farming is permitted only when durable state
-                    # chose it as a materially different tactic: either an
-                    # operator-authored public goal or the planner's persisted
-                    # internal campaign phase. A one-turn model-only false
-                    # value is still normalized to the wall strategy.
-                    "use_safe_spots": False if allow_open_field else True,
+                    # chose it as a materially different tactic. New keepers
+                    # retain opportunistic/held safe walls while independently
+                    # disabling the wall requirement; legacy keepers receive
+                    # their original combined true/false switch.
+                    **self._farm_wall_policy_arguments(
+                        allow_open_field=allow_open_field
+                    ),
                     "hold_resume_above": max(0.9, float(arguments.get("hold_resume_above", 0.9))),
                     # The harness constructor now defaults to eight, but its
                     # roster persists the complete prior policy. An older
@@ -10243,6 +10433,48 @@ class BotController:
                 "applied": None,
             }
         return normalized, changes
+
+    def _autopilot_accepts(self, argument: str) -> bool:
+        try:
+            tool = self.broker.capabilities().get("autopilot")
+        except (AttributeError, BrokerError, ValueError):
+            # Pure normalization callers and a temporarily unavailable legacy
+            # broker cannot prove support for the split switch. Fail back to
+            # the established one-flag contract.
+            return False
+        return tool is not None and tool.accepts(argument)
+
+    def _farm_wall_policy_arguments(
+        self, *, allow_open_field: bool
+    ) -> dict[str, bool]:
+        """Map durable positioning intent onto the available keeper schema."""
+
+        require_safe_wall = not allow_open_field
+        if self._autopilot_accepts("require_safe_wall"):
+            return {
+                "use_safe_spots": True,
+                "require_safe_wall": require_safe_wall,
+            }
+        return {"use_safe_spots": require_safe_wall}
+
+    def _autonomous_combat_start_health_floor(
+        self, arguments: dict[str, Any]
+    ) -> float:
+        """Return the keeper-owned health floor for a new farm launch."""
+
+        try:
+            requested = float(arguments.get("hold_resume_above", 0.9))
+        except (TypeError, ValueError):
+            requested = 0.9
+        return min(
+            1.0,
+            max(
+                0.9,
+                self.config.policy.rest_health_fraction,
+                FARM_FLEE_THRESHOLD,
+                requested,
+            ),
+        )
 
     @staticmethod
     def _underworld(observation: dict[str, Any]) -> bool:
@@ -10428,14 +10660,23 @@ class BotController:
                             ),
                         }
                     )
-            elif health < 1.0:
-                blockers.append(
-                    {
-                        "kind": "recover_health",
-                        "health_fraction": health,
-                        "guidance": "return to full health before launching autonomous combat",
-                    }
+            else:
+                minimum_start = self._autonomous_combat_start_health_floor(
+                    arguments
                 )
+                if health < minimum_start:
+                    blockers.append(
+                        {
+                            "kind": "recover_health",
+                            "health_fraction": health,
+                            "minimum_start_fraction": minimum_start,
+                            "guidance": (
+                                "recover to the keeper's bounded resume threshold "
+                                "before launching autonomous combat "
+                                f"({minimum_start:.0%}); full health is not required"
+                            ),
+                        }
+                    )
         mana = self._vital_fraction(observation, "mana")
         if mana is not None and mana < 1.0:
             blockers.append({"kind": "recover_mana", "mana_fraction": mana, "guidance": "return to full mana before a new hazardous encounter"})
@@ -10493,7 +10734,7 @@ class BotController:
             stagnation = stagnations.get(stagnation_key)
             if isinstance(stagnation, dict) and self._farm_stagnation_blocks_strategy(
                 stagnation,
-                use_safe_spots=arguments.get("use_safe_spots"),
+                use_safe_spots=farm_positioning_strategy(arguments),
             ):
                 blockers.append(
                     {
@@ -11070,6 +11311,295 @@ class BotController:
             block=False,
         )
         return {"event": event, "strategic_goal_preserved": True, **deferred}
+
+    @staticmethod
+    def _observed_max_health(observation: dict[str, Any] | None) -> int | None:
+        if not isinstance(observation, dict):
+            return None
+        raw = deep_get(
+            observation,
+            "status.vitals.health.max",
+            deep_get(observation, "look.vitals.health.max"),
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _durable_death_candidate(
+        self,
+        observation: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return stable death evidence independent of keeper operating mode."""
+
+        keeper = observation.get("autopilot")
+        keeper = keeper if isinstance(keeper, dict) else {}
+        last_death = keeper.get("last_death")
+        last_death = last_death if isinstance(last_death, dict) else None
+        before_max = self._observed_max_health(previous)
+        after_max = self._observed_max_health(observation)
+        entered_underworld = bool(
+            isinstance(previous, dict)
+            and not self._underworld(previous)
+            and self._underworld(observation)
+        )
+        lost_max_health = bool(
+            before_max is not None
+            and after_max is not None
+            and after_max < before_max
+        )
+        if last_death:
+            identity = next(
+                (
+                    last_death.get(key)
+                    for key in ("death_id", "id", "seq", "at")
+                    if last_death.get(key) is not None
+                ),
+                None,
+            )
+            if identity is None:
+                identity = json_hash(
+                    {
+                        "character": self._character_name(observation),
+                        "room": last_death.get("room_num", last_death.get("died_in")),
+                        "target": last_death.get("hunting", last_death.get("target")),
+                        "last_health": last_death.get("last_health"),
+                        "post_mortem": last_death.get("post_mortem"),
+                        "after_max": after_max,
+                    }
+                )
+            explicit = {
+                "death_id": f"keeper:{self.config.game.agent}:{identity}",
+                "source": "keeper_last_death",
+                "record": deepcopy(last_death),
+                "before_max_health": before_max,
+                "after_max_health": after_max,
+            }
+            cursor = self.storage.get_runtime(
+                CHARACTER_DEATH_CURSOR_RUNTIME_KEY, {}
+            )
+            known_death_ids = {
+                str(value)
+                for value in (
+                    cursor.get("recent_death_ids", [])
+                    if isinstance(cursor, dict)
+                    and isinstance(cursor.get("recent_death_ids"), list)
+                    else []
+                )
+            }
+            if isinstance(cursor, dict) and cursor.get("accounted") is True:
+                known_death_ids.add(str(cursor.get("death_id") or ""))
+            # last_death is a durable "most recent" receipt, so it can remain
+            # unchanged while a new raw Underworld transition is happening.
+            # In that narrow interval, prefer the fresh transition and later
+            # use the updated keeper receipt only to corroborate it.
+            if not (
+                isinstance(cursor, dict)
+                and explicit["death_id"] in known_death_ids
+                and (entered_underworld or lost_max_health)
+            ):
+                return explicit
+
+        if not entered_underworld and not lost_max_health:
+            return None
+        source = "underworld_transition" if entered_underworld else "max_health_decrement"
+        return {
+            "death_id": "observed:"
+            + json_hash(
+                {
+                    "agent": self.config.game.agent,
+                    "source": source,
+                    "before_max_health": before_max,
+                    "after_max_health": after_max,
+                    "before_room": self._observation_room(previous or {}),
+                    "after_room": self._observation_room(observation),
+                }
+            ),
+            "source": source,
+            "record": {},
+            "before_max_health": before_max,
+            "after_max_health": after_max,
+        }
+
+    def _reconcile_durable_death(
+        self,
+        observation: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Account for each observed death once, before any mode-specific return.
+
+        This deliberately records facts only. A death does not, by itself,
+        disprove a safe wall or authorize tactic quarantine: an already-engaged
+        monster can continue damaging a character at a valid safe position.
+        """
+
+        candidate = self._durable_death_candidate(observation, previous)
+        if candidate is None:
+            return None
+        cursor = self.storage.get_runtime(CHARACTER_DEATH_CURSOR_RUNTIME_KEY, {})
+        cursor = cursor if isinstance(cursor, dict) else {}
+        death_id = str(candidate["death_id"])
+        recent_death_ids = [
+            str(value)
+            for value in cursor.get("recent_death_ids", [])
+            if str(value).strip()
+        ] if isinstance(cursor.get("recent_death_ids"), list) else []
+        if cursor.get("accounted") is True and cursor.get("death_id") is not None:
+            recent_death_ids.append(str(cursor["death_id"]))
+        recent_death_ids = list(dict.fromkeys(recent_death_ids))[-64:]
+        if death_id in recent_death_ids:
+            return {
+                "death_reconciled": True,
+                "duplicate": True,
+                "death_id": death_id,
+                "source": candidate.get("source"),
+            }
+
+        # A transient Underworld observation can precede the keeper's durable
+        # last_death receipt. Treat that later receipt as corroboration when no
+        # additional max-HP loss occurred, rather than counting one death twice.
+        same_recent_fallback = bool(
+            candidate.get("source") == "keeper_last_death"
+            and cursor.get("source") in {"underworld_transition", "max_health_decrement"}
+            and cursor.get("accounted") is True
+            and cursor.get("after_max_health") == candidate.get("after_max_health")
+            and time.time() - float(cursor.get("observed_unix") or 0) < 10 * 60
+        )
+        if same_recent_fallback:
+            self.storage.set_runtime(
+                CHARACTER_DEATH_CURSOR_RUNTIME_KEY,
+                {
+                    **cursor,
+                    "death_id": death_id,
+                    "source": candidate.get("source"),
+                    "corroborated_fallback_death_id": cursor.get("death_id"),
+                    "record": redact(candidate.get("record")),
+                    "recent_death_ids": list(
+                        dict.fromkeys([*recent_death_ids, death_id])
+                    )[-64:],
+                },
+            )
+            last_death = candidate.get("record")
+            if isinstance(last_death, dict) and last_death.get("at") is not None:
+                self.storage.set_runtime(
+                    "background_farm_last_death_at", str(last_death["at"])
+                )
+            return {
+                "death_reconciled": True,
+                "duplicate": True,
+                "death_id": death_id,
+                "source": candidate.get("source"),
+                "corroborated": True,
+            }
+
+        # Persist a pending receipt before secondary accounting. If a later
+        # operation fails, the next observation retries instead of losing the
+        # raw death signal behind a keeper mode transition.
+        pending = {
+            **candidate,
+            "record": redact(candidate.get("record")),
+            "accounted": False,
+            "observed_at": timestamp(),
+            "observed_unix": time.time(),
+            "recent_death_ids": recent_death_ids,
+        }
+        self.storage.set_runtime(CHARACTER_DEATH_CURSOR_RUNTIME_KEY, pending)
+        last_death = candidate.get("record")
+        last_death = last_death if isinstance(last_death, dict) else {}
+        if last_death.get("at") is not None:
+            # Prevent the older farm-only ingestion path from emitting a second
+            # event or treating this factual receipt as tactic disposition.
+            self.storage.set_runtime(
+                "background_farm_last_death_at", str(last_death["at"])
+            )
+        goal = self.storage.active_goal()
+        target = (
+            last_death.get("hunting")
+            or last_death.get("target")
+            or deep_get(observation, "autopilot.policy.hunt")
+            or "unknown"
+        )
+        before = previous if isinstance(previous, dict) else {
+            "look": {
+                "room": {
+                    "num": last_death.get("room_num"),
+                    "name": last_death.get("died_in"),
+                }
+            },
+            "status": {
+                "vitals": {
+                    "health": {
+                        "current": last_death.get("last_health"),
+                        "max": candidate.get("before_max_health"),
+                    }
+                }
+            },
+            "inventory": observation.get("inventory", {}),
+        }
+        combat = self.learning.record_combat_outcome(
+            tool="autopilot",
+            arguments={"target": target, "death_id": death_id},
+            before=before,
+            result={
+                "died": True,
+                "target": target,
+                "death_id": death_id,
+                "post_mortem": last_death.get("post_mortem"),
+            },
+            after=observation,
+            died=True,
+        )
+        event = self.storage.emit_event(
+            "character.died",
+            "The character's death was reconciled from durable game evidence",
+            severity="critical",
+            interesting=True,
+            goal_id=goal.get("id") if isinstance(goal, dict) else None,
+            data={
+                "death_id": death_id,
+                "source": candidate.get("source"),
+                "broker_death": redact(last_death),
+                "before": {
+                    "room": redact(deep_get(before, "look.room")),
+                    "vitals": redact(
+                        deep_get(before, "status.vitals", deep_get(before, "look.vitals", {}))
+                    ),
+                },
+                "after": {
+                    "room": redact(deep_get(observation, "look.room")),
+                    "vitals": redact(
+                        deep_get(
+                            observation,
+                            "status.vitals",
+                            deep_get(observation, "look.vitals", {}),
+                        )
+                    ),
+                },
+                "combat_memory": combat,
+                "tactic_disposition": "unchanged",
+                "safe_spot_invalidated": False,
+            },
+        )
+        accounted = {
+            **pending,
+            "accounted": True,
+            "event_id": event["id"],
+            "accounted_at": timestamp(),
+            "recent_death_ids": list(
+                dict.fromkeys([*recent_death_ids, death_id])
+            )[-64:],
+        }
+        self.storage.set_runtime(CHARACTER_DEATH_CURSOR_RUNTIME_KEY, accounted)
+        return {
+            "death_reconciled": True,
+            "duplicate": False,
+            "death_id": death_id,
+            "source": candidate.get("source"),
+            "event_id": event["id"],
+            "safe_spot_invalidated": False,
+        }
 
     def _goal_draft_character_state(self) -> dict[str, Any]:
         observation = self.last_observation or {}
@@ -13124,6 +13654,7 @@ class BotController:
         selected_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         intent = self._effective_farm_intent(goal)
+        launch_health_floor = self._autonomous_combat_start_health_floor(intent)
         observation = self.last_observation or {}
         launch_origin = self._farm_launch_origin(goal, observation, intent)
         if launch_origin is None:
@@ -13196,9 +13727,17 @@ class BotController:
             + [
                 {
                     "id": "rest-for-farm",
-                    "outcome": "Rest safely to the ordinary 80-vigor ceiling and stand again.",
+                    "outcome": (
+                        "Recover to the keeper's bounded "
+                        f"{launch_health_floor:.0%} health resume threshold and the "
+                        "ordinary 80-vigor rest ceiling in safe staging, then stand "
+                        "again."
+                    ),
                     "tool": "rest_up",
-                    "verification": "Live vigor is at least 80 and the character is standing.",
+                    "verification": (
+                        f"Live health is at least {launch_health_floor:.0%}, vigor is "
+                        "at least 80, and the character is standing."
+                    ),
                 },
                 {
                     "id": "equip-before-farm",
@@ -13338,6 +13877,28 @@ class BotController:
                 "farm-staging-transit",
                 "Reach the source-verified safe staging room before the keeper launch.",
             )
+        health_fraction = self._vital_fraction(observation, "health")
+        launch_health_floor = self._autonomous_combat_start_health_floor(intent)
+        if (
+            health_fraction is not None
+            and health_fraction < launch_health_floor
+        ):
+            # The harness currently exposes one coupled rest target for health
+            # and vigor. Its own no-progress detector stops after the ordinary
+            # 80-vigor ceiling, so this bounded attempt does not make food-only
+            # vigor recovery a prerequisite. A truthful no-progress result is
+            # handled as failed evidence rather than renewed phase liveness.
+            return action(
+                "rest_up",
+                {"to": launch_health_floor, "max_seconds": 30},
+                "rest-for-farm",
+                (
+                    "Recover to the keeper's bounded health resume threshold in "
+                    "source-verified safe staging before autonomous combat; the "
+                    "coupled vigor target remains bounded by the rest tool's "
+                    "plateau detector."
+                ),
+            )
         rested = deep_get(
             observation,
             "status.vitals.vigor.rested",
@@ -13401,7 +13962,7 @@ class BotController:
             quarantine,
             room=arguments.get("assigned_room"),
             target=arguments.get("hunt"),
-            use_safe_spots=arguments.get("use_safe_spots"),
+            use_safe_spots=farm_positioning_strategy(arguments),
             target_matches=self._farm_targets_match,
         )
 
@@ -13986,13 +14547,34 @@ class BotController:
                 for key, value in intent.items()
                 if key != "eat_before_fighting"
             },
+            # Farm launches always normalize model/legacy recipes to this
+            # controller-owned boundary. Include it in reconciliation so a
+            # keeper surviving a controller restart cannot silently retain an
+            # obsolete threshold indefinitely.
+            "flee_below": FARM_FLEE_THRESHOLD,
             "fight_above_vigor": self._farm_fight_vigor(goal),
             "buy_food": intent.get("buy_food") is True,
         }
+        policy = status.get("policy")
+        policy = policy if isinstance(policy, dict) else {}
         actual = {
             "assigned_room": self._farm_assigned_room(status),
             "hunt": self._farm_target(status).strip().casefold(),
-            "use_safe_spots": deep_get(status, "policy.useSafeSpots", deep_get(status, "policy.use_safe_spots")),
+            # This field is the durable positioning strategy, not merely the
+            # keeper's opportunistic wall-use switch. On a decoupled keeper,
+            # useSafeSpots=true + requireSafeWall=false is open-field allowed.
+            "use_safe_spots": farm_positioning_strategy(policy),
+            "keeper_use_safe_spots": deep_get(
+                status,
+                "policy.useSafeSpots",
+                deep_get(status, "policy.use_safe_spots"),
+            ),
+            "require_safe_wall": deep_get(
+                status,
+                "policy.requireSafeWall",
+                deep_get(status, "policy.require_safe_wall"),
+            ),
+            "flee_below": self._farm_flee_threshold(status),
             "fight_above_vigor": deep_get(
                 status,
                 "policy.fightAboveVigor",
@@ -14026,6 +14608,7 @@ class BotController:
             "assigned_room",
             "hunt",
             "use_safe_spots",
+            "flee_below",
             "fight_above_vigor",
             "buy_food",
         ):
@@ -15086,10 +15669,9 @@ class BotController:
         if fallback_pending and not operator_requires_safe_spots:
             if safety_evidence:
                 return None
-            actual_safe_spots = deep_get(
-                status,
-                "policy.useSafeSpots",
-                deep_get(status, "policy.use_safe_spots"),
+            status_policy = status.get("policy")
+            actual_safe_spots = farm_positioning_strategy(
+                status_policy if isinstance(status_policy, dict) else {}
             )
             if actual_safe_spots is False:
                 updated_phase = self._confirm_farm_open_field_fallback(
@@ -15475,12 +16057,11 @@ class BotController:
         goal: dict[str, Any],
         *,
         kill_delta: int,
+        kill_records: list[dict[str, Any]],
         cumulative_kills: int,
     ) -> dict[str, Any] | None:
-        """Renew a long farm phase whenever the keeper verifies another kill."""
+        """Renew a farm phase from idempotent, phase-scoped kill receipts."""
 
-        if kill_delta <= 0:
-            return None
         phase = self._active_keeper_combat_phase(goal)
         if not isinstance(phase, dict) or phase.get("kind") != "farm":
             return None
@@ -15488,6 +16069,69 @@ class BotController:
             CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
         )
         leases = dict(leases) if isinstance(leases, dict) else {}
+        previous_lease = leases.get(str(phase["id"]), {})
+        previous_lease = (
+            previous_lease if isinstance(previous_lease, dict) else {}
+        )
+        prior_receipts = previous_lease.get("target_kill_receipts")
+        prior_receipts = (
+            [str(item) for item in prior_receipts]
+            if isinstance(prior_receipts, list)
+            else []
+        )
+        prior_receipt_set = set(prior_receipts)
+        seen_receipts = set(prior_receipt_set)
+        phase_target = self._campaign_phase_farm_intent(phase).get("hunt")
+        new_records: list[tuple[str, dict[str, Any]]] = []
+        new_target_receipts: list[str] = []
+        for record in kill_records:
+            receipt_id = self._farm_kill_receipt_id(record)
+            if receipt_id is None or receipt_id in seen_receipts:
+                continue
+            seen_receipts.add(receipt_id)
+            new_records.append((receipt_id, record))
+            if phase_target and self._farm_targets_match(
+                record.get("target"), phase_target
+            ):
+                new_target_receipts.append(receipt_id)
+
+        has_target_kill_criterion = any(
+            isinstance(criterion, dict)
+            and criterion.get("kind") == PHASE_KEEPER_TARGET_KILLS
+            for criterion in phase.get("success_criteria", [])
+        )
+        required_target_kills = max(
+            [
+                int(criterion.get("count", 1) or 1)
+                for criterion in phase.get("success_criteria", [])
+                if isinstance(criterion, dict)
+                and criterion.get("kind") == PHASE_KEEPER_TARGET_KILLS
+            ]
+            or [0]
+        )
+        previous_target_kills = int(
+            previous_lease.get("phase_target_kills", 0) or 0
+        )
+        target_kill_delta = len(new_target_receipts)
+        # A target-kill phase advances and renews its timeout only on exact
+        # target receipts. Nuisance kills cannot keep an impossible phase alive.
+        if has_target_kill_criterion:
+            if previous_target_kills >= required_target_kills:
+                return None
+            if target_kill_delta <= 0:
+                return None
+            phase_kill_delta = len(new_records)
+        else:
+            # Older max-HP phases may run against keeper builds whose compact
+            # journal omits a record. Retain their counter fallback; exact-kill
+            # completion never relies on that session-local tally.
+            phase_kill_delta = (
+                len(new_records)
+                if kill_records
+                else max(0, int(kill_delta))
+            )
+            if phase_kill_delta <= 0:
+                return None
         downtime = self.storage.campaign_phase_downtime(str(phase.get("id") or ""))
         downtime_seconds = 0.0
         if isinstance(downtime, dict):
@@ -15502,8 +16146,18 @@ class BotController:
             "phase_id": phase.get("id"),
             "renewed_at": timestamp(),
             "progress_kind": "verified_keeper_kill",
-            "kill_delta": int(kill_delta),
+            "kill_delta": phase_kill_delta,
+            "target_kill_delta": target_kill_delta,
             "cumulative_kills": int(cumulative_kills),
+            "phase_kills": int(previous_lease.get("phase_kills", 0) or 0)
+            + phase_kill_delta,
+            "phase_target_kills": int(
+                previous_target_kills
+            ) + target_kill_delta,
+            "target_kill_receipts": [
+                *prior_receipts,
+                *new_target_receipts,
+            ],
             "downtime_seconds": downtime_seconds,
         }
         leases[str(phase["id"])] = value
@@ -15512,6 +16166,45 @@ class BotController:
             dict(list(leases.items())[-100:]),
         )
         return value
+
+    @staticmethod
+    def _farm_kill_receipt_id(record: dict[str, Any]) -> str | None:
+        """Return a stable identity for one explicit keeper kill journal row."""
+
+        record_at = record.get("at")
+        if not isinstance(record_at, (int, float)) or isinstance(record_at, bool):
+            return None
+        record_pass = record.get("pass")
+        normalized_pass = (
+            int(record_pass)
+            if isinstance(record_pass, (int, float))
+            and not isinstance(record_pass, bool)
+            else None
+        )
+        return json_hash(
+            {
+                "at": float(record_at),
+                "pass": normalized_pass,
+                "target": normalize_farm_target(record.get("target")) or "unknown",
+            }
+        )
+
+    @staticmethod
+    def _phase_started_at_milliseconds(
+        phase: dict[str, Any] | None,
+    ) -> int | None:
+        """Convert a durable phase creation timestamp into a journal boundary."""
+
+        raw = phase.get("created_at") if isinstance(phase, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
 
     @staticmethod
     def _farm_kill_records(
@@ -15552,6 +16245,12 @@ class BotController:
         key = f"background_farm_snapshot_v2:{goal['id']}"
         previous = self.storage.get_runtime(key, {})
         previous = previous if isinstance(previous, dict) else {}
+        active_phase = self._active_keeper_combat_phase(goal)
+        active_phase_id = (
+            str(active_phase.get("id") or "")
+            if isinstance(active_phase, dict)
+            else ""
+        )
         did = status.get("did") if isinstance(status.get("did"), dict) else {}
         counters = {
             name: self._farm_counter(status, name)
@@ -15596,26 +16295,63 @@ class BotController:
             else None
         )
         target = self._farm_target(status)
-        use_safe_spots = deep_get(
+        keeper_use_safe_spots = deep_get(
             status,
             "policy.useSafeSpots",
             deep_get(status, "policy.use_safe_spots"),
         )
-        use_safe_spots = use_safe_spots if isinstance(use_safe_spots, bool) else None
+        keeper_use_safe_spots = (
+            keeper_use_safe_spots
+            if isinstance(keeper_use_safe_spots, bool)
+            else None
+        )
+        require_safe_wall = deep_get(
+            status,
+            "policy.requireSafeWall",
+            deep_get(status, "policy.require_safe_wall"),
+        )
+        require_safe_wall = (
+            require_safe_wall if isinstance(require_safe_wall, bool) else None
+        )
+        policy = status.get("policy")
+        use_safe_spots = farm_positioning_strategy(
+            policy if isinstance(policy, dict) else {}
+        )
 
         pass_floor = previous.get("pass_floor")
         pass_floor = int(pass_floor) if isinstance(pass_floor, (int, float)) else None
         prior_kill_at = previous.get("last_kill_at")
         prior_kill_at = prior_kill_at if isinstance(prior_kill_at, (int, float)) else None
-        kill_records = self._farm_kill_records(
-            status, minimum_pass=pass_floor, after_at=prior_kill_at
+        phase_started_at = self._phase_started_at_milliseconds(active_phase)
+        launch_boundary = self.storage.get_runtime(
+            f"background_farm_launch_boundary_v1:{goal['id']}", {}
         )
-        if len(kill_records) > deltas["kills"]:
-            kill_records = kill_records[-deltas["kills"] :] if deltas["kills"] else []
+        launch_boundary = launch_boundary if isinstance(launch_boundary, dict) else {}
+        launch_boundary_at = (
+            launch_boundary.get("at_ms")
+            if str(launch_boundary.get("phase_id") or "") == active_phase_id
+            else None
+        )
+        boundary_candidates = [
+            value
+            for value in (prior_kill_at, phase_started_at, launch_boundary_at)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        ]
+        kill_boundary_at = max(boundary_candidates) if boundary_candidates else None
+        kill_records = self._farm_kill_records(
+            # Journal timestamps are wall-clock identities and survive the
+            # keeper's session-local pass/counter reset. They are the durable
+            # boundary; a prior session's pass floor must not hide a new kill.
+            status,
+            minimum_pass=None,
+            after_at=kill_boundary_at,
+        )
         kills_by_target: dict[str, int] = {}
-        for record in kill_records[:20]:
+        for record in kill_records:
             actual_target = str(record.get("target") or "unknown")
             kills_by_target[actual_target] = kills_by_target.get(actual_target, 0) + 1
+        for record in kill_records[:20]:
+            actual_target = str(record.get("target") or "unknown")
             self.learning.record_combat_outcome(
                 tool="autopilot",
                 arguments={"target": actual_target, "hunt": target, "assigned_room": room},
@@ -15640,6 +16376,7 @@ class BotController:
         progress_lease = self._renew_farm_progress_lease(
             goal,
             kill_delta=deltas["kills"],
+            kill_records=kill_records,
             cumulative_kills=counters["kills"],
         )
 
@@ -15763,11 +16500,14 @@ class BotController:
 
         snapshot = {
             "observed_at": timestamp(),
+            "phase_id": active_phase_id or None,
             "room": room,
             "assigned_room": assigned_room,
             "at_assigned_room": at_assigned_room,
             "target": target,
             "use_safe_spots": use_safe_spots,
+            "keeper_use_safe_spots": keeper_use_safe_spots,
+            "require_safe_wall": require_safe_wall,
             "counters": counters,
             "launch_counters": launch_counters,
             "launch_placement": (
@@ -15776,6 +16516,7 @@ class BotController:
                 else self._farm_placement_signature(status.get("placement"))
             ),
             "launch_started_at": previous.get("launch_started_at"),
+            "launch_boundary_at": launch_boundary_at,
             "origin_room": previous.get("origin_room"),
             "healing_supply_count": current_supplies,
             "safe_spot": redact(status.get("safe_spot")),
@@ -15785,7 +16526,11 @@ class BotController:
             "pass_floor": pass_floor,
             "last_kill_at": max(
                 [float(record.get("at") or 0) for record in kill_records]
-                + ([float(prior_kill_at)] if prior_kill_at is not None else [0])
+                + (
+                    [float(kill_boundary_at)]
+                    if kill_boundary_at is not None
+                    else [0]
+                )
             ),
             "safe_spot_failure_ids": all_safe_spot_failures[-50:],
             "safe_spot_failure_count": safe_spot_failure_count,
@@ -15799,7 +16544,13 @@ class BotController:
             "progress_lease": redact(progress_lease),
         }
         self.storage.set_runtime(key, snapshot)
-        if any(deltas.values()) or supplies_used or safe_spot_disproved or tactic_warnings:
+        if (
+            any(deltas.values())
+            or kill_records
+            or supplies_used
+            or safe_spot_disproved
+            or tactic_warnings
+        ):
             history = self.storage.get_runtime("background_farm_history_v1", [])
             history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
             sample = {
@@ -15833,6 +16584,8 @@ class BotController:
             "at_assigned_room": at_assigned_room,
             "target": target,
             "use_safe_spots": use_safe_spots,
+            "keeper_use_safe_spots": keeper_use_safe_spots,
+            "require_safe_wall": require_safe_wall,
             "counters": counters,
             "deltas": deltas,
             "session_deltas": session_deltas,
@@ -18567,6 +19320,52 @@ class BotController:
         )
         return list(assessment["threats"]) if assessment is not None else []
 
+    def _snapshot_legacy_initial_outcome_candidates(self) -> set[str]:
+        """Capture only pre-upgrade farm phases eligible for no-op migration.
+
+        New phases receive a controller-owned receipt after their outcome is
+        verified unmet.  Taking this snapshot during controller construction
+        makes the migration one-way: a phase created later cannot be mistaken
+        for legacy state merely because live progress satisfies it before its
+        first recorded action.
+        """
+
+        candidates: set[str] = set()
+        for goal in self.storage.goals(["active", "paused"]):
+            run = self.storage.campaign_run(
+                str(goal.get("id") or ""), include_terminal=True
+            )
+            if not isinstance(run, dict) or run.get("status") not in {
+                "active",
+                "paused",
+            }:
+                continue
+            phase_id = str(run.get("active_phase_id") or "")
+            phase = self.storage.campaign_phase(phase_id) if phase_id else None
+            if (
+                not isinstance(phase, dict)
+                or phase.get("status") not in {"active", "paused"}
+                or phase.get("kind") != "farm"
+                or int(phase.get("attempt_count", 0) or 0) != 0
+            ):
+                continue
+            context = phase.get("context")
+            context = context if isinstance(context, dict) else {}
+            if context.get("initial_observable_outcome_unmet") is True:
+                continue
+            history = self.storage.campaign_phases(str(run["id"]))
+            if any(
+                str(item.get("parent_phase_id") or "") == phase_id
+                for item in history
+                if isinstance(item, dict)
+            ):
+                # A support child may have legitimately satisfied an untried
+                # parent while it was paused.  Without creation evidence, that
+                # case must re-enter ordinary deterministic completion.
+                continue
+            candidates.add(phase_id)
+        return candidates
+
     def _campaign_phase_grounding_blocker(
         self,
         phase: dict[str, Any] | None,
@@ -18623,6 +19422,70 @@ class BotController:
         phase_kind = str(phase.get("kind") or "")
         context = phase.get("context")
         context = context if isinstance(context, dict) else {}
+        phase_id = str(phase.get("id") or "")
+        invalid_farm_outcomes = self.campaign.invalid_farm_outcome_criteria(
+            criteria
+        )
+        if phase_kind == "farm" and invalid_farm_outcomes:
+            return {
+                "kind": "invalid_farm_phase_outcome",
+                "criteria": redact(invalid_farm_outcomes),
+                "guidance": (
+                    "farm completion must be forward max-health progress or a "
+                    "phase-local exact-target keeper-kill count; inventory, food, "
+                    "equipment, currency, location, and recovery outcomes belong "
+                    "to support phases because they can become true before any "
+                    "farm combat"
+                ),
+            }
+        if (
+            phase_id in self._legacy_initial_outcome_candidates
+            and isinstance(observation, dict)
+            and goal_id
+        ):
+            try:
+                attempt_count = int(phase.get("attempt_count", 0) or 0)
+            except (TypeError, ValueError):
+                attempt_count = 1
+            if attempt_count != 0:
+                self._legacy_initial_outcome_candidates.discard(phase_id)
+                initial_outcome = None
+            else:
+                bound_goal = self.storage.goal(str(goal_id))
+                initial_outcome = (
+                    self.campaign.observable_success_evaluation(
+                        bound_goal,
+                        criteria,
+                        observation,
+                    )
+                    if isinstance(bound_goal, dict)
+                    else None
+                )
+            if (
+                isinstance(initial_outcome, dict)
+                and initial_outcome.get("evidence_complete") is True
+                and initial_outcome.get("all_met") is True
+            ):
+                return {
+                    "kind": "initially_satisfied_phase_outcome",
+                    "phase_id": phase_id,
+                    "phase_kind": phase_kind,
+                    "completion": redact(initial_outcome),
+                    "guidance": (
+                        "retire this pre-upgrade zero-attempt farm phase because "
+                        "its entire observable outcome was already true before "
+                        "the controller could verify any phase work; select an "
+                        "unmet observable farming milestone"
+                    ),
+                }
+            if (
+                isinstance(initial_outcome, dict)
+                and initial_outcome.get("evidence_complete") is True
+            ):
+                # The first complete post-upgrade observation proves this
+                # legacy phase began with real work remaining. From now on,
+                # ordinary attempts and deterministic completion own it.
+                self._legacy_initial_outcome_candidates.discard(phase_id)
         train_combat = self._train_ability_uses_combat_keeper(phase)
         if phase_kind != "farm" and not train_combat:
             return None
@@ -18687,7 +19550,7 @@ class BotController:
                 "guidance": (
                     f"{('combat-training' if train_combat else 'farm')} phase cannot complete "
                     "when the keeper merely launches; require an observable outcome such as "
-                    "an ability or max-HP milestone"
+                    "an ability, max-HP, or phase-local exact-target kill milestone"
                 ),
             }
         if isinstance(observation, dict):
@@ -19972,8 +20835,12 @@ class BotController:
         if not self._turn_lock.acquire(blocking=False):
             return {"skipped": "turn already running"}
         try:
+            previous_observation = self.last_observation
             observation = self._reconcile_recent_inventory_creation(
                 self._reconcile_recent_room_transition(self.broker.observe())
+            )
+            death_reconciliation = self._reconcile_durable_death(
+                observation, previous_observation
             )
             self.last_observation = observation
             self._remember_safe_staging(observation)
@@ -19999,6 +20866,11 @@ class BotController:
                 onboarding = self._onboarding_turn(observation)
                 return {
                     "idle": True,
+                    **(
+                        {"death_reconciliation": death_reconciliation}
+                        if death_reconciliation is not None
+                        else {}
+                    ),
                     **(
                         {"keeper_reconciliation": keeper_reconciliation}
                         if keeper_reconciliation is not None
@@ -20690,6 +21562,33 @@ class BotController:
                         )
                     )
                 )
+                if execution_plan is None:
+                    planner_operation = PLAN_CREATE
+                elif revision_needed:
+                    planner_operation = PLAN_REVISE
+                else:
+                    predicted_active_step = self._active_execution_plan_step(
+                        goal,
+                        execution_plan,
+                        safe_return_required=safe_return_required,
+                    )
+                    planner_operation = (
+                        PLAN_REVISE
+                        if predicted_active_step is None
+                        and isinstance(revision_authorization, dict)
+                        else PLAN_CREATE
+                        if predicted_active_step is None
+                        else EXECUTE_STEP
+                    )
+                planner_gate = self._planner_failure_gate(
+                    goal,
+                    observation,
+                    campaign_phase,
+                    execution_plan,
+                    planner_operation,
+                )
+                if planner_gate is not None:
+                    return planner_gate
                 try:
                     if execution_plan is None:
                         decision, progressive_context = (
@@ -20781,6 +21680,7 @@ class BotController:
                                 self._progressive_action_decision(
                                     goal=goal,
                                     observation=observation,
+                                    completion=completion,
                                     campaign_phase=campaign_phase,
                                     tools=planner_tools,
                                     planner_feedback=planner_feedback,
@@ -20810,37 +21710,97 @@ class BotController:
                             "details": redact(exc.details),
                         },
                     )
+                    circuit = self._record_planner_failure_circuit(
+                        goal,
+                        observation,
+                        campaign_phase,
+                        execution_plan,
+                        planner_operation,
+                        failure_kind="tactical_protocol_rejection",
+                        failure_code=exc.code,
+                        reason=str(exc),
+                        details=exc.details,
+                    )
                     return {
                         "tactical_protocol_rejected": True,
                         "code": exc.code,
                         "reason": str(exc),
+                        **circuit,
                     }
+                except ModelError as exc:
+                    failure_kind = self._deterministic_planner_failure_kind(exc)
+                    if failure_kind is None:
+                        raise
+                    self._set_planner_feedback(
+                        goal,
+                        "A deterministic planner failure opened a retry circuit. "
+                        "Wait for material state change before another model call: "
+                        f"{exc}",
+                        failure_context={
+                            "kind": failure_kind,
+                            "reason": str(exc)[:1000],
+                        },
+                    )
+                    return self._record_planner_failure_circuit(
+                        goal,
+                        observation,
+                        campaign_phase,
+                        execution_plan,
+                        planner_operation,
+                        failure_kind=failure_kind,
+                        reason=str(exc),
+                    )
             else:
-                decision = self.model.plan(
-                    goal=goal,
-                    observation=redact(observation),
-                    tools=planner_tools,
-                    persona=self.storage.persona(),
-                    recent_events=page["events"],
-                    pending_proposals=[
-                        {
-                            "id": proposal["id"],
-                            "title": proposal["goal_draft"].get("title"),
-                            "objective": proposal["goal_draft"].get("objective"),
-                        }
-                        for proposal in pending_proposals
-                    ],
-                    planner_feedback=planner_feedback,
-                    policy_summary=policy_summary,
-                    financial_context=financial_context,
-                    grounded_knowledge=grounded_context,
-                    learned_failures=learned_failures,
-                    execution_plan=redact(execution_plan) if execution_plan else None,
-                    revision_authorization=revision_authorization,
-                    campaign_context=self._campaign_context(
-                        campaign_run, campaign_phase, audience="tactical"
-                    ),
+                planner_operation = "legacy_plan"
+                planner_gate = self._planner_failure_gate(
+                    goal,
+                    observation,
+                    campaign_phase,
+                    execution_plan,
+                    planner_operation,
                 )
+                if planner_gate is not None:
+                    return planner_gate
+                try:
+                    decision = self.model.plan(
+                        goal=goal,
+                        observation=redact(observation),
+                        tools=planner_tools,
+                        persona=self.storage.persona(),
+                        recent_events=page["events"],
+                        pending_proposals=[
+                            {
+                                "id": proposal["id"],
+                                "title": proposal["goal_draft"].get("title"),
+                                "objective": proposal["goal_draft"].get("objective"),
+                            }
+                            for proposal in pending_proposals
+                        ],
+                        planner_feedback=planner_feedback,
+                        policy_summary=policy_summary,
+                        financial_context=financial_context,
+                        grounded_knowledge=grounded_context,
+                        learned_failures=learned_failures,
+                        execution_plan=redact(execution_plan) if execution_plan else None,
+                        revision_authorization=revision_authorization,
+                        campaign_context=self._campaign_context(
+                            campaign_run, campaign_phase, audience="tactical"
+                        ),
+                    )
+                except ModelError as exc:
+                    failure_kind = self._deterministic_planner_failure_kind(exc)
+                    if failure_kind is None:
+                        raise
+                    return self._record_planner_failure_circuit(
+                        goal,
+                        observation,
+                        campaign_phase,
+                        execution_plan,
+                        planner_operation,
+                        failure_kind=failure_kind,
+                        reason=str(exc),
+                    )
+            self._clear_planner_failure_circuit(goal)
             self.dependencies["model"] = "healthy"
             self.storage.set_runtime("planner_event_cursor", page["next_cursor"])
             if decision["decision"] == "plan":
@@ -21079,7 +22039,20 @@ class BotController:
                                 "reason": rejected_invariant,
                                 "strategic_goal_preserved": True,
                             }
-                    return {"plan_rejected": True, "reason": str(exc)}
+                    circuit = self._record_planner_failure_circuit(
+                        goal,
+                        observation,
+                        campaign_phase,
+                        execution_plan,
+                        planner_operation,
+                        failure_kind="invalid_execution_plan",
+                        reason=rejected_invariant,
+                    )
+                    return {
+                        "plan_rejected": True,
+                        "reason": str(exc),
+                        **circuit,
+                    }
                 self._clear_planner_feedback()
                 return {"planned": True, "execution_plan": stored_plan}
             safe_return_checkpoint = (
@@ -22454,16 +23427,6 @@ class BotController:
                         "action_suppressed": True,
                         **expired,
                     }
-        # The exhausted budget must remain a hard ceiling. Sanctuary travel is
-        # still recorded by the ordinary action-attempt audit, but it is safety
-        # hygiene rather than another attempt to advance the exhausted phase.
-        phase_attempt_id, repeated_signature = self.campaign.prepare_attempt(
-            None if safety_recovery else campaign_phase,
-            tool=tool,
-            arguments=arguments,
-            observation=observation,
-            expected_effect=plan.get("expected_observation"),
-        )
         phase_failure_context = self._phase_action_failure_context(
             goal,
             campaign_phase,
@@ -22472,6 +23435,31 @@ class BotController:
             tool,
             arguments,
             safety_recovery=safety_recovery,
+        )
+        terminal_safe_return = bool(
+            safety_recovery
+            or self._goal_completion_checkpoint(goal) is not None
+            or (
+                isinstance(campaign_phase, dict)
+                and (
+                    self._phase_completion_checkpoint(campaign_phase) is not None
+                    or self._phase_exhaustion_checkpoint(campaign_phase) is not None
+                    or self._phase_abandonment_checkpoint(campaign_phase) is not None
+                )
+            )
+        )
+        # Terminal sanctuary travel is recorded by the ordinary action-attempt
+        # audit, but it is not phase work.  A route/client failure during that
+        # epilogue must revise the safe return rather than trip the completed
+        # phase's work breaker and erase its verified outcome. A nonterminal
+        # safe-ending step can still be real phase work and must retain its
+        # action receipt.
+        phase_attempt_id, repeated_signature = self.campaign.prepare_attempt(
+            None if terminal_safe_return else campaign_phase,
+            tool=tool,
+            arguments=arguments,
+            observation=observation,
+            expected_effect=plan.get("expected_observation"),
         )
         if repeated_signature:
             breaker = self.campaign.trip_breaker(
@@ -22841,6 +23829,8 @@ class BotController:
             if tool == "reroll" and arguments.get("action") == "reroll":
                 arguments["confirm"] = True
         self.storage.update_action_attempt(attempt_id, "sent")
+        farm_launch_boundary_at_ms: int | None = None
+        farm_launch_boundary_started_at: str | None = None
         try:
             if tool == KNOWLEDGE_TOOL_NAME:
                 self.knowledge.validate_tool_arguments(arguments)
@@ -22887,6 +23877,35 @@ class BotController:
                             {"agent": self.config.game.agent},
                             timeout=20,
                             mutation=False,
+                        )
+                    if (
+                        tool == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "farm"
+                    ):
+                        # Commit the journal boundary before the external start
+                        # mutation. If the process dies after the keeper accepts
+                        # the launch but before its result is persisted, startup
+                        # can still exclude retained pre-launch kill history.
+                        farm_launch_boundary_at_ms = int(time.time() * 1000)
+                        farm_launch_boundary_started_at = timestamp()
+                        self.storage.set_runtime(
+                            f"background_farm_launch_boundary_v1:{goal['id']}",
+                            {
+                                "goal_id": goal["id"],
+                                "phase_id": (
+                                    campaign_phase.get("id")
+                                    if isinstance(campaign_phase, dict)
+                                    else None
+                                ),
+                                "action_attempt_id": attempt_id,
+                                "assigned_room": arguments.get("assigned_room"),
+                                "hunt": str(
+                                    arguments.get("hunt") or ""
+                                ).strip().casefold(),
+                                "at_ms": farm_launch_boundary_at_ms,
+                                "recorded_at": farm_launch_boundary_started_at,
+                            },
                         )
                     result = self.broker.call_tool(
                         tool,
@@ -23628,18 +24647,29 @@ class BotController:
                         ),
                         "assigned_room": arguments.get("assigned_room"),
                         "hunt": str(arguments.get("hunt") or "").strip().casefold(),
-                        "use_safe_spots": arguments.get("use_safe_spots"),
+                        "use_safe_spots": farm_positioning_strategy(arguments),
+                        "keeper_use_safe_spots": arguments.get("use_safe_spots"),
+                        "require_safe_wall": arguments.get("require_safe_wall"),
                         "origin_room": self._observation_room(observation),
-                        "started_at": timestamp(),
+                        "started_at": (
+                            farm_launch_boundary_started_at or timestamp()
+                        ),
                     },
                 )
                 self.storage.set_runtime(
                     f"background_farm_snapshot_v2:{goal['id']}",
                     {
                         "observed_at": timestamp(),
+                        "phase_id": (
+                            campaign_phase.get("id")
+                            if isinstance(campaign_phase, dict)
+                            else None
+                        ),
                         "room": arguments.get("assigned_room"),
                         "target": arguments.get("hunt"),
-                        "use_safe_spots": arguments.get("use_safe_spots"),
+                        "use_safe_spots": farm_positioning_strategy(arguments),
+                        "keeper_use_safe_spots": arguments.get("use_safe_spots"),
+                        "require_safe_wall": arguments.get("require_safe_wall"),
                         "counters": {
                             name: self._farm_counter(result, name)
                             for name in (
@@ -23667,7 +24697,10 @@ class BotController:
                         "launch_placement": self._farm_placement_signature(
                             result.get("placement") if isinstance(result, dict) else None
                         ),
-                        "launch_started_at": timestamp(),
+                        "launch_started_at": (
+                            farm_launch_boundary_started_at or timestamp()
+                        ),
+                        "launch_boundary_at": farm_launch_boundary_at_ms,
                         "origin_room": self._observation_room(observation),
                         "healing_supply_count": self.learning.profile(observation).get(
                             "healing_supply_count", 0
@@ -23685,7 +24718,11 @@ class BotController:
                         # The keeper uses Date.now() for journal ids. Establish
                         # the launch boundary even when its compact tail has no
                         # kill record, so cumulative history cannot be replayed.
-                        "last_kill_at": int(time.time() * 1000),
+                        "last_kill_at": (
+                            farm_launch_boundary_at_ms
+                            if farm_launch_boundary_at_ms is not None
+                            else int(time.time() * 1000)
+                        ),
                     },
                 )
             completion = self.criteria.evaluate(goal, self.last_observation)
@@ -24285,6 +25322,9 @@ class BotController:
                 "produced no verified carried item" in text
                 or is_inventory_capacity_refusal(text)
             )
+        ) or (
+            tool == "rest_up"
+            and "nothing recovered" in text
         )
 
     @staticmethod
@@ -24593,6 +25633,34 @@ class BotController:
     ) -> str | None:
         if not isinstance(result, dict):
             return None
+        if tool == "rest_up" and result.get("reached_target") is False:
+            before = result.get("from")
+            after = result.get("vitals")
+            before = before if isinstance(before, dict) else {}
+            after = after if isinstance(after, dict) else {}
+
+            def vital_value(values: dict[str, Any], name: str) -> float | None:
+                vital = values.get(name)
+                if not isinstance(vital, dict):
+                    return None
+                raw = vital.get("current", vital.get("value"))
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+
+            progress = any(
+                prior is not None and current is not None and current > prior
+                for prior, current in (
+                    (vital_value(before, name), vital_value(after, name))
+                    for name in ("health", "mana", "vigor")
+                )
+            )
+            if not progress:
+                return str(
+                    result.get("note")
+                    or "rest_up reached neither its target nor any verified vital increase"
+                )[:500]
         if tool == "cast":
             if result.get("cast") is False:
                 return str(
@@ -25439,6 +26507,250 @@ class BotController:
             interesting=True,
             goal_id=goal and goal["id"],
         )
+
+    @staticmethod
+    def _deterministic_planner_failure_kind(exc: ModelError) -> str | None:
+        text = " ".join(str(exc).casefold().split())
+        if any(
+            marker in text
+            for marker in (
+                "prompt budget",
+                "token budget",
+                "required context exceeds",
+                "context length",
+                "maximum context",
+                "too many tokens",
+            )
+        ):
+            return "overbudget"
+        if isinstance(exc, ModelResponseFormatError):
+            return "planner_response"
+        return None
+
+    @staticmethod
+    def _planner_failure_runtime_key(goal: dict[str, Any]) -> str:
+        return f"{PLANNER_FAILURE_CIRCUIT_RUNTIME_PREFIX}:{goal['id']}"
+
+    def _planner_retry_state_fingerprint(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        campaign_phase: dict[str, Any] | None,
+        execution_plan: dict[str, Any] | None,
+        operation: str,
+    ) -> str:
+        """Hash material planner inputs while ignoring recovery-tick churn."""
+
+        state = self.campaign.state_fingerprint(observation)
+        state = deepcopy(state) if isinstance(state, dict) else {}
+        health = state.get("health")
+        if isinstance(health, dict):
+            # Current HP and vigor can tick every turn while a deterministic
+            # formatter/size failure remains unchanged. Maximum HP is durable
+            # capability state and does reopen the circuit after progression.
+            state["health"] = {"max": health.get("max")}
+        state.pop("vigor", None)
+        objects = deep_get(observation, "look.objects", [])
+        visible = sorted(
+            [
+                {
+                    "id": item.get("id", item.get("object_id")),
+                    "name": normalize(str(item.get("name") or "")),
+                    "can": sorted(
+                        str(value)
+                        for value in (
+                            item.get("can")
+                            if isinstance(item.get("can"), list)
+                            else []
+                        )
+                    ),
+                }
+                for item in (objects if isinstance(objects, list) else [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ],
+            key=canonical_json,
+        )
+        phase_contract = None
+        if isinstance(campaign_phase, dict):
+            phase_contract = {
+                key: campaign_phase.get(key)
+                for key in (
+                    "id",
+                    "kind",
+                    "objective",
+                    "success_criteria",
+                    "abandon_predicates",
+                    "context",
+                    "status",
+                )
+            }
+        return json_hash(
+            {
+                "schema_version": 1,
+                "operation": operation,
+                "goal": {
+                    key: goal.get(key)
+                    for key in (
+                        "id",
+                        "title",
+                        "objective",
+                        "success_criteria",
+                        "constraints",
+                        "status",
+                    )
+                },
+                "phase": phase_contract,
+                "state": state,
+                "visible": visible,
+                "execution_plan": (
+                    self._execution_plan_fingerprint(execution_plan)
+                    if isinstance(execution_plan, dict)
+                    else None
+                ),
+                "knowledge_corpus_version": self.knowledge.corpus_version,
+                "tactical_protocol_version": TACTICAL_PROTOCOL_VERSION,
+            }
+        )
+
+    def _planner_failure_gate(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        campaign_phase: dict[str, Any] | None,
+        execution_plan: dict[str, Any] | None,
+        operation: str,
+    ) -> dict[str, Any] | None:
+        key = self._planner_failure_runtime_key(goal)
+        prior = self.storage.get_runtime(key)
+        if not isinstance(prior, dict) or prior.get("open") is not True:
+            return None
+        state_fingerprint = self._planner_retry_state_fingerprint(
+            goal, observation, campaign_phase, execution_plan, operation
+        )
+        same_state = bool(
+            prior.get("operation") == operation
+            and prior.get("state_fingerprint") == state_fingerprint
+        )
+        if not same_state:
+            self.storage.set_runtime(key, None)
+            self.storage.emit_event(
+                "planner.retry_circuit.reopened",
+                "Material planner state changed; one bounded retry is allowed",
+                severity="info",
+                interesting=False,
+                goal_id=goal["id"],
+                data={
+                    "prior_operation": prior.get("operation"),
+                    "operation": operation,
+                    "prior_state_fingerprint": prior.get("state_fingerprint"),
+                    "state_fingerprint": state_fingerprint,
+                },
+            )
+            return None
+        suppressed_count = int(prior.get("suppressed_count", 0) or 0) + 1
+        updated = {
+            **prior,
+            "suppressed_count": suppressed_count,
+            "last_suppressed_at": timestamp(),
+        }
+        self.storage.set_runtime(key, updated)
+        if suppressed_count == 1:
+            self.storage.emit_event(
+                "planner.retry_circuit.suppressed",
+                "Suppressed an identical deterministic planner retry",
+                severity="warning",
+                interesting=False,
+                goal_id=goal["id"],
+                data={
+                    "operation": operation,
+                    "failure_kind": prior.get("failure_kind"),
+                    "failure_code": prior.get("failure_code"),
+                    "failure_fingerprint": prior.get("failure_fingerprint"),
+                    "state_fingerprint": state_fingerprint,
+                },
+            )
+        result = {
+            "planner_retry_suppressed": True,
+            "operation": operation,
+            "failure_kind": prior.get("failure_kind"),
+            "failure_code": prior.get("failure_code"),
+            "reason": prior.get("reason"),
+            "state_fingerprint": state_fingerprint,
+            "suppressed_count": suppressed_count,
+            "retry_when": "material planner state or operation changes",
+        }
+        if prior.get("failure_kind") == "invalid_execution_plan":
+            result["plan_rejected"] = True
+            result["phase_retired"] = False
+        return result
+
+    def _record_planner_failure_circuit(
+        self,
+        goal: dict[str, Any],
+        observation: dict[str, Any],
+        campaign_phase: dict[str, Any] | None,
+        execution_plan: dict[str, Any] | None,
+        operation: str,
+        *,
+        failure_kind: str,
+        reason: str,
+        failure_code: str | None = None,
+        details: Any = None,
+    ) -> dict[str, Any]:
+        state_fingerprint = self._planner_retry_state_fingerprint(
+            goal, observation, campaign_phase, execution_plan, operation
+        )
+        compact_reason = " ".join(str(reason).split())[:1000]
+        failure_fingerprint = json_hash(
+            {
+                "kind": failure_kind,
+                "code": failure_code,
+                "reason": compact_reason,
+                "details": redact(details),
+            }
+        )
+        value = {
+            "open": True,
+            "goal_id": goal["id"],
+            "operation": operation,
+            "failure_kind": failure_kind,
+            "failure_code": failure_code,
+            "reason": compact_reason,
+            "failure_fingerprint": failure_fingerprint,
+            "state_fingerprint": state_fingerprint,
+            "opened_at": timestamp(),
+            "suppressed_count": 0,
+        }
+        self.storage.set_runtime(self._planner_failure_runtime_key(goal), value)
+        self.storage.emit_event(
+            "planner.retry_circuit.opened",
+            "Opened the deterministic planner retry circuit",
+            severity="warning",
+            interesting=False,
+            goal_id=goal["id"],
+            data={
+                "operation": operation,
+                "failure_kind": failure_kind,
+                "failure_code": failure_code,
+                "failure_fingerprint": failure_fingerprint,
+                "state_fingerprint": state_fingerprint,
+                "reason": compact_reason,
+            },
+        )
+        return {
+            "planner_failure_circuit_opened": True,
+            "operation": operation,
+            "failure_kind": failure_kind,
+            "failure_code": failure_code,
+            "reason": compact_reason,
+            "failure_fingerprint": failure_fingerprint,
+            "state_fingerprint": state_fingerprint,
+        }
+
+    def _clear_planner_failure_circuit(self, goal: dict[str, Any]) -> None:
+        key = self._planner_failure_runtime_key(goal)
+        if isinstance(self.storage.get_runtime(key), dict):
+            self.storage.set_runtime(key, None)
 
     def _planner_feedback(self, goal: dict[str, Any]) -> dict[str, Any] | None:
         value = self.storage.get_runtime("planner_feedback")
@@ -28354,6 +29666,113 @@ class BotController:
         except (TypeError, ValueError):
             return False
 
+    @classmethod
+    def _shutdown_keeper_open_field_evidence(
+        cls, status: Any, *, current_room: Any
+    ) -> tuple[int, float, int] | None:
+        """Return advancing proof that a quiescent open-field keeper is unharmed.
+
+        Positional threat counters say that a monster *could* reach the
+        character; they do not establish that it is landing attacks.  An
+        open-field farm deliberately disables safe spots, so requiring a
+        proven safe-spot object can otherwise deadlock shutdown forever while
+        the survival keeper waits at full health.  Fail closed unless the
+        harness supplies two consecutive, settled trials showing awake nearby
+        monsters, no movement or swings, and no health loss.
+        """
+
+        if not cls._keeper_is_driving(status):
+            return None
+        if isinstance(current_room, bool):
+            return None
+        if isinstance(current_room, float) and not current_room.is_integer():
+            return None
+        try:
+            current_room_id = int(current_room)
+        except (TypeError, ValueError):
+            return None
+        if str(status.get("mode") or "").strip().casefold() != "survive":
+            return None
+        activity = str(status.get("activity") or "").strip().casefold()
+        if activity not in {"idle", "waiting", "watching", "standing by"}:
+            return None
+        if status.get("last_error") not in (None, ""):
+            return None
+
+        policy = status.get("policy")
+        if (
+            not isinstance(policy, dict)
+            or farm_positioning_strategy(policy) is not False
+            or status.get("safe_spot") is not False
+        ):
+            return None
+        threat = status.get("threat")
+        if not isinstance(threat, dict) or "landing_damage" not in threat:
+            return None
+        try:
+            if float(threat["landing_damage"]) != 0.0:
+                return None
+        except (TypeError, ValueError):
+            return None
+
+        trials = status.get("trials")
+        if not isinstance(trials, list) or len(trials) < 2:
+            return None
+        recent = trials[-2:]
+        signatures: list[tuple[int, float, int]] = []
+        for trial in recent:
+            if not isinstance(trial, dict):
+                return None
+            if (
+                trial.get("monsters_awake") is not True
+                or trial.get("swung_in_window") is not False
+                or trial.get("moved_in_window") is not False
+            ):
+                return None
+            required = {
+                "pass",
+                "at",
+                "room",
+                "adjacent_at_start",
+                "lost",
+                "health_before",
+                "health_after",
+                "window_s",
+                "settled_ms",
+            }
+            if not required.issubset(trial):
+                return None
+            try:
+                pass_number = int(trial["pass"])
+                observed_at = float(trial["at"])
+                room_id = int(trial["room"])
+                adjacent = float(trial["adjacent_at_start"])
+                lost = float(trial["lost"])
+                health_before = float(trial["health_before"])
+                health_after = float(trial["health_after"])
+                window_seconds = float(trial["window_s"])
+                settled_ms = float(trial["settled_ms"])
+            except (TypeError, ValueError):
+                return None
+            if (
+                adjacent <= 0
+                or lost != 0.0
+                or health_before <= 0
+                or health_after != health_before
+                or window_seconds < 0.5
+                or settled_ms < 2000
+            ):
+                return None
+            signatures.append((pass_number, observed_at, room_id))
+        if (
+            signatures[1][0] <= signatures[0][0]
+            or signatures[1][1] <= signatures[0][1]
+            or signatures[1][2] != signatures[0][2]
+            or signatures[1][2] != current_room_id
+        ):
+            return None
+        return signatures[1]
+
     def _refresh_shutdown_observation(self) -> dict[str, Any]:
         observation = self._reconcile_recent_inventory_creation(
             self._reconcile_recent_room_transition(self.broker.observe())
@@ -28525,6 +29944,16 @@ class BotController:
         ):
             return observation
 
+        open_field_evidence = (
+            self._shutdown_keeper_open_field_evidence(
+                keeper,
+                current_room=self._observation_room(observation),
+            )
+            if self._shutdown_full_health(observation)
+            else None
+        )
+        open_field_passes = 1 if open_field_evidence is not None else 0
+
         self._set_shutdown_stage(
             "recovering",
             detail="survival keeper is recovering or withdrawing before safe travel",
@@ -28547,6 +29976,22 @@ class BotController:
                 observation
             ) and self._shutdown_keeper_travel_ready(keeper):
                 return observation
+            next_open_field_evidence = (
+                self._shutdown_keeper_open_field_evidence(
+                    keeper,
+                    current_room=self._observation_room(observation),
+                )
+                if self._shutdown_full_health(observation)
+                else None
+            )
+            if next_open_field_evidence is None:
+                open_field_evidence = None
+                open_field_passes = 0
+            elif next_open_field_evidence != open_field_evidence:
+                open_field_evidence = next_open_field_evidence
+                open_field_passes += 1
+                if open_field_passes >= 2:
+                    return observation
         raise RuntimeError(
             "survival keeper did not establish full-health, threat-clear travel "
             "readiness before the shutdown recovery timeout"

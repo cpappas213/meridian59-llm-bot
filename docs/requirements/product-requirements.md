@@ -216,6 +216,26 @@ revising tactics in service of the active goal.
   `ROOM_SANCTUARY`/`ROOM_NO_COMBAT` room before marking the phase failed. Safety
   return actions shall remain audited but shall not consume the exhausted phase
   budget or create a goal-wide block.
+- **FR-PLAY-020**: While a keeper owns urgent combat, pull, travel, retreat, or
+  recovery work, controller observation shall first use broker-local keeper
+  status and cached pushed look state. Current room and vitals shall override
+  older status values, slower inventory/spell context shall be explicitly marked
+  cached or unknown, and packet-paced full refreshes shall resume only after the
+  urgent ownership boundary ends.
+- **FR-PLAY-021**: The controller shall reconcile a durable keeper death receipt
+  before any keeper-mode or goal-state early return. Each death shall be
+  accounted once by a stable death identity, with a fresh Underworld transition
+  or maximum-HP decrement as fallback evidence when the receipt is delayed.
+  Recording a death shall not by itself invalidate a verified safe spot: damage
+  or death from the monster already engaged or pulled there is compatible with
+  the spot; only evidence that a new monster can acquire the character or an
+  explicit placement/geometry failure may retire that coordinate.
+- **FR-PLAY-022**: After bounded repair exhausts on a deterministic planner
+  protocol, response-format, prompt-budget, or execution-plan failure, the
+  controller shall durably suppress another equivalent model request for the
+  same goal, phase, operation, plan, and material character/world fingerprint.
+  The circuit shall survive controller restart and permit one bounded retry only
+  after that fingerprint or planner operation changes.
 - **FR-PLAY-012**: A PvP search shall visit multiple grounded public rooms and
   acquire an attack target only from a fresh local observation. A global online
   list shall not establish local attackability. The controller shall immediately

@@ -207,6 +207,21 @@ Do not advance the harness independently of the root gitlink and
 
 - **Model unavailable/model missing:** verify base URL, API key, and exact model
   returned from `/models`.
+- **Planner retry suppressed:** inspect `planner.retry_circuit.opened`,
+  `.suppressed`, and `.reopened` events. A deterministic protocol,
+  response-format, prompt-budget, or plan-verification failure remains suppressed
+  across restart while the goal, phase, operation, plan, inventory, equipment,
+  abilities, room, and visible-object fingerprint is unchanged. Correct the
+  cause or allow material state to change; restarting alone is not a retry.
+- **Observation reports `freshness.mode=tactical_cache`:** expected while the
+  keeper is fighting, pulling, travelling, retreating, or recovering. Room and
+  vitals come from pushed look state; inventory and spells may be marked cached
+  or unknown until urgent keeper ownership ends and the next full refresh runs.
+- **Death occurred during `survive`:** inspect `character.died` and the durable
+  `character_death_cursor_v1` runtime receipt. Mode handoff does not suppress
+  accounting, and a repeated death ID is intentionally ignored. Do not manually
+  quarantine a verified wall solely because the already engaged monster damaged
+  or killed the character there.
 - **Harness revision mismatch:** initialize/update the submodule to the committed
   revision; never bypass the expected-revision check.
 - **Character preserved:** this is intentional for an established identity. Set

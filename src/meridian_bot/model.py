@@ -436,8 +436,8 @@ chooses banking. Otherwise proceed with the carried wealth instead of treating i
 One successful bank balance call is sufficient evidence; never repeat it in an unchanged state. If carried
 shillings are already zero, deposit-before-hazard is complete. Do not retry a knowingly unaffordable shop call.
 Honor the durable goal's explicit use_safe_spots value, or the active internal farm phase's explicit
-use_safe_spots value: true requests wall trials; false requests bounded open-field
-combat and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.60
+use_safe_spots value: true requires wall trials; false permits bounded open-field combat while retaining
+any opportunistic working wall, and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.425
 for ordinary bounded farms, hold_resume_above at least 0.90 and fight_above_vigor 80 by default, and
 break_out_via_logoff=false until stable room saving is verified. A safe_spot.works label alone is not proof.
 Keeper banking is optional: use bank_above=0 unless the current financial_context and plan deliberately
@@ -545,11 +545,20 @@ Supported targets (only the listed fields are accepted):
 - {{"id":string,"type":"wielding_equals","items":null or array of canonical weapon names}}
 - {{"id":string,"type":"wielding_contains","item":canonical item name OR "category":"weapon"}}
 - {{"id":string,"type":"ability_at_least","ability_kind":"skill|spell","name":canonical name,"value":number}}
+- {{"id":string,"type":"keeper_target_kills_at_least","count":integer from 1 through 25}}
 - {{"id":string,"type":"phase_action_succeeded","tools":[exact names from campaign.phase_capabilities[phase.kind]]}}
 
 Use phase_action_succeeded only when successful controller evidence collection is itself the bounded outcome,
 especially research_progression. Never use it as the sole farm outcome: a farm needs an observable result such as
-the next max-health milestone. campaign.phase_capabilities is the closed callable-tool vocabulary for these
+the next max-health milestone. Every farm target must be max_health_at_least or
+keeper_target_kills_at_least. Prefer max_health_at_least strictly above verified_observation's live maximum health,
+normally the next one-point milestone, while the configured prey can still raise it. Otherwise use a meaningful bounded
+keeper_target_kills_at_least batch, normally 10-25; the controller verifies only exact-target kills recorded after this phase began.
+Never use
+item_count_at_least, food, inventory, equipment, currency, location, vigor, or current health as a farm target:
+those can be satisfied by preparation or cleanup before the keeper fights and therefore belong to a support phase.
+Food may be provisioned inside a farm plan, but provisioning is never farm completion.
+campaign.phase_capabilities is the closed callable-tool vocabulary for these
 targets. Choose each tool only from the array for the selected phase kind. All other JSON property names in
 campaign, grounded_knowledge, progression_context, learned_failures, financial_context, and verified_observation
 are fact namespaces, not callable tools. In particular, never copy context labels such as room_options_by_candidate,
@@ -634,12 +643,13 @@ invent Blink as a farm escape policy, and do not make flasks an automatic prereq
 are usable capability evidence, while acquiring supplies remains a deliberate, feasible planner choice.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
-name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
+name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.425 for ordinary bounded farming),
 and fight_above_vigor (80 by default). The keeper owns opportunistic food consumption and currently applies an
 internal 100-vigor minimum while food is available; an explicit floor above 100 is the deliberate higher-food
 tactic. buy_food is false when omitted. The controller persists and enforces these fields across planning turns. If choosing
-open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
-it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
+open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; this relaxes the wall
+requirement rather than forbidding a working wall. If combat must require wall protection, set it true. Objective,
+rationale, and notes explain the choice but never substitute for the structured fields.
 If campaign.operator_contract.binding_farm_target is present, it is an operator requirement: every
 farm-recipe hunting_grounds lookup and every farm phase must use that exact creature. A support phase
 may improve capability, recovery, equipment, supplies, or route knowledge, but it must return to the

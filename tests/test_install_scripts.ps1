@@ -54,7 +54,9 @@ if ($restartSource -notmatch 'Invoke-ControllerCli @\("stop"\)' -or
     throw "The restart script must gracefully stop and verify a joined replacement"
 }
 if ($restartSource -notmatch 'coordinated pause, safe return, logout, and shutdown' -or
-    $restartSource -notmatch 'ShutdownTimeoutSeconds = 900') {
+    $restartSource -notmatch 'ShutdownTimeoutSeconds = 900' -or
+    $restartSource -notmatch '\$shutdown\.stage -eq "failed"' -or
+    $restartSource -notmatch 'failed safe during coordinated shutdown') {
     throw "The restart script must delegate to the coordinated safe shutdown sequence"
 }
 $wanted = @(

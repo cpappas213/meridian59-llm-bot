@@ -32,7 +32,13 @@ class CliTests(unittest.TestCase):
 
             def status(self) -> dict[str, object]:
                 return {
-                    "controller": {"state": "running"},
+                    "controller": {
+                        "state": "running",
+                        "shutdown": {
+                            "stage": "failed",
+                            "error": "safe return timed out",
+                        },
+                    },
                     "game": {"connection": "joining"},
                 }
 
@@ -46,7 +52,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, result)
         self.assertEqual(
             {
-                "controller": {"state": "running"},
+                "controller": {
+                    "state": "running",
+                    "shutdown": {
+                        "stage": "failed",
+                        "error": "safe return timed out",
+                    },
+                },
                 "game": {"connection": "joining"},
             },
             json.loads(output.getvalue()),

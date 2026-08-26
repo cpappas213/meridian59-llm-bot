@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -357,6 +358,96 @@ class KnowledgeTests(unittest.TestCase):
         value = replace(value, harness=replace(value.harness, root=harness, expected_revision="fixture-revision"))
         return KnowledgeBase(value)
 
+    @staticmethod
+    def _tactical_financial_fixture() -> dict[str, object]:
+        instruction = (
+            "Use merchants with buys=<exact carried item> and then sell "
+            "confirm=false; only the live quote proves acceptance."
+        )
+        buyers = []
+        for item_index, item in enumerate(("sapphire", "leather armor")):
+            buyers.append(
+                {
+                    "item": item,
+                    "item_kind": "armor" if item_index else "reagent",
+                    "inferred_source_category": (
+                        "Wearable" if item_index else "Reagent"
+                    ),
+                    "candidates": [
+                        {
+                            "merchant": "  Jasper   Merchant  ",
+                            "room_ids": [103, "103", 106, 103.7, 0, "unknown"],
+                            "buys_anything": False,
+                            "matched_category": "  Reagent  ",
+                            "buying_categories": ["Reagent", "Weapon"],
+                            "verification": "V" * 600,
+                            "entity_id": "merchant:jasper",
+                            "instances": [
+                                {
+                                    "seller_id_at_build": 900 + item_index,
+                                    "name": "Static catalogue instance",
+                                    "room_id": 103,
+                                }
+                            ],
+                        }
+                    ],
+                    "next_evidence": instruction,
+                }
+            )
+        return {
+            "carried_shillings": 12,
+            "source_estimated_inventory_value": 450,
+            "source_estimated_liquidatable_inventory_value": 300,
+            "confirmed_live_quote_liquidatable_value": 75,
+            "known_inventory_item_value": 450,
+            "known_liquidatable_inventory_value": 300,
+            "known_total_carried_value": 462,
+            "valuation_complete": True,
+            "valued_items": [{"id": 77, "name": "sapphire", "subtotal": 60}],
+            "unknown_value_items": [],
+            "unquoted_liquidatable_items": [
+                {"id": 77, "name": "sapphire", "quantity": 1}
+            ],
+            "valid_live_sell_quotes": [
+                {
+                    "offered_price": 75,
+                    "merchant_id": 901,
+                    "room_id": 103,
+                    "items": [
+                        {
+                            "id": 77,
+                            "name": "sapphire",
+                            "quantity": 1,
+                            "inventory_quantity": 1,
+                        }
+                    ],
+                }
+            ],
+            "liquidation_status": {
+                "state": "live_quotes_available",
+                "interpretation": "A current positive quote exists.",
+            },
+            "npc_transfer_restricted_items": [
+                {"id": 88, "name": "created mace", "reason": "not transferable"}
+            ],
+            "protected_sale_items": [
+                {"id": 99, "name": "short sword", "reason": "equipped"}
+            ],
+            "npc_transfer_rules": [{"source": "Create Weapon", "rule": "equipment only"}],
+            "bank_accounts": [
+                {"account": "shared mainland", "last_known_balance": 1712}
+            ],
+            "buyer_candidates": buyers,
+            "rejected_buyer_candidates": [{"item": "sapphire", "room_ids": [50]}],
+            "merchant_sale_refusals": [{"item_names": ["sapphire"], "room": 50}],
+            "sale_exhausted_items": [],
+            "valuation_note": "Source values are estimates; live quotes prove a sale.",
+            "banking_policy": {
+                "mode": "planner_discretion",
+                "never_blocks_travel_or_combat": True,
+            },
+        }
+
     def test_resolves_canonical_entities_and_rejects_invention(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             knowledge = self.knowledge(Path(temporary))
@@ -439,6 +530,98 @@ class KnowledgeTests(unittest.TestCase):
                 self.assertTrue(finances["banking_policy"]["never_blocks_travel_or_combat"])
             finally:
                 controller.storage.close()
+
+    def test_tactical_financial_context_omits_unavailable_sale_catalogue(
+        self,
+    ) -> None:
+        finances = self._tactical_financial_fixture()
+        original = deepcopy(finances)
+
+        projected = BotController._tactical_financial_context(
+            finances,
+            tool_names=["inventory", "merchants", "shop", "bank", "travel"],
+        )
+
+        self.assertEqual(original, finances)
+        self.assertEqual(12, projected["carried_shillings"])
+        self.assertEqual(finances["bank_accounts"], projected["bank_accounts"])
+        self.assertEqual(
+            finances["protected_sale_items"], projected["protected_sale_items"]
+        )
+        self.assertEqual(
+            finances["npc_transfer_restricted_items"],
+            projected["npc_transfer_restricted_items"],
+        )
+        for key in (
+            "valued_items",
+            "unknown_value_items",
+            "unquoted_liquidatable_items",
+            "valid_live_sell_quotes",
+            "buyer_candidates",
+            "buyer_routes",
+            "buyer_route_context",
+            "buyer_candidate_instructions",
+            "rejected_buyer_candidates",
+            "merchant_sale_refusals",
+            "sale_exhausted_items",
+        ):
+            self.assertNotIn(key, projected)
+
+    def test_tactical_financial_context_compacts_actionable_sale_choices(
+        self,
+    ) -> None:
+        finances = self._tactical_financial_fixture()
+        original = deepcopy(finances)
+
+        for sale_tool in ("sell", "sell_all"):
+            with self.subTest(sale_tool=sale_tool):
+                projected = BotController._tactical_financial_context(
+                    finances,
+                    tool_names=["inventory", sale_tool],
+                )
+
+                self.assertEqual(original, finances)
+                self.assertEqual(
+                    finances["valid_live_sell_quotes"],
+                    projected["valid_live_sell_quotes"],
+                )
+                self.assertEqual(
+                    finances["merchant_sale_refusals"],
+                    projected["merchant_sale_refusals"],
+                )
+                self.assertEqual(
+                    {
+                        "sapphire": {"Jasper Merchant": [103, 106]},
+                        "leather armor": {"Jasper Merchant": [103, 106]},
+                    },
+                    projected["buyer_routes"],
+                )
+                self.assertEqual(
+                    {
+                        "item_kind": "reagent",
+                        "inferred_source_category": "Reagent",
+                    },
+                    projected["buyer_route_context"]["sapphire"],
+                )
+                self.assertEqual(
+                    [
+                        "Use merchants with buys=<exact carried item> and then "
+                        "sell confirm=false; only the live quote proves acceptance."
+                    ],
+                    projected["buyer_candidate_instructions"],
+                )
+                serialized = json.dumps(projected)
+                self.assertNotIn("verification", serialized)
+                self.assertNotIn("entity_id", serialized)
+                self.assertNotIn("instances", serialized)
+                self.assertNotIn("buying_categories", serialized)
+                compacted = BotController._compact_tactical_value(
+                    {"financial": projected},
+                    max_list=20,
+                    max_dict=32,
+                    max_string=800,
+                )["financial"]
+                self.assertEqual(projected["buyer_routes"], compacted["buyer_routes"])
 
     def test_financial_context_separates_source_estimate_from_live_quote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -144,6 +144,30 @@ def farm_tactic_identity(
     }
 
 
+def farm_positioning_strategy(policy: Any) -> bool | None:
+    """Return the durable wall requirement from wire policy or saved evidence.
+
+    New keepers separate opportunistic safe-wall use from requiring a wall
+    before combat. The controller's durable ``use_safe_spots`` strategy keeps
+    its historical meaning (true requires a wall; false permits open-field
+    combat), so ``require_safe_wall`` is authoritative when it is available.
+    Older harnesses expose only ``use_safe_spots`` and retain the legacy
+    one-flag interpretation.
+    """
+
+    if not isinstance(policy, dict):
+        return None
+    for key in ("require_safe_wall", "requireSafeWall"):
+        value = policy.get(key)
+        if isinstance(value, bool):
+            return value
+    for key in ("use_safe_spots", "useSafeSpots"):
+        value = policy.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
 def farm_tactic_key(room: Any, target: Any, use_safe_spots: Any) -> str:
     """Return a compact stable key for one room/prey/positioning tactic."""
 
@@ -682,7 +706,7 @@ class GoalLearning:
                 observed_room = observed_room.get("id", observed_room.get("name"))
             room = assigned_room if assigned_room not in (None, "") else observed_room
             target = self._normal_text(sample.get("target") or "unknown") or "unknown"
-            safe_spots = sample.get("use_safe_spots")
+            safe_spots = farm_positioning_strategy(sample)
             strategy = (
                 "safe_spots"
                 if safe_spots is True
@@ -1564,7 +1588,7 @@ class GoalLearning:
             .casefold()
             .split()
         )
-        safe_spots = arguments.get("use_safe_spots")
+        safe_spots = farm_positioning_strategy(arguments)
         return str(room), target, safe_spots if isinstance(safe_spots, bool) else None
 
     def _release_matching_farm_quarantine(

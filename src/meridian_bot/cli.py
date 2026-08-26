@@ -363,6 +363,7 @@ def runtime_command(
                     "state",
                     "since",
                     "last_heartbeat_at",
+                    "shutdown",
                     "foreground_action",
                 )
                 if key in controller

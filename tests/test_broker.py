@@ -347,6 +347,83 @@ class BrokerTests(unittest.TestCase):
             self.assertEqual(5, observation["abilities"]["spells"][0]["ability"])
             self.assertIn(("abilities", {"agent": "primary", "known_only": True}), calls)
 
+    def test_observe_uses_only_cached_tactical_reads_during_keeper_retreat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                name: Tool(
+                    name,
+                    name,
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            **(
+                                {
+                                    "cached": {"type": "boolean"},
+                                    "minimap": {"type": "boolean"},
+                                }
+                                if name == "look"
+                                else {}
+                            ),
+                            **({"brief": {"type": "boolean"}} if name == "status" else {}),
+                            **({"action": {"type": "string"}} if name == "autopilot" else {}),
+                        },
+                        "required": ["agent"],
+                    },
+                )
+                for name in ("look", "status", "inventory", "spells", "autopilot")
+            }
+            broker._observation_cache = {
+                "look": {
+                    "room": {"num": 562, "name": "The Ocean"},
+                    "vitals": {"health": {"current": 30, "max": 40}},
+                },
+                "status": {"vitals": {"health": {"current": 30, "max": 40}}},
+                "inventory": {"items": [{"id": 7, "name": "mace"}]},
+                "spells": {"known": True, "spells": []},
+            }
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            def fake_call(
+                name: str, arguments: dict[str, object], **_kwargs: object
+            ) -> dict[str, object]:
+                calls.append((name, dict(arguments)))
+                if name == "autopilot":
+                    return {
+                        "running": True,
+                        "mode": "survive",
+                        "activity": "retreating to Brownestone",
+                        "policy": {"restBelow": 0.9},
+                    }
+                if name == "look" and arguments.get("cached") is True:
+                    return {
+                        "room": {"num": 563, "name": "Brownestone"},
+                        "vitals": {"health": {"current": 5, "max": 40}},
+                        "minimap": {"text": "@", "walls": [[0, 0]]},
+                    }
+                raise AssertionError(f"unexpected bulk read during retreat: {name}")
+
+            broker.call_tool = fake_call  # type: ignore[method-assign]
+
+            observation = broker.observe()
+
+            self.assertEqual(
+                [
+                    ("autopilot", {"agent": "primary", "action": "status"}),
+                    (
+                        "look",
+                        {"agent": "primary", "cached": True, "minimap": True},
+                    ),
+                ],
+                calls,
+            )
+            self.assertEqual("tactical_cache", observation["freshness"]["mode"])
+            self.assertEqual(5, observation["status"]["vitals"]["health"]["current"])
+            self.assertEqual(563, observation["status"]["where"]["num"])
+            self.assertEqual("mace", observation["inventory"]["items"][0]["name"])
+            self.assertNotIn("walls", observation["look"]["minimap"])
+
     def test_planner_view_hides_controller_owned_agent_argument(self) -> None:
         schema = {
             "type": "object",

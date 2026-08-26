@@ -80,6 +80,22 @@ $shutdownDeadline = (Get-Date).AddSeconds($ShutdownTimeoutSeconds)
 do {
     $task = Get-ScheduledTask -TaskName $TaskName
     $probe = Invoke-ControllerCli @("status")
+    if ($probe.ExitCode -eq 0) {
+        try {
+            $statusSnapshot = ($probe.Output -join [Environment]::NewLine) | ConvertFrom-Json
+        } catch {
+            throw "The controller returned unreadable status while shutting down: $($probe.Output -join [Environment]::NewLine)"
+        }
+        $shutdown = $statusSnapshot.controller.shutdown
+        if ($shutdown -and $shutdown.stage -eq "failed") {
+            $shutdownError = if ($shutdown.error) {
+                $shutdown.error
+            } else {
+                "the controller reported a failed shutdown without an error detail"
+            }
+            throw "The controller failed safe during coordinated shutdown: $shutdownError"
+        }
+    }
     if ($task.State -ne "Running" -and $probe.ExitCode -ne 0) { break }
     Start-Sleep -Milliseconds 500
 } while ((Get-Date) -lt $shutdownDeadline)

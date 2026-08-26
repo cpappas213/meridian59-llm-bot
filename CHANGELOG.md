@@ -39,6 +39,21 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Prevented controller observation polling from competing with urgent keeper
+  combat, retreat, travel, and recovery. The bot now checks in-process keeper
+  status and cached pushed look state first, uses current room/vitals with
+  explicitly cached slow context while survival owns the packet budget, and
+  resumes a full refresh after the urgent activity ends.
+- Reconciled durable keeper death receipts before every mode-specific controller
+  return, with stable death-ID deduplication and Underworld/max-HP fallbacks when
+  the receipt arrives late. Death accounting now survives `farm` to `survive`
+  handoff without treating ordinary retaliation or death from the already
+  engaged monster as proof that a verified safe spot failed.
+- Added a durable retry circuit for deterministic planner protocol, response,
+  prompt-budget, and execution-plan failures. An unchanged goal/phase/material
+  character state no longer repeats the same model request across turns or a
+  controller restart; one bounded retry becomes eligible after the fingerprint
+  materially changes.
 - Made an out-of-reach open-field quarry advance along at most four exact,
   guarded path steps instead of entering the wall-only pull loop. Policy-off or
   stale holds no longer influence farm combat, obstacle detours count as
@@ -69,9 +84,11 @@ and intends to use semantic versioning after its first public release.
   harmless adjacent monsters remain camped there, instead of waiting forever
   for a threat-clear condition the survival keeper cannot create while holding.
 - Made operator safe-spot verification an evidence checkpoint instead of
-  permanent immunity: a later observed hit retires the square again. Selection,
-  keeper status, and broker reporting now consistently reject failed verified
-  spots rather than repeatedly resting on them as proven.
+  permanent immunity. Ordinary retaliation, rest damage, withdrawal, or death
+  from the monster already engaged or pulled to the wall does not disprove the
+  square; evidence that a new monster can acquire the character, or an explicit
+  placement/geometry failure, retires that exact coordinate. Selection, keeper
+  status, and broker reporting consistently reject only those failed spots.
 - Preferred collision-proven baked room rails over learned coordinate tracks and
   bounded the remaining learned replay by one deadline and movement budget. Tight
   forest crossings no longer expand one stale waypoint into repeated fine-walk
@@ -120,8 +137,9 @@ and intends to use semantic versioning after its first public release.
   `near is not defined` exception without misreporting a cornered character as safe.
 - Scoped JavaScript keeper-crash stagnation to the exact harness revision that
   produced it. A newly pinned build may retry a death-free tactic once, while
-  same-revision crashes and any death, withdrawal, mulligan, logout, or quarantine
-  evidence remain durable.
+  same-revision crashes and explicit route, over-level-hazard, spawn-cap, or
+  placement/geometry quarantine evidence remain durable. Death remains durable
+  combat accounting but is not, by itself, safe-spot disproof.
 - Reused controller-grounded open-field positioning for the same farm room and
   prey instead of reviving a cached safe-wall recipe. Explicit operator policy,
   stricter flee and vigor thresholds, and all retained danger evidence remain
@@ -129,8 +147,9 @@ and intends to use semantic versioning after its first public release.
   tactic provenance.
 - Kept operator-named farm prey binding across research, campaign phases, and
   keeper launches. Exhausting only a safe-wall search now retries the same room
-  and prey in bounded open-field mode, while death, critical-health, room-hazard,
-  and spawn-cap evidence continues to block unsafe tactics.
+  and prey in bounded open-field mode, while explicit new-monster safe-spot
+  breaches, critical-health, room-hazard, and spawn-cap evidence continue to
+  block unsafe tactics.
 - Made `Esc` an immediate, consistent cancel/back control across character
   status, goal drafting/review, goal modification, goal management, priority
   editing, and destructive confirmations.
