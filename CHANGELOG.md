@@ -92,7 +92,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `838fc5918e9b0e6e7b461811605d162c683b12af`, based on official upstream revision
+  `800928ce2da29264dcf6d47b035ad178c8d5094d`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
@@ -101,6 +101,9 @@ and intends to use semantic versioning after its first public release.
   operator-configured round budgets. Monster health-band messages are now captured
   through the complete exchange and used only for a conservative early retreat;
   they can never relax the hard flee threshold.
+- Counted source-defined positive combat prose such as weapon pokes only when it
+  names the exact selected foe. Real damage now advances combat progress without
+  mistaking status, item, room, or other-target messages for landed hits.
 - Fixed failed-heal recovery after a farm fight to re-read adjacent hostiles rather
   than referencing state from another behavior pass, eliminating the live
   `near is not defined` exception without misreporting a cornered character as safe.
