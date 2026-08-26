@@ -2388,6 +2388,9 @@ class BotController:
             self.learning.refresh_unlocks(self.last_observation)
             self.learning.release_unlocked_farm_quarantines()
             self._reconcile_blocked_farm_exhaustion(self.last_observation)
+            self._repair_paused_campaign_phase_tactic_preferences(
+                self.last_observation
+            )
         if self.config.notifications.obsidian_enabled:
             try:
                 self.notifications.refresh_executive_summary()
@@ -17070,6 +17073,15 @@ class BotController:
                 and isinstance(intent.get("use_safe_spots"), bool)
             ):
                 run = self.storage.campaign_run(str(goal.get("id") or ""))
+                if run is None and goal.get("status") == "paused":
+                    paused_run = self.storage.campaign_run(
+                        str(goal.get("id") or ""), include_terminal=True
+                    )
+                    if (
+                        isinstance(paused_run, dict)
+                        and paused_run.get("status") == "paused"
+                    ):
+                        run = paused_run
                 preference = self._farm_positioning_preference(
                     goal,
                     run,
@@ -17143,6 +17155,32 @@ class BotController:
             goal,
             "; ".join(repair_reasons),
         )
+        return repaired
+
+    def _repair_paused_campaign_phase_tactic_preferences(
+        self, observation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Normalize stored paused farm tactics without resuming gameplay."""
+
+        repaired: list[dict[str, Any]] = []
+        for goal in self.storage.goals(["paused"]):
+            run = self.storage.campaign_run(
+                str(goal.get("id") or ""), include_terminal=True
+            )
+            if not isinstance(run, dict) or run.get("status") != "paused":
+                continue
+            phase_id = str(run.get("active_phase_id") or "")
+            phase = self.storage.campaign_phase(phase_id) if phase_id else None
+            if not isinstance(phase, dict) or phase.get("status") != "paused":
+                continue
+            normalized = self._repair_persisted_phase_tactic_preferences(
+                goal, phase, observation
+            )
+            if (
+                isinstance(normalized, dict)
+                and normalized.get("context") != phase.get("context")
+            ):
+                repaired.append(normalized)
         return repaired
 
     def _campaign_turn_state(

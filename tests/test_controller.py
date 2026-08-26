@@ -2734,6 +2734,140 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_startup_reconciliation_repairs_live_shaped_paused_v49_farm(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="paused-v49-safe-recipe",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 999.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-999",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 999,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562 in the open field.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.72,
+                            "fight_above_vigor": 90,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(
+                    prior["id"], "failed", reason="keeper implementation fault"
+                )
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": True,
+                            "flee_below": 0.75,
+                            "rest_below": 0.82,
+                            "fight_above_vigor": 95,
+                            "selection_basis": "grounded_new_room",
+                        },
+                    },
+                    mode="start",
+                )
+                with controller.storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET ordinal=35 WHERE id=?",
+                        (prior["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE campaign_phases SET ordinal=37 WHERE id=?",
+                        (current["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE goals SET version=48 WHERE id=?", (goal["id"],)
+                    )
+                paused = controller.storage.manage_goal(
+                    {
+                        "request_id": "pause-live-v49-farm",
+                        "goal_id": goal["id"],
+                        "expected_version": 48,
+                        "action": "pause",
+                        "reason": "operator paused before controller restart",
+                    }
+                )["goal"]
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "legacy safe-wall launch"}},
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                broker_calls_before = list(broker.calls)
+
+                repaired = controller._repair_paused_campaign_phase_tactic_preferences(
+                    observation
+                )
+
+                self.assertEqual(49, paused["version"])
+                self.assertEqual("paused", paused["status"])
+                self.assertEqual([current["id"]], [item["id"] for item in repaired])
+                stored_goal = controller.storage.goal(goal["id"])
+                stored_run = controller.storage.campaign_run(
+                    goal["id"], include_terminal=True
+                )
+                stored_phase = controller.storage.campaign_phase(current["id"])
+                self.assertEqual(49, stored_goal["version"])
+                self.assertEqual("paused", stored_goal["status"])
+                self.assertEqual("paused", stored_run["status"])
+                self.assertEqual("paused", stored_phase["status"])
+                self.assertEqual(37, stored_phase["ordinal"])
+                self.assertFalse(stored_phase["context"]["use_safe_spots"])
+                self.assertEqual(0.75, stored_phase["context"]["flee_below"])
+                self.assertEqual(0.82, stored_phase["context"]["rest_below"])
+                self.assertEqual(95, stored_phase["context"]["fight_above_vigor"])
+                self.assertEqual(
+                    current["success_criteria"], stored_phase["success_criteria"]
+                )
+                self.assertEqual(
+                    "grounded_positioning_variant",
+                    stored_phase["context"]["positioning_preference_repair"][
+                        "source"
+                    ],
+                )
+                self.assertEqual(broker_calls_before, broker.calls)
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
     def test_active_open_field_recipe_repairs_to_explicit_operator_true(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
