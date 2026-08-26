@@ -92,10 +92,18 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `ffcde659bb7809b4fdb39123571bc02e5a3cb11e`, based on official upstream revision
+  `838fc5918e9b0e6e7b461811605d162c683b12af`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
+- Kept farm combat engaged for a bounded 30-round window instead of falling back
+  to the generic three-swing probe, while preserving per-swing health aborts and
+  operator-configured round budgets. Monster health-band messages are now captured
+  through the complete exchange and used only for a conservative early retreat;
+  they can never relax the hard flee threshold.
+- Fixed failed-heal recovery after a farm fight to re-read adjacent hostiles rather
+  than referencing state from another behavior pass, eliminating the live
+  `near is not defined` exception without misreporting a cornered character as safe.
 - Kept operator-named farm prey binding across research, campaign phases, and
   keeper launches. Exhausting only a safe-wall search now retries the same room
   and prey in bounded open-field mode, while death, critical-health, room-hazard,

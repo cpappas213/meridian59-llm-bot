@@ -16,7 +16,7 @@ autojoin = true
 
 [harness]
 root = "../vendor/m59-harness"
-expected_revision = "ffcde659bb7809b4fdb39123571bc02e5a3cb11e"
+expected_revision = "838fc5918e9b0e6e7b461811605d162c683b12af"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 # External brokers must also launch m59-broker.mjs with --in-process.
