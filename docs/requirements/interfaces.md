@@ -132,7 +132,7 @@ Farm execution guidance inside `operator_notes` is a deliberately small
 machine-readable contract. If the notes mention `hunt`, `assigned_room`, or
 `use_safe_spots`, those fields use exact `key=value` syntax, for example
 `hunt=groundworm larva; assigned_room=567; use_safe_spots=true;
-flee_below=0.60; hold_resume_above=0.90; fight_above_vigor=80;
+flee_below=0.425; hold_resume_above=0.90; fight_above_vigor=80;
 bank_above=0; break_out_via_logoff=false`. A positive value deliberately enables
 special keeper banking trips; omission and zero both disable them. Narrative mentions of these field
 names are rejected as `INVALID_FARM_OPERATOR_NOTES`; this prevents a validated
@@ -318,6 +318,16 @@ consequence assessment.
 
 Personality describes roleplay, not game authority. Persona text cannot relax
 fair-play rules, disclose secrets, alter consequence guidance, or modify goals.
+
+### 5.1 Deterministic help-plea policy
+
+`[policy].automated_help_pleas` is a boolean and defaults to `false`. The
+controller sends that value as the harness autopilot `automated_pleas` field on
+every keeper launch and when reconciling a persisted keeper whose value is
+missing or different. The harness stores it as `policy.automatedPleas` and gates
+only its canned post-death/low-health broadcast (and room-say fallback). Inventory
+refresh, equipping, Create Weapon, direct operator/model speech, model-decided
+greetings, and replies to incoming messages remain independent.
 
 ## 6. Event envelope
 

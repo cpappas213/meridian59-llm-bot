@@ -484,7 +484,7 @@ autojoin = true
 
 [harness]
 root = "$escapedHarness"
-expected_revision = "e6620d6b70a9e76feb7f5e2816b278f8a8ca946a"
+expected_revision = "6ce42e806f1d2941e9eaecdeaff4809964dce230"
 control_url = "http://127.0.0.1:8901"
 dashboard_port = 8902
 lifecycle = "controller_managed"
@@ -514,7 +514,7 @@ error_backoff_max_seconds = 60
 fallback_mode = "survive"
 conversation_enabled = true
 social_poll_seconds = 1
-proactive_greetings_enabled = true
+proactive_greetings_enabled = false
 greeting_cooldown_seconds = 1200
 greetings_per_minute = 20
 conversation_history_turns = 8
@@ -537,6 +537,7 @@ carried_currency_bank_threshold = 1
 protected_item_value_threshold = 5000
 protected_item_names = []
 consequential_action_guidance = "strongly_avoid_unnecessary_loss"
+automated_help_pleas = false
 
 [learning]
 enabled = true

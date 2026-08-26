@@ -65,6 +65,14 @@ Configuration is TOML and unknown keys fail closed. Important sections are:
 | `learning` | Failure budgets and deterministic retry cooldowns. |
 | `notifications` | Optional Windows/Obsidian sinks. |
 
+Keep `harness.lifecycle = "controller_managed"` for the supported deployment.
+If an operator deliberately supplies an external broker at the pinned harness
+revision, it must launch `m59-broker.mjs` with `--in-process`; the bot depends on
+the direct synchronous session contract. That revision's `/health` response does
+not report the keeper arrangement, so the bot cannot verify an external process's
+flag after attachment. Do not use the harness dashboard's broker-restart control
+for this deployment because it does not preserve `--in-process`.
+
 `secrets.env` supports `M59_ACCOUNT_USERNAME`, `M59_ACCOUNT_PASSWORD`,
 `M59_BOT_CONTROL_TOKEN`, `M59_LLM_API_KEY`, and
 `M59_OBSIDIAN_VAULT_PATH`. Do not quote values, print the file, or commit it.
@@ -199,6 +207,21 @@ Do not advance the harness independently of the root gitlink and
 
 - **Model unavailable/model missing:** verify base URL, API key, and exact model
   returned from `/models`.
+- **Planner retry suppressed:** inspect `planner.retry_circuit.opened`,
+  `.suppressed`, and `.reopened` events. A deterministic protocol,
+  response-format, prompt-budget, or plan-verification failure remains suppressed
+  across restart while the goal, phase, operation, plan, inventory, equipment,
+  abilities, room, and visible-object fingerprint is unchanged. Correct the
+  cause or allow material state to change; restarting alone is not a retry.
+- **Observation reports `freshness.mode=tactical_cache`:** expected while the
+  keeper is fighting, pulling, travelling, retreating, or recovering. Room and
+  vitals come from pushed look state; inventory and spells may be marked cached
+  or unknown until urgent keeper ownership ends and the next full refresh runs.
+- **Death occurred during `survive`:** inspect `character.died` and the durable
+  `character_death_cursor_v1` runtime receipt. Mode handoff does not suppress
+  accounting, and a repeated death ID is intentionally ignored. Do not manually
+  quarantine a verified wall solely because the already engaged monster damaged
+  or killed the character there.
 - **Harness revision mismatch:** initialize/update the submodule to the committed
   revision; never bypass the expected-revision check.
 - **Character preserved:** this is intentional for an established identity. Set

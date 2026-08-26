@@ -17,6 +17,7 @@ TEXT_SUFFIXES = {".md", ".py", ".ps1", ".toml", ".yml", ".yaml", ".txt"}
 EXCLUDED_PREFIXES = (
     ".git/",
     ".venv/",
+    ".worktrees/",
     "build/",
     "runtime/",
     "vendor/",
@@ -88,7 +89,7 @@ def main() -> int:
 
     gitmodules = (ROOT / ".gitmodules").read_text(encoding="utf-8")
     if f"url = {HARNESS_URL}" not in gitmodules:
-        errors.append(".gitmodules: harness URL is not the public integration fork")
+        errors.append(".gitmodules: harness URL is not the authoritative public upstream")
 
     returncode, staged_gitlink = git_output(
         "ls-files", "--stage", "--", "vendor/m59-harness"

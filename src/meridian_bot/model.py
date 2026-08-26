@@ -42,6 +42,25 @@ TACTICAL_REPAIR_PROMPT_TOKEN_BUDGET = 8_000
 TACTICAL_PLAN_PROMPT_TOKEN_BUDGET = 12_000
 TACTICAL_ACTION_OUTPUT_TOKEN_BUDGET = 1_024
 PROMPT_ESTIMATED_CHARS_PER_TOKEN = 4
+TACTICAL_CONTEXT_PROVENANCE_KEYS = frozenset(
+    {
+        "citation",
+        "citations",
+        "source_evidence",
+        "source_hash",
+        "source_ref",
+    }
+)
+TACTICAL_RANKED_CONTEXT_LIST_KEYS = frozenset(
+    {
+        "hunt_room_options",
+        "ranked_facts",
+        "ranked_options",
+        "relevant_entities",
+        "room_spawn_tables",
+        "rules",
+    }
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -133,7 +152,10 @@ Constraints may contain only avoid_death (boolean), bank_before_hazard (boolean)
 merchant_class, room_id, and maximum_price; do not create it unless grounded hints contain the exact
 offering and merchant placement. For paid training, use a complete purchase_plan_candidates entry
 from a training_options grounding hint verbatim; a location name is never a merchant_class, and prices
-must not be guessed. If multiple candidates exist, select only from that list. priority is an integer
+must not be guessed. If multiple candidates exist, select only from that list. When the operator
+explicitly requires farming, hunting, fighting, or killing a named creature, preserve its canonical
+singular name in operator_notes as hunt=<creature>; never substitute a progression-equivalent prey.
+priority is an integer
 from 0 (lowest) through 100 (highest), normally
 50. activation is queue unless the operator explicitly requests replacing the active goal; use
 replace_active_pause for ordinary replacement and replace_active_cancel only when cancellation is
@@ -414,8 +436,8 @@ chooses banking. Otherwise proceed with the carried wealth instead of treating i
 One successful bank balance call is sufficient evidence; never repeat it in an unchanged state. If carried
 shillings are already zero, deposit-before-hazard is complete. Do not retry a knowingly unaffordable shop call.
 Honor the durable goal's explicit use_safe_spots value, or the active internal farm phase's explicit
-use_safe_spots value: true requests wall trials; false requests bounded open-field
-combat and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.60
+use_safe_spots value: true requires wall trials; false permits bounded open-field combat while retaining
+any opportunistic working wall, and is valid when wall evidence is poor but prior open-field evidence is safe. Use flee_below=0.425
 for ordinary bounded farms, hold_resume_above at least 0.90 and fight_above_vigor 80 by default, and
 break_out_via_logoff=false until stable room saving is verified. A safe_spot.works label alone is not proof.
 Keeper banking is optional: use bank_above=0 unless the current financial_context and plan deliberately
@@ -443,14 +465,14 @@ omits or contradicts these facts before any action is permitted.
 If the HP/progression criterion is already met, omit every farm/autopilot launch step and plan only the
 remaining recovery and explicit finish criteria. Never repeat hazardous work merely because the original
 objective or operator_notes still contains its completed recipe.
-Before starting, compare live numeric vigor with fight_above_vigor. Resting reaches the ordinary 80-vigor
-keeper floor, so food and spending are never implicit launch requirements. The controller will not insert a
-food, reagent, or food-funding phase. At the ordinary 80-vigor floor, omitted eat_before_fighting lets the
-keeper consume carried or self-created food opportunistically; set it false only when the phase must preserve
-food. Set eat_before_fighting=true with an explicit fight_above_vigor above 80 only when you deliberately make
-that higher, food-dependent launch floor part of the tactic. Set buy_food=true only when you deliberately want
-paid food acquisition and current financial evidence makes that route viable; it remains false when omitted.
-Buying, creating, carrying, and eating food are separate choices. Carried herbs and
+Before starting, compare live numeric vigor with fight_above_vigor. The controller's ordinary configured floor is
+the rest-reachable 80, so paid food is never an implicit launch requirement. The controller will not insert a food,
+reagent, or food-funding phase. The keeper consumes carried or self-created food opportunistically and currently
+enforces its own 100-vigor minimum while food is available; that is not a planner switch, and it falls back when
+supply is absent. Set fight_above_vigor above 100 only when you deliberately make a higher, food-dependent launch
+floor part of the tactic. Set buy_food=true only when you deliberately want paid food acquisition and current
+financial evidence makes that route viable; it remains false when omitted.
+Buying food remains separate from creating, carrying, and eating it. Carried herbs and
 elderberries are usable only when the verified spell list says the character knows Create Food. If a retreat
 happens before the assigned room is reached, treat it as hazardous-route evidence and do not condemn
 the destination room.
@@ -523,11 +545,20 @@ Supported targets (only the listed fields are accepted):
 - {{"id":string,"type":"wielding_equals","items":null or array of canonical weapon names}}
 - {{"id":string,"type":"wielding_contains","item":canonical item name OR "category":"weapon"}}
 - {{"id":string,"type":"ability_at_least","ability_kind":"skill|spell","name":canonical name,"value":number}}
+- {{"id":string,"type":"keeper_target_kills_at_least","count":integer from 1 through 25}}
 - {{"id":string,"type":"phase_action_succeeded","tools":[exact names from campaign.phase_capabilities[phase.kind]]}}
 
 Use phase_action_succeeded only when successful controller evidence collection is itself the bounded outcome,
 especially research_progression. Never use it as the sole farm outcome: a farm needs an observable result such as
-the next max-health milestone. campaign.phase_capabilities is the closed callable-tool vocabulary for these
+the next max-health milestone. Every farm target must be max_health_at_least or
+keeper_target_kills_at_least. Prefer max_health_at_least strictly above verified_observation's live maximum health,
+normally the next one-point milestone, while the configured prey can still raise it. Otherwise use a meaningful bounded
+keeper_target_kills_at_least batch, normally 10-25; the controller verifies only exact-target kills recorded after this phase began.
+Never use
+item_count_at_least, food, inventory, equipment, currency, location, vigor, or current health as a farm target:
+those can be satisfied by preparation or cleanup before the keeper fights and therefore belong to a support phase.
+Food may be provisioned inside a farm plan, but provisioning is never farm completion.
+campaign.phase_capabilities is the closed callable-tool vocabulary for these
 targets. Choose each tool only from the array for the selected phase kind. All other JSON property names in
 campaign, grounded_knowledge, progression_context, learned_failures, financial_context, and verified_observation
 are fact namespaces, not callable tools. In particular, never copy context labels such as room_options_by_candidate,
@@ -612,12 +643,17 @@ invent Blink as a farm escape policy, and do not make flasks an automatic prereq
 are usable capability evidence, while acquiring supplies remains a deliberate, feasible planner choice.
 
 Every farm phase must put its executable choices in phase.context, not only in prose: target (canonical creature
-name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.60 for ordinary bounded farming),
-and fight_above_vigor (80 by default). Optional eat_before_fighting uses available food when omitted and may be
-set false to preserve it; buy_food is false when omitted. Set eat_before_fighting=true explicitly when choosing
-an above-80 food-dependent floor. The controller persists and enforces these fields across planning turns. If choosing
-open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; if choosing wall trials, set
-it true. Objective, rationale, and notes explain the choice but never substitute for the structured fields.
+name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below (0.425 for ordinary bounded farming),
+and fight_above_vigor (80 by default). The keeper owns opportunistic food consumption and currently applies an
+internal 100-vigor minimum while food is available; an explicit floor above 100 is the deliberate higher-food
+tactic. buy_food is false when omitted. The controller persists and enforces these fields across planning turns. If choosing
+open-field farming because wall evidence is poor, set use_safe_spots=false explicitly; this relaxes the wall
+requirement rather than forbidding a working wall. If combat must require wall protection, set it true. Objective,
+rationale, and notes explain the choice but never substitute for the structured fields.
+If campaign.operator_contract.binding_farm_target is present, it is an operator requirement: every
+farm-recipe hunting_grounds lookup and every farm phase must use that exact creature. A support phase
+may improve capability, recovery, equipment, supplies, or route knowledge, but it must return to the
+bound creature and must never replace it with progression-equivalent prey.
 Every combat-driven train_ability phase uses the same keeper recipe and must set training_method="combat", prey
 (canonical creature name), room (numeric assigned-room id), use_safe_spots (boolean), flee_below, and
 fight_above_vigor. Its observable target must be the intended ability milestone. The tactical planner will launch
@@ -1007,6 +1043,125 @@ class VllmClient:
 
         return visit(deepcopy(envelope))
 
+    @classmethod
+    def _compact_tactical_supporting_sections(
+        cls,
+        envelope: dict[str, Any],
+        *,
+        max_fact_list: int | None,
+        include_persona: bool,
+    ) -> dict[str, Any]:
+        """Project non-contract planning context without weakening invariants.
+
+        Full provenance stays in controller storage and the safe-ending compiler's
+        out-of-band candidate map. It is routing/audit metadata, not a planning
+        input. Ranked context lists may be shortened only after the complete
+        projected prompt still exceeds its mode budget; retained values are
+        copied whole and the omitted count is explicit.
+
+        Goal and phase contracts, available tool descriptions, action schemas,
+        violations, state tokens, and every other controller-owned invariant are
+        deliberately outside this projection.
+        """
+
+        def project_context(
+            value: Any,
+            *,
+            depth: int = 0,
+            ranked_list: bool = False,
+        ) -> Any:
+            if depth >= 10:
+                return deepcopy(value)
+            if isinstance(value, list):
+                selected = value
+                omitted = 0
+                if (
+                    ranked_list
+                    and max_fact_list is not None
+                    and len(value) > max_fact_list
+                ):
+                    selected = value[:max_fact_list]
+                    omitted = len(value) - max_fact_list
+                projected = [
+                    project_context(item, depth=depth + 1) for item in selected
+                ]
+                if omitted:
+                    projected.append({"omitted_ranked_items": omitted})
+                return projected
+            if isinstance(value, dict):
+                return {
+                    str(key): project_context(
+                        item,
+                        depth=depth + 1,
+                        ranked_list=(
+                            str(key).casefold().replace("-", "_")
+                            in TACTICAL_RANKED_CONTEXT_LIST_KEYS
+                        ),
+                    )
+                    for key, item in value.items()
+                    if str(key).casefold().replace("-", "_")
+                    not in TACTICAL_CONTEXT_PROVENANCE_KEYS
+                }
+            return deepcopy(value)
+
+        projected = deepcopy(envelope)
+        if "relevant_facts" in projected:
+            projected["relevant_facts"] = project_context(
+                projected["relevant_facts"]
+            )
+        if include_persona:
+            if "planning_persona" in projected:
+                projected["planning_persona"] = project_context(
+                    projected["planning_persona"]
+                )
+        else:
+            projected.pop("planning_persona", None)
+
+        constraints = projected.get("plan_constraints")
+        if isinstance(constraints, dict):
+            candidates = constraints.get("safe_ending_candidates")
+            if isinstance(candidates, list):
+                compact_candidates: list[Any] = []
+                for raw in candidates:
+                    if not isinstance(raw, dict):
+                        compact_candidates.append(deepcopy(raw))
+                        continue
+                    candidate = {
+                        str(key): deepcopy(item)
+                        for key, item in raw.items()
+                        if str(key).casefold().replace("-", "_")
+                        not in TACTICAL_CONTEXT_PROVENANCE_KEYS
+                        and str(key).casefold() != "evidence"
+                    }
+                    compact_candidates.append(candidate)
+                constraints["safe_ending_candidates"] = compact_candidates
+
+        for section in ("rule_cards", "matched_rule_cards"):
+            cards = projected.get(section)
+            if not isinstance(cards, list):
+                continue
+            projected[section] = [
+                {
+                    str(key): deepcopy(item)
+                    for key, item in card.items()
+                    if str(key).casefold() != "selectors"
+                }
+                if isinstance(card, dict)
+                else deepcopy(card)
+                for card in cards
+            ]
+        return projected
+
+    @staticmethod
+    def _serialize_tactical_envelope(envelope: dict[str, Any]) -> str:
+        """Serialize deterministic compact JSON; whitespace is not model context."""
+
+        return json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     def _budget_tactical_envelope(
         self,
         mode: str,
@@ -1024,10 +1179,30 @@ class VllmClient:
             tactical_system_prompt(normalized_mode) if system is None else system
         )
         candidate = deepcopy(normalized_envelope)
-        user = json.dumps(candidate, ensure_ascii=False)
+        user = self._serialize_tactical_envelope(candidate)
         original_estimated = self._estimated_prompt_tokens(system, user)
         estimated = original_estimated
         compacted = False
+        optional_context_compacted = False
+        supporting_context_compacted = False
+        compaction_profile = "none"
+        if estimated > token_budget:
+            # First remove only routing/audit metadata that the controller keeps
+            # out of band. In the common case this preserves all ranked facts and
+            # all optional feedback while eliminating duplicated provenance.
+            projected_base = self._compact_tactical_supporting_sections(
+                normalized_envelope,
+                max_fact_list=None,
+                include_persona=True,
+            )
+            candidate = projected_base
+            user = self._serialize_tactical_envelope(candidate)
+            estimated = self._estimated_prompt_tokens(system, user)
+            supporting_context_compacted = candidate != normalized_envelope
+            compacted = supporting_context_compacted
+            if supporting_context_compacted:
+                compaction_profile = "routing-and-provenance"
+
         if estimated > token_budget:
             stages = (
                 (12, 16, 800, False),
@@ -1038,15 +1213,50 @@ class VllmClient:
             )
             for max_list, max_dict, max_string, drop in stages:
                 candidate = self._compact_tactical_optional_sections(
-                    normalized_envelope,
+                    projected_base,
                     max_list=max_list,
                     max_dict=max_dict,
                     max_string=max_string,
                     drop=drop,
                 )
-                user = json.dumps(candidate, ensure_ascii=False)
+                user = self._serialize_tactical_envelope(candidate)
                 estimated = self._estimated_prompt_tokens(system, user)
                 compacted = True
+                optional_context_compacted = True
+                compaction_profile = (
+                    "optional-drop"
+                    if drop
+                    else f"optional-{max_list}-{max_dict}-{max_string}"
+                )
+                if estimated <= token_budget:
+                    break
+
+        if estimated > token_budget:
+            # At this point dispensable history/evidence/examples are already
+            # absent. Bound only ranked contextual lists, retaining each selected
+            # fact byte-for-byte and recording how many lower-ranked items were
+            # omitted. The protected contracts remain exact and can still force a
+            # fail-closed rejection below.
+            optional_base = candidate
+            for max_fact_list, include_persona in (
+                (12, True),
+                (6, True),
+                (3, False),
+                (1, False),
+            ):
+                candidate = self._compact_tactical_supporting_sections(
+                    optional_base,
+                    max_fact_list=max_fact_list,
+                    include_persona=include_persona,
+                )
+                user = self._serialize_tactical_envelope(candidate)
+                estimated = self._estimated_prompt_tokens(system, user)
+                compacted = True
+                supporting_context_compacted = True
+                compaction_profile = (
+                    f"ranked-context-{max_fact_list}"
+                    + ("" if include_persona else "-no-persona")
+                )
                 if estimated <= token_budget:
                     break
 
@@ -1062,6 +1272,9 @@ class VllmClient:
             "token_budget": token_budget,
             "user_context_characters": len(user),
             "compacted": compacted,
+            "optional_context_compacted": optional_context_compacted,
+            "supporting_context_compacted": supporting_context_compacted,
+            "compaction_profile": compaction_profile,
             "over_budget": over_budget,
             "output_token_budget": target_output,
             "effective_max_output_tokens": effective_output,
@@ -1076,13 +1289,15 @@ class VllmClient:
         }
         LOG.info(
             "tactical prompt mode=%s estimated_tokens=%s original_tokens=%s budget=%s "
-            "context_chars=%s compacted=%s over_budget=%s output_target=%s output_max=%s",
+            "context_chars=%s compacted=%s profile=%s over_budget=%s "
+            "output_target=%s output_max=%s",
             normalized_mode,
             estimated,
             original_estimated,
             token_budget,
             len(user),
             compacted,
+            compaction_profile,
             over_budget,
             target_output,
             effective_output,
@@ -1090,7 +1305,7 @@ class VllmClient:
         if over_budget:
             raise ModelError(
                 f"tactical {normalized_mode} required context exceeds its {token_budget}-token "
-                f"prompt budget ({estimated} estimated tokens after optional-context compaction)"
+                f"prompt budget ({estimated} estimated tokens after bounded-context compaction)"
             )
         return candidate, user
 

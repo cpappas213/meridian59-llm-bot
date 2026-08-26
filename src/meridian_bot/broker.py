@@ -29,6 +29,9 @@ class ToolCallError(BrokerError):
     code = "TOOL_CALL_FAILED"
 
 
+UNSUPPORTED_AUTOPILOT_MODES = {"tick"}
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -40,6 +43,24 @@ class Tool:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         if isinstance(properties, dict):
             properties.pop("agent", None)
+            # Travel is scoped to the destination authorized by the bot. Newer
+            # harnesses otherwise run unrelated banking/provisioning errands by
+            # default before departure, so that switch stays controller-owned.
+            if self.name == "travel":
+                properties.pop("run_errands", None)
+            # The upstream tick driver is experimental and has lifecycle rules
+            # this controller does not implement. Keep supported keeper modes
+            # visible while withholding that one enum value.
+            if self.name == "autopilot":
+                properties.pop("travel_deaths_allowed", None)
+                mode = properties.get("mode")
+                enum = mode.get("enum") if isinstance(mode, dict) else None
+                if isinstance(enum, list):
+                    mode["enum"] = [
+                        value
+                        for value in enum
+                        if value not in UNSUPPORTED_AUTOPILOT_MODES
+                    ]
         required = schema.get("required") if isinstance(schema, dict) else None
         if isinstance(required, list):
             schema["required"] = [name for name in required if name != "agent"]
@@ -72,6 +93,29 @@ class Tool:
                 raise ValueError(f"{self.name}.{name} must be one of {enum}")
 
 
+def normalize_tool_arguments(tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Apply controller-owned defaults before policy, audit, and wire validation."""
+
+    normalized = dict(arguments)
+    if tool.name == "travel" and tool.accepts("run_errands"):
+        # A requested destination is the complete authority for this action;
+        # unrelated pre-trip errands require their own planned steps.
+        normalized["run_errands"] = False
+    if tool.name == "autopilot":
+        if normalized.get("mode") in UNSUPPORTED_AUTOPILOT_MODES:
+            raise ValueError(
+                f"unsupported experimental autopilot mode: {normalized['mode']}"
+            )
+        if tool.accepts("travel_deaths_allowed") and (
+            normalized.get("action") == "start"
+            or "travel_deaths_allowed" in normalized
+        ):
+            # Continuing a journey after death conflicts with the bot's
+            # no-cheating/survival contract and is not planner-authorized.
+            normalized["travel_deaths_allowed"] = 0
+    return normalized
+
+
 # Session lifecycle, credential-bearing, debugging, and conversation tools are
 # controller-owned. The planner sees every other ordinary-player capability.
 CONTROLLER_ONLY_TOOLS = {
@@ -94,6 +138,9 @@ CONTROLLER_ONLY_TOOLS = {
     "move_intent",
     "context_intent",
     "cancel_action",
+    # Upstream added this as an operator-measured ledge experiment. The bot has
+    # no policy, movement preflight, or recovery contract for deliberate falls.
+    "jump",
 }
 
 
@@ -107,6 +154,12 @@ class BrokerClient:
         self._manifest: dict[str, Tool] | None = None
         self._process: subprocess.Popen[str] | None = None
         self._log_handle: Any = None
+        # A controller turn must be able to inspect a character that is already
+        # escaping without spending the escape's five-packets-per-second budget.
+        # The cache is populated by an ordinary full observation and is then
+        # combined with the harness's push-maintained cached look while the
+        # keeper is doing time-critical work.
+        self._observation_cache: dict[str, Any] | None = None
 
     def _next_id(self) -> int:
         with self._id_lock:
@@ -156,6 +209,10 @@ class BrokerClient:
             str(control_port),
             "--dashboard",
             str(self.config.harness.dashboard_port),
+            # This bot is a synchronous commander. The newer harness defaults
+            # restored sessions to keeper proxies unless explicitly told to
+            # retain the direct in-process Session contract.
+            "--in-process",
         ]
 
     def _launch_environment(self) -> dict[str, str]:
@@ -255,6 +312,9 @@ class BrokerClient:
         tool = self.capabilities().get(name)
         if tool is None:
             raise HarnessIncompatible(f"unknown broker tool: {name}")
+        # Normalize again at the wire boundary so direct shutdown/PvP helpers
+        # receive the same guarantees as controller-planned calls.
+        arguments = normalize_tool_arguments(tool, arguments)
         tool.validate(arguments)
 
         def invoke() -> Any:
@@ -284,30 +344,153 @@ class BrokerClient:
                 return invoke()
         return invoke()
 
+    @staticmethod
+    def _compact_minimap(look: dict[str, Any]) -> dict[str, Any]:
+        """Keep the tactical rendering without copying raw vector walls."""
+
+        if not isinstance(look.get("minimap"), dict):
+            return look
+        minimap = look["minimap"]
+        look["minimap"] = {
+            key: copy.deepcopy(minimap[key])
+            for key in ("text", "legend", "size", "wall_summary", "truncated")
+            if key in minimap
+        }
+        look["minimap"]["note"] = (
+            "Compact live tactical picture; raw vector walls are intentionally omitted "
+            "from LLM context. The keeper uses the full geometry for movement and safe-spot tests."
+        )
+        return look
+
+    @staticmethod
+    def _health_fraction(look: dict[str, Any]) -> float | None:
+        health = look.get("vitals", {}).get("health") if isinstance(look.get("vitals"), dict) else None
+        if not isinstance(health, dict):
+            return None
+        current = health.get("current", health.get("value"))
+        maximum = health.get("max")
+        if not isinstance(current, (int, float)) or not isinstance(maximum, (int, float)) or maximum <= 0:
+            return None
+        return float(current) / float(maximum)
+
+    @classmethod
+    def _keeper_needs_tactical_observation(
+        cls, look: dict[str, Any], keeper: dict[str, Any]
+    ) -> bool:
+        """Return true while fresh bulk reads would contend with keeper survival."""
+
+        if keeper.get("running") is not True or keeper.get("inert"):
+            return False
+        activity = str(keeper.get("activity") or "").strip().casefold()
+        urgent_activity = any(
+            marker in activity
+            for marker in (
+                "fight",
+                "pull",
+                "travel",
+                "zoning",
+                "withdraw",
+                "retreat",
+                "recover",
+                "rest",
+                "loot",
+                "moving",
+            )
+        )
+        watchdog = keeper.get("watchdog") if isinstance(keeper.get("watchdog"), dict) else {}
+        try:
+            blocked_now_ms = float(watchdog.get("blocked_now_ms") or 0)
+        except (TypeError, ValueError):
+            blocked_now_ms = 0.0
+        if urgent_activity or watchdog.get("wedged") or blocked_now_ms > 0:
+            return True
+        health_fraction = cls._health_fraction(look)
+        policy = keeper.get("policy") if isinstance(keeper.get("policy"), dict) else {}
+        rest_below = policy.get("restBelow", policy.get("rest_below", 0.7))
+        return bool(
+            health_fraction is not None
+            and isinstance(rest_below, (int, float))
+            and health_fraction < float(rest_below)
+        )
+
+    def _tactical_observation(
+        self, look: dict[str, Any], keeper: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Merge push-current tactical state with explicitly stale slow context."""
+
+        observation = copy.deepcopy(self._observation_cache or {})
+        observation.update(
+            {
+                "id": uuid7(),
+                "observed_at": time.time(),
+                "look": look,
+                "autopilot": copy.deepcopy(keeper),
+                "freshness": {
+                    "mode": "tactical_cache",
+                    "look": "push_current",
+                    "status": "derived_from_cached_look",
+                    "inventory": "cached" if self._observation_cache else "unknown",
+                    "spells": "cached" if self._observation_cache else "unknown",
+                    "reason": "keeper survival movement owns the server packet budget",
+                },
+            }
+        )
+        # Never let a prior full status override the current pushed health or
+        # room. Controller safety helpers read status first and look second.
+        status = copy.deepcopy(observation.get("status")) if isinstance(observation.get("status"), dict) else {}
+        if isinstance(look.get("vitals"), dict):
+            status["vitals"] = copy.deepcopy(look["vitals"])
+        if isinstance(look.get("room"), dict):
+            status["where"] = copy.deepcopy(look["room"])
+        observation["status"] = status
+        if "inventory" not in observation:
+            observation["inventory"] = {"known": False, "items": []}
+        return observation
+
     def observe(self) -> dict[str, Any]:
         agent = self.config.game.agent
+        capabilities = self.capabilities()
+        look_tool = capabilities.get("look")
+
+        # The autopilot status and cached look are in-process cache reads. Take
+        # them before any room/status/inventory refresh so a live retreat can
+        # withhold bulk reads before those reads enter the shared harness pacer.
+        keeper: dict[str, Any] | None = None
+        if "autopilot" in capabilities and look_tool and look_tool.accepts("cached"):
+            try:
+                raw_keeper = self.call_tool(
+                    "autopilot",
+                    {"agent": agent, "action": "status"},
+                    timeout=10,
+                )
+                keeper = raw_keeper if isinstance(raw_keeper, dict) else None
+                cached_arguments: dict[str, Any] = {"agent": agent, "cached": True}
+                if look_tool.accepts("minimap"):
+                    cached_arguments["minimap"] = True
+                cached_look = self.call_tool("look", cached_arguments, timeout=10)
+                if not isinstance(cached_look, dict):
+                    cached_look = {}
+                cached_look = self._compact_minimap(cached_look)
+                if keeper is not None and self._keeper_needs_tactical_observation(
+                    cached_look, keeper
+                ):
+                    return self._tactical_observation(cached_look, keeper)
+            except (BrokerError, ValueError):
+                # Compatibility with an older harness must not prevent the
+                # ordinary verified observation below.
+                keeper = None
+
         look_arguments: dict[str, Any] = {"agent": agent}
         # The broker's text minimap contains the same live creature, player, exit,
         # and position markers a human sees in the client. Request it when the
         # installed harness supports it so the planner gets room geometry without
         # spending a separate turn on discovery.
-        look_tool = self.capabilities().get("look")
         if look_tool and look_tool.accepts("minimap"):
             look_arguments["minimap"] = True
         look = self.call_tool("look", look_arguments, timeout=20)
-        if isinstance(look, dict) and isinstance(look.get("minimap"), dict):
-            minimap = look["minimap"]
-            # Raw vector walls can be hundreds of KB. The readable picture is a
-            # few KB and already carries the tactical symbols and coordinates.
-            look["minimap"] = {
-                key: copy.deepcopy(minimap[key])
-                for key in ("text", "legend", "size", "wall_summary", "truncated")
-                if key in minimap
-            }
-            look["minimap"]["note"] = (
-                "Compact live tactical picture; raw vector walls are intentionally omitted "
-                "from LLM context. The keeper uses the full geometry for movement and safe-spot tests."
-            )
+        if not isinstance(look, dict):
+            look = {}
+        look = self._compact_minimap(look)
         status = self.call_tool("status", {"agent": agent, "brief": True}, timeout=20)
         inventory = self.call_tool("inventory", {"agent": agent}, timeout=20)
         observation = {
@@ -316,6 +499,8 @@ class BrokerClient:
             "look": look,
             "status": status,
             "inventory": inventory,
+            **({"autopilot": copy.deepcopy(keeper)} if keeper is not None else {}),
+            "freshness": {"mode": "full_refresh"},
         }
         # Spell knowledge is planner context, not an instruction to provision.
         # In particular, exposing Create Food here must never cause the controller
@@ -356,6 +541,7 @@ class BrokerClient:
                     "spells": [],
                     "freshness": {"known": False},
                 }
+        self._observation_cache = copy.deepcopy(observation)
         return observation
 
     def ensure_started(self, startup_timeout: float = 20) -> dict[str, Any]:

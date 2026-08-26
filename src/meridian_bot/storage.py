@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,6 +20,35 @@ from .utils import canonical_json, json_hash, timestamp, uuid7
 
 TERMINAL_GOAL_STATES = {"succeeded", "failed", "cancelled"}
 GOAL_STATES = {"proposed", "queued", "active", "paused", "blocked", *TERMINAL_GOAL_STATES}
+CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
+
+
+def campaign_phase_downtime_runtime_key(phase_id: str) -> str:
+    """Return the durable per-phase key while retaining the legacy summary key."""
+
+    return f"{CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY}:{phase_id}"
+
+
+def _elapsed_timestamp_seconds(started_at: Any, ended_at: str) -> float:
+    """Return a non-negative interval; corrupt or future timestamps cost no budget."""
+
+    if not isinstance(started_at, str) or not started_at.strip():
+        return 0.0
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return 0.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=timezone.utc)
+    return max(
+        0.0,
+        (ended.astimezone(timezone.utc) - started.astimezone(timezone.utc)).total_seconds(),
+    )
+
+
 class StorageError(RuntimeError):
     code = "INTERNAL_ERROR"
 
@@ -1736,6 +1766,21 @@ class Storage:
             return None
         now = timestamp()
         if run["active_phase_id"]:
+            phase = connection.execute(
+                "SELECT id,status,updated_at FROM campaign_phases WHERE id=? AND run_id=?",
+                (run["active_phase_id"], run["id"]),
+            ).fetchone()
+            if phase is not None and phase["status"] == "paused":
+                paused_seconds = _elapsed_timestamp_seconds(phase["updated_at"], now)
+                if paused_seconds > 0:
+                    self._add_campaign_phase_downtime_in_tx(
+                        connection,
+                        goal_id=goal_id,
+                        run_id=str(run["id"]),
+                        phase_id=str(phase["id"]),
+                        seconds=paused_seconds,
+                        updated_at=now,
+                    )
             connection.execute(
                 "UPDATE campaign_phases SET status='active',updated_at=? "
                 "WHERE id=? AND status='paused'",
@@ -2544,6 +2589,100 @@ class Storage:
         if run_id is None:
             return None
         return self.campaign_run(goal_id, include_terminal=True)
+
+    def _campaign_phase_downtime_in_tx(
+        self,
+        connection: sqlite3.Connection,
+        phase_id: str,
+    ) -> dict[str, Any] | None:
+        """Read a phase record, falling back to the pre-per-phase summary key."""
+
+        phase_id = str(phase_id or "")
+        if not phase_id:
+            return None
+        row = connection.execute(
+            "SELECT value_json FROM runtime_kv WHERE key=?",
+            (campaign_phase_downtime_runtime_key(phase_id),),
+        ).fetchone()
+        value = self._loads(row["value_json"], None) if row else None
+        if isinstance(value, dict) and str(value.get("phase_id") or "") == phase_id:
+            return dict(value)
+
+        # Releases before per-phase keys kept only the most recently touched phase at
+        # this key.  Reading it preserves that accrued time until the phase is next
+        # updated, at which point it is copied into its own durable record.
+        row = connection.execute(
+            "SELECT value_json FROM runtime_kv WHERE key=?",
+            (CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,),
+        ).fetchone()
+        value = self._loads(row["value_json"], None) if row else None
+        if isinstance(value, dict) and str(value.get("phase_id") or "") == phase_id:
+            return dict(value)
+        return None
+
+    def campaign_phase_downtime(self, phase_id: str) -> dict[str, Any] | None:
+        return self._campaign_phase_downtime_in_tx(self._connect(), phase_id)
+
+    def _add_campaign_phase_downtime_in_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        goal_id: str,
+        run_id: str,
+        phase_id: str,
+        seconds: float,
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Accumulate one phase's excluded time and update the legacy projection."""
+
+        prior = self._campaign_phase_downtime_in_tx(connection, phase_id)
+        prior_seconds = 0.0
+        if isinstance(prior, dict):
+            try:
+                prior_seconds = max(0.0, float(prior.get("seconds", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                prior_seconds = 0.0
+        try:
+            added_seconds = max(0.0, float(seconds or 0.0))
+        except (TypeError, ValueError):
+            added_seconds = 0.0
+        recorded_at = updated_at or timestamp()
+        value = {
+            "goal_id": str(goal_id),
+            "run_id": str(run_id),
+            "phase_id": str(phase_id),
+            "seconds": prior_seconds + added_seconds,
+            "updated_at": recorded_at,
+        }
+        payload = canonical_json(value)
+        for key in (
+            campaign_phase_downtime_runtime_key(str(phase_id)),
+            CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+        ):
+            connection.execute(
+                """INSERT INTO runtime_kv(key,value_json,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     value_json=excluded.value_json,updated_at=excluded.updated_at""",
+                (key, payload, recorded_at),
+            )
+        return value
+
+    def add_campaign_phase_downtime(
+        self,
+        *,
+        goal_id: str,
+        run_id: str,
+        phase_id: str,
+        seconds: float,
+    ) -> dict[str, Any]:
+        with self.transaction() as connection:
+            return self._add_campaign_phase_downtime_in_tx(
+                connection,
+                goal_id=goal_id,
+                run_id=run_id,
+                phase_id=phase_id,
+                seconds=seconds,
+            )
 
     def get_runtime(self, key: str, default: Any = None) -> Any:
         row = self._connect().execute("SELECT value_json FROM runtime_kv WHERE key=?", (key,)).fetchone()

@@ -8,11 +8,13 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from meridian_bot.broker import Tool, ToolCallError
+from meridian_bot.broker import BrokerError, Tool, ToolCallError
 from meridian_bot.campaign import (
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
+    PHASE_KEEPER_TARGET_KILLS,
     RESEARCH_RETRY_UNLOCKED,
 )
 from meridian_bot.contracts import CRITERION_KINDS
@@ -24,12 +26,115 @@ from meridian_bot.controller import (
 )
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.mcp import TOOLS
-from meridian_bot.model import CAMPAIGN_MANAGER_SYSTEM, ModelError, PLANNER_SYSTEM
+from meridian_bot.model import (
+    CAMPAIGN_MANAGER_SYSTEM,
+    GOAL_DRAFT_SYSTEM,
+    ModelError,
+    PLANNER_SYSTEM,
+)
 from meridian_bot.persona import PERSONA_FIELDS
 from meridian_bot.simulator import SimulatedBroker
 from meridian_bot.config import OnboardingConfig
 
 from .helpers import config, goal_payload
+
+
+def enable_decoupled_safe_walls(broker: SimulatedBroker) -> None:
+    tool = broker.tools["autopilot"]
+    schema = copy.deepcopy(tool.schema)
+    schema.setdefault("properties", {})["require_safe_wall"] = {
+        "type": "boolean"
+    }
+    broker.tools["autopilot"] = Tool(tool.name, tool.description, schema)
+    if hasattr(broker, "farm_require_safe_wall"):
+        broker.farm_require_safe_wall = True
+
+
+def fungus_beast_knowledge() -> SimpleNamespace:
+    """Minimal canonical creature catalogue for operator-target tests."""
+
+    entity = {
+        "id": "creature:fungusbeast",
+        "kind": "creature",
+        "canonical_name": "Fungus Beast",
+        "aliases": ["fungus beast", "fungus beasts", "FungusBeast"],
+    }
+
+    def resolve(
+        query: str,
+        *,
+        kinds: object = None,
+        limit: int = 8,
+        allow_fuzzy: bool = False,
+    ) -> dict[str, object]:
+        del kinds, limit, allow_fuzzy
+        normalized = " ".join(re.findall(r"[a-z0-9]+", str(query).casefold()))
+        if normalized in {"fungus beast", "fungus beasts", "fungusbeast"}:
+            return {"status": "found", "entity": entity, "matches": [entity]}
+        return {"status": "not_found", "matches": []}
+
+    def search(
+        query: str, *, kinds: object = None, limit: int = 8
+    ) -> dict[str, object]:
+        del query, kinds, limit
+        return {"status": "ok", "matches": [entity], "count": 1}
+
+    return SimpleNamespace(
+        corpus_version="operator-target-test",
+        resolve=resolve,
+        search=search,
+        get=lambda _entity_id: {"status": "not_found"},
+    )
+
+
+def creature_catalogue_knowledge(
+    *entities: dict[str, object],
+) -> SimpleNamespace:
+    """Catalogue double whose search exposes every literal creature candidate."""
+
+    catalogue = [dict(entity) for entity in entities]
+
+    def normalized(value: object) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+
+    def resolve(
+        query: str,
+        *,
+        kinds: object = None,
+        limit: int = 8,
+        allow_fuzzy: bool = False,
+    ) -> dict[str, object]:
+        del kinds, limit, allow_fuzzy
+        wanted = normalized(query)
+        for entity in catalogue:
+            names = [entity.get("canonical_name")]
+            aliases = entity.get("aliases")
+            if isinstance(aliases, list):
+                names.extend(aliases)
+            if wanted in {normalized(name) for name in names}:
+                return {
+                    "status": "found",
+                    "entity": entity,
+                    "matches": [entity],
+                }
+        return {"status": "not_found", "matches": []}
+
+    def search(
+        query: str, *, kinds: object = None, limit: int = 8
+    ) -> dict[str, object]:
+        del query, kinds, limit
+        return {
+            "status": "ok",
+            "matches": list(catalogue),
+            "count": len(catalogue),
+        }
+
+    return SimpleNamespace(
+        corpus_version="multi-creature-operator-target-test",
+        resolve=resolve,
+        search=search,
+        get=lambda _entity_id: {"status": "not_found"},
+    )
 
 
 def source_verify_safe_rooms(controller: BotController, *room_ids: int) -> None:
@@ -107,7 +212,7 @@ class FixedModel:
                     "target": hunt_match.group(1).strip(),
                     "room": int(assigned_match.group(1)),
                     "use_safe_spots": "use_safe_spots=false" not in notes.casefold(),
-                    "flee_below": 0.60,
+                    "flee_below": 17 / 40,
                     "fight_above_vigor": 80,
                 },
                 "rationale": "Use the operator's grounded farm recipe.",
@@ -963,13 +1068,20 @@ class BackgroundFarmBroker(SimulatedBroker):
         self.farm_safe_spot: object = False
         self.farm_journal: list[object] = []
         self.farm_recent: list[object] = []
-        self.farm_flee_below = 0.75
+        self.farm_rest_below = 0.7
+        self.farm_flee_below = 17 / 40
+        self.farm_assigned_room: int | None = self.farm_room
+        self.farm_bank_above = 0
+        self.farm_break_out_via_logoff = False
         self.farm_fight_above_vigor = 80
-        self.farm_eat_before_fighting = True
         self.farm_buy_food = False
         self.farm_use_safe_spots = True
+        self.farm_require_safe_wall: bool | None = None
+        self.farm_automated_pleas = False
+        self.farm_reports_automated_pleas = True
         self.farm_inert: dict[str, object] | None = None
         self.soft_stop_inert = False
+        self.before_farm_start: object = None
 
     def call_tool(self, name: str, arguments: dict[str, object], *, timeout: float = 180, mutation: bool = False) -> object:
         if name == "autopilot" and arguments.get("action") == "status":
@@ -989,11 +1101,24 @@ class BackgroundFarmBroker(SimulatedBroker):
                 "last_death": self.last_death,
                 "policy": {
                     "hunt": self.farm_hunt,
+                    "restBelow": self.farm_rest_below,
                     "fleeBelow": self.farm_flee_below,
+                    "assignedRoom": self.farm_assigned_room,
+                    "bankAbove": self.farm_bank_above,
+                    "breakOutViaLogoff": self.farm_break_out_via_logoff,
                     "fightAboveVigor": self.farm_fight_above_vigor,
-                    "eatBeforeFighting": self.farm_eat_before_fighting,
                     "buyFood": self.farm_buy_food,
                     "useSafeSpots": self.farm_use_safe_spots,
+                    **(
+                        {"requireSafeWall": self.farm_require_safe_wall}
+                        if isinstance(self.farm_require_safe_wall, bool)
+                        else {}
+                    ),
+                    **(
+                        {"automatedPleas": self.farm_automated_pleas}
+                        if self.farm_reports_automated_pleas
+                        else {}
+                    ),
                 },
             }
         if name == "autopilot" and arguments.get("action") == "stop":
@@ -1009,25 +1134,53 @@ class BackgroundFarmBroker(SimulatedBroker):
             return {"running": False, "stopped": True}
         if name == "autopilot" and arguments.get("action") == "start":
             self.calls.append((name, dict(arguments)))
+            if arguments.get("mode") == "farm" and callable(self.before_farm_start):
+                self.before_farm_start()
             self.farm_running = True
             self.farm_inert = None
             self.farm_mode = str(arguments.get("mode") or self.farm_mode)
-            self.farm_room = int(arguments.get("assigned_room") or self.farm_room)
-            self.farm_hunt = str(arguments.get("hunt") or self.farm_hunt)
+            if "assigned_room" in arguments:
+                assigned = arguments.get("assigned_room")
+                self.farm_assigned_room = (
+                    int(assigned) if assigned is not None else None
+                )
+                if assigned is not None:
+                    self.farm_room = int(assigned)
+            if "hunt" in arguments:
+                self.farm_hunt = str(arguments.get("hunt") or "")
+            self.farm_rest_below = float(
+                arguments.get("rest_below", self.farm_rest_below)
+            )
+            self.farm_flee_below = float(
+                arguments.get("flee_below", self.farm_flee_below)
+            )
+            self.farm_bank_above = int(
+                arguments.get("bank_above", self.farm_bank_above)
+            )
+            self.farm_break_out_via_logoff = bool(
+                arguments.get(
+                    "break_out_via_logoff", self.farm_break_out_via_logoff
+                )
+            )
             self.farm_fight_above_vigor = int(
                 arguments.get("fight_above_vigor")
                 or self.farm_fight_above_vigor
             )
-            self.farm_eat_before_fighting = bool(
-                arguments.get("eat_before_fighting", True)
+            self.farm_buy_food = bool(
+                arguments.get("buy_food", self.farm_buy_food)
             )
-            self.farm_buy_food = bool(arguments.get("buy_food", False))
             self.farm_use_safe_spots = bool(
                 arguments.get("use_safe_spots", self.farm_use_safe_spots)
             )
+            if "require_safe_wall" in arguments:
+                self.farm_require_safe_wall = bool(
+                    arguments.get("require_safe_wall")
+                )
+            self.farm_automated_pleas = bool(
+                arguments.get("automated_pleas", self.farm_automated_pleas)
+            )
             return {"running": True, "mode": self.farm_mode}
         return super().call_tool(name, arguments, timeout=timeout, mutation=mutation)
-
 
 class ShutdownBroker(SimulatedBroker):
     def __init__(
@@ -1207,6 +1360,10 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertEqual(phase["id"], accounted["phase_id"])
                 self.assertGreaterEqual(accounted["seconds"], 119)
+                self.assertEqual(
+                    accounted,
+                    controller.storage.campaign_phase_downtime(phase["id"]),
+                )
                 self.assertIsNone(
                     controller.storage.get_runtime(
                         PLANNED_CONTROLLER_STOP_RUNTIME_KEY
@@ -1558,9 +1715,41 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.close()
 
-    def test_visible_player_gets_one_proactive_greeting_but_silent_npc_does_not(self) -> None:
+    def test_visible_player_is_not_greeted_when_proactive_greetings_are_default_off(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
+            try:
+                broker = SocialBroker()
+                model = SocialModel()
+                controller.broker = broker
+                controller.model = model  # type: ignore[assignment]
+                self._set_social_persona(controller)
+
+                controller._greeting_turn(broker.look())
+                controller._greeting_turn(broker.look())
+
+                self.assertFalse(
+                    controller.config.controller.proactive_greetings_enabled
+                )
+                self.assertEqual([], model.greetings)
+                self.assertEqual(
+                    [],
+                    [arguments for name, arguments in broker.calls if name == "say"],
+                )
+            finally:
+                controller.close()
+
+    def test_opted_in_visible_player_gets_one_proactive_greeting_but_silent_npc_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = config(Path(temporary))
+            value = replace(
+                value,
+                controller=replace(
+                    value.controller,
+                    proactive_greetings_enabled=True,
+                ),
+            )
+            controller = BotController(value)
             try:
                 broker = SocialBroker()
                 model = SocialModel()
@@ -1609,6 +1798,7 @@ class ControllerTests(unittest.TestCase):
                 controller._conversation_turn(look=broker.look())
 
                 self.assertEqual("npc", model.responses[0]["message"]["speaker_kind"])
+                self.assertFalse(controller.config.policy.automated_help_pleas)
                 second_history = model.responses[1]["history"]
                 self.assertEqual(["speaker", "assistant"], [entry["role"] for entry in second_history])
                 replies = [arguments for name, arguments in broker.calls if name == "inbox" and arguments.get("action") == "reply"]
@@ -1747,6 +1937,13 @@ class ControllerTests(unittest.TestCase):
     def test_conversation_window_is_durable_and_also_bounds_greetings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = config(Path(temporary))
+            value = replace(
+                value,
+                controller=replace(
+                    value.controller,
+                    proactive_greetings_enabled=True,
+                ),
+            )
             controller = BotController(value)
             speaker_key = "name:blackstone"
             try:
@@ -1838,6 +2035,18 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertIn(
             "Room and target exclusions are controller-owned evidence",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
+        self.assertIn(
+            "Every farm target must be max_health_at_least or",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
+        self.assertIn(
+            "exact-target kills recorded after this phase began",
+            CAMPAIGN_MANAGER_SYSTEM,
+        )
+        self.assertIn(
+            "provisioning is never farm completion",
             CAMPAIGN_MANAGER_SYSTEM,
         )
         self.assertIn("last_failure.cause", CAMPAIGN_MANAGER_SYSTEM)
@@ -2498,6 +2707,650 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_active_legacy_safe_recipe_repairs_to_grounded_open_field_preference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="repair-legacy-safe-recipe",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 99.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-99",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 99,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562 in the open field.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.71,
+                            "fight_above_vigor": 87,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(
+                    prior["id"],
+                    "failed",
+                    reason="keeper implementation ReferenceError",
+                )
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": True,
+                            "flee_below": 0.73,
+                            "fight_above_vigor": 91,
+                            "selection_basis": "grounded_new_room",
+                            "source_evidence": {"best_room": 562},
+                        },
+                    },
+                    mode="start",
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "legacy safe-wall launch"}},
+                )
+
+                repaired = controller._repair_persisted_phase_tactic_preferences(
+                    goal, current, observation
+                )
+
+                self.assertEqual(current["id"], repaired["id"])
+                self.assertFalse(repaired["context"]["use_safe_spots"])
+                self.assertEqual(0.73, repaired["context"]["flee_below"])
+                self.assertEqual(91, repaired["context"]["fight_above_vigor"])
+                self.assertEqual(562, repaired["context"]["room"])
+                self.assertEqual("fungus beast", repaired["context"]["target"])
+                self.assertEqual(current["success_criteria"], repaired["success_criteria"])
+                self.assertEqual(
+                    prior["id"],
+                    repaired["context"]["positioning_preference_repair"][
+                        "source_phase_id"
+                    ],
+                )
+                self.assertEqual(
+                    "grounded_positioning_variant",
+                    repaired["context"]["positioning_preference_repair"]["source"],
+                )
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_startup_reconciliation_repairs_live_shaped_paused_v49_farm(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="paused-v49-safe-recipe",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 999.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-999",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 999,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562 in the open field.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.72,
+                            "fight_above_vigor": 90,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(
+                    prior["id"], "failed", reason="keeper implementation fault"
+                )
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": True,
+                            "flee_below": 0.75,
+                            "rest_below": 0.82,
+                            "fight_above_vigor": 95,
+                            "selection_basis": "grounded_new_room",
+                        },
+                    },
+                    mode="start",
+                )
+                with controller.storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET ordinal=35 WHERE id=?",
+                        (prior["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE campaign_phases SET ordinal=37 WHERE id=?",
+                        (current["id"],),
+                    )
+                    connection.execute(
+                        "UPDATE goals SET version=48 WHERE id=?", (goal["id"],)
+                    )
+                paused = controller.storage.manage_goal(
+                    {
+                        "request_id": "pause-live-v49-farm",
+                        "goal_id": goal["id"],
+                        "expected_version": 48,
+                        "action": "pause",
+                        "reason": "operator paused before controller restart",
+                    }
+                )["goal"]
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "legacy safe-wall launch"}},
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                broker_calls_before = list(broker.calls)
+
+                repaired = controller._repair_paused_campaign_phase_tactic_preferences(
+                    observation
+                )
+
+                self.assertEqual(49, paused["version"])
+                self.assertEqual("paused", paused["status"])
+                self.assertEqual([current["id"]], [item["id"] for item in repaired])
+                stored_goal = controller.storage.goal(goal["id"])
+                stored_run = controller.storage.campaign_run(
+                    goal["id"], include_terminal=True
+                )
+                stored_phase = controller.storage.campaign_phase(current["id"])
+                self.assertEqual(49, stored_goal["version"])
+                self.assertEqual("paused", stored_goal["status"])
+                self.assertEqual("paused", stored_run["status"])
+                self.assertEqual("paused", stored_phase["status"])
+                self.assertEqual(37, stored_phase["ordinal"])
+                self.assertFalse(stored_phase["context"]["use_safe_spots"])
+                self.assertEqual(0.75, stored_phase["context"]["flee_below"])
+                self.assertEqual(0.82, stored_phase["context"]["rest_below"])
+                self.assertEqual(95, stored_phase["context"]["fight_above_vigor"])
+                self.assertEqual(
+                    current["success_criteria"], stored_phase["success_criteria"]
+                )
+                self.assertEqual(
+                    "grounded_positioning_variant",
+                    stored_phase["context"]["positioning_preference_repair"][
+                        "source"
+                    ],
+                )
+                self.assertEqual(broker_calls_before, broker.calls)
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_active_open_field_recipe_repairs_to_explicit_operator_true(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="operator-safe-recipe-wins",
+                        constraints={"operator_notes": "use_safe_spots=true"},
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Use an earlier open-field fungus tactic.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(prior["id"], "failed")
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Use a stale open-field fungus tactic.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.74,
+                            "fight_above_vigor": 92,
+                            "safe_spot_fallback": {
+                                "kind": "wall_search_exhausted",
+                                "safety_provenance": "controller_wall_search_only_v1",
+                                "state": "applied",
+                                "assigned_room": 562,
+                                "hunt": "fungus beast",
+                                "reason": "bounded wall search exhausted",
+                            },
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "operator safe-wall launch"}},
+                )
+                self.assertEqual(
+                    {"use_safe_spots": True, "source": "operator_goal"},
+                    controller._farm_positioning_preference(
+                        goal,
+                        run,
+                        assigned_room=562,
+                        hunt="fungus beast",
+                        exclude_phase_id=current["id"],
+                    ),
+                )
+                self.assertTrue(
+                    controller._effective_farm_intent(goal)["use_safe_spots"]
+                )
+
+                repaired = controller._repair_persisted_phase_tactic_preferences(
+                    goal, current, observation
+                )
+
+                self.assertTrue(repaired["context"]["use_safe_spots"])
+                self.assertEqual(
+                    "operator_goal",
+                    repaired["context"]["positioning_preference_repair"]["source"],
+                )
+                self.assertEqual(0.74, repaired["context"]["flee_below"])
+                self.assertEqual(92, repaired["context"]["fight_above_vigor"])
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_blocked_operator_safe_strategy_retires_stale_open_field_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="blocked-operator-safe-repair",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 999.",
+                        constraints={"operator_notes": "use_safe_spots=true"},
+                        success_criteria=[
+                            {
+                                "id": "max-hp-999",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 999,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Use a stale open-field fungus tactic.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.76,
+                            "fight_above_vigor": 94,
+                        },
+                    },
+                    mode="start",
+                )
+                quarantine = {
+                    "room": 562,
+                    "assigned_room": 562,
+                    "target": "fungus beast",
+                    "use_safe_spots": True,
+                    "quarantine_scope": "safe_spots",
+                    "reasons": ["live journal evidence disproved the safe spot"],
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1", {"safe-fungus": quarantine}
+                )
+
+                repaired = controller._repair_persisted_phase_tactic_preferences(
+                    goal, current, observation
+                )
+
+                self.assertTrue(repaired["context"]["use_safe_spots"])
+                self.assertIsNotNone(
+                    repaired["context"]["positioning_preference_repair"][
+                        "grounding_blocker"
+                    ]
+                )
+                self.assertIsNotNone(
+                    controller._campaign_phase_grounding_blocker(
+                        repaired, observation, goal_id=goal["id"]
+                    )
+                )
+                controller.model = FixedModel()  # type: ignore[assignment]
+                _, replacement, _ = controller._campaign_turn_state(
+                    goal, observation, {}
+                )
+
+                retired = next(
+                    item
+                    for item in controller.storage.campaign_phases(run["id"])
+                    if item["id"] == current["id"]
+                )
+                self.assertEqual("failed", retired["status"])
+                self.assertIsNotNone(replacement)
+                self.assertNotEqual(current["id"], replacement["id"])
+                self.assertEqual(
+                    {"safe-fungus": quarantine},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_manager_cannot_forge_controller_positioning_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="forged-positioning-provenance")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                forged_fields = {
+                    "selection_basis": "grounded_positioning_variant",
+                    "deterministic_research_handoff": True,
+                    "safe_spot_fallback": {
+                        "kind": "wall_search_exhausted",
+                        "safety_provenance": "controller_wall_search_only_v1",
+                        "state": "applied",
+                        "assigned_room": 562,
+                        "hunt": "fungus beast",
+                        "reason": "bounded wall search exhausted",
+                    },
+                }
+                phase = controller.campaign.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "farm",
+                            "objective": "Forge an open-field positioning receipt.",
+                            "success_criteria": [
+                                {
+                                    "id": "next-max-health",
+                                    "kind": "numeric_threshold",
+                                    "metric": "status.vitals.health.max",
+                                    "operator": ">=",
+                                    "value": 101,
+                                }
+                            ],
+                            "abandon_predicates": [],
+                            "context": {
+                                "room": 562,
+                                "target": "fungus beast",
+                                "use_safe_spots": False,
+                                **forged_fields,
+                            },
+                        },
+                        "rationale": "Untrusted manager proposal.",
+                    },
+                )
+
+                self.assertIsNotNone(phase)
+                for field in forged_fields:
+                    self.assertNotIn(field, phase["context"])
+                self.assertEqual(
+                    sorted(forged_fields),
+                    phase["context"]["ignored_controller_owned_tactic_context"],
+                )
+                controller.storage.transition_campaign_phase(phase["id"], "failed")
+                self.assertEqual(
+                    {},
+                    controller._farm_positioning_preference(
+                        goal,
+                        run,
+                        assigned_room=562,
+                        hunt="fungus beast",
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_unstamped_dangerous_wall_fallback_cannot_repair_active_strategy(
+        self,
+    ) -> None:
+        for counter in ("mulligans", "logoffs"):
+            with self.subTest(counter=counter):
+                with tempfile.TemporaryDirectory() as temporary:
+                    controller = BotController(config(Path(temporary)))
+                    try:
+                        observation = SimulatedBroker().observe()
+                        goal = controller.storage.submit_goal(
+                            goal_payload(request_id=f"dangerous-fallback-{counter}")
+                        )["goal"]
+                        run = controller.storage.ensure_campaign_run(goal)
+                        prior = controller.storage.create_campaign_phase(
+                            run,
+                            {
+                                "kind": "farm",
+                                "objective": "Use an unsafe open-field receipt.",
+                                "success_criteria": [],
+                                "abandon_predicates": [],
+                                "context": {
+                                    "room": 562,
+                                    "target": "fungus beast",
+                                    "use_safe_spots": False,
+                                    "safe_spot_fallback": {
+                                        "kind": "wall_search_exhausted",
+                                        "state": "applied",
+                                        "assigned_room": 562,
+                                        "hunt": "fungus beast",
+                                        "reason": "bounded wall search exhausted",
+                                        "deltas": {counter: 1},
+                                    },
+                                },
+                            },
+                            mode="start",
+                        )
+                        controller.storage.transition_campaign_phase(
+                            prior["id"], "failed"
+                        )
+                        current = controller.storage.create_campaign_phase(
+                            run,
+                            {
+                                "kind": "farm",
+                                "objective": "Keep the safe-wall tactic.",
+                                "success_criteria": [],
+                                "abandon_predicates": [],
+                                "context": {
+                                    "room": 562,
+                                    "target": "fungus beast",
+                                    "use_safe_spots": True,
+                                },
+                            },
+                            mode="start",
+                        )
+
+                        self.assertFalse(
+                            controller._farm_wall_search_only_deferral(
+                                prior["context"]["safe_spot_fallback"]
+                            )
+                        )
+                        repaired = (
+                            controller._repair_persisted_phase_tactic_preferences(
+                                goal, current, observation
+                            )
+                        )
+                        self.assertTrue(repaired["context"]["use_safe_spots"])
+                        self.assertNotIn(
+                            "positioning_preference_repair", repaired["context"]
+                        )
+                    finally:
+                        controller.storage.close()
+
+    def test_active_safe_recipe_does_not_adopt_blocked_open_field_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="blocked-open-field-repair")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Use an open-field fungus tactic.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(prior["id"], "failed")
+                current = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Use a later safe-wall fungus recipe.",
+                        "success_criteria": [],
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": True,
+                            "flee_below": 0.75,
+                            "fight_above_vigor": 93,
+                        },
+                    },
+                    mode="start",
+                )
+                lethal = {
+                    "room": 562,
+                    "assigned_room": 562,
+                    "target": "fungus beast",
+                    "use_safe_spots": False,
+                    "reasons": ["the keeper observed a death"],
+                    "deltas": {"deaths": 1},
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1", {"lethal-fungus": lethal}
+                )
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "retain while repair is blocked"}},
+                )
+                preference = controller._farm_positioning_preference(
+                    goal,
+                    run,
+                    assigned_room=562,
+                    hunt="fungus beast",
+                    exclude_phase_id=current["id"],
+                )
+                self.assertFalse(preference["use_safe_spots"])
+                self.assertEqual(prior["id"], preference["phase_id"])
+
+                repaired = controller._repair_persisted_phase_tactic_preferences(
+                    goal, current, observation
+                )
+
+                self.assertTrue(repaired["context"]["use_safe_spots"])
+                self.assertNotIn(
+                    "positioning_preference_repair", repaired["context"]
+                )
+                self.assertEqual(
+                    {"lethal-fungus": lethal},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
+                self.assertIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+            finally:
+                controller.storage.close()
+
     def test_latched_phase_travel_failure_does_not_implicate_researched_room(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -2522,6 +3375,16 @@ class ControllerTests(unittest.TestCase):
                     },
                     mode="start",
                 )
+                controller.storage.set_runtime(
+                    "phase_completion_checkpoints_v1",
+                    {
+                        phase["id"]: {
+                            "phase_contract": controller._phase_contract(phase),
+                            "completion": {"all_met": False},
+                        }
+                    },
+                )
+                self.assertIsNone(controller._phase_completion_checkpoint(phase))
                 controller._latch_phase_completion(
                     goal, run, phase, {"all_met": True, "criteria": []}
                 )
@@ -2542,6 +3405,166 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_latched_phase_safe_return_failures_do_not_trip_phase_breaker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                original_call = broker.call_tool
+
+                def fail_safe_return(
+                    name: str,
+                    arguments: dict[str, object],
+                    *,
+                    timeout: float = 180,
+                    mutation: bool = False,
+                ) -> object:
+                    if name == "travel":
+                        broker.calls.append((name, dict(arguments)))
+                        return {
+                            "arrived": False,
+                            "reason": "no route from Training Hall to room 106",
+                            "now": {"room": dict(broker.room)},
+                        }
+                    return original_call(
+                        name, arguments, timeout=timeout, mutation=mutation
+                    )
+
+                broker.call_tool = fail_safe_return  # type: ignore[method-assign]
+                controller.broker = broker
+                observation = broker.observe()
+                controller.last_observation = observation
+                source_verify_safe_rooms(controller, 106)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="safe-return-failure-not-phase-work")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Finish research, then return safely.",
+                        "success_criteria": [
+                            {
+                                "id": "research",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                controller._latch_phase_completion(
+                    goal, run, phase, {"all_met": True, "criteria": []}
+                )
+                execution_plan = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Return after verified research.",
+                            "steps": [],
+                            "assumptions": [],
+                        },
+                        106,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                decision = {
+                    "tool": "travel",
+                    "arguments": {"to": 106},
+                    "expected_observation": {"room_id": 106},
+                    "plan_step_id": execution_plan["safe_ending"]["step_id"],
+                }
+
+                results = [
+                    controller._execute(goal, broker.observe(), decision)
+                    for _ in range(2)
+                ]
+
+                self.assertTrue(any(result.get("no_progress") for result in results))
+                self.assertTrue(
+                    all("campaign_breaker" not in result for result in results)
+                )
+                self.assertEqual([], controller.storage.phase_attempts(phase["id"]))
+                self.assertEqual(
+                    "active", controller.storage.campaign_phase(phase["id"])["status"]
+                )
+                self.assertIsNotNone(
+                    controller._phase_completion_checkpoint(
+                        controller.storage.campaign_phase(phase["id"])
+                    )
+                )
+            finally:
+                controller.close()
+
+    def test_nonterminal_safe_ending_travel_remains_phase_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.room = {"num": 200, "name": "Work room"}
+                controller.broker = broker
+                observation = broker.observe()
+                controller.last_observation = observation
+                source_verify_safe_rooms(controller, 100)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="nonterminal-safe-travel-receipt")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "return_home",
+                        "objective": "Travel home as the phase work.",
+                        "success_criteria": [
+                            {
+                                "id": "home",
+                                "kind": "location_reached",
+                                "room_id": 100,
+                            },
+                            {
+                                "id": "travel-receipt",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["travel"],
+                            },
+                        ],
+                    },
+                    mode="start",
+                )
+                execution_plan = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Travel home and finish safely.",
+                            "steps": [],
+                            "assumptions": [],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+
+                result = controller._execute(
+                    goal,
+                    observation,
+                    {
+                        "tool": "travel",
+                        "arguments": {"to": 100},
+                        "expected_observation": {"room_id": 100},
+                        "plan_step_id": execution_plan["safe_ending"]["step_id"],
+                    },
+                )
+
+                self.assertEqual("travel", result["action"])
+                attempts = controller.storage.phase_attempts(phase["id"])
+                self.assertEqual(1, len(attempts))
+                self.assertEqual("succeeded", attempts[0]["status"])
+                self.assertEqual("travel", attempts[0]["semantic_action"])
+            finally:
+                controller.close()
+
     def test_autopilot_stop_is_not_classified_as_farm_launch(self) -> None:
         self.assertFalse(
             BotController._autopilot_launch_step(
@@ -2559,6 +3582,22 @@ class ControllerTests(unittest.TestCase):
                 }
             )
         )
+        self.assertFalse(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Stop the running fungus-beast autopilot in room 562.",
+                }
+            )
+        )
+        self.assertFalse(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Check whether the fungus-beast autopilot is running.",
+                }
+            )
+        )
         self.assertTrue(
             BotController._autopilot_launch_step(
                 {
@@ -2567,6 +3606,97 @@ class ControllerTests(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(
+            BotController._autopilot_launch_step(
+                {
+                    "tool": "autopilot",
+                    "outcome": "Autopilot keeper launched for fungus beasts in room 562.",
+                }
+            )
+        )
+
+    def test_terminal_phase_checkpoint_accepts_only_a_safe_return_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                source_verify_safe_rooms(controller, 100)
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="terminal-phase-safe-only-plan")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "acquire_item",
+                        "objective": "Acquire a mace, whose outcome is now complete.",
+                        "success_criteria": [
+                            {
+                                "id": "mace-owned",
+                                "kind": "inventory_contains",
+                                "item": "mace",
+                                "count": 1,
+                            }
+                        ],
+                    },
+                    mode="start",
+                )
+                controller._latch_phase_completion(
+                    goal, run, phase, {"all_met": True, "criteria": []}
+                )
+
+                with self.assertRaisesRegex(
+                    ModelError,
+                    "terminal goal or campaign-phase checkpoint accepts only",
+                ):
+                    controller._store_execution_plan(
+                        goal,
+                        with_safe_ending(
+                            {
+                                "summary": "Do more work, then return safely.",
+                                "steps": [
+                                    {
+                                        "id": "obsolete-work",
+                                        "outcome": "Inspect inventory before finishing.",
+                                        "tool": "inventory",
+                                        "verification": "The inventory is observed.",
+                                    }
+                                ],
+                                "assumptions": [],
+                            },
+                            100,
+                        ),
+                        grounding=controller.knowledge.validate_goal(goal),
+                        revision=False,
+                    )
+
+                controller.last_observation = {
+                    "look": {
+                        "room": {"num": 100, "name": "Training Hall"}
+                    }
+                }
+                safe_only = controller._store_execution_plan(
+                    goal,
+                    with_safe_ending(
+                        {
+                            "summary": "Return safely after verified completion.",
+                            "steps": [],
+                            "assumptions": [],
+                        },
+                        100,
+                    ),
+                    grounding=controller.knowledge.validate_goal(goal),
+                    revision=False,
+                )
+                self.assertEqual(1, len(safe_only["steps"]))
+                self.assertEqual(
+                    safe_only["safe_ending"]["step_id"],
+                    safe_only["steps"][0]["id"],
+                )
+            finally:
+                controller.close()
 
     def test_safe_ending_travel_may_also_satisfy_the_public_location_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3006,6 +4136,17 @@ class ControllerTests(unittest.TestCase):
                     },
                     revision=False,
                 )
+                boundary_during_start: dict[str, object] = {}
+
+                def capture_launch_boundary() -> None:
+                    boundary_during_start.update(
+                        controller.storage.get_runtime(
+                            f"background_farm_launch_boundary_v1:{goal['id']}",
+                            {},
+                        )
+                    )
+
+                broker.before_farm_start = capture_launch_boundary
                 launch = controller._execute(
                     goal,
                     observation,
@@ -3023,6 +4164,8 @@ class ControllerTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual("autopilot", launch["action"])
+                self.assertEqual(phase["id"], boundary_during_start["phase_id"])
+                self.assertIsInstance(boundary_during_start["at_ms"], int)
                 owner = controller.storage.get_runtime(
                     "background_farm_owner_v1", {}
                 )
@@ -3399,6 +4542,31 @@ class ControllerTests(unittest.TestCase):
         )
 
         self.assertIn("found no route from current room 103", reason or "")
+
+    def test_rest_plateau_is_no_progress_and_invalidates_the_plan(self) -> None:
+        reason = BotController._no_progress_reason(
+            {
+                "rested": True,
+                "reached_target": False,
+                "note": "nothing recovered for several checks",
+                "from": {
+                    "health": {"value": 39, "max": 40},
+                    "mana": {"value": 18, "max": 18},
+                    "vigor": {"value": 80, "scale_max": 200},
+                },
+                "vitals": {
+                    "health": {"value": 39, "max": 40},
+                    "mana": {"value": 18, "max": 18},
+                    "vigor": {"value": 80, "scale_max": 200},
+                },
+            },
+            {"look": {"room": {"num": 106, "name": "Brownestone Inn"}}},
+            tool="rest_up",
+            arguments={"to": 0.9, "max_seconds": 30},
+        )
+
+        self.assertEqual("nothing recovered for several checks", reason)
+        self.assertTrue(BotController._failure_invalidates_plan("rest_up", reason))
 
     def test_empty_merchant_lookup_invalidates_undefined_seller_plan(self) -> None:
         reason = BotController._no_progress_reason(
@@ -5251,8 +6419,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_pause_keeps_keeper_ownership_when_survival_handoff_fails(self) -> None:
+    def test_pause_retries_retained_keeper_ownership_on_next_turn(self) -> None:
         class FailingHandoffBroker(BackgroundFarmBroker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.handoff_failures_remaining = 1
+
             def call_tool(
                 self,
                 name: str,
@@ -5261,7 +6433,12 @@ class ControllerTests(unittest.TestCase):
                 timeout: float = 180,
                 mutation: bool = False,
             ) -> object:
-                if name == "autopilot" and arguments.get("action") == "start":
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and self.handoff_failures_remaining > 0
+                ):
+                    self.handoff_failures_remaining -= 1
                     raise ToolCallError("keeper handoff failed")
                 return super().call_tool(
                     name, arguments, timeout=timeout, mutation=mutation
@@ -5270,7 +6447,8 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
-                controller.broker = FailingHandoffBroker()
+                broker = FailingHandoffBroker()
+                controller.broker = broker
                 goal = controller.storage.submit_goal(
                     goal_payload(request_id="pause-failed-handoff")
                 )["goal"]
@@ -5290,6 +6468,48 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     owner,
                     controller.storage.get_runtime("background_farm_owner_v1", {}),
+                )
+
+                reconciled = controller.turn()
+
+                self.assertTrue(reconciled["idle"])
+                self.assertTrue(
+                    reconciled["keeper_reconciliation"][
+                        "inactive_goal_keeper_handoff"
+                    ]
+                )
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("background_farm_owner_v1", {})
+                )
+                events = controller.storage.events(
+                    kinds=["background_farm.inactive_owner_handoff"]
+                )["events"]
+                self.assertEqual(1, len(events))
+            finally:
+                controller.storage.close()
+
+    def test_idle_turn_retasks_unowned_farm_keeper_to_survival(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+
+                result = controller.turn()
+
+                self.assertTrue(result["idle"])
+                self.assertTrue(
+                    result["keeper_reconciliation"][
+                        "inactive_goal_keeper_handoff"
+                    ]
+                )
+                self.assertIsNone(
+                    result["keeper_reconciliation"]["previous_goal_id"]
+                )
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("background_farm_owner_v1", {})
                 )
             finally:
                 controller.storage.close()
@@ -7385,6 +8605,300 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_persisted_food_outcome_farm_is_retired_before_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="persisted-food-outcome-farm")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Legacy fungus farm completed by any food source.",
+                        "success_criteria": [
+                            {
+                                "id": "farm-kill-milestone",
+                                "kind": "inventory_contains",
+                                "item": "food",
+                                "count": 1,
+                            }
+                        ],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "initial_observable_outcome_unmet": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "phase_completion_checkpoints_v1",
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "completion": {"all_met": True},
+                        }
+                    },
+                )
+
+                outcome = controller._evaluate_campaign_phase(
+                    goal, run, phase, broker.observe()
+                )
+
+                self.assertTrue(outcome.failed)
+                self.assertEqual("failed", outcome.phase["status"])
+                self.assertEqual(
+                    "invalid_farm_phase_outcome",
+                    outcome.detail["grounding_blocker"]["kind"],
+                )
+                self.assertIn("before any farm combat", outcome.detail["reason"])
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime(
+                        "phase_completion_checkpoints_v1", {}
+                    ),
+                )
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertFalse(
+                    any(
+                        tool == "autopilot" and arguments.get("action") == "start"
+                        for tool, arguments in broker.calls
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_pre_upgrade_zero_attempt_farm_with_met_outcome_is_retired_on_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config(Path(temporary))
+            original = BotController(settings)
+            try:
+                goal = original.storage.submit_goal(
+                    goal_payload(
+                        request_id="legacy-already-met-fungus-phase",
+                        title="Farm Fungus Beasts",
+                        objective="Kill fungus beasts while raising maximum HP to 50.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-50",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 50,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = original.storage.ensure_campaign_run(goal)
+                phase = original.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Legacy no-op fungus farm at 40 max HP.",
+                        "success_criteria": [
+                            {
+                                "id": "already-40",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 40,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                        },
+                    },
+                    mode="start",
+                )
+                original._latch_phase_completion(
+                    goal,
+                    run,
+                    phase,
+                    {
+                        "all_met": True,
+                        "criteria": [
+                            {
+                                "id": "already-40",
+                                "kind": "numeric_threshold",
+                                "met": True,
+                                "detail": "observed 40 >= 40",
+                            }
+                        ],
+                    },
+                )
+            finally:
+                original.close()
+
+            controller = BotController(settings)
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 40, "max": 40}
+                controller.broker = broker
+                observation = broker.observe()
+                restored_goal = controller.storage.goal(goal["id"])
+                assert restored_goal is not None
+
+                result = controller._reconcile_existing_campaign_phase(
+                    restored_goal, observation
+                )
+
+                self.assertTrue(result["campaign_phase_abandoned"])
+                self.assertFalse(result["goal_blocked"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertEqual("failed", result["phase"]["status"])
+                self.assertEqual(
+                    "initially_satisfied_phase_outcome",
+                    result["completion"]["grounding_blocker"]["kind"],
+                )
+                self.assertEqual(
+                    {},
+                    controller.storage.get_runtime(
+                        "phase_completion_checkpoints_v1", {}
+                    ),
+                )
+                self.assertFalse(
+                    any(
+                        name == "travel"
+                        or (
+                            name == "autopilot"
+                            and arguments.get("action") == "start"
+                        )
+                        for name, arguments in broker.calls
+                    )
+                )
+                self.assertEqual(
+                    "active", controller.storage.goal(goal["id"])["status"]
+                )
+                events = controller.storage.goal_events(
+                    goal["id"],
+                    kinds=["campaign.phase.grounding_rejected"],
+                    limit=10,
+                )
+                self.assertEqual(
+                    "initially_satisfied_phase_outcome",
+                    events[-1]["data"]["blocker"]["kind"],
+                )
+            finally:
+                controller.close()
+
+    def test_pre_upgrade_unmet_farm_leaves_migration_after_first_observation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config(Path(temporary))
+            original = BotController(settings)
+            try:
+                goal = original.storage.submit_goal(
+                    goal_payload(
+                        request_id="legacy-unmet-farm-remains-valid",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 50.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-50",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 50,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = original.storage.ensure_campaign_run(goal)
+                phase = original.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Raise maximum HP from 40 to 41.",
+                        "success_criteria": [
+                            {
+                                "id": "next-41",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 41,
+                            }
+                        ],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                        },
+                    },
+                    mode="start",
+                )
+            finally:
+                original.close()
+
+            controller = BotController(settings)
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 40, "max": 40}
+                controller.broker = broker
+                restored_goal = controller.storage.goal(goal["id"])
+                restored_run = controller.storage.campaign_run(goal["id"])
+                restored_phase = controller.storage.campaign_phase(phase["id"])
+                assert restored_goal is not None
+                assert restored_run is not None
+                assert restored_phase is not None
+
+                first = controller._evaluate_campaign_phase(
+                    restored_goal, restored_run, restored_phase, broker.observe()
+                )
+
+                self.assertFalse(first.completed)
+                self.assertFalse(first.failed)
+                self.assertNotIn(
+                    phase["id"], controller._legacy_initial_outcome_candidates
+                )
+                attempt_id = controller.storage.create_phase_attempt(
+                    phase["id"],
+                    semantic_action="autopilot",
+                    signature="legitimate-farm-work",
+                    expected_effect={"max_health": 41},
+                )
+                controller.storage.update_phase_attempt(
+                    attempt_id,
+                    "succeeded",
+                    verification={"max_health_increased": True},
+                )
+                broker.vitals["health"] = {"current": 41, "max": 41}
+                progressed_phase = controller.storage.campaign_phase(phase["id"])
+                assert progressed_phase is not None
+
+                completed = controller._evaluate_campaign_phase(
+                    restored_goal,
+                    restored_run,
+                    progressed_phase,
+                    broker.observe(),
+                )
+
+                self.assertFalse(completed.failed)
+                self.assertTrue(completed.detail["completion_deferred"])
+                self.assertTrue(completed.detail["all_met"])
+                self.assertEqual(
+                    "active", controller.storage.campaign_phase(phase["id"])["status"]
+                )
+                self.assertIsNotNone(
+                    controller._phase_completion_checkpoint(
+                        controller.storage.campaign_phase(phase["id"])
+                    )
+                )
+            finally:
+                controller.close()
+
     def test_persisted_action_only_mutating_preparation_is_retired(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -7430,6 +8944,531 @@ class ControllerTests(unittest.TestCase):
                     "observable equipment, inventory, or capacity state",
                     outcome.detail["reason"],
                 )
+            finally:
+                controller.storage.close()
+
+    def test_prose_farm_goal_binds_canonical_creature_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="prose-fungus-target",
+                        title="Bank riches via Fungus Beast farming",
+                        objective="Farm fungus beasts until the bank target is met.",
+                        constraints={
+                            "operator_notes": (
+                                "Farm fungus beasts for the strategic outcome; do not "
+                                "substitute progression prey."
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+
+                self.assertEqual(
+                    "fungus beast", controller._goal_bound_farm_target(goal)
+                )
+                context = controller._campaign_context(
+                    run, None, audience="manager"
+                )
+                self.assertEqual(
+                    "fungus beast",
+                    context["operator_contract"]["binding_farm_target"],
+                )
+                self.assertIn("hunt=<creature>", GOAL_DRAFT_SYSTEM)
+                self.assertIn(
+                    "operator_contract.binding_farm_target",
+                    CAMPAIGN_MANAGER_SYSTEM,
+                )
+            finally:
+                controller.storage.close()
+
+    def test_live_fungus_goal_ignores_roq_in_liquidation_clause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = creature_catalogue_knowledge(
+                    {
+                        "id": "creature:fungusbeast",
+                        "kind": "creature",
+                        "canonical_name": "Fungus Beast",
+                        "aliases": [
+                            "fungus beast",
+                            "fungusbeast",
+                            "puucmecmoch",
+                        ],
+                        "facts": {"role": "monster"},
+                    },
+                    {
+                        "id": "creature:assassin",
+                        "kind": "creature",
+                        "canonical_name": "Roq",
+                        "aliases": ["Roq", "assassin", "moch"],
+                        "facts": {"role": "teacher"},
+                    },
+                )
+                goal = goal_payload(
+                    request_id="live-fungus-target-with-roq",
+                    title=(
+                        "Bank 1,000,000 Shillings via Fungus Beast Farming"
+                    ),
+                    objective=(
+                        "Acquire over 1,000,000 banked shillings by farming "
+                        "fungus beasts, liquidating inventory with Roq when "
+                        "its value exceeds 2,000 shillings, and banking the "
+                        "proceeds."
+                    ),
+                    constraints={
+                        "operator_notes": (
+                            "Farm fungus beasts. When inventory value exceeds "
+                            "2000 shillings, liquidate with Roq and bank the "
+                            "proceeds. Repeat until banked shillings exceed "
+                            "1,000,000."
+                        )
+                    },
+                )
+
+                self.assertEqual(
+                    "fungus beast", controller._goal_bound_farm_target(goal)
+                )
+            finally:
+                controller.storage.close()
+
+    def test_two_prey_combat_prose_does_not_guess_binding_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = creature_catalogue_knowledge(
+                    {
+                        "id": "creature:fungusbeast",
+                        "kind": "creature",
+                        "canonical_name": "Fungus Beast",
+                        "aliases": ["fungus beast", "fungus beasts"],
+                        "facts": {"role": "monster"},
+                    },
+                    {
+                        "id": "creature:duskrat",
+                        "kind": "creature",
+                        "canonical_name": "Dusk Rat",
+                        "aliases": ["dusk rat", "dusk rats"],
+                        "facts": {"role": "monster"},
+                    },
+                )
+                goal = goal_payload(
+                    request_id="ambiguous-two-prey-combat",
+                    title="Fight Fungus Beasts and Dusk Rats",
+                    objective=(
+                        "Farm fungus beasts and dusk rats for their loot."
+                    ),
+                )
+
+                self.assertIsNone(controller._goal_bound_farm_target(goal))
+            finally:
+                controller.storage.close()
+
+    def test_bound_research_queries_exact_creature_not_level_band(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                goal = goal_payload(
+                    request_id="exact-fungus-research",
+                    title="Farm Fungus Beasts",
+                    objective="Kill fungus beasts for this campaign.",
+                )
+                phase = {
+                    "kind": "research_progression",
+                    "success_criteria": [
+                        {
+                            "id": "candidate",
+                            "kind": "phase_action_succeeded",
+                            "tools": ["hunting_grounds"],
+                        }
+                    ],
+                    "context": {"deterministic_fallback": True},
+                }
+                observation = {
+                    "look": {"room": {"num": 106}},
+                    "status": {"vitals": {"health": {"current": 40, "max": 40}}},
+                }
+                execution_plan = {
+                    "steps": [
+                        {
+                            "id": "find-prey",
+                            "tool": "prey",
+                            "outcome": "Find farm rooms.",
+                        }
+                    ],
+                    "safe_ending": {"room_id": 106, "step_id": "finish-safe"},
+                }
+
+                action = controller._structured_research_progression_action(
+                    phase,
+                    observation,
+                    execution_plan,
+                    goal=goal,
+                )
+
+                self.assertEqual("hunting_grounds", action["tool"])
+                self.assertEqual(
+                    {"creature": "fungus beast", "limit": 12, "max_danger": 55},
+                    action["arguments"],
+                )
+                self.assertNotIn("for_level", action["arguments"])
+                with self.assertRaisesRegex(ModelError, "operator-required prey"):
+                    controller._guard_research_farm_target(
+                        goal,
+                        phase,
+                        "hunting_grounds",
+                        {"for_level": 40, "limit": 6},
+                    )
+            finally:
+                controller.storage.close()
+
+    def test_exact_creature_hunting_grounds_rooms_become_farm_candidates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="exact-creature-result-shape")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                research = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Find exact fungus beast rooms.",
+                        "success_criteria": [
+                            {
+                                "id": "grounds",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 8, "max_minutes": 30},
+                        "context": {},
+                    },
+                    mode="start",
+                )
+                attempt_id = controller.storage.create_phase_attempt(
+                    research["id"],
+                    semantic_action="hunting_grounds",
+                    signature="fungus-exact",
+                    expected_effect={"progression_candidates": "returned"},
+                )
+                controller.storage.update_phase_attempt(
+                    attempt_id,
+                    "succeeded",
+                    result={
+                        "creature": "fungus beast",
+                        "rooms": [
+                            {"room": 563, "chance": 70},
+                            {"room": 544, "chance": 60},
+                        ],
+                        "rejected": [{"room": 562, "rejected": True}],
+                    },
+                )
+
+                candidates, attempts = controller._research_farm_candidates(
+                    research
+                )
+
+                self.assertEqual([563, 544], [item["room"] for item in candidates])
+                self.assertEqual(
+                    ["fungus beast", "fungus beast"],
+                    [item["target"] for item in candidates],
+                )
+                self.assertEqual(1, len(attempts))
+            finally:
+                controller.storage.close()
+
+    def test_research_filters_mixed_prey_to_operator_bound_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="filter-fungus-research",
+                        title="Farm Fungus Beasts",
+                        objective="Kill fungus beasts for the campaign.",
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                controller._research_farm_candidates = lambda _phase: (  # type: ignore[method-assign]
+                    [
+                        {
+                            "room": 2012,
+                            "target": "dusk rat",
+                            "attempt_id": "mixed-prey",
+                            "source": {"creature": "dusk rat", "best_room": 2012},
+                        },
+                        {
+                            "room": 544,
+                            "target": "fungus beast",
+                            "attempt_id": "mixed-prey",
+                            "source": {"creature": "fungus beast", "best_room": 544},
+                        },
+                    ],
+                    [{"id": "mixed-prey", "result": {"for_level": 40}}],
+                )
+
+                validation = controller._research_farm_recipe_validation(
+                    goal,
+                    run,
+                    {"id": "mixed-research", "context": {}},
+                    SimulatedBroker().observe(),
+                )
+
+                self.assertEqual("selected", validation["status"])
+                self.assertEqual("fungus beast", validation["required_target"])
+                self.assertEqual(544, validation["recipe"]["room"])
+                self.assertEqual("fungus beast", validation["recipe"]["target"])
+                self.assertEqual(1, validation["candidate_count"])
+                self.assertEqual(1, validation["unmatched_candidate_count"])
+            finally:
+                controller.storage.close()
+
+    def test_persisted_wrong_target_farm_is_retired_on_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                broker = SimulatedBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="retire-dusk-rat-for-fungus",
+                        title="Farm Fungus Beasts",
+                        objective="Kill fungus beasts until the campaign is complete.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-99",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 99,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm dusk rats in room 2012.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 2012,
+                            "target": "dusk rat",
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+
+                intent = controller._effective_farm_intent(goal)
+                self.assertEqual("fungus beast", intent["hunt"])
+                self.assertIsNone(intent["assigned_room"])
+
+                result = controller._reconcile_existing_campaign_phase(
+                    goal, broker.observe()
+                )
+
+                self.assertTrue(result["campaign_phase_abandoned"])
+                self.assertFalse(result["goal_blocked"])
+                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertEqual("failed", result["phase"]["status"])
+                self.assertEqual(
+                    "operator_farm_target_mismatch",
+                    result["completion"]["grounding_blocker"]["kind"],
+                )
+                self.assertIsNone(
+                    controller.storage.active_campaign_phase(run["id"])
+                )
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                events = controller.storage.goal_events(
+                    goal["id"], kinds=["campaign.phase.grounding_rejected"], limit=10
+                )
+                self.assertEqual(phase["id"], events[-1]["data"]["phase_id"])
+            finally:
+                controller.storage.close()
+
+    def test_operator_bound_farm_target_allows_other_prey_support_training(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="fungus-support-training",
+                        title="Farm Fungus Beasts",
+                        objective="Kill fungus beasts after improving combat capability.",
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                support = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "train_ability",
+                        "objective": "Train mace fighting against ants.",
+                        "success_criteria": [
+                            {
+                                "id": "mace-20",
+                                "kind": "numeric_threshold",
+                                "metric": "ability.skill.mace fighting",
+                                "operator": ">=",
+                                "value": 20,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 40, "max_minutes": 90},
+                        "context": {
+                            "training_method": "combat",
+                            "prey": "ant",
+                            "room": 6,
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+
+                blocker = controller._campaign_phase_grounding_blocker(
+                    support,
+                    SimulatedBroker().observe(),
+                    goal_id=goal["id"],
+                )
+                intent = controller._effective_farm_intent(goal)
+
+                self.assertIsNone(blocker)
+                self.assertEqual(
+                    {"assigned_room": 6, "hunt": "ant"},
+                    {key: intent.get(key) for key in ("assigned_room", "hunt")},
+                )
+            finally:
+                controller.storage.close()
+
+    def test_farm_phase_rejects_foreground_fight_before_broker_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = CombatBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="fungus-keeper-only-combat",
+                        title="Farm Fungus Beasts",
+                        objective="Kill fungus beasts for the campaign.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm fungus beasts in room 544.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                        "context": {
+                            "room": 544,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+
+                self.assertNotIn(
+                    "fight", {tool["name"] for tool in controller._planner_tools(phase)}
+                )
+                with self.assertRaisesRegex(
+                    ModelError, "combat must remain with.*farm keeper"
+                ):
+                    controller._execute(
+                        goal,
+                        broker.observe(),
+                        {
+                            "tool": "fight",
+                            "arguments": {"target": "dusk rat"},
+                            "rationale": "Fight the visible substitute prey.",
+                        },
+                    )
+                self.assertEqual([], broker.calls)
+            finally:
+                controller.storage.close()
+
+    def test_farm_quarantine_matches_canonical_plural_and_alias_targets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.knowledge = fungus_beast_knowledge()
+                requested = {
+                    "assigned_room": 544,
+                    "hunt": "fungus beast",
+                    "use_safe_spots": False,
+                }
+                for recorded_target in ("fungus beasts", "FungusBeast"):
+                    lethal = {
+                        "room": 544,
+                        "assigned_room": 544,
+                        "target": recorded_target,
+                        "use_safe_spots": True,
+                        "reasons": ["the keeper observed a death"],
+                        "deltas": {"deaths": 1},
+                    }
+
+                    self.assertTrue(
+                        controller._farm_quarantine_matches(lethal, requested)
+                    )
+                    self.assertIs(
+                        lethal,
+                        controller._matching_farm_quarantine(
+                            {recorded_target: lethal}, requested
+                        ),
+                    )
+                    self.assertFalse(
+                        controller._farm_quarantine_matches(
+                            lethal,
+                            {**requested, "hunt": "dusk rat"},
+                        )
+                    )
+                    self.assertFalse(
+                        controller._farm_quarantine_matches(
+                            lethal,
+                            {**requested, "assigned_room": 545},
+                        )
+                    )
             finally:
                 controller.storage.close()
 
@@ -7520,6 +9559,298 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     "recent_successful_tactic",
                     validation["recipe"]["selection_basis"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_research_prefers_prior_grounded_open_field_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                observation = SimulatedBroker().observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="research-reuses-open-field-positioning",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 99.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-99",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 99,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562 in the open field.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.70,
+                            "fight_above_vigor": 85,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(
+                    prior["id"], "failed", reason="keeper implementation fault"
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                controller._research_farm_candidates = lambda _phase: (  # type: ignore[method-assign]
+                    [
+                        {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "attempt_id": "new-fungus-receipt",
+                            "source": {
+                                "creature": "fungus beast",
+                                "best_room": 562,
+                            },
+                        }
+                    ],
+                    [{"id": "new-fungus-receipt", "result": {}}],
+                )
+
+                validation = controller._research_farm_recipe_validation(
+                    goal,
+                    run,
+                    {"id": "later-research", "context": {}},
+                    observation,
+                )
+
+                recipe = validation["recipe"]
+                self.assertEqual("selected", validation["status"])
+                self.assertFalse(recipe["use_safe_spots"])
+                self.assertEqual("grounded_positioning_variant", recipe["selection_basis"])
+                self.assertEqual(
+                    {
+                        "use_safe_spots": False,
+                        "source": "grounded_positioning_variant",
+                        "phase_id": prior["id"],
+                        "phase_status": "failed",
+                    },
+                    recipe["positioning_preference"],
+                )
+                self.assertEqual(17 / 40, recipe["flee_below"])
+                self.assertEqual(80, recipe["fight_above_vigor"])
+            finally:
+                controller.storage.close()
+
+    def test_cached_safe_recipe_revalidates_against_operator_open_field_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="cached-safe-recipe-operator-open-field",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 99.",
+                        constraints={"operator_notes": "use_safe_spots=false"},
+                        success_criteria=[
+                            {
+                                "id": "max-hp-99",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 99,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                research = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Find a grounded fungus hunting room.",
+                        "success_criteria": [
+                            {
+                                "id": "find-fungus-room",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "context": {
+                            "next_hp_milestone": 34,
+                            "farm_recipe": {
+                                "room": 562,
+                                "target": "fungus beast",
+                                "use_safe_spots": True,
+                                "flee_below": 0.75,
+                                "rest_below": 0.82,
+                                "fight_above_vigor": 95,
+                                "selection_basis": "grounded_new_room",
+                            },
+                        },
+                    },
+                    mode="start",
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                controller._research_farm_candidates = lambda _phase: (  # type: ignore[method-assign]
+                    [
+                        {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "attempt_id": "cached-fungus-receipt",
+                            "source": {
+                                "creature": "fungus beast",
+                                "best_room": 562,
+                            },
+                        }
+                    ],
+                    [{"id": "cached-fungus-receipt", "result": {}}],
+                )
+
+                farm = controller._handoff_completed_research_phase(
+                    goal, run, research, observation
+                )
+
+                self.assertIsNotNone(farm)
+                self.assertFalse(farm["context"]["use_safe_spots"])
+                self.assertEqual(562, farm["context"]["room"])
+                self.assertEqual("fungus beast", farm["context"]["target"])
+                self.assertEqual(0.75, farm["context"]["flee_below"])
+                self.assertEqual(0.82, farm["context"]["rest_below"])
+                self.assertEqual(95, farm["context"]["fight_above_vigor"])
+                self.assertEqual(
+                    "operator_positioning_preference",
+                    farm["context"]["selection_basis"],
+                )
+                self.assertEqual(
+                    "operator_goal",
+                    farm["context"]["positioning_preference"]["source"],
+                )
+            finally:
+                controller.storage.close()
+
+    def test_cached_safe_recipe_revalidates_against_prior_grounded_open_field(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = SimulatedBroker()
+                broker.vitals["health"] = {"current": 33, "max": 33}
+                observation = broker.observe()
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="cached-safe-recipe-prior-open-field",
+                        title="Raise maximum HP",
+                        objective="Raise maximum HP to at least 99.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-99",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 99,
+                            }
+                        ],
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                prior = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Fight fungus beasts in room 562 in the open field.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "use_safe_spots": False,
+                            "flee_below": 0.60,
+                            "fight_above_vigor": 80,
+                            "selection_basis": "grounded_positioning_variant",
+                            "deterministic_research_handoff": True,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.transition_campaign_phase(
+                    prior["id"], "failed", reason="keeper implementation fault"
+                )
+                research = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "research_progression",
+                        "objective": "Refresh the grounded fungus hunting receipt.",
+                        "success_criteria": [
+                            {
+                                "id": "find-fungus-room-again",
+                                "kind": "phase_action_succeeded",
+                                "tools": ["hunting_grounds"],
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "context": {
+                            "next_hp_milestone": 34,
+                            "farm_recipe": {
+                                "room": 562,
+                                "target": "fungus beast",
+                                "use_safe_spots": True,
+                                "flee_below": 0.75,
+                                "rest_below": 0.83,
+                                "fight_above_vigor": 95,
+                                "selection_basis": "grounded_new_room",
+                            },
+                        },
+                    },
+                    mode="start",
+                )
+                controller._source_room_overlevel_hostiles = lambda *_: []  # type: ignore[method-assign]
+                controller._research_farm_candidates = lambda _phase: (  # type: ignore[method-assign]
+                    [
+                        {
+                            "room": 562,
+                            "target": "fungus beast",
+                            "attempt_id": "refreshed-fungus-receipt",
+                            "source": {
+                                "creature": "fungus beast",
+                                "best_room": 562,
+                            },
+                        }
+                    ],
+                    [{"id": "refreshed-fungus-receipt", "result": {}}],
+                )
+
+                farm = controller._handoff_completed_research_phase(
+                    goal, run, research, observation
+                )
+
+                self.assertIsNotNone(farm)
+                self.assertFalse(farm["context"]["use_safe_spots"])
+                self.assertEqual(562, farm["context"]["room"])
+                self.assertEqual("fungus beast", farm["context"]["target"])
+                self.assertEqual(0.75, farm["context"]["flee_below"])
+                self.assertEqual(0.83, farm["context"]["rest_below"])
+                self.assertEqual(95, farm["context"]["fight_above_vigor"])
+                self.assertEqual(
+                    "grounded_positioning_variant",
+                    farm["context"]["selection_basis"],
+                )
+                self.assertEqual(
+                    prior["id"],
+                    farm["context"]["positioning_preference"]["phase_id"],
                 )
             finally:
                 controller.storage.close()
@@ -8189,7 +10520,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(545, farm["context"]["room"])
                 self.assertEqual("centipede", farm["context"]["target"])
                 self.assertTrue(farm["context"]["use_safe_spots"])
-                self.assertEqual(0.60, farm["context"]["flee_below"])
+                self.assertEqual(17 / 40, farm["context"]["flee_below"])
                 self.assertEqual(80, farm["context"]["fight_above_vigor"])
                 self.assertEqual(28, farm["context"]["next_hp_milestone"])
                 self.assertEqual(
@@ -11222,6 +13553,91 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_supervision_flags_critical_or_unverified_safe_spot_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_activity = "fighting from a proven safe spot"
+                broker.farm_safe_spot = {
+                    "works": True,
+                    "room": 544,
+                    "col": 44,
+                    "row": 32,
+                }
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+                controller.storage.submit_goal(
+                    goal_payload(request_id="critical-wall-status")
+                )
+
+                critical = controller.status(
+                    detail="supervision", include_recent_events=0
+                )
+
+                critical_keeper = critical["attention"]["liveness"][
+                    "broker_keeper"
+                ]
+                self.assertEqual(
+                    "critical_health_during_farm",
+                    critical_keeper["safety_conflict"]["kind"],
+                )
+                self.assertEqual(
+                    "fighting from a proven safe spot",
+                    critical_keeper["safety_conflict"]["reported_activity"],
+                )
+                self.assertEqual(
+                    "critical", critical["attention"]["liveness"]["state"]
+                )
+                self.assertEqual(
+                    "keeper_conflict", critical["controller"]["safety_owner"]
+                )
+                self.assertFalse(critical["controller"]["safety_covered"])
+
+                broker.vitals["health"] = {"current": 39, "max": 39}
+                broker.farm_safe_spot = False
+                controller.last_observation = broker.observe()
+                off_wall = controller.status(
+                    detail="supervision", include_recent_events=0
+                )
+
+                off_wall_keeper = off_wall["attention"]["liveness"][
+                    "broker_keeper"
+                ]
+                self.assertEqual(
+                    "unverified_proven_safe_spot_activity",
+                    off_wall_keeper["safety_conflict"]["kind"],
+                )
+                self.assertEqual(
+                    "critical", off_wall["attention"]["liveness"]["state"]
+                )
+                self.assertFalse(off_wall["controller"]["safety_covered"])
+
+                for activity in (
+                    "pulling quarry back to a proven safe spot",
+                    "away from a proven safe spot — fighting",
+                ):
+                    with self.subTest(activity=activity):
+                        broker.farm_activity = activity
+                        pulling = controller.status(
+                            detail="supervision", include_recent_events=0
+                        )
+                        pulling_keeper = pulling["attention"]["liveness"][
+                            "broker_keeper"
+                        ]
+                        self.assertNotIn("safety_conflict", pulling_keeper)
+                        self.assertNotEqual(
+                            "critical", pulling["attention"]["liveness"]["state"]
+                        )
+                        self.assertEqual(
+                            "keeper", pulling["controller"]["safety_owner"]
+                        )
+                        self.assertTrue(pulling["controller"]["safety_covered"])
+            finally:
+                controller.storage.close()
+
     def test_paused_goal_supervision_uses_latest_global_recovery_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -11434,10 +13850,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_available_food_is_used_without_raising_default_vigor_floor(self) -> None:
+    def test_current_keeper_uses_vigor_floor_without_legacy_food_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
+                self.assertNotIn("eat_before_fighting", PLANNER_SYSTEM)
+                self.assertNotIn("eat_before_fighting", CAMPAIGN_MANAGER_SYSTEM)
                 observation = {"inventory": {"items": []}}
                 ordinary, _changes = controller._normalize_combat_arguments(
                     "autopilot",
@@ -11448,11 +13866,11 @@ class ControllerTests(unittest.TestCase):
                     },
                     observation,
                 )
-                self.assertEqual(80, ordinary["fight_above_vigor"])
-                self.assertTrue(ordinary["eat_before_fighting"])
+                self.assertEqual(140, ordinary["fight_above_vigor"])
+                self.assertNotIn("eat_before_fighting", ordinary)
                 self.assertFalse(ordinary["buy_food"])
 
-                preserving, _changes = controller._normalize_combat_arguments(
+                preserving, preserving_changes = controller._normalize_combat_arguments(
                     "autopilot",
                     {
                         "action": "start",
@@ -11463,7 +13881,11 @@ class ControllerTests(unittest.TestCase):
                     observation,
                 )
                 self.assertEqual(80, preserving["fight_above_vigor"])
-                self.assertFalse(preserving["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", preserving)
+                self.assertEqual(
+                    {"requested": False, "applied": None},
+                    preserving_changes["eat_before_fighting"],
+                )
                 self.assertFalse(preserving["buy_food"])
 
                 planned, _changes = controller._normalize_combat_arguments(
@@ -11478,18 +13900,21 @@ class ControllerTests(unittest.TestCase):
                     observation,
                 )
                 self.assertEqual(140, planned["fight_above_vigor"])
-                self.assertTrue(planned["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", planned)
                 self.assertTrue(planned["buy_food"])
             finally:
                 controller.storage.close()
 
-    def test_background_farm_uses_available_food_at_rested_floor(self) -> None:
+    def test_background_farm_uses_current_food_dependent_vigor_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = CombatBroker()
                 broker.vitals["vigor"] = {"value": 93, "scale_max": 200, "rested": True}
                 controller.broker = broker
+                self.assertFalse(
+                    broker.tools["autopilot"].accepts("eat_before_fighting")
+                )
                 goal = controller.storage.submit_goal(goal_payload(request_id="farm-vigor-gate"))["goal"]
                 run = controller.storage.ensure_campaign_run(goal)
                 farm = controller.storage.create_campaign_phase(
@@ -11541,8 +13966,8 @@ class ControllerTests(unittest.TestCase):
                     for name, arguments in broker.calls
                     if name == "autopilot" and arguments.get("action") == "start"
                 )
-                self.assertEqual(80, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertEqual(140, call["fight_above_vigor"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(farm["id"], active["id"])
@@ -11812,7 +14237,7 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.active_campaign_phase(run["id"])["id"],
                 )
                 self.assertEqual(
-                    80,
+                    100,
                     controller.storage.active_campaign_phase(run["id"])["context"][
                         "fight_above_vigor"
                     ],
@@ -11821,7 +14246,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_active_legacy_farm_vigor_recipe_normalizes_without_child(self) -> None:
+    def test_legacy_food_preservation_request_uses_lowest_configured_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -11847,6 +14272,7 @@ class ControllerTests(unittest.TestCase):
                             "room": 575,
                             "target": "giant rat",
                             "fight_above_vigor": 100,
+                            "eat_before_fighting": False,
                             "use_safe_spots": True,
                         },
                     },
@@ -11863,7 +14289,47 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_explicit_food_recipe_survives_campaign_reconciliation(self) -> None:
+    def test_legacy_food_fields_do_not_rewrite_noncombat_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="preserve-noncombat-phase")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "prepare_combat",
+                        "objective": "Acquire a working mace.",
+                        "success_criteria": [
+                            {
+                                "id": "have-mace",
+                                "kind": "inventory_contains",
+                                "item": "mace",
+                                "count": 1,
+                            }
+                        ],
+                        "context": {
+                            "fight_above_vigor": 100,
+                            "eat_before_fighting": False,
+                        },
+                    },
+                    mode="start",
+                )
+
+                result = controller._reconcile_existing_campaign_phase(
+                    goal, {"inventory": {"items": []}}
+                )
+
+                self.assertIsNone(result)
+                active = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active["id"])
+                self.assertEqual(100, active["context"]["fight_above_vigor"])
+            finally:
+                controller.storage.close()
+
+    def test_explicit_high_vigor_recipe_survives_campaign_reconciliation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -11889,7 +14355,6 @@ class ControllerTests(unittest.TestCase):
                             "room": 575,
                             "target": "giant rat",
                             "fight_above_vigor": 140,
-                            "eat_before_fighting": True,
                             "buy_food": False,
                             "use_safe_spots": True,
                         },
@@ -11903,7 +14368,7 @@ class ControllerTests(unittest.TestCase):
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(farm["id"], active["id"])
                 self.assertEqual(140, active["context"]["fight_above_vigor"])
-                self.assertTrue(active["context"]["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", active["context"])
                 self.assertFalse(active["context"]["buy_food"])
                 self.assertEqual(140, controller._farm_fight_vigor(goal))
             finally:
@@ -11945,7 +14410,7 @@ class ControllerTests(unittest.TestCase):
                     if name == "autopilot" and arguments.get("action") == "start"
                 )
                 self.assertEqual(140, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
             finally:
                 controller.storage.close()
@@ -11980,14 +14445,70 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("autopilot", result["action"])
                 call = next(arguments for name, arguments in broker.calls if name == "autopilot")
                 self.assertEqual(0.7, call["rest_below"])
-                self.assertEqual(0.60, call["flee_below"])
+                self.assertEqual(17 / 40, call["flee_below"])
                 self.assertEqual(80, call["fight_above_vigor"])
-                self.assertTrue(call["eat_before_fighting"])
+                self.assertNotIn("eat_before_fighting", call)
                 self.assertFalse(call["buy_food"])
                 self.assertTrue(call["use_safe_spots"])
                 self.assertEqual(0.9, call["hold_resume_above"])
+                self.assertEqual(8, call["pull_within"])
                 self.assertFalse(call["break_out_via_logoff"])
+                self.assertFalse(call["automated_pleas"])
                 self.assertEqual(len(broker.inventory_items) + 6, call["max_carry"])
+
+                survival, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "survive",
+                        "rest_below": 0.7,
+                        "flee_below": 0.75,
+                    },
+                    broker.observe(),
+                )
+                self.assertEqual(0.95, survival["rest_below"])
+                self.assertEqual(0.75, survival["flee_below"])
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        rest_health_fraction=0.98,
+                        critical_health_fraction=0.90,
+                    ),
+                )
+                stricter_survival, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {"action": "start", "mode": "survive"},
+                    broker.observe(),
+                )
+                self.assertEqual(0.98, stricter_survival["rest_below"])
+                self.assertEqual(0.90, stricter_survival["flee_below"])
+
+                explicit_unlimited, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "pull_within": 0,
+                    },
+                    broker.observe(),
+                )
+                self.assertEqual(0, explicit_unlimited["pull_within"])
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        automated_help_pleas=True,
+                    ),
+                )
+                opted_in, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {"action": "start", "mode": "farm"},
+                    broker.observe(),
+                )
+                self.assertTrue(opted_in["automated_pleas"])
             finally:
                 controller.storage.close()
 
@@ -12040,30 +14561,180 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_waiting_survival_keeper_above_rest_floor_protects_unsafe_room(self) -> None:
+    def test_waiting_survival_keeper_below_recovery_floor_reconciles_without_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = BackgroundFarmBroker()
                 broker.farm_mode = "survive"
                 broker.farm_activity = "waiting"
+                broker.farm_use_safe_spots = False
                 broker.vitals["health"] = {"value": 25, "max": 28}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
-                    goal_payload(request_id="quiescent-survival-yields")
+                    goal_payload(request_id="quiescent-survival-recovers")
                 )["goal"]
 
-                result = controller._manage_background_farm(
+                first = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                second = controller._manage_background_farm(
                     goal, broker.observe(), {"all_met": False}
                 )
 
-                self.assertIsNone(result)
+                self.assertTrue(first["background_survival_monitoring"])
+                self.assertTrue(first["survival_policy_reconciled"])
+                self.assertTrue(second["background_survival_monitoring"])
+                self.assertFalse(second["survival_policy_reconciled"])
+                self.assertEqual(0.95, broker.farm_rest_below)
+                self.assertEqual(0.75, broker.farm_flee_below)
+                self.assertFalse(broker.farm_use_safe_spots)
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertNotIn("use_safe_spots", starts[0])
                 self.assertFalse(
                     any(
                         name == "autopilot" and arguments.get("action") == "stop"
                         for name, arguments in broker.calls
                     )
                 )
+            finally:
+                controller.storage.close()
+
+    def test_live_27_of_38_survival_policy_converges_without_critical_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_mode = "survive"
+                broker.farm_activity = "waiting"
+                broker.vitals["health"] = {"value": 27, "max": 38}
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="live-27-of-38-survival")
+                )["goal"]
+
+                self.assertNotIn(
+                    "survival_interrupt",
+                    {
+                        item["kind"]
+                        for item in controller.policy.advisories(broker.observe())
+                    },
+                )
+                first = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                second = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+
+                self.assertTrue(first["background_survival_monitoring"])
+                self.assertTrue(first["survival_policy_reconciled"])
+                self.assertTrue(second["background_survival_monitoring"])
+                self.assertFalse(second["survival_policy_reconciled"])
+                self.assertEqual(0.95, broker.farm_rest_below)
+                self.assertEqual(0.75, broker.farm_flee_below)
+                self.assertEqual(
+                    1,
+                    sum(
+                        1
+                        for name, arguments in broker.calls
+                        if name == "autopilot"
+                        and arguments.get("action") == "start"
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_incomplete_survival_status_is_throttled_by_desired_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.farm_mode = "survive"
+                broker.farm_activity = "waiting"
+                broker.farm_reports_automated_pleas = False
+                broker.vitals["health"] = {"value": 27, "max": 38}
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="throttle-incomplete-survival-status")
+                )["goal"]
+
+                entry = controller._ensure_outside_safety_owner(
+                    broker.observe(), reason="test turn entry"
+                )
+                managed = controller._manage_background_farm(
+                    goal, broker.observe(), {"all_met": False}
+                )
+                exit_coverage = controller._ensure_outside_safety_owner(
+                    broker.observe(), reason="test turn exit"
+                )
+
+                self.assertTrue(entry["survival_policy_reconciled"])
+                self.assertFalse(managed["survival_policy_reconciled"])
+                self.assertTrue(
+                    managed["policy_reconciliation"][
+                        "survival_policy_reconcile_throttled"
+                    ]
+                )
+                self.assertFalse(exit_coverage["survival_policy_reconciled"])
+                self.assertTrue(
+                    exit_coverage["policy_reconciliation"][
+                        "survival_policy_reconcile_throttled"
+                    ]
+                )
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+
+                controller.config = replace(
+                    controller.config,
+                    policy=replace(
+                        controller.config.policy,
+                        rest_health_fraction=0.90,
+                        critical_health_fraction=0.85,
+                    ),
+                )
+                changed = controller._ensure_survival_keeper(
+                    status=broker.call_tool(
+                        "autopilot", {"agent": "primary", "action": "status"}
+                    )
+                )
+                self.assertTrue(changed["survival_policy_reconciled"])
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(2, len(starts))
+                self.assertEqual(0.85, starts[-1]["flee_below"])
+            finally:
+                controller.storage.close()
+
+    def test_survival_policy_match_rejects_fractional_bank_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_mode = "survive"
+                broker.farm_hunt = ""
+                broker.farm_assigned_room = None
+                broker.farm_rest_below = 0.95
+                broker.farm_flee_below = 0.75
+                broker.farm_bank_above = 0.5  # type: ignore[assignment]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+
+                self.assertFalse(controller._survival_keeper_policy_matches(status))
             finally:
                 controller.storage.close()
 
@@ -12146,6 +14817,81 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(broker.farm_running)
                 self.assertIsNone(broker.farm_inert)
                 self.assertEqual("survive", broker.farm_mode)
+                self.assertFalse(controller._game_action_active.is_set())
+            finally:
+                controller.storage.close()
+
+    def test_outside_safety_invariant_retasks_critical_farm_before_yield(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_mode = "farm"
+                controller.broker = broker
+
+                coverage = controller._ensure_outside_safety_owner(
+                    broker.observe(),
+                    reason="test critical farm boundary",
+                )
+
+                self.assertTrue(coverage["covered"])
+                self.assertEqual("keeper", coverage["owner"])
+                self.assertTrue(coverage["restored"])
+                self.assertTrue(coverage["critical_farm_handoff"])
+                self.assertEqual("survive", broker.farm_mode)
+                self.assertTrue(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "survive"
+                        for name, arguments in broker.calls
+                    )
+                )
+            finally:
+                controller.storage.close()
+
+    def test_outside_safety_invariant_rejects_unacknowledged_critical_handoff(
+        self,
+    ) -> None:
+        class IgnoredSurvivalStartBroker(BackgroundFarmBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "survive"
+                ):
+                    self.calls.append((name, dict(arguments)))
+                    return {"running": True, "mode": "farm"}
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = IgnoredSurvivalStartBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                controller.broker = broker
+
+                with self.assertRaisesRegex(
+                    ToolCallError, "survival keeper did not acknowledge"
+                ):
+                    controller._ensure_outside_safety_owner(
+                        broker.observe(),
+                        reason="test ignored critical handoff",
+                    )
+
+                self.assertEqual("farm", broker.farm_mode)
                 self.assertFalse(controller._game_action_active.is_set())
             finally:
                 controller.storage.close()
@@ -12351,6 +15097,7 @@ class ControllerTests(unittest.TestCase):
             controller = BotController(config(Path(temporary)))
             try:
                 broker = CombatBroker()
+                enable_decoupled_safe_walls(broker)
                 controller.broker = broker
                 controller.storage.set_runtime(
                     "farm_tactic_quarantine_v1",
@@ -12401,10 +15148,17 @@ class ControllerTests(unittest.TestCase):
                 )
                 self.assertEqual("giant rat", call["hunt"])
                 self.assertEqual(575, call["assigned_room"])
-                self.assertFalse(call["use_safe_spots"])
+                self.assertTrue(call["use_safe_spots"])
+                self.assertFalse(call["require_safe_wall"])
+                owner = controller.storage.get_runtime(
+                    "background_farm_owner_v1", {}
+                )
+                self.assertFalse(owner["use_safe_spots"])
+                self.assertTrue(owner["keeper_use_safe_spots"])
+                self.assertFalse(owner["require_safe_wall"])
                 # Old durable recipes cannot restore the superseded 80%
                 # boundary; operator policy owns the farm flee threshold.
-                self.assertEqual(0.60, call["flee_below"])
+                self.assertEqual(17 / 40, call["flee_below"])
                 self.assertEqual(400, call["bank_above"])
             finally:
                 controller.storage.close()
@@ -12469,6 +15223,7 @@ class ControllerTests(unittest.TestCase):
                             "hunt": "giant rat",
                             "assigned_room": 575,
                             "use_safe_spots": True,
+                            "require_safe_wall": False,
                         },
                         "rationale": "Launch the active internal farm phase.",
                     },
@@ -12483,7 +15238,32 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("ant", call["hunt"])
                 self.assertEqual(26, call["assigned_room"])
                 self.assertFalse(call["use_safe_spots"])
-                self.assertEqual(0.60, call["flee_below"])
+                self.assertNotIn("require_safe_wall", call)
+                self.assertEqual(17 / 40, call["flee_below"])
+            finally:
+                controller.storage.close()
+
+    def test_decoupled_safe_spot_strategy_enables_and_requires_walls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = CombatBroker()
+                enable_decoupled_safe_walls(broker)
+                controller.broker = broker
+
+                normalized, _ = controller._normalize_combat_arguments(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "use_safe_spots": False,
+                    },
+                    broker.observe(),
+                    allow_open_field=False,
+                )
+
+                self.assertTrue(normalized["use_safe_spots"])
+                self.assertTrue(normalized["require_safe_wall"])
             finally:
                 controller.storage.close()
 
@@ -13150,7 +15930,7 @@ class ControllerTests(unittest.TestCase):
                     item for item in released if item["room"] == 557
                 )
                 self.assertEqual(0.8, former_policy["prior_flee_threshold"])
-                self.assertEqual(0.6, former_policy["current_flee_threshold"])
+                self.assertEqual(17 / 40, former_policy["current_flee_threshold"])
             finally:
                 controller.storage.close()
 
@@ -13303,7 +16083,10 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("", arguments["hunt"])
                 self.assertIsNone(arguments["assigned_room"])
                 self.assertEqual(0, arguments["bank_above"])
+                self.assertEqual(0.95, arguments["rest_below"])
+                self.assertEqual(0.75, arguments["flee_below"])
                 self.assertFalse(arguments["break_out_via_logoff"])
+                self.assertFalse(arguments["automated_pleas"])
             finally:
                 controller.storage.close()
 
@@ -13350,6 +16133,178 @@ class ControllerTests(unittest.TestCase):
                     submitted["id"], kinds=["background_farm.recovered"], limit=5
                 )
                 self.assertEqual(1, len(events))
+
+                # Missing means an old/stale broker, not proof that the old
+                # keeper is silent. Fail closed by sending the policy anyway.
+                broker.calls.clear()
+                broker.farm_reports_automated_pleas = False
+                controller._set_fallback()
+                starts = [
+                    args
+                    for name, args in broker.calls
+                    if name == "autopilot"
+                    and args.get("action") == "start"
+                    and args.get("mode") == "farm"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertFalse(starts[0]["automated_pleas"])
+
+                # A persisted opt-in from an older configuration is corrected
+                # in place without otherwise retasking the recovered farm.
+                broker.calls.clear()
+                broker.farm_reports_automated_pleas = True
+                broker.farm_automated_pleas = True
+                controller._set_fallback()
+                starts = [
+                    args
+                    for name, args in broker.calls
+                    if name == "autopilot"
+                    and args.get("action") == "start"
+                    and args.get("mode") == "farm"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertFalse(starts[0]["automated_pleas"])
+            finally:
+                controller.storage.close()
+
+    def test_decoupled_open_field_policy_matches_without_retask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                enable_decoupled_safe_walls(broker)
+                broker.farm_use_safe_spots = True
+                broker.farm_require_safe_wall = False
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        "decoupled-open-field-match",
+                        title="Raise max HP",
+                        objective="Raise maximum health with giant rats.",
+                        activation="replace_active_pause",
+                        constraints={
+                            "operator_notes": (
+                                "hunt='giant rat'; assigned_room=586; "
+                                "use_safe_spots=false"
+                            )
+                        },
+                    )
+                )["goal"]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+
+                mismatch = controller._background_farm_mismatch(goal, status)
+                broker.calls.clear()
+                controller._set_fallback()
+
+                self.assertIsNone(mismatch)
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "farm"
+                ]
+                self.assertEqual([], starts)
+            finally:
+                controller.storage.close()
+
+    def test_stale_farm_flee_threshold_is_not_re_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_flee_below = 0.60
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        "stale-farm-flee-threshold",
+                        title="Raise max HP",
+                        objective="Raise maximum health with giant rats.",
+                        activation="replace_active_pause",
+                        constraints={
+                            "operator_notes": (
+                                "hunt='giant rat'; assigned_room=586; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+
+                mismatch = controller._background_farm_mismatch(goal, status)
+
+                self.assertIsNotNone(mismatch)
+                assert mismatch is not None
+                self.assertIn(
+                    "flee_below is 0.6, expected 0.425", mismatch["reasons"]
+                )
+                self.assertEqual(17 / 40, mismatch["expected"]["flee_below"])
+                self.assertEqual(0.60, mismatch["actual"]["flee_below"])
+            finally:
+                controller.storage.close()
+
+    def test_decoupled_open_field_status_records_durable_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                enable_decoupled_safe_walls(broker)
+                broker.farm_use_safe_spots = True
+                broker.farm_require_safe_wall = False
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="decoupled-open-field-evidence")
+                )["goal"]
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+
+                evidence = controller._farm_status_evidence(
+                    goal, broker.observe(), status
+                )
+
+                self.assertFalse(evidence["use_safe_spots"])
+                self.assertTrue(evidence["keeper_use_safe_spots"])
+                self.assertFalse(evidence["require_safe_wall"])
+            finally:
+                controller.storage.close()
+
+    def test_current_keeper_status_without_food_switch_matches_owned_farm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        "current-keeper-farm-match",
+                        constraints={
+                            "operator_notes": (
+                                "hunt='giant rat'; assigned_room=586; "
+                                "use_safe_spots=true; fight_above_vigor=80; "
+                                "buy_food=false"
+                            )
+                        },
+                    )
+                )["goal"]
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "assigned_room": 586,
+                        "hunt": "giant rat",
+                    },
+                )
+                status = broker.call_tool(
+                    "autopilot", {"action": "status", "agent": "primary"}
+                )
+
+                self.assertNotIn("eatBeforeFighting", status["policy"])
+                self.assertIsNone(controller._background_farm_mismatch(goal, status))
             finally:
                 controller.storage.close()
 
@@ -13588,6 +16543,24 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertNotIn("recover_health", {item["kind"] for item in manual})
                 self.assertIn("recover_health", {item["kind"] for item in autonomous})
+
+                observation["status"]["vitals"]["health"]["current"] = 95
+                observation["look"]["vitals"]["health"]["current"] = 95
+                ready_autonomous = controller._combat_preflight(
+                    "autopilot",
+                    {
+                        "action": "start",
+                        "mode": "farm",
+                        "hunt": "giant rat",
+                        "hold_resume_above": 0.9,
+                    },
+                    observation,
+                    goal,
+                )
+                self.assertNotIn(
+                    "recover_health",
+                    {item["kind"] for item in ready_autonomous},
+                )
 
                 observation["status"]["vitals"]["health"]["current"] = 79
                 observation["look"]["vitals"]["health"]["current"] = 79
@@ -13927,6 +16900,34 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(0.4, rest["arguments"]["to"])
 
                 ready = observation(52, vigor=80, rested=True)
+                damaged = copy.deepcopy(ready)
+                damaged["look"]["vitals"]["health"]["value"] = 27
+                damaged["status"]["vitals"]["health"]["value"] = 27
+                health_recovery = controller._structured_farm_preparation_action(
+                    goal, damaged, completion
+                )
+                self.assertEqual("rest_up", health_recovery["tool"])
+                self.assertEqual(0.9, health_recovery["arguments"]["to"])
+                self.assertEqual(30, health_recovery["arguments"]["max_seconds"])
+                near_ceiling = copy.deepcopy(ready)
+                near_ceiling["look"]["vitals"]["health"] = {
+                    "value": 39,
+                    "max": 40,
+                }
+                near_ceiling["status"]["vitals"]["health"] = {
+                    "value": 39,
+                    "max": 40,
+                }
+                self.assertIsNone(
+                    controller._structured_farm_preparation_action(
+                        goal, near_ceiling, completion
+                    )
+                )
+                self.assertIsNotNone(
+                    controller._structured_farm_launch_plan(
+                        goal, near_ceiling, completion
+                    )
+                )
                 self.assertIsNone(
                     controller._structured_farm_preparation_action(
                         goal, ready, completion
@@ -14404,7 +17405,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_two_equivalent_invalid_initial_plans_retire_only_the_phase(self) -> None:
+    def test_invalid_initial_plan_retry_waits_for_material_state_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -14419,11 +17420,12 @@ class ControllerTests(unittest.TestCase):
 
                 self.assertTrue(first["plan_rejected"])
                 self.assertTrue(second["plan_rejected"])
-                self.assertTrue(second["phase_retired"])
+                self.assertTrue(second["planner_retry_suppressed"])
+                self.assertFalse(second["phase_retired"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
                 run = controller.storage.campaign_run(goal["id"])
                 self.assertIsNotNone(run)
-                self.assertIsNone(
+                self.assertIsNotNone(
                     controller.storage.active_campaign_phase(run["id"])
                 )
             finally:
@@ -14650,6 +17652,233 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
+    def test_safe_shutdown_can_leave_a_full_health_proven_spot_with_camped_monsters(self) -> None:
+        class CampedShutdownBroker(ShutdownBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                result = super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+                if name == "autopilot" and arguments.get("action") == "status":
+                    return {
+                        **result,
+                        "safe_spot": {
+                            "standing_here": True,
+                            "works": True,
+                        },
+                        "threat": {
+                            "could_reach_us": 2,
+                            "camped_on_us": 2,
+                            "in_swing_range": 2,
+                            "landing_damage": 0,
+                        },
+                    }
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = CampedShutdownBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop(destination_room_id=52)
+                result = controller._perform_safe_shutdown()
+
+                self.assertEqual("complete", result["stage"])
+                self.assertFalse(broker.joined)
+                self.assertIn("travel", [name for name, _ in broker.calls])
+                self.assertNotEqual("recovering", result.get("stage"))
+            finally:
+                controller.storage.close()
+
+        unsafe = {
+            "safe_spot": {"standing_here": True, "works": False},
+            "threat": {
+                "could_reach_us": 2,
+                "camped_on_us": 2,
+                "in_swing_range": 2,
+                "landing_damage": 0,
+            },
+        }
+        taking_damage = {
+            **unsafe,
+            "safe_spot": {"standing_here": True, "works": True},
+            "threat": {**unsafe["threat"], "landing_damage": 1},
+        }
+        self.assertFalse(BotController._shutdown_keeper_travel_ready(unsafe))
+        self.assertFalse(
+            BotController._shutdown_keeper_travel_ready(taking_damage)
+        )
+
+    def test_safe_shutdown_can_leave_stably_quiescent_open_field(self) -> None:
+        class StableOpenFieldShutdownBroker(ShutdownBroker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.open_field_pass = 100
+
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                result = super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+                if (
+                    name != "autopilot"
+                    or arguments.get("action") != "status"
+                    or not isinstance(result, dict)
+                    or result.get("running") is not True
+                ):
+                    return result
+                self.open_field_pass += 1
+
+                def trial(pass_number: int) -> dict[str, object]:
+                    return {
+                        "pass": pass_number,
+                        "at": pass_number * 1000,
+                        "room": 544,
+                        "adjacent_at_start": 2,
+                        "lost": 0,
+                        "health_before": 100,
+                        "health_after": 100,
+                        "window_s": 1,
+                        "settled_ms": 5000,
+                        "monsters_awake": True,
+                        "swung_in_window": False,
+                        "moved_in_window": False,
+                    }
+
+                return {
+                    **result,
+                    "mode": "survive",
+                    "activity": "waiting",
+                    "last_error": None,
+                    "policy": {"useSafeSpots": False},
+                    "safe_spot": False,
+                    "threat": {
+                        "could_reach_us": 2,
+                        "camped_on_us": 2,
+                        "in_swing_range": 2,
+                        "landing_damage": 0,
+                    },
+                    "trials": [
+                        trial(self.open_field_pass - 1),
+                        trial(self.open_field_pass),
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                source_verify_safe_rooms(controller, 52)
+                broker = StableOpenFieldShutdownBroker()
+                broker.room = {"num": 544, "name": "Valley of Ileria"}
+                controller.broker = broker
+                controller.last_observation = broker.observe()
+
+                controller.safe_stop(destination_room_id=52)
+                with mock.patch(
+                    "meridian_bot.controller.time.sleep", return_value=None
+                ):
+                    result = controller._perform_safe_shutdown()
+
+                self.assertEqual("complete", result["stage"])
+                self.assertFalse(broker.joined)
+                self.assertIn("travel", [name for name, _ in broker.calls])
+            finally:
+                controller.storage.close()
+
+    def test_open_field_shutdown_evidence_fails_closed(self) -> None:
+        def trial(pass_number: int) -> dict[str, object]:
+            return {
+                "pass": pass_number,
+                "at": pass_number * 1000,
+                "room": 562,
+                "adjacent_at_start": 2,
+                "lost": 0,
+                "health_before": 40,
+                "health_after": 40,
+                "window_s": 1,
+                "settled_ms": 5000,
+                "monsters_awake": True,
+                "swung_in_window": False,
+                "moved_in_window": False,
+            }
+
+        stable = {
+            "running": True,
+            "mode": "survive",
+            "activity": "waiting",
+            "last_error": None,
+            "policy": {"useSafeSpots": False},
+            "safe_spot": False,
+            "threat": {
+                "could_reach_us": 2,
+                "camped_on_us": 2,
+                "in_swing_range": 2,
+                "landing_damage": 0,
+            },
+            "trials": [trial(10), trial(11)],
+        }
+        self.assertIsNotNone(
+            BotController._shutdown_keeper_open_field_evidence(
+                stable, current_room=562
+            )
+        )
+
+        unsafe_variants = [
+            {**stable, "running": False},
+            {**stable, "inert": True},
+            {**stable, "mode": "farm"},
+            {**stable, "activity": "fighting"},
+            {**stable, "last_error": "keeper failed"},
+            {**stable, "safe_spot": {"standing_here": True, "works": False}},
+            {**stable, "policy": {"useSafeSpots": True}},
+            {**stable, "threat": {"landing_damage": 1}},
+            {**stable, "threat": {}},
+            {**stable, "trials": [trial(11)]},
+            {**stable, "current_room": 563},
+            {
+                **stable,
+                "trials": [trial(10), {**trial(11), "lost": 1}],
+            },
+            {
+                **stable,
+                "trials": [
+                    trial(10),
+                    {**trial(11), "monsters_awake": False},
+                ],
+            },
+            {
+                **stable,
+                "trials": [
+                    trial(10),
+                    {**trial(11), "moved_in_window": True},
+                ],
+            },
+        ]
+        for unsafe in unsafe_variants:
+            with self.subTest(unsafe=unsafe):
+                current_room = unsafe.get("current_room", 562)
+                self.assertIsNone(
+                    BotController._shutdown_keeper_open_field_evidence(
+                        unsafe, current_room=current_room
+                    )
+                )
+
     def test_safe_shutdown_in_verified_room_skips_travel_before_logout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -14780,6 +18009,86 @@ class ControllerTests(unittest.TestCase):
                 controller.stop_event.set()
                 controller.storage.close()
 
+    def test_controller_loop_retries_degraded_broker_before_idle_turn(self) -> None:
+        class InitiallyUnavailableGameBroker(SimulatedBroker):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = 0
+                self.join_attempts = 0
+                self.capability_refreshes: list[bool] = []
+
+            def ensure_started(self) -> dict[str, object]:
+                self.started += 1
+                return super().ensure_started()
+
+            def capabilities(self, *, refresh: bool = False) -> dict[str, Tool]:
+                self.capability_refreshes.append(refresh)
+                return super().capabilities(refresh=refresh)
+
+            def ensure_joined(self) -> dict[str, object]:
+                self.join_attempts += 1
+                if self.join_attempts < 3:
+                    raise BrokerError("game session is temporarily unavailable")
+                return super().ensure_joined()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = config(Path(temporary))
+            controller = BotController(
+                replace(
+                    base,
+                    controller=replace(
+                        base.controller,
+                        conversation_enabled=False,
+                    ),
+                )
+            )
+            try:
+                broker = InitiallyUnavailableGameBroker()
+                broker.joined = False
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="broker-recovery-paused-goal")
+                )["goal"]
+                controller.storage.manage_goal(
+                    {
+                        "request_id": "pause-before-broker-recovery",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                        "reason": "operator paused this goal before restart",
+                    }
+                )
+
+                with self.assertRaises(BrokerError):
+                    controller.startup(connect_game=True)
+                controller.dependencies["broker"] = "unhealthy"
+                controller._degrade(
+                    "broker", BrokerError("initial game session startup failed")
+                )
+
+                turns = 0
+
+                def idle_turn() -> dict[str, object]:
+                    nonlocal turns
+                    turns += 1
+                    controller.stop_event.set()
+                    return {"idle": True}
+
+                controller.turn = idle_turn  # type: ignore[method-assign]
+                # Avoid sleeping through the first failed recovery attempt.
+                controller._wake_event.set()
+                controller.run_forever()
+
+                self.assertEqual(3, broker.started)
+                self.assertEqual(3, broker.join_attempts)
+                self.assertEqual([True, True, True], broker.capability_refreshes)
+                self.assertEqual(1, turns)
+                self.assertTrue(broker.joined)
+                self.assertEqual("healthy", controller.dependencies["broker"])
+                self.assertEqual("paused", controller.storage.goal(goal["id"])["status"])
+            finally:
+                controller.stop_event.set()
+                controller.storage.close()
+
     def test_safe_shutdown_request_suspends_background_social_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
@@ -14811,6 +18120,8 @@ class ControllerTests(unittest.TestCase):
                 result = controller._perform_safe_shutdown()
 
                 self.assertEqual("failed", result["stage"])
+                failed_request_id = result["request_id"]
+                self.assertFalse(controller._shutdown_requested.is_set())
                 self.assertFalse(controller.stop_event.is_set())
                 self.assertTrue(broker.joined)
                 self.assertTrue(broker.keeper_running)
@@ -14819,6 +18130,10 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(
                     "paused", controller.storage.goal(goal["id"])["status"]
                 )
+                retry = controller.safe_stop(destination_room_id=52)
+                self.assertEqual("requested", retry["stage"])
+                self.assertNotEqual(failed_request_id, retry["request_id"])
+                self.assertTrue(controller._shutdown_requested.is_set())
             finally:
                 controller.storage.close()
 
@@ -15619,7 +18934,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_assignment_deferral_retires_only_active_farm_phase(self) -> None:
+    def test_wall_assignment_deferral_retasks_same_phase_open_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -15657,8 +18972,7 @@ class ControllerTests(unittest.TestCase):
                         ],
                         constraints={
                             "operator_notes": (
-                                "hunt=groundworm larva; assigned_room=566; "
-                                "use_safe_spots=true"
+                                "hunt=groundworm larva; assigned_room=566"
                             )
                         },
                     )
@@ -15699,6 +19013,10 @@ class ControllerTests(unittest.TestCase):
                         "hunt": "groundworm larva",
                     },
                 )
+                controller.storage.set_runtime(
+                    "goal_execution_plans_v1",
+                    {goal["id"]: {"summary": "Use the safe wall farm."}},
+                )
                 observation = broker.observe()
 
                 result = controller._manage_background_farm(
@@ -15708,44 +19026,584 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertIsNotNone(result)
-                self.assertTrue(result["background_farm_assignment_deferred"])
-                self.assertFalse(result["goal_blocked"])
-                self.assertTrue(result["strategic_goal_preserved"])
+                self.assertTrue(result["background_farm_open_field_fallback"])
+                self.assertFalse(result["use_safe_spots"])
                 self.assertTrue(broker.farm_running)
-                self.assertEqual("survive", broker.farm_mode)
-                self.assertIsNotNone(result["recovery"])
+                self.assertEqual("farm", broker.farm_mode)
+                self.assertFalse(broker.farm_use_safe_spots)
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
-                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                active_phase = controller.storage.active_campaign_phase(run["id"])
+                self.assertEqual(phase["id"], active_phase["id"])
+                self.assertEqual("active", active_phase["status"])
+                self.assertFalse(active_phase["context"]["use_safe_spots"])
                 self.assertEqual(
-                    "failed", controller.storage.campaign_phases(run["id"])[0]["status"]
+                    "wall_search_exhausted",
+                    active_phase["context"]["safe_spot_fallback"]["kind"],
                 )
-                stagnation = controller.storage.get_runtime(
-                    "farm_tactic_stagnation_v1", {}
-                )[f"{goal['id']}|566|groundworm larva"]
-                self.assertEqual("farm_assignment_deferred", stagnation["kind"])
-                # A successful arrival does not negate an exhausted in-room
-                # wall search; the exact tactic receives a bounded cooldown.
-                self.assertTrue(controller._farm_stagnation_blocks(stagnation))
                 self.assertEqual(
-                    [], controller._repair_disproved_farm_route_stagnations()
+                    "controller_wall_search_only_v1",
+                    active_phase["context"]["safe_spot_fallback"][
+                        "safety_provenance"
+                    ],
                 )
-                self.assertIn(
-                    f"{goal['id']}|566|groundworm larva",
-                    controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
-                )
-                self.assertEqual("ineffective_tactic", result["lesson"]["classification"])
-                self.assertEqual("tactic", result["lesson"]["scope"])
-                feedback = controller._planner_feedback(goal)
+                # Positioning was left to the controller, so the grounded phase
+                # fallback remains the effective policy on later turns.
+                self.assertFalse(controller._effective_farm_intent(goal)["use_safe_spots"])
                 self.assertEqual(
-                    "farm_assignment_deferred", feedback["failure_context"]["kind"]
+                    {}, controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
                 )
-                self.assertIn("different grounded", feedback["message"])
+                self.assertIsNone(controller._planner_feedback(goal))
+                self.assertNotIn(
+                    goal["id"],
+                    controller.storage.get_runtime("goal_execution_plans_v1", {}),
+                )
+                owner = controller.storage.get_runtime("background_farm_owner_v1", {})
+                self.assertEqual(phase["id"], owner["phase_id"])
+                self.assertFalse(owner["use_safe_spots"])
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertEqual(566, starts[0]["assigned_room"])
+                self.assertEqual("groundworm larva", starts[0]["hunt"])
+                self.assertFalse(starts[0]["use_safe_spots"])
                 events = controller.storage.goal_events(
                     goal["id"],
-                    kinds=["background_farm.assignment_deferred"],
+                    kinds=["background_farm.safe_spot_fallback"],
                     limit=10,
                 )
                 self.assertEqual(1, len(events))
+
+                # The keeper may retain its compact wall-exhaustion record after
+                # the policy update. It must not retask or fail the phase again.
+                controller._manage_background_farm(
+                    goal,
+                    broker.observe(),
+                    controller.criteria.evaluate(goal, broker.observe()),
+                )
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot" and arguments.get("action") == "start"
+                ]
+                self.assertEqual(1, len(starts))
+                self.assertEqual(
+                    phase["id"],
+                    controller.storage.active_campaign_phase(run["id"])["id"],
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
+                )
+            finally:
+                controller.storage.close()
+
+    def test_explicit_safe_spot_goal_retires_exhausted_wall_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="explicit-safe-wall-exhausted",
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae using safe spots.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+                observation = broker.observe()
+
+                result = controller._manage_background_farm(
+                    goal,
+                    observation,
+                    controller.criteria.evaluate(goal, observation),
+                )
+
+                self.assertTrue(result["background_farm_assignment_deferred"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertTrue(controller._effective_farm_intent(goal)["use_safe_spots"])
+                self.assertFalse(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "farm"
+                        and arguments.get("use_safe_spots") is False
+                        for name, arguments in broker.calls
+                    )
+                )
+                retired = next(
+                    item
+                    for item in controller.storage.campaign_phases(run["id"])
+                    if item["id"] == phase["id"]
+                )
+                self.assertEqual("failed", retired["status"])
+            finally:
+                controller.storage.close()
+
+    def test_split_farm_danger_deltas_prevent_wall_fallback_receipt(self) -> None:
+        cases: tuple[tuple[str, object], ...] = (
+            ("deaths", {"deaths": 1}),
+            ("safe_spot_deaths", {"deaths_in_safe_spot": 1}),
+            ("proven_safe_spot_deaths", {"deaths_in_proven_safe_spot": 1}),
+            ("withdrawals", {"withdrawals": 1}),
+            ("mulligans", {"mulligans": 1}),
+            ("logoffs", {"logoffs": 1}),
+            ("malformed_count", {"mulligans": "unknown"}),
+            ("negative_count", {"logoffs": -1}),
+            ("fractional_count", {"mulligans": 0.5}),
+            ("malformed_deltas", "not-a-counter-map"),
+        )
+        for label, deltas in cases:
+            with self.subTest(danger_evidence=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    controller = BotController(config(Path(temporary)))
+                    try:
+                        broker = BackgroundFarmBroker()
+                        broker.farm_room = 566
+                        broker.farm_hunt = "groundworm larva"
+                        broker.farm_placement = {
+                            "assigned_room": 566,
+                            "assignment_deferred": True,
+                            "assignment_deferred_reason": (
+                                "3 top-ranked walls each failed 3 complete pull window(s); "
+                                "stopping the wall search in this room"
+                            ),
+                        }
+                        controller.broker = broker
+                        controller._keeper_is_driving = lambda _status: False  # type: ignore[method-assign]
+                        goal = controller.storage.submit_goal(
+                            goal_payload(
+                                request_id=f"split-wall-danger-{label}",
+                                constraints={
+                                    "operator_notes": (
+                                        "hunt=groundworm larva; assigned_room=566"
+                                    )
+                                },
+                            )
+                        )["goal"]
+                        run = controller.storage.ensure_campaign_run(goal)
+                        phase = controller.storage.create_campaign_phase(
+                            run,
+                            {
+                                "kind": "farm",
+                                "objective": "Farm larvae using safe spots.",
+                                "success_criteria": list(goal["success_criteria"]),
+                                "abandon_predicates": [],
+                                "context": {
+                                    "room": 566,
+                                    "target": "groundworm larva",
+                                    "use_safe_spots": True,
+                                    "fight_above_vigor": 80,
+                                },
+                            },
+                            mode="start",
+                        )
+                        observation = broker.observe()
+                        status = broker.call_tool(
+                            "autopilot", {"action": "status"}, mutation=False
+                        )
+
+                        result = controller._handle_deferred_farm_assignment(
+                            goal,
+                            observation,
+                            status,
+                            controller.criteria.evaluate(goal, observation),
+                            farm_evidence={
+                                "health_fraction": 1.0,
+                                "deltas": deltas,
+                            },
+                        )
+
+                        self.assertTrue(
+                            result["background_farm_assignment_deferred"]
+                        )
+                        retired = next(
+                            item
+                            for item in controller.storage.campaign_phases(run["id"])
+                            if item["id"] == phase["id"]
+                        )
+                        self.assertEqual("failed", retired["status"])
+                        self.assertNotIn(
+                            "safe_spot_fallback", retired["context"]
+                        )
+                        self.assertFalse(
+                            any(
+                                name == "autopilot"
+                                and arguments.get("action") == "start"
+                                and arguments.get("mode") == "farm"
+                                and arguments.get("use_safe_spots") is False
+                                for name, arguments in broker.calls
+                            )
+                        )
+                    finally:
+                        controller.storage.close()
+
+    def test_open_field_fallback_persists_before_broker_and_reconciles_retry(self) -> None:
+        class OneLostFallbackReplyBroker(BackgroundFarmBroker):
+            def __init__(self, *, accepted: bool) -> None:
+                super().__init__()
+                self.accepted = accepted
+                self.failed_once = False
+
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                fallback = bool(
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "farm"
+                    and arguments.get("use_safe_spots") is True
+                    and arguments.get("require_safe_wall") is False
+                )
+                if fallback and not self.failed_once:
+                    self.failed_once = True
+                    if self.accepted:
+                        super().call_tool(
+                            name, arguments, timeout=timeout, mutation=mutation
+                        )
+                    else:
+                        self.calls.append((name, dict(arguments)))
+                    raise BrokerError("keeper reply was lost")
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        for accepted in (False, True):
+            with self.subTest(accepted_before_lost_reply=accepted):
+                with tempfile.TemporaryDirectory() as temporary:
+                    controller = BotController(config(Path(temporary)))
+                    try:
+                        broker = OneLostFallbackReplyBroker(accepted=accepted)
+                        enable_decoupled_safe_walls(broker)
+                        broker.farm_room = 566
+                        broker.farm_hunt = "groundworm larva"
+                        broker.farm_placement = {
+                            "assigned_room": 566,
+                            "assignment_deferred": True,
+                            "assignment_deferred_reason": (
+                                "3 top-ranked walls each failed 3 complete pull window(s); "
+                                "stopping the wall search in this room"
+                            ),
+                        }
+                        controller.broker = broker
+                        goal = controller.storage.submit_goal(
+                            goal_payload(
+                                request_id=f"lost-fallback-reply-{accepted}",
+                                constraints={
+                                    "operator_notes": (
+                                        "hunt=groundworm larva; assigned_room=566"
+                                    )
+                                },
+                            )
+                        )["goal"]
+                        run = controller.storage.ensure_campaign_run(goal)
+                        phase = controller.storage.create_campaign_phase(
+                            run,
+                            {
+                                "kind": "farm",
+                                "objective": "Farm groundworm larvae in room 566.",
+                                "success_criteria": list(goal["success_criteria"]),
+                                "abandon_predicates": [],
+                                "context": {
+                                    "room": 566,
+                                    "target": "groundworm larva",
+                                    "use_safe_spots": True,
+                                    "fight_above_vigor": 80,
+                                },
+                            },
+                            mode="start",
+                        )
+                        controller.storage.set_runtime(
+                            "background_farm_owner_v1",
+                            {
+                                "goal_id": goal["id"],
+                                "phase_id": phase["id"],
+                                "assigned_room": 566,
+                                "hunt": "groundworm larva",
+                            },
+                        )
+
+                        with self.assertRaises(BrokerError):
+                            controller._manage_background_farm(
+                                goal,
+                                broker.observe(),
+                                controller.criteria.evaluate(goal, broker.observe()),
+                            )
+
+                        pending = controller.storage.active_campaign_phase(run["id"])
+                        self.assertEqual(phase["id"], pending["id"])
+                        self.assertFalse(pending["context"]["use_safe_spots"])
+                        self.assertEqual(
+                            "pending",
+                            pending["context"]["safe_spot_fallback"]["state"],
+                        )
+                        self.assertEqual(
+                            "controller_wall_search_only_v1",
+                            pending["context"]["safe_spot_fallback"][
+                                "safety_provenance"
+                            ],
+                        )
+                        self.assertEqual(
+                            "keeper reply was lost",
+                            pending["context"]["safe_spot_fallback"]["last_error"],
+                        )
+                        self.assertFalse(
+                            controller._effective_farm_intent(goal)["use_safe_spots"]
+                        )
+                        owner = controller.storage.get_runtime(
+                            "background_farm_owner_v1", {}
+                        )
+                        self.assertFalse(owner["use_safe_spots"])
+                        self.assertEqual(False, controller.storage.get_runtime(
+                            f"background_farm_snapshot_v2:{goal['id']}", {}
+                        )["use_safe_spots"])
+                        self.assertTrue(broker.farm_use_safe_spots)
+                        self.assertEqual(
+                            not accepted, broker.farm_require_safe_wall
+                        )
+
+                        if not accepted:
+                            controller._update_farm_open_field_fallback(
+                                pending,
+                                changes={"next_retry_at_epoch": 0},
+                                reason="expire the retry delay in the focused test",
+                            )
+
+                        result = controller._manage_background_farm(
+                            goal,
+                            broker.observe(),
+                            controller.criteria.evaluate(goal, broker.observe()),
+                        )
+
+                        self.assertTrue(result["background_farm_open_field_fallback"])
+                        applied = controller.storage.active_campaign_phase(run["id"])
+                        self.assertEqual(
+                            "applied",
+                            applied["context"]["safe_spot_fallback"]["state"],
+                        )
+                        self.assertTrue(broker.farm_use_safe_spots)
+                        self.assertFalse(broker.farm_require_safe_wall)
+                        starts = [
+                            arguments
+                            for name, arguments in broker.calls
+                            if name == "autopilot"
+                            and arguments.get("action") == "start"
+                            and arguments.get("mode") == "farm"
+                        ]
+                        self.assertEqual(1 if accepted else 2, len(starts))
+                        self.assertTrue(
+                            all(
+                                arguments.get("use_safe_spots") is True
+                                and arguments.get("require_safe_wall") is False
+                                for arguments in starts
+                            )
+                        )
+                        self.assertEqual(
+                            {},
+                            controller.storage.get_runtime(
+                                "farm_tactic_stagnation_v1", {}
+                            ),
+                        )
+                    finally:
+                        controller.storage.close()
+
+    def test_open_field_fallback_retries_are_bounded_before_survival_handoff(self) -> None:
+        class AlwaysFailFallbackBroker(BackgroundFarmBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                if (
+                    name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "farm"
+                    and arguments.get("use_safe_spots") is False
+                ):
+                    self.calls.append((name, dict(arguments)))
+                    raise BrokerError("keeper mutation endpoint unavailable")
+                return super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = AlwaysFailFallbackBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="bounded-fallback-retries",
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae in room 566.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+
+                with self.assertRaises(BrokerError):
+                    controller._manage_background_farm(
+                        goal,
+                        broker.observe(),
+                        controller.criteria.evaluate(goal, broker.observe()),
+                    )
+                pending = controller._manage_background_farm(
+                    goal,
+                    broker.observe(),
+                    controller.criteria.evaluate(goal, broker.observe()),
+                )
+                self.assertTrue(
+                    pending["background_farm_open_field_fallback_pending"]
+                )
+                self.assertEqual(1, pending["attempt_count"])
+
+                for expected_attempt in (2, 3):
+                    active = controller.storage.active_campaign_phase(run["id"])
+                    controller._update_farm_open_field_fallback(
+                        active,
+                        changes={"next_retry_at_epoch": 0},
+                        reason="expire the retry delay in the focused test",
+                    )
+                    if expected_attempt < 3:
+                        with self.assertRaises(BrokerError):
+                            controller._manage_background_farm(
+                                goal,
+                                broker.observe(),
+                                controller.criteria.evaluate(goal, broker.observe()),
+                            )
+                        pending = controller._manage_background_farm(
+                            goal,
+                            broker.observe(),
+                            controller.criteria.evaluate(goal, broker.observe()),
+                        )
+                        self.assertTrue(
+                            pending["background_farm_open_field_fallback_pending"]
+                        )
+                        self.assertEqual(expected_attempt, pending["attempt_count"])
+                    else:
+                        terminal = controller._manage_background_farm(
+                            goal,
+                            broker.observe(),
+                            controller.criteria.evaluate(goal, broker.observe()),
+                        )
+
+                self.assertTrue(
+                    terminal["background_farm_open_field_fallback_failed"]
+                )
+                self.assertTrue(terminal["strategic_goal_preserved"])
+                self.assertEqual(3, terminal["attempt_count"])
+                self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertEqual("survive", broker.farm_mode)
+                starts = [
+                    arguments
+                    for name, arguments in broker.calls
+                    if name == "autopilot"
+                    and arguments.get("action") == "start"
+                    and arguments.get("mode") == "farm"
+                ]
+                self.assertEqual(3, len(starts))
+                self.assertTrue(
+                    all(arguments.get("use_safe_spots") is False for arguments in starts)
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.goal_lessons(
+                        statuses=["deferred"], goal_id=goal["id"]
+                    ),
+                )
             finally:
                 controller.storage.close()
 
@@ -15816,7 +19674,7 @@ class ControllerTests(unittest.TestCase):
                         ],
                         constraints={
                             "operator_notes": (
-                                "hunt=orc; assigned_room=27; use_safe_spots=true"
+                                "hunt=orc; assigned_room=27"
                             )
                         },
                     )
@@ -15873,19 +19731,237 @@ class ControllerTests(unittest.TestCase):
                 )
 
                 self.assertIsNotNone(result)
-                self.assertTrue(result["background_farm_assignment_deferred"])
+                self.assertTrue(result["background_farm_open_field_fallback"])
+                self.assertEqual("farm", broker.farm_mode)
+                self.assertFalse(broker.farm_use_safe_spots)
+                self.assertEqual(
+                    phase["id"], controller.storage.active_campaign_phase(run["id"])["id"]
+                )
+                self.assertEqual(
+                    "recent", result["deferral_evidence"]["source"]
+                )
+                self.assertEqual(
+                    245, result["deferral_evidence"]["record"]["pass"]
+                )
+                self.assertNotIn(
+                    "stale exhaustion", result["deferral_evidence"]["reason"]
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
+                )
+                self.assertIsNone(controller._planner_feedback(goal))
+            finally:
+                controller.storage.close()
+
+    def test_wall_assignment_deferral_does_not_bypass_new_death_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.room = {"num": 566, "name": "The Lowlands"}
+                broker.farm_did["deaths"] = 1
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                    "standing_where_assigned": True,
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="unsafe-wall-deferral",
+                        objective="Raise max HP to 101.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae in room 566.",
+                        "success_criteria": [
+                            {
+                                "id": "phase-hp-101",
+                                "kind": "numeric_threshold",
+                                "metric": "status.vitals.health.max",
+                                "operator": ">=",
+                                "value": 101,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 120, "max_minutes": 60},
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
+                )
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+                controller.storage.set_runtime(
+                    f"background_farm_snapshot_v2:{goal['id']}",
+                    {
+                        "counters": {
+                            "kills": 0,
+                            "deaths": 0,
+                            "withdrawals": 0,
+                            "mulligans": 0,
+                            "logoffs": 0,
+                            "deaths_in_safe_spot": 0,
+                            "deaths_in_proven_safe_spot": 0,
+                        },
+                        "launch_counters": {
+                            "kills": 0,
+                            "deaths": 0,
+                            "withdrawals": 0,
+                            "mulligans": 0,
+                            "logoffs": 0,
+                            "deaths_in_safe_spot": 0,
+                            "deaths_in_proven_safe_spot": 0,
+                        },
+                    },
+                )
+
+                result = controller._manage_background_farm(
+                    goal,
+                    broker.observe(),
+                    controller.criteria.evaluate(goal, broker.observe()),
+                )
+
+                self.assertTrue(result["switched_to_survival"])
                 self.assertEqual("survive", broker.farm_mode)
+                self.assertFalse(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "farm"
+                        and arguments.get("use_safe_spots") is False
+                        for name, arguments in broker.calls
+                    )
+                )
+                self.assertEqual(
+                    [],
+                    controller.storage.goal_events(
+                        goal["id"],
+                        kinds=["background_farm.safe_spot_fallback"],
+                        limit=10,
+                    ),
+                )
                 self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
-                self.assertEqual(
-                    "recent", result["failure"]["deferral_evidence"]["source"]
+                self.assertTrue(
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
                 )
-                self.assertEqual(
-                    245, result["failure"]["deferral_evidence"]["record"]["pass"]
+            finally:
+                controller.storage.close()
+
+    def test_non_wall_assignment_deferral_keeps_terminal_tactic_handling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_room = 566
+                broker.farm_hunt = "groundworm larva"
+                broker.farm_placement = {
+                    "assigned_room": 566,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "the room spawn cap is occupied by creatures this keeper "
+                        "will not safely fight"
+                    ),
+                    "standing_where_assigned": False,
+                }
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(
+                        request_id="non-wall-assignment-deferral",
+                        constraints={
+                            "operator_notes": (
+                                "hunt=groundworm larva; assigned_room=566; "
+                                "use_safe_spots=true"
+                            )
+                        },
+                    )
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Farm groundworm larvae in room 566.",
+                        "success_criteria": list(goal["success_criteria"]),
+                        "abandon_predicates": [],
+                        "context": {
+                            "room": 566,
+                            "target": "groundworm larva",
+                            "use_safe_spots": True,
+                            "fight_above_vigor": 80,
+                        },
+                    },
+                    mode="start",
                 )
-                self.assertNotIn("stale exhaustion", result["failure"]["reason"])
-                feedback = controller._planner_feedback(goal)
-                self.assertEqual(
-                    "farm_assignment_deferred", feedback["failure_context"]["kind"]
+                controller.storage.set_runtime(
+                    "background_farm_owner_v1",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "assigned_room": 566,
+                        "hunt": "groundworm larva",
+                    },
+                )
+
+                result = controller._manage_background_farm(
+                    goal,
+                    broker.observe(),
+                    controller.criteria.evaluate(goal, broker.observe()),
+                )
+
+                self.assertTrue(result["background_farm_assignment_deferred"])
+                self.assertIsNone(controller.storage.active_campaign_phase(run["id"]))
+                self.assertFalse(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "farm"
+                        and arguments.get("use_safe_spots") is False
+                        for name, arguments in broker.calls
+                    )
+                )
+                stagnation = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )[f"{goal['id']}|566|groundworm larva"]
+                self.assertEqual("farm_assignment_deferred", stagnation["kind"])
+                self.assertFalse(
+                    controller._farm_wall_search_only_deferral(stagnation)
                 )
             finally:
                 controller.storage.close()
@@ -16382,6 +20458,10 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(stopped["background_farm_survival_handoff"])
                 stagnations = controller.storage.get_runtime("farm_tactic_stagnation_v1", {})
                 self.assertIn(f"{goal['id']}|575|giant rat", stagnations)
+                self.assertEqual(
+                    "test",
+                    stagnations[f"{goal['id']}|575|giant rat"]["harness_revision"],
+                )
                 phase_blocker = controller._campaign_phase_grounding_blocker(
                     {
                         "kind": "farm",
@@ -16468,9 +20548,80 @@ class ControllerTests(unittest.TestCase):
                     },
                     goal_id=goal["id"],
                 )
+                open_field = controller._campaign_phase_grounding_blocker(
+                    {
+                        "kind": "farm",
+                        "context": {
+                            "room": 27,
+                            "target": "orc",
+                            "use_safe_spots": False,
+                        },
+                    },
+                    goal_id=goal["id"],
+                )
 
                 self.assertEqual("stagnated_farm_phase", blocked["kind"])
                 self.assertIsNone(different_room)
+                self.assertIsNone(open_field)
+                self.assertTrue(controller._research_may_vary_positioning(blocked))
+                self.assertEqual(
+                    {"class": "safe_spot_failure", "scope": "exact_tactic"},
+                    controller._research_rejection_disposition(blocked),
+                )
+                mixed = {
+                    **deferred,
+                    "deltas": {"deaths": 1, "withdrawals": 1},
+                    "live_overlevel_hostiles": [{"name": "troll", "level": 80}],
+                    "quarantine_reasons": ["the keeper observed a death"],
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_stagnation_v1", {key: mixed}
+                )
+                mixed_open_field = controller._campaign_phase_grounding_blocker(
+                    {
+                        "kind": "farm",
+                        "context": {
+                            "room": 27,
+                            "target": "orc",
+                            "use_safe_spots": False,
+                        },
+                    },
+                    goal_id=goal["id"],
+                )
+                self.assertEqual(
+                    "stagnated_farm_phase", mixed_open_field["kind"]
+                )
+                self.assertFalse(
+                    controller._research_may_vary_positioning(mixed_open_field)
+                )
+                self.assertFalse(controller._farm_wall_search_only_deferral(mixed))
+                for label, deltas in (
+                    ("mulligan", {"mulligans": 1}),
+                    ("logoff", {"logoffs": 1}),
+                    ("malformed", {"mulligans": "unknown"}),
+                    ("negative", {"logoffs": -1}),
+                    ("fractional", {"mulligans": 0.5}),
+                    ("infinite", {"logoffs": float("inf")}),
+                ):
+                    with self.subTest(danger_evidence=label):
+                        unsafe_wall_record = {
+                            **deferred,
+                            "use_safe_spots": True,
+                            "record": {"deltas": deltas},
+                        }
+                        self.assertFalse(
+                            controller._farm_wall_search_only_deferral(
+                                unsafe_wall_record
+                            )
+                        )
+                        self.assertFalse(
+                            controller._research_may_vary_positioning(
+                                {
+                                    "kind": "stagnated_farm_phase",
+                                    "evidence": unsafe_wall_record,
+                                }
+                            )
+                        )
                 self.assertFalse(
                     controller._farm_stagnation_blocks(
                         {
@@ -16638,7 +20789,7 @@ class ControllerTests(unittest.TestCase):
                 }
                 broker.farm_did = {"kills": 12, "deaths": 0, "withdrawals": 0}
                 broker.farm_room = 575
-                broker.farm_flee_below = 0.6
+                broker.farm_flee_below = 17 / 40
                 broker.room = {"num": 575, "name": "The King's Way"}
                 controller.broker = broker
                 controller.model = FixedModel()  # type: ignore[assignment]
@@ -16735,6 +20886,136 @@ class ControllerTests(unittest.TestCase):
                     controller.storage.get_runtime("farm_tactic_stagnation_v1", {}),
                 )
                 self.assertFalse(controller._farm_stagnation_blocks(record))
+            finally:
+                controller.storage.close()
+
+    def test_new_harness_revision_repairs_only_safe_implementation_stagnations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="repair-implementation-stagnation")
+                )["goal"]
+                prefix = f"{goal['id']}|"
+                safe_prior = {
+                    "goal_id": goal["id"],
+                    "room": 562,
+                    "assigned_room": 562,
+                    "target": "fungus beast",
+                    "recorded_at": "2026-08-25T00:00:00.000Z",
+                    "last_error": "ReferenceError: near is not defined",
+                    "harness_revision": "prior-exact-revision",
+                    "deltas": {},
+                }
+                legacy = {
+                    **safe_prior,
+                    "room": 563,
+                    "assigned_room": 563,
+                    "last_error": "near is not defined",
+                }
+                legacy.pop("harness_revision")
+                same_revision = {
+                    **safe_prior,
+                    "room": 564,
+                    "assigned_room": 564,
+                    "last_error": "near is not defined",
+                    "harness_revision": controller.config.harness.expected_revision,
+                }
+                ordinary_fault = {
+                    **safe_prior,
+                    "room": 565,
+                    "assigned_room": 565,
+                    "last_error": "keeper route placement failed",
+                }
+                retained_danger = {}
+                for offset, field in enumerate(
+                    (
+                        "deaths",
+                        "deaths_in_safe_spot",
+                        "deaths_in_proven_safe_spot",
+                        "withdrawals",
+                        "mulligans",
+                        "logoffs",
+                    ),
+                    start=566,
+                ):
+                    retained_danger[f"{prefix}{offset}|fungus beast"] = {
+                        **safe_prior,
+                        "room": offset,
+                        "assigned_room": offset,
+                        "deltas": {field: 1},
+                    }
+                values = {
+                    f"{prefix}562|fungus beast": safe_prior,
+                    f"{prefix}563|fungus beast": legacy,
+                    f"{prefix}564|fungus beast": same_revision,
+                    f"{prefix}565|fungus beast": ordinary_fault,
+                    **retained_danger,
+                }
+                controller.storage.set_runtime("farm_tactic_stagnation_v1", values)
+                death_quarantine = {
+                    "goal_id": goal["id"],
+                    "room": 562,
+                    "target": "fungus beast",
+                    "quarantine_reasons": ["the keeper observed a death"],
+                }
+                controller.storage.set_runtime(
+                    "farm_tactic_quarantine_v1", {"death": death_quarantine}
+                )
+                controller.storage.set_runtime(
+                    "research_recipe_exhaustion_v1", {goal["id"]: {"blocked": True}}
+                )
+                controller.storage.set_runtime(
+                    "safety_suppression_v1", {"goal_id": goal["id"]}
+                )
+                controller.storage.set_runtime(
+                    f"background_farm_route_failure_handled_v1:{goal['id']}", True
+                )
+                controller._set_planner_feedback(goal, "Use another farm room.")
+
+                repaired = controller._repair_revision_obsolete_farm_stagnations()
+
+                self.assertEqual(2, len(repaired))
+                retained = controller.storage.get_runtime(
+                    "farm_tactic_stagnation_v1", {}
+                )
+                self.assertNotIn(f"{prefix}562|fungus beast", retained)
+                self.assertNotIn(f"{prefix}563|fungus beast", retained)
+                self.assertIn(f"{prefix}564|fungus beast", retained)
+                self.assertIn(f"{prefix}565|fungus beast", retained)
+                self.assertTrue(set(retained_danger).issubset(retained))
+                self.assertFalse(controller._farm_stagnation_blocks(safe_prior))
+                self.assertTrue(controller._farm_stagnation_blocks(same_revision))
+                self.assertTrue(controller._farm_stagnation_blocks(ordinary_fault))
+                self.assertTrue(
+                    all(
+                        controller._farm_stagnation_blocks(record)
+                        for record in retained_danger.values()
+                    )
+                )
+                self.assertEqual(
+                    {goal["id"]: {"blocked": True}},
+                    controller.storage.get_runtime("research_recipe_exhaustion_v1", {}),
+                )
+                self.assertEqual(
+                    {"goal_id": goal["id"]},
+                    controller.storage.get_runtime("safety_suppression_v1"),
+                )
+                self.assertTrue(
+                    controller.storage.get_runtime(
+                        f"background_farm_route_failure_handled_v1:{goal['id']}"
+                    )
+                )
+                self.assertEqual(
+                    "Use another farm room.",
+                    controller._planner_feedback(goal)["message"],
+                )
+                self.assertEqual(
+                    {"death": death_quarantine},
+                    controller.storage.get_runtime("farm_tactic_quarantine_v1", {}),
+                )
             finally:
                 controller.storage.close()
 
@@ -16888,12 +21169,12 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_foreground_critical_health_starts_survival_keeper_once(self) -> None:
+    def test_foreground_critical_health_reconciles_survival_keeper_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
                 broker = BackgroundFarmBroker()
-                broker.farm_running = False
+                broker.farm_mode = "survive"
                 broker.vitals["health"] = {"current": 20, "max": 100}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
@@ -16904,20 +21185,30 @@ class ControllerTests(unittest.TestCase):
                 second = controller.turn()
 
                 self.assertTrue(first["survival_interrupt"])
-                self.assertTrue(first["background_farm"]["survival_keeper_started"])
+                self.assertTrue(first["background_farm"]["already_running"])
+                self.assertTrue(
+                    first["background_farm"]["survival_policy_reconciled"]
+                )
                 self.assertTrue(second["survival_interrupt"])
                 self.assertTrue(second["background_farm"]["already_running"])
+                self.assertFalse(
+                    second["background_farm"]["survival_policy_reconciled"]
+                )
                 starts = [
                     arguments
                     for name, arguments in broker.calls
                     if name == "autopilot" and arguments.get("action") == "start"
                 ]
                 self.assertEqual(1, len(starts))
-                self.assertEqual("survive", starts[0]["mode"])
-                self.assertEqual("", starts[0]["hunt"])
-                self.assertIsNone(starts[0]["assigned_room"])
-                self.assertEqual(0, starts[0]["bank_above"])
-                self.assertFalse(starts[0]["break_out_via_logoff"])
+                for start in starts:
+                    self.assertEqual("survive", start["mode"])
+                    self.assertEqual("", start["hunt"])
+                    self.assertIsNone(start["assigned_room"])
+                    self.assertEqual(0, start["bank_above"])
+                    self.assertEqual(0.95, start["rest_below"])
+                    self.assertEqual(0.75, start["flee_below"])
+                    self.assertFalse(start["break_out_via_logoff"])
+                    self.assertFalse(start["automated_pleas"])
                 self.assertEqual("active", controller.storage.goal(goal["id"])["status"])
                 events = controller.storage.goal_events(
                     goal["id"], kinds=["survival.interrupt"], limit=20
@@ -16966,7 +21257,9 @@ class ControllerTests(unittest.TestCase):
                 broker = BackgroundFarmBroker()
                 broker.farm_room = 535
                 broker.room = {"num": 535, "name": "West Merchant Way through Ilerian Woods"}
-                broker.vitals["health"] = {"current": 19, "max": 26}
+                # 11/26 is just below the controller's 17/40 farm line while
+                # remaining above the separate 40% critical-health interrupt.
+                broker.vitals["health"] = {"current": 11, "max": 26}
                 broker.farm_did.update({"kills": 4, "withdrawals": 0})
                 broker.farm_journal = [
                     {
@@ -17013,7 +21306,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.storage.close()
 
-    def test_critical_farm_recovery_preserves_active_phase_and_tactic(self) -> None:
+    def test_critical_farm_retasks_to_survival_without_quarantining_tactic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller = BotController(config(Path(temporary)))
             try:
@@ -17023,8 +21316,24 @@ class ControllerTests(unittest.TestCase):
                     "num": 535,
                     "name": "West Merchant Way through Ilerian Woods",
                 }
-                broker.vitals["health"] = {"current": 10, "max": 26}
+                broker.vitals["health"] = {"current": 1, "max": 39}
+                broker.farm_activity = "fighting from a proven safe spot"
+                broker.farm_safe_spot = {
+                    "works": True,
+                    "room": 535,
+                    "col": 44,
+                    "row": 32,
+                }
                 broker.farm_did.update({"kills": 4, "withdrawals": 0})
+                broker.farm_placement = {
+                    "assigned_room": 535,
+                    "assignment_deferred": True,
+                    "assignment_deferred_reason": (
+                        "3 top-ranked walls each failed 3 complete pull window(s); "
+                        "stopping the wall search in this room"
+                    ),
+                    "standing_where_assigned": True,
+                }
                 broker.farm_journal = [
                     {
                         "at": 1000 + index,
@@ -17081,13 +21390,26 @@ class ControllerTests(unittest.TestCase):
                 result = controller.turn()
 
                 self.assertTrue(result["survival_interrupt"])
-                self.assertTrue(result["background_farm"]["farm_recovery_preserved"])
-                self.assertFalse(result["background_farm"]["switched_to_survival"])
-                self.assertEqual("farm", broker.farm_mode)
+                self.assertTrue(
+                    result["background_farm"]["critical_recovery_handoff"]
+                )
+                self.assertTrue(result["background_farm"]["switched_to_survival"])
+                self.assertEqual("survive", broker.farm_mode)
                 self.assertTrue(broker.farm_running)
                 active = controller.storage.active_campaign_phase(run["id"])
                 self.assertEqual(phase["id"], active["id"])
                 self.assertEqual("active", active["status"])
+                self.assertTrue(active["context"]["use_safe_spots"])
+                self.assertNotIn("safe_spot_fallback", active["context"])
+                self.assertFalse(
+                    any(
+                        name == "autopilot"
+                        and arguments.get("action") == "start"
+                        and arguments.get("mode") == "farm"
+                        and arguments.get("use_safe_spots") is False
+                        for name, arguments in broker.calls
+                    )
+                )
                 self.assertEqual(
                     {}, controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
                 )
@@ -17099,11 +21421,12 @@ class ControllerTests(unittest.TestCase):
                 )
                 events = controller.storage.goal_events(
                     goal["id"],
-                    kinds=["background_farm.critical_recovery_monitored"],
+                    kinds=["background_farm.critical_recovery_handoff"],
                     limit=10,
                 )
                 self.assertEqual(1, len(events))
                 self.assertTrue(events[0]["data"]["campaign_phase_preserved"])
+                self.assertTrue(events[0]["data"]["ownership_preserved"])
             finally:
                 controller.storage.close()
 
@@ -17118,7 +21441,7 @@ class ControllerTests(unittest.TestCase):
                     "name": "West Merchant Way through Ilerian Woods",
                 }
                 broker.vitals["health"] = {"current": 7, "max": 26}
-                broker.farm_flee_below = 0.7
+                broker.farm_flee_below = 17 / 40
                 controller.broker = broker
                 source_verify_safe_rooms(controller, 100)
                 goal = controller.storage.submit_goal(
@@ -17258,7 +21581,7 @@ class ControllerTests(unittest.TestCase):
                     "num": 535,
                     "name": "West Merchant Way through Ilerian Woods",
                 }
-                broker.farm_flee_below = 0.6
+                broker.farm_flee_below = 17 / 40
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
                     goal_payload(
@@ -17305,12 +21628,13 @@ class ControllerTests(unittest.TestCase):
 
                 completion = controller.criteria.evaluate(goal, broker.observe())
                 journal: list[dict[str, object]] = []
+                kill_time_base = int(time.time() * 1000)
                 for cycle in range(50):
                     for offset in range(5):
                         kill_number = cycle * 5 + offset + 1
                         journal.append(
                             {
-                                "at": 1000 + kill_number,
+                                "at": kill_time_base + kill_number,
                                 "pass": kill_number,
                                 "what": "killed",
                                 "target": "giant rat",
@@ -17319,7 +21643,7 @@ class ControllerTests(unittest.TestCase):
                     broker.farm_journal = list(journal)
                     broker.farm_did["kills"] = (cycle + 1) * 5
                     broker.farm_did["withdrawals"] = cycle + 1
-                    broker.vitals["health"] = {"current": 15, "max": 26}
+                    broker.vitals["health"] = {"current": 11, "max": 26}
                     recovering = controller._manage_background_farm(
                         goal, broker.observe(), completion
                     )
@@ -17349,6 +21673,7 @@ class ControllerTests(unittest.TestCase):
                     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
                 )[phase["id"]]
                 self.assertEqual(250, lease["cumulative_kills"])
+                self.assertEqual(250, lease["phase_target_kills"])
                 self.assertIsNone(controller.campaign.budget_exhausted(active))
                 self.assertTrue(broker.farm_running)
                 self.assertFalse(
@@ -17506,25 +21831,315 @@ class ControllerTests(unittest.TestCase):
                 broker = BackgroundFarmBroker()
                 controller.broker = broker
                 goal = controller.storage.submit_goal(goal_payload(request_id="actual-farm-targets"))["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Kill one giant rat, excluding nuisance prey.",
+                        "success_criteria": [
+                            {
+                                "id": "one-exact-target-kill",
+                                "kind": PHASE_KEEPER_TARGET_KILLS,
+                                "count": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 20, "max_minutes": 30},
+                        "context": {
+                            "target": "giant rat",
+                            "room": broker.farm_room,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
                 observation = broker.observe()
                 status = broker.call_tool(
                     "autopilot", {"agent": "primary", "action": "status"}
                 )
                 status["did"]["kills"] = 2
+                kill_time_base = int(time.time() * 1000)
                 status["journal"] = [
-                    {"at": 1001, "pass": 11, "what": "killed", "target": "baby spider"},
-                    {"at": 1002, "pass": 12, "what": "killed", "target": "giant rat"},
+                    {
+                        "at": kill_time_base + 1,
+                        "pass": 11,
+                        "what": "killed",
+                        "target": "baby spider",
+                    },
+                    {
+                        "at": kill_time_base + 2,
+                        "pass": 12,
+                        "what": "killed",
+                        "target": "giant rat",
+                    },
                 ]
 
                 evidence = controller._farm_status_evidence(goal, observation, status)
 
                 self.assertEqual({"baby spider": 1, "giant rat": 1}, evidence["kills_by_target"])
+                lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+                self.assertEqual(2, lease["phase_kills"])
+                self.assertEqual(1, lease["phase_target_kills"])
+                phase_outcome = controller.campaign.evaluate_phase(
+                    goal, run, phase, observation
+                )
+                self.assertTrue(phase_outcome.completed)
+                self.assertIn(
+                    "verified phase-local keeper target kills 1; required 1",
+                    phase_outcome.detail["criteria"][0]["detail"],
+                )
                 by_target = {
                     item["target"]: item["kills"]
                     for item in controller.learning.combat_summary()["by_target"]
                 }
                 self.assertEqual(1, by_target["baby spider"])
                 self.assertEqual(1, by_target["giant rat"])
+            finally:
+                controller.storage.close()
+
+    def test_phase_target_kill_receipt_is_idempotent_across_snapshot_crash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="target-kill-crash-idempotency")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Verify two giant-rat kills.",
+                        "success_criteria": [
+                            {
+                                "id": "two-rats",
+                                "kind": PHASE_KEEPER_TARGET_KILLS,
+                                "count": 2,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 20, "max_minutes": 30},
+                        "context": {
+                            "target": "giant rat",
+                            "room": broker.farm_room,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                phase_started_at = (
+                    controller._phase_started_at_milliseconds(phase) or 0
+                )
+                kill_at = max(int(time.time() * 1000), phase_started_at) + 10
+                stale_snapshot = {
+                    "phase_id": phase["id"],
+                    "counters": {"kills": 0},
+                    "last_kill_at": kill_at - 1,
+                    "pass_floor": 1,
+                }
+                snapshot_key = f"background_farm_snapshot_v2:{goal['id']}"
+                controller.storage.set_runtime(snapshot_key, stale_snapshot)
+                observation = broker.observe()
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+                status["did"]["kills"] = 1
+                status["journal"] = [
+                    {
+                        "at": kill_at,
+                        "pass": 2,
+                        "what": "killed",
+                        "target": "giant rat",
+                    }
+                ]
+
+                controller._farm_status_evidence(goal, observation, status)
+                first_lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+                self.assertEqual(1, first_lease["phase_target_kills"])
+
+                # Simulate a crash after the lease write but before the cursor
+                # snapshot commits, then replay the exact same keeper status.
+                controller.storage.set_runtime(snapshot_key, stale_snapshot)
+                controller._farm_status_evidence(goal, observation, status)
+                replayed_lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+
+                self.assertEqual(1, replayed_lease["phase_target_kills"])
+                self.assertEqual(1, replayed_lease["phase_kills"])
+                self.assertFalse(
+                    controller.campaign.evaluate_phase(
+                        goal, run, phase, observation
+                    ).completed
+                )
+            finally:
+                controller.storage.close()
+
+    def test_phase_target_kill_survives_keeper_counter_and_pass_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="target-kill-session-reset")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Verify one giant-rat kill after restart.",
+                        "success_criteria": [
+                            {
+                                "id": "one-rat-after-restart",
+                                "kind": PHASE_KEEPER_TARGET_KILLS,
+                                "count": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 20, "max_minutes": 30},
+                        "context": {
+                            "target": "giant rat",
+                            "room": broker.farm_room,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                phase_started_at = (
+                    controller._phase_started_at_milliseconds(phase) or 0
+                )
+                prior_kill_at = max(
+                    int(time.time() * 1000), phase_started_at
+                ) + 10
+                controller.storage.set_runtime(
+                    f"background_farm_snapshot_v2:{goal['id']}",
+                    {
+                        "phase_id": phase["id"],
+                        "counters": {"kills": 10},
+                        "launch_counters": {"kills": 10},
+                        "last_kill_at": prior_kill_at,
+                        "pass_floor": 100,
+                    },
+                )
+                observation = broker.observe()
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+                status["did"]["kills"] = 1
+                status["journal"] = [
+                    {
+                        "at": prior_kill_at + 1,
+                        "pass": 1,
+                        "what": "killed",
+                        "target": "giant rat",
+                    }
+                ]
+
+                evidence = controller._farm_status_evidence(
+                    goal, observation, status
+                )
+                lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+
+                self.assertEqual(0, evidence["deltas"]["kills"])
+                self.assertEqual({"giant rat": 1}, evidence["kills_by_target"])
+                self.assertEqual(1, lease["phase_target_kills"])
+                self.assertTrue(
+                    controller.campaign.evaluate_phase(
+                        goal, run, phase, observation
+                    ).completed
+                )
+            finally:
+                controller.storage.close()
+
+    def test_prelaunch_kill_history_cannot_satisfy_phase_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                controller.broker = broker
+                goal = controller.storage.submit_goal(
+                    goal_payload(request_id="target-kill-launch-boundary")
+                )["goal"]
+                run = controller.storage.ensure_campaign_run(goal)
+                phase = controller.storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Verify one post-launch giant-rat kill.",
+                        "success_criteria": [
+                            {
+                                "id": "one-post-launch-rat",
+                                "kind": PHASE_KEEPER_TARGET_KILLS,
+                                "count": 1,
+                            }
+                        ],
+                        "abandon_predicates": [],
+                        "budget": {"max_actions": 20, "max_minutes": 30},
+                        "context": {
+                            "target": "giant rat",
+                            "room": broker.farm_room,
+                            "use_safe_spots": True,
+                        },
+                    },
+                    mode="start",
+                )
+                phase_started_at = (
+                    controller._phase_started_at_milliseconds(phase) or 0
+                )
+                boundary_at = max(
+                    int(time.time() * 1000), phase_started_at
+                ) + 10
+                controller.storage.set_runtime(
+                    f"background_farm_launch_boundary_v1:{goal['id']}",
+                    {
+                        "goal_id": goal["id"],
+                        "phase_id": phase["id"],
+                        "at_ms": boundary_at,
+                    },
+                )
+                observation = broker.observe()
+                status = broker.call_tool(
+                    "autopilot", {"agent": "primary", "action": "status"}
+                )
+                status["did"]["kills"] = 2
+                status["journal"] = [
+                    {
+                        "at": boundary_at - 1,
+                        "pass": 1,
+                        "what": "killed",
+                        "target": "giant rat",
+                    },
+                    {
+                        "at": boundary_at + 1,
+                        "pass": 2,
+                        "what": "killed",
+                        "target": "giant rat",
+                    },
+                ]
+
+                evidence = controller._farm_status_evidence(
+                    goal, observation, status
+                )
+                lease = controller.storage.get_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+                )[phase["id"]]
+
+                self.assertEqual({"giant rat": 1}, evidence["kills_by_target"])
+                self.assertEqual(1, lease["phase_target_kills"])
+                self.assertEqual(1, len(lease["target_kill_receipts"]))
             finally:
                 controller.storage.close()
 
@@ -17535,7 +22150,7 @@ class ControllerTests(unittest.TestCase):
                 broker = BackgroundFarmBroker()
                 broker.farm_room = 575
                 broker.room = {"num": 577, "name": "The Twisted Wood"}
-                broker.vitals["health"] = {"current": 17, "max": 26}
+                broker.vitals["health"] = {"current": 11, "max": 26}
                 broker.vitals["vigor"] = {"value": 93, "scale_max": 200, "rested": True}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
@@ -17584,9 +22199,11 @@ class ControllerTests(unittest.TestCase):
                 broker = BackgroundFarmBroker()
                 broker.farm_room = 557
                 broker.farm_activity = "travelling"
-                broker.farm_flee_below = 0.85
+                broker.farm_flee_below = 17 / 40
                 broker.room = {"num": 576, "name": "The King's Way"}
-                broker.vitals["health"] = {"current": 25, "max": 30}
+                # 11/26 is below the 17/40 farm retreat line but remains above
+                # the separate 40% critical-health interrupt.
+                broker.vitals["health"] = {"current": 11, "max": 26}
                 controller.broker = broker
                 goal = controller.storage.submit_goal(
                     goal_payload(
@@ -17678,6 +22295,171 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("survive", broker.farm_mode)
                 self.assertEqual(1, controller.learning.combat_summary()["total_deaths"])
                 self.assertEqual(1, len(controller.storage.events(kinds=["character.died"])["events"]))
+            finally:
+                controller.storage.close()
+
+    def test_survival_mode_death_is_reconciled_once_without_safe_spot_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                broker = BackgroundFarmBroker()
+                broker.farm_mode = "survive"
+                broker.farm_activity = "recovering at safe wall"
+                broker.vitals["health"] = {"current": 5, "max": 39}
+                broker.last_death = {
+                    "at": 54321,
+                    "died_in": "The Ocean",
+                    "room_num": 562,
+                    "last_health": 1,
+                    "hunting": "fungus beast",
+                    "post_mortem": "postmortem.json",
+                }
+                original_observe = broker.observe
+
+                def observe_with_keeper_death() -> dict[str, object]:
+                    observation = original_observe()
+                    observation["autopilot"] = {
+                        "running": True,
+                        "mode": broker.farm_mode,
+                        "activity": broker.farm_activity,
+                        "last_death": copy.deepcopy(broker.last_death),
+                        "policy": {
+                            "hunt": broker.farm_hunt,
+                            "restBelow": broker.farm_rest_below,
+                        },
+                    }
+                    return observation
+
+                broker.observe = observe_with_keeper_death  # type: ignore[method-assign]
+                controller.broker = broker
+                controller.storage.submit_goal(
+                    goal_payload(request_id="survival-mode-death")
+                )
+
+                controller.turn()
+                controller.turn()
+
+                deaths = controller.storage.events(kinds=["character.died"])["events"]
+                self.assertEqual(1, len(deaths))
+                self.assertEqual(1, controller.learning.combat_summary()["total_deaths"])
+                self.assertFalse(deaths[0]["data"]["safe_spot_invalidated"])
+                self.assertEqual(
+                    "unchanged", deaths[0]["data"]["tactic_disposition"]
+                )
+                self.assertEqual(
+                    {}, controller.storage.get_runtime("farm_tactic_quarantine_v1", {})
+                )
+                cursor = controller.storage.get_runtime("character_death_cursor_v1")
+                self.assertTrue(cursor["accounted"])
+                self.assertEqual("keeper:primary:54321", cursor["death_id"])
+            finally:
+                controller.storage.close()
+
+    def test_underworld_transition_reconciles_death_without_keeper_mode_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.storage.submit_goal(
+                    goal_payload(request_id="underworld-death-fallback")
+                )
+                before = SimulatedBroker().observe()
+                before["status"]["vitals"]["health"] = {
+                    "current": 17,
+                    "max": 40,
+                }
+                before["look"]["vitals"]["health"] = {
+                    "current": 17,
+                    "max": 40,
+                }
+                after = copy.deepcopy(before)
+                after["look"]["room"] = {"num": 666, "name": "The Underworld"}
+                after["status"]["vitals"]["health"] = {
+                    "current": 1,
+                    "max": 39,
+                }
+                after["look"]["vitals"]["health"] = {
+                    "current": 1,
+                    "max": 39,
+                }
+
+                reconciled = controller._reconcile_durable_death(after, before)
+                repeated = controller._reconcile_durable_death(after, before)
+
+                self.assertEqual("underworld_transition", reconciled["source"])
+                self.assertTrue(repeated["duplicate"])
+                self.assertEqual(
+                    1,
+                    len(
+                        controller.storage.events(kinds=["character.died"])[
+                            "events"
+                        ]
+                    ),
+                )
+            finally:
+                controller.storage.close()
+
+    def test_stale_keeper_receipt_does_not_mask_a_fresh_underworld_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                base = SimulatedBroker().observe()
+                base["status"]["vitals"]["health"] = {
+                    "current": 40,
+                    "max": 40,
+                }
+                base["look"]["vitals"]["health"] = {
+                    "current": 40,
+                    "max": 40,
+                }
+                first_receipt = copy.deepcopy(base)
+                first_receipt["autopilot"] = {
+                    "last_death": {"at": 1000, "hunting": "slime"}
+                }
+                controller._reconcile_durable_death(first_receipt, None)
+
+                before_second = copy.deepcopy(base)
+                before_second["status"]["vitals"]["health"]["max"] = 39
+                before_second["look"]["vitals"]["health"]["max"] = 39
+                after_second = copy.deepcopy(before_second)
+                after_second["look"]["room"] = {
+                    "num": 666,
+                    "name": "The Underworld",
+                }
+                after_second["status"]["vitals"]["health"] = {
+                    "current": 1,
+                    "max": 38,
+                }
+                after_second["look"]["vitals"]["health"] = {
+                    "current": 1,
+                    "max": 38,
+                }
+                after_second["autopilot"] = copy.deepcopy(
+                    first_receipt["autopilot"]
+                )
+
+                raw = controller._reconcile_durable_death(
+                    after_second, before_second
+                )
+                updated_receipt = copy.deepcopy(after_second)
+                updated_receipt["autopilot"]["last_death"] = {
+                    "at": 2000,
+                    "hunting": "slime",
+                }
+                corroborated = controller._reconcile_durable_death(
+                    updated_receipt, after_second
+                )
+
+                self.assertEqual("underworld_transition", raw["source"])
+                self.assertTrue(corroborated["corroborated"])
+                self.assertEqual(
+                    2,
+                    len(
+                        controller.storage.events(kinds=["character.died"])[
+                            "events"
+                        ]
+                    ),
+                )
+                self.assertEqual(2, controller.learning.combat_summary()["total_deaths"])
             finally:
                 controller.storage.close()
 

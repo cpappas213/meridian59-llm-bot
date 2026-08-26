@@ -32,9 +32,115 @@ class BrokerTests(unittest.TestCase):
                     "8901",
                     "--dashboard",
                     "8902",
+                    "--in-process",
                 ],
                 command,
             )
+
+    def test_travel_hides_and_disables_upstream_errand_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "travel": Tool(
+                    "travel",
+                    "Travel to a room.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "to": {"type": ["string", "number"]},
+                            "run_errands": {"type": "boolean"},
+                        },
+                        "required": ["agent", "to"],
+                    },
+                )
+            }
+            sent: dict[str, object] = {}
+
+            def fake_rpc(
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 30,
+            ) -> dict[str, object]:
+                sent.update(params or {})
+                return {"content": [{"text": "{}"}]}
+
+            broker.rpc = fake_rpc  # type: ignore[method-assign]
+
+            view = broker._manifest["travel"].planner_view()
+            result = broker.call_tool(
+                "travel",
+                {"agent": "primary", "to": 42, "run_errands": True},
+                mutation=True,
+            )
+
+            self.assertNotIn("run_errands", view["input_schema"]["properties"])
+            self.assertEqual({}, result)
+            self.assertEqual(
+                {"agent": "primary", "to": 42, "run_errands": False},
+                sent["arguments"],
+            )
+
+    def test_experimental_upstream_controls_are_not_planner_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "jump": Tool(
+                    "jump",
+                    "Attempt a declared ledge jump.",
+                    {"type": "object", "properties": {}},
+                ),
+                "autopilot": Tool(
+                    "autopilot",
+                    "Configure the keeper.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["start", "stop"],
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["survive", "farm", "idle", "tick"],
+                            },
+                            "travel_deaths_allowed": {"type": "number"},
+                        },
+                    },
+                ),
+            }
+            sent: dict[str, object] = {}
+
+            def fake_rpc(
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 30,
+            ) -> dict[str, object]:
+                sent.update(params or {})
+                return {"content": [{"text": "{}"}]}
+
+            broker.rpc = fake_rpc  # type: ignore[method-assign]
+
+            visible = {tool["name"]: tool for tool in broker.planner_tools()}
+            autopilot_schema = visible["autopilot"]["input_schema"]["properties"]
+
+            self.assertNotIn("jump", visible)
+            self.assertNotIn("travel_deaths_allowed", autopilot_schema)
+            self.assertEqual(
+                ["survive", "farm", "idle"],
+                autopilot_schema["mode"]["enum"],
+            )
+            broker.call_tool(
+                "autopilot",
+                {
+                    "action": "start",
+                    "mode": "farm",
+                    "travel_deaths_allowed": 3,
+                },
+            )
+            self.assertEqual(0, sent["arguments"]["travel_deaths_allowed"])
+            with self.assertRaisesRegex(ValueError, "unsupported experimental"):
+                broker.call_tool("autopilot", {"mode": "tick"})
 
     def test_attach_refuses_broker_missing_configured_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -240,6 +346,83 @@ class BrokerTests(unittest.TestCase):
 
             self.assertEqual(5, observation["abilities"]["spells"][0]["ability"])
             self.assertIn(("abilities", {"agent": "primary", "known_only": True}), calls)
+
+    def test_observe_uses_only_cached_tactical_reads_during_keeper_retreat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                name: Tool(
+                    name,
+                    name,
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            **(
+                                {
+                                    "cached": {"type": "boolean"},
+                                    "minimap": {"type": "boolean"},
+                                }
+                                if name == "look"
+                                else {}
+                            ),
+                            **({"brief": {"type": "boolean"}} if name == "status" else {}),
+                            **({"action": {"type": "string"}} if name == "autopilot" else {}),
+                        },
+                        "required": ["agent"],
+                    },
+                )
+                for name in ("look", "status", "inventory", "spells", "autopilot")
+            }
+            broker._observation_cache = {
+                "look": {
+                    "room": {"num": 562, "name": "The Ocean"},
+                    "vitals": {"health": {"current": 30, "max": 40}},
+                },
+                "status": {"vitals": {"health": {"current": 30, "max": 40}}},
+                "inventory": {"items": [{"id": 7, "name": "mace"}]},
+                "spells": {"known": True, "spells": []},
+            }
+            calls: list[tuple[str, dict[str, object]]] = []
+
+            def fake_call(
+                name: str, arguments: dict[str, object], **_kwargs: object
+            ) -> dict[str, object]:
+                calls.append((name, dict(arguments)))
+                if name == "autopilot":
+                    return {
+                        "running": True,
+                        "mode": "survive",
+                        "activity": "retreating to Brownestone",
+                        "policy": {"restBelow": 0.9},
+                    }
+                if name == "look" and arguments.get("cached") is True:
+                    return {
+                        "room": {"num": 563, "name": "Brownestone"},
+                        "vitals": {"health": {"current": 5, "max": 40}},
+                        "minimap": {"text": "@", "walls": [[0, 0]]},
+                    }
+                raise AssertionError(f"unexpected bulk read during retreat: {name}")
+
+            broker.call_tool = fake_call  # type: ignore[method-assign]
+
+            observation = broker.observe()
+
+            self.assertEqual(
+                [
+                    ("autopilot", {"agent": "primary", "action": "status"}),
+                    (
+                        "look",
+                        {"agent": "primary", "cached": True, "minimap": True},
+                    ),
+                ],
+                calls,
+            )
+            self.assertEqual("tactical_cache", observation["freshness"]["mode"])
+            self.assertEqual(5, observation["status"]["vitals"]["health"]["current"])
+            self.assertEqual(563, observation["status"]["where"]["num"])
+            self.assertEqual("mace", observation["inventory"]["items"][0]["name"])
+            self.assertNotIn("walls", observation["look"]["minimap"])
 
     def test_planner_view_hides_controller_owned_agent_argument(self) -> None:
         schema = {

@@ -42,21 +42,22 @@ flowchart LR
 
 ### 2.1 Harness checkout
 
-The deployment shall use an independent checkout of
-[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), consumed through
-the public integration fork and pinned to an
-explicit tested commit. The preferred implementation is a Git submodule at
-`vendor/m59-harness`; a configured external checkout is also allowed for local
-development.
+The deployment shall use an independent checkout derived from
+[`tpeppers/m59-harness`](https://github.com/tpeppers/m59-harness), pinned to an
+explicit tested commit. The preferred implementation is the public integration
+fork as a Git submodule at `vendor/m59-harness`; a configured external checkout is
+also allowed for local development.
 
 Rules for the upstream boundary:
 
-- No copied source snapshot and no permanent private fork.
+- No copied source snapshot and no private fork; integration patches remain public
+  and retain the authoritative upstream as their base.
 - No controller behavior injected into the harness broker.
 - The controller consumes the broker's documented HTTP JSON-RPC/MCP contract and
   reads only documented status/event data.
-- If a required game primitive is missing, implement the generic primitive in the
-  upstream project with the maintainer, then advance the pinned revision here.
+- If a required game primitive is missing, implement the generic primitive on a
+  public integration branch, offer it upstream to the maintainer, then advance the
+  exact tested pin here without waiting on a moving branch.
 - Keep compatibility checks in an adapter so upstream changes do not spread
   through planner, policy, or goal code.
 - Never start a second broker for an account already owned by a broker. Attach to
@@ -71,7 +72,10 @@ behaviors, but contains no LLM and does not own product goals.
 
 The broker must retain responsibility for packet rate limits. The controller adds
 a stricter rule: only one mutating broker request may be in flight for a
-character. Read-after-write verification also remains sequential.
+character. Read-after-write verification also remains sequential. The bot-side
+broker adapter uses keeper status and cached pushed look state as a zero-packet
+first observation stage; while urgent keeper work owns survival it withholds
+packet-paced bulk refreshes and labels retained slow context as cached or unknown.
 
 ### 2.3 Controller service
 
@@ -80,8 +84,8 @@ The controller is one long-lived process with these internal modules:
 | Module | Responsibility |
 |---|---|
 | Goal manager | Transactional active-goal/queue state machine, proposals, completion evidence, reversible replacement, and a commitment guard against premature active-goal cancellation. |
-| Reconciler | Compares durable intent with current broker/game state after start, reconnect, timeout, or ambiguous action result. |
-| Planner | Produces bounded next-step plans using the local model and an intentionally small capability set. |
+| Reconciler | Compares durable intent with current broker/game state after start, reconnect, timeout, ambiguous action result, or death. It consumes keeper death IDs before mode-specific returns and falls back to a fresh Underworld transition or max-HP decrement. |
+| Planner | Produces bounded next-step plans using the local model and an intentionally small capability set. Deterministic failures open a durable state-fingerprinted retry circuit after bounded repair is exhausted. |
 | Executor | Calls one broker action at a time, records request/result, then obtains verification evidence. A bounded controller-owned tactical composite may sequence several such calls while retaining exclusive turn ownership. |
 | Authority engine | Deterministically enforces no-cheating rules and attaches non-blocking consequence guidance before execution. The LLM cannot override hard denials. |
 | Risk manager | Interrupts goal work for survival, recovery, or safe-idle behavior. Banking remains an informed planner tactic, not a risk-manager gate. |
@@ -105,7 +109,9 @@ logical collections are:
 - `events` with a monotonic cursor;
 - `persona_versions`;
 - `notification_deliveries` for exactly-once-per-sink behavior;
-- `runtime_leases` for controller singleton ownership; and
+- `runtime_leases` for controller singleton ownership;
+- durable runtime key/value receipts for death-ID reconciliation and planner
+  retry circuits; and
 - `schema_migrations`.
 
 SQLite stores no account password or API keys. Credentials remain in a private
@@ -306,6 +312,25 @@ sequenceDiagram
 6. Active goal resumes only after risk and authority checks.
 7. Startup/recovery event is emitted, including downtime and reconciled state.
 
+### 4.4 Survival observation and death accounting
+
+1. Controller requests broker-local keeper status and cached pushed look state.
+2. If keeper activity is urgent or current health is below its recovery boundary,
+   current look room/vitals replace older status values and retained
+   inventory/spell context is labelled cached or unknown; no packet-paced bulk
+   observation enters the keeper's survival window.
+3. Before any `farm`, `survive`, inactive-goal, or idle early return, controller
+   reconciles the keeper's durable `last_death` identity. A fresh Underworld
+   transition or max-HP decrement covers the interval before that receipt arrives.
+4. The durable death cursor suppresses duplicate event and combat accounting,
+   including across restart and a late receipt that corroborates a raw fallback.
+5. Death recording is factual, not safe-spot disposition. Retaliation from the
+   already engaged or pulled monster may continue at a valid wall; only evidence
+   that a new monster can acquire the character or an explicit placement/geometry
+   failure retires that coordinate.
+6. When urgent keeper ownership ends, the next observation refreshes full status,
+   inventory, spells, equipment, and abilities normally.
+
 ## 5. Failure containment
 
 | Failure | Required behavior |
@@ -314,7 +339,7 @@ sequenceDiagram
 | Broker unavailable | Do not spawn duplicates blindly; inspect singleton/health, reconnect or restart configured broker, then reconcile. |
 | Game server unavailable | Preserve state, stop inference hot-looping, retry connection with jittered backoff, alert on outage/recovery. |
 | Ambiguous action timeout | Mark attempt `unknown`, observe actual state, classify succeeded/failed/unknown before any retry. |
-| Invalid model output | Reject without action, record validation code, retry with compact correction prompt within budget, then safe fallback. |
+| Invalid model output or deterministic prompt-budget/plan failure | Reject without action, record the validation code, permit only the bounded correction/repair path, then durably suppress the same operation and material-state fingerprint until it changes. Preserve the goal and survival owner. |
 | Authority violation proposed | Reject deterministically, block or replan, emit audit event. Repeated proposals trigger degraded mode. |
 | Database write failure | Stop game mutation immediately; continue only survival behavior that can operate without corrupting durable intent. |
 | Notification sink failure | Preserve event, retry sink independently, never block game survival or goal state commits. |

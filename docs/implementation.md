@@ -6,9 +6,12 @@ in the [operations runbook](requirements/operations.md).
 
 ## Runtime topology
 
-The controller is a companion process, not a harness fork. The harness is pinned
-to the public integration fork as a Git submodule at tested revision
-`e6620d6b70a9e76feb7f5e2816b278f8a8ca946a`.
+The controller is a companion process. The harness submodule is pinned to the
+public integration fork at tested revision
+`6ce42e806f1d2941e9eaecdeaff4809964dce230`, based directly on the frozen upstream
+main revision `50af50e7dfa09ed1cb66b31f60dd9a464cb55d83`. Controller-managed launches use
+the harness's explicit `--in-process` mode so ordinary synchronous broker tools
+retain their direct-session contract.
 
 | Surface | Default | Access |
 |---|---:|---|
@@ -28,10 +31,11 @@ injects the configured agent identity, records policy decisions and prepared
 attempts, and serializes mutations.
 
 Conversation is an independent, tool-less LLM role. Player/NPC text is untrusted
-roleplay and cannot mutate goals or controller state. Bounded proactive greetings
-and per-speaker history are optional. Chat generation uses a separate temperature
-from planning, and a deterministic rolling window limits each speaker conversation
-to 12 total incoming/outgoing lines in 30 minutes by default.
+roleplay and cannot mutate goals or controller state. Replies and per-speaker
+history remain enabled, while proactive greetings are explicit opt-in and disabled
+by default. Chat generation uses a separate temperature from planning, and a
+deterministic rolling window limits each speaker conversation to 12 total
+incoming/outgoing lines in 30 minutes by default.
 
 ## First-run state machine
 

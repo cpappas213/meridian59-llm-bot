@@ -104,6 +104,33 @@ def normalize_farm_target(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def farm_target_spellings_match(left: Any, right: Any) -> bool:
+    """Compare ordinary creature spellings without collapsing distinct prey."""
+
+    def variants(value: Any) -> set[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        normalized = " ".join(re.findall(r"[a-z0-9]+", text.casefold()))
+        if not normalized:
+            return set()
+        values = {normalized}
+        words = normalized.split()
+        last = words[-1]
+        singular: str | None = None
+        if last.endswith("ies") and len(last) > 3:
+            singular = last[:-3] + "y"
+        elif last.endswith("es") and last[:-2].endswith(
+            ("s", "x", "z", "ch", "sh")
+        ):
+            singular = last[:-2]
+        elif last.endswith("s") and len(last) > 1:
+            singular = last[:-1]
+        if singular:
+            values.add(" ".join([*words[:-1], singular]))
+        return values
+
+    return bool(variants(left) & variants(right))
+
+
 def farm_tactic_identity(
     room: Any, target: Any, use_safe_spots: Any
 ) -> dict[str, Any]:
@@ -115,6 +142,30 @@ def farm_tactic_identity(
         "target": normalize_farm_target(target),
         "use_safe_spots": strategy,
     }
+
+
+def farm_positioning_strategy(policy: Any) -> bool | None:
+    """Return the durable wall requirement from wire policy or saved evidence.
+
+    New keepers separate opportunistic safe-wall use from requiring a wall
+    before combat. The controller's durable ``use_safe_spots`` strategy keeps
+    its historical meaning (true requires a wall; false permits open-field
+    combat), so ``require_safe_wall`` is authoritative when it is available.
+    Older harnesses expose only ``use_safe_spots`` and retain the legacy
+    one-flag interpretation.
+    """
+
+    if not isinstance(policy, dict):
+        return None
+    for key in ("require_safe_wall", "requireSafeWall"):
+        value = policy.get(key)
+        if isinstance(value, bool):
+            return value
+    for key in ("use_safe_spots", "useSafeSpots"):
+        value = policy.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
 
 
 def farm_tactic_key(room: Any, target: Any, use_safe_spots: Any) -> str:
@@ -212,6 +263,7 @@ def farm_quarantine_matches(
     room: Any,
     target: Any,
     use_safe_spots: Any,
+    target_matches: Callable[[Any, Any], bool] | None = None,
 ) -> bool:
     """Whether one retained disposition applies to the proposed farm tactic."""
 
@@ -223,7 +275,12 @@ def farm_quarantine_matches(
         return True
     recorded_target = normalize_farm_target(record.get("target"))
     requested_target = normalize_farm_target(target)
-    if recorded_target and requested_target and recorded_target != requested_target:
+    target_matches = target_matches or farm_target_spellings_match
+    if (
+        recorded_target
+        and requested_target
+        and not target_matches(record.get("target"), target)
+    ):
         return False
     if scope == "room_and_prey":
         return True
@@ -649,7 +706,7 @@ class GoalLearning:
                 observed_room = observed_room.get("id", observed_room.get("name"))
             room = assigned_room if assigned_room not in (None, "") else observed_room
             target = self._normal_text(sample.get("target") or "unknown") or "unknown"
-            safe_spots = sample.get("use_safe_spots")
+            safe_spots = farm_positioning_strategy(sample)
             strategy = (
                 "safe_spots"
                 if safe_spots is True
@@ -1531,7 +1588,7 @@ class GoalLearning:
             .casefold()
             .split()
         )
-        safe_spots = arguments.get("use_safe_spots")
+        safe_spots = farm_positioning_strategy(arguments)
         return str(room), target, safe_spots if isinstance(safe_spots, bool) else None
 
     def _release_matching_farm_quarantine(

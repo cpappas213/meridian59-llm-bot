@@ -84,16 +84,20 @@ controller upgrade cannot manufacture an improvement.
 Farm quarantine is the corresponding fast runtime gate. Crossing the configured
 flee boundary, withdrawing, resting, and resuming are ordinary recovery events:
 the keeper retains control, the phase remains active, and no lesson or quarantine
-is created however often that productive cycle repeats. A death, lethal
-safe-spot failure, or verified live over-level hazard still quarantines the exact
-room/prey tactic immediately. Rest damage or another verified safe-spot failure
-retires that coordinate without condemning the room. Two recoveries before ever
-reaching the assignment invalidate only that exact launch route. An over-level
-hazard uses a specific retry predicate: max HP must reach the level required by
-the configured danger margin, or the pinned source corpus must change. It cannot
-unlock from a generic cooldown or unrelated equipment-id churn. Other room/prey
-tactics remain available while a precisely disproved one stays quarantined until
-readiness measurably improves.
+is created however often that productive cycle repeats. A death is accounted and
+triggers survival reassessment, but it does not by itself quarantine the
+room/prey tactic or invalidate its verified safe spot: the monster already
+engaged or pulled to the wall may continue retaliating there. Verified live
+over-level hazards still quarantine the exact room/prey tactic immediately.
+Evidence that a new, previously unengaged monster can acquire the character at
+the wall, or an explicit placement/geometry failure, retires only that coordinate
+without condemning the room. Two recoveries before ever reaching the assignment
+invalidate only that exact launch route. An over-level hazard uses a specific
+retry predicate: max HP must reach the level required by the configured danger
+margin, or the pinned source corpus must change. It cannot unlock from a generic
+cooldown or unrelated equipment-id churn. Other room/prey tactics remain
+available while a precisely disproved one stays quarantined until readiness
+measurably improves.
 
 Startup removes legacy quarantines and assigned-room tactic lessons whose sole
 evidence was an ordinary flee/withdraw/rest/resume cycle. Other survivability

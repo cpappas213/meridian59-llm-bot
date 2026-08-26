@@ -28,6 +28,23 @@ function Read-ScriptAst {
 $installerAst = Read-ScriptAst $installerPath
 $null = Read-ScriptAst $launcherPath
 $null = Read-ScriptAst $restartPath
+$launcherSource = Get-Content -LiteralPath $launcherPath -Raw
+if ($launcherSource -notmatch 'StartupTimeoutSeconds = 120' -or
+    $launcherSource -notmatch 'Invoke-ControllerStatus' -or
+    $launcherSource -notmatch 'RequireJoined' -or
+    ($launcherSource -notmatch 'status --require-joined' -and
+        $launcherSource -notmatch '"--require-joined"') -or
+    $launcherSource -notmatch 'Start-ScheduledTask' -or
+    $launcherSource -notmatch 'Start-Process' -or
+    $launcherSource -notmatch 'WindowStyle Hidden' -or
+    $launcherSource -notmatch 'Controller, broker, and game session ready') {
+    throw "The TUI launcher must start either controller form and wait for joined readiness"
+}
+$readyMessageAt = $launcherSource.IndexOf('Controller, broker, and game session ready')
+$tuiLaunchAt = $launcherSource.LastIndexOf('-m meridian_bot.cli --config $resolvedConfigPath tui')
+if ($readyMessageAt -lt 0 -or $tuiLaunchAt -lt 0 -or $readyMessageAt -gt $tuiLaunchAt) {
+    throw "The TUI launcher opens the console before joined readiness is established"
+}
 $restartSource = Get-Content -LiteralPath $restartPath -Raw
 if ($restartSource -match "Stop-ScheduledTask") {
     throw "The supported restart script must not orphan child processes with Stop-ScheduledTask"
@@ -37,7 +54,9 @@ if ($restartSource -notmatch 'Invoke-ControllerCli @\("stop"\)' -or
     throw "The restart script must gracefully stop and verify a joined replacement"
 }
 if ($restartSource -notmatch 'coordinated pause, safe return, logout, and shutdown' -or
-    $restartSource -notmatch 'ShutdownTimeoutSeconds = 900') {
+    $restartSource -notmatch 'ShutdownTimeoutSeconds = 900' -or
+    $restartSource -notmatch '\$shutdown\.stage -eq "failed"' -or
+    $restartSource -notmatch 'failed safe during coordinated shutdown') {
     throw "The restart script must delegate to the coordinated safe shutdown sequence"
 }
 $wanted = @(

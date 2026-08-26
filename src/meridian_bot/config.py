@@ -10,6 +10,21 @@ from typing import Any
 from .utils import expand_path
 
 
+SURVIVAL_RECOVERY_THRESHOLD = 0.95
+SURVIVAL_FLEE_FLOOR = 0.75
+
+
+def survival_keeper_thresholds(
+    configured_rest: float,
+    configured_critical: float,
+) -> tuple[float, float]:
+    """Return the recovery target and emergency withdraw floor for survive mode."""
+
+    rest = max(SURVIVAL_RECOVERY_THRESHOLD, float(configured_rest))
+    flee = max(SURVIVAL_FLEE_FLOOR, float(configured_critical))
+    return rest, min(rest, flee)
+
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
     if not isinstance(value, dict):
@@ -81,7 +96,7 @@ class ControllerConfig:
     fallback_mode: str
     conversation_enabled: bool
     social_poll_seconds: float = 1.0
-    proactive_greetings_enabled: bool = True
+    proactive_greetings_enabled: bool = False
     greeting_cooldown_seconds: float = 20 * 60
     greetings_per_minute: int = 20
     conversation_history_turns: int = 8
@@ -101,6 +116,7 @@ class PolicyConfig:
     protected_item_value_threshold: int
     protected_item_names: tuple[str, ...]
     consequential_action_guidance: str
+    automated_help_pleas: bool = False
 
 
 @dataclass(frozen=True)
@@ -298,7 +314,7 @@ class BotConfig:
             fallback_mode=str(ctl_raw.get("fallback_mode", "survive")),
             conversation_enabled=bool(ctl_raw.get("conversation_enabled", True)),
             social_poll_seconds=float(ctl_raw.get("social_poll_seconds", 1.0)),
-            proactive_greetings_enabled=bool(ctl_raw.get("proactive_greetings_enabled", True)),
+            proactive_greetings_enabled=bool(ctl_raw.get("proactive_greetings_enabled", False)),
             greeting_cooldown_seconds=float(ctl_raw.get("greeting_cooldown_seconds", 20 * 60)),
             greetings_per_minute=int(ctl_raw.get("greetings_per_minute", 20)),
             conversation_history_turns=int(ctl_raw.get("conversation_history_turns", 8)),
@@ -333,7 +349,7 @@ class BotConfig:
             raise ValueError("controller goal commitment and stall durations cannot be negative")
 
         policy_raw = _section(raw, "policy")
-        _unknown(policy_raw, {"avoid_death", "bank_before_hazard", "rest_health_fraction", "critical_health_fraction", "carried_currency_bank_threshold", "protected_item_value_threshold", "protected_item_names", "consequential_action_guidance"}, "policy")
+        _unknown(policy_raw, {"avoid_death", "bank_before_hazard", "rest_health_fraction", "critical_health_fraction", "carried_currency_bank_threshold", "protected_item_value_threshold", "protected_item_names", "consequential_action_guidance", "automated_help_pleas"}, "policy")
         policy = PolicyConfig(
             avoid_death=bool(policy_raw.get("avoid_death", True)),
             bank_before_hazard=bool(policy_raw.get("bank_before_hazard", True)),
@@ -343,6 +359,7 @@ class BotConfig:
             protected_item_value_threshold=int(policy_raw.get("protected_item_value_threshold", 5000)),
             protected_item_names=tuple(str(item) for item in policy_raw.get("protected_item_names", [])),
             consequential_action_guidance=str(policy_raw.get("consequential_action_guidance", "strongly_avoid_unnecessary_loss")),
+            automated_help_pleas=bool(policy_raw.get("automated_help_pleas", False)),
         )
         if not 0 < policy.critical_health_fraction <= policy.rest_health_fraction <= 1:
             raise ValueError("health fractions must satisfy 0 < critical <= rest <= 1")

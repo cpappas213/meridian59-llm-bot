@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .broker import BrokerError, Tool, ToolCallError
-from .config import BotConfig
+from .config import BotConfig, survival_keeper_thresholds
 
 
 PVP_TOOL_NAME = "pvp_engage"
@@ -820,7 +820,18 @@ class PvpCoordinator:
                 break_out_via_logoff=False,
             )
             if mode in {"survive", "idle"}:
-                arguments.update(hunt="", assigned_room=None)
+                rest_below, flee_below = survival_keeper_thresholds(
+                    self.config.policy.rest_health_fraction,
+                    self.config.policy.critical_health_fraction,
+                )
+                arguments.update(
+                    hunt="",
+                    assigned_room=None,
+                    bank_above=0,
+                    rest_below=rest_below,
+                    flee_below=flee_below,
+                    automated_pleas=self.config.policy.automated_help_pleas,
+                )
         return arguments
 
     def _threshold(self, arguments: dict[str, Any]) -> float:

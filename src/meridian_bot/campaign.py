@@ -6,12 +6,30 @@ from typing import Any
 
 from .contracts import parse_ability_metric
 from .criteria import CriteriaEvaluator
-from .storage import Storage
+from .storage import CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, Storage
 from .utils import canonical_json, deep_get, json_hash, redact, timestamp
 
 
-CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY = "campaign_phase_downtime_v1"
 CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY = "campaign_phase_progress_lease_v1"
+
+# These fields are written only after controller-owned validation or live keeper
+# evidence. A campaign-manager response may propose tactics, but it cannot mint
+# durable evidence that later outranks operator intent or recipe selection.
+CONTROLLER_OWNED_TACTIC_CONTEXT_FIELDS = frozenset(
+    {
+        "deterministic_research_handoff",
+        "farm_recipe",
+        "initial_observable_outcome_unmet",
+        "positioning_preference",
+        "positioning_preference_repair",
+        "recipe_validation",
+        "research_attempt_id",
+        "research_fingerprint",
+        "research_phase_id",
+        "safe_spot_fallback",
+        "selection_basis",
+    }
+)
 
 
 PHASE_KINDS = {
@@ -188,7 +206,6 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
         "map",
         "travel",
         "autopilot",
-        "fight",
         "knowledge_search",
     },
     "recover": {
@@ -220,6 +237,9 @@ PHASE_TOOL_NAMES: dict[str, set[str]] = {
 
 PHASE_ACTION_SUCCEEDED = "phase_action_succeeded"
 PHASE_ACTION_CRITERION_FIELDS = frozenset({"id", "kind", "tools"})
+PHASE_KEEPER_TARGET_KILLS = "phase_keeper_target_kills"
+PHASE_KEEPER_TARGET_KILL_FIELDS = frozenset({"id", "kind", "count"})
+MAX_PHASE_KEEPER_TARGET_KILLS = 25
 RESEARCH_RETRY_UNLOCKED = "research_retry_unlocked"
 RESEARCH_RETRY_CRITERION_FIELDS = frozenset({"id", "kind"})
 
@@ -247,6 +267,7 @@ PHASE_TARGET_FIELDS: dict[str, frozenset[str]] = {
     "ability_at_least": frozenset(
         {"id", "type", "ability_kind", "name", "value"}
     ),
+    "keeper_target_kills_at_least": frozenset({"id", "type", "count"}),
     PHASE_ACTION_SUCCEEDED: frozenset({"id", "type", "tools"}),
 }
 
@@ -625,6 +646,23 @@ class CampaignCoordinator:
                     "operator": ">=",
                     "value": cls._target_number(target, "value"),
                 }
+            elif target_type == "keeper_target_kills_at_least":
+                count = target.get("count")
+                if (
+                    not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                    or count > MAX_PHASE_KEEPER_TARGET_KILLS
+                ):
+                    raise ValueError(
+                        "keeper_target_kills_at_least.count must be an integer from "
+                        f"1 through {MAX_PHASE_KEEPER_TARGET_KILLS}"
+                    )
+                criterion = {
+                    "id": target_id,
+                    "kind": PHASE_KEEPER_TARGET_KILLS,
+                    "count": count,
+                }
             else:
                 tools = target.get("tools")
                 if (
@@ -675,6 +713,8 @@ class CampaignCoordinator:
         goal: dict[str, Any],
         phase: dict[str, Any],
         observation: dict[str, Any] | None,
+        *,
+        controller_owned_context: bool = False,
     ) -> dict[str, Any]:
         """Compile and normalize one manager-selected phase without persisting it."""
 
@@ -707,8 +747,36 @@ class CampaignCoordinator:
             criteria, phase_kind=kind, migrate_legacy=True
         )
         self._validate_phase_success_criteria(kind, criteria, goal, phase)
+        initial_observable_outcome: dict[str, Any] | None = None
         if observation is not None:
             self._validate_material_equipment_targets(kind, criteria, observation)
+            initial_observable_outcome = self.observable_success_evaluation(
+                goal, criteria, observation
+            )
+            if (
+                initial_observable_outcome is not None
+                and initial_observable_outcome.get("evidence_complete") is not True
+            ):
+                raise ValueError(
+                    "campaign phase observable outcome cannot be verified from the "
+                    "current observation; refresh the required live state before "
+                    "selecting this milestone"
+                )
+            if (
+                initial_observable_outcome is not None
+                and initial_observable_outcome.get("all_met") is True
+            ):
+                details = "; ".join(
+                    str(result.get("detail") or "")
+                    for result in initial_observable_outcome.get("criteria", [])[:3]
+                    if isinstance(result, dict) and result.get("detail")
+                )
+                raise ValueError(
+                    "campaign phase observable outcome is already true before any "
+                    "phase action"
+                    + (f": {details}" if details else "")
+                    + "; select an unmet observable improvement instead of a no-op milestone"
+                )
         abandon_predicates = phase.get("abandon_predicates", [])
         if not isinstance(abandon_predicates, list):
             raise ValueError("campaign phase abandon_predicates must be an array")
@@ -743,6 +811,31 @@ class CampaignCoordinator:
             if isinstance(phase.get("context"), dict)
             else {}
         )
+        if not controller_owned_context:
+            ignored_controller_fields = sorted(
+                field
+                for field in CONTROLLER_OWNED_TACTIC_CONTEXT_FIELDS
+                if field in phase_context
+            )
+            for field in ignored_controller_fields:
+                phase_context.pop(field, None)
+            if ignored_controller_fields:
+                phase_context["ignored_controller_owned_tactic_context"] = (
+                    ignored_controller_fields
+                )
+        has_phase_local_kill_target = any(
+            isinstance(criterion, dict)
+            and criterion.get("kind") == PHASE_KEEPER_TARGET_KILLS
+            for criterion in criteria
+        )
+        if initial_observable_outcome is not None or has_phase_local_kill_target:
+            # This controller-owned receipt distinguishes a newly validated
+            # phase whose outcome was genuinely unmet from markerless phases
+            # persisted by older builds.  It lets resume-time migration retire
+            # the latter without misclassifying later progress on a valid phase.
+            # A new phase-local kill counter is definitionally zero here and is
+            # therefore also a verified unmet outcome.
+            phase_context["initial_observable_outcome_unmet"] = True
         unverified_preferences: dict[str, Any] = {}
         for field in ("avoid_rooms", "avoid_targets"):
             proposed = phase_context.pop(field, None)
@@ -802,13 +895,20 @@ class CampaignCoordinator:
         goal: dict[str, Any],
         decision: dict[str, Any],
         observation: dict[str, Any] | None = None,
+        *,
+        controller_owned_context: bool = False,
     ) -> dict[str, Any] | None:
         action = str(decision.get("decision") or "").strip()
         if action in {"start_phase", "replace_phase", "push_support_phase"}:
             phase = decision.get("phase")
             if not isinstance(phase, dict):
                 raise ValueError(f"{action} requires a phase object")
-            phase = self._validated_manager_phase(goal, phase, observation)
+            phase = self._validated_manager_phase(
+                goal,
+                phase,
+                observation,
+                controller_owned_context=controller_owned_context,
+            )
             mode = "push" if action == "push_support_phase" else "replace"
             if self.storage.active_campaign_phase(run["id"]) is None:
                 mode = "start"
@@ -985,7 +1085,8 @@ class CampaignCoordinator:
     ) -> None:
         public_criteria: list[dict[str, Any]] = []
         ids: set[str] = set()
-        has_internal = False
+        has_action_receipt = False
+        has_keeper_target_kills = False
         for index, criterion in enumerate(criteria):
             if not isinstance(criterion, dict):
                 raise ValueError("campaign phase success criteria must be objects")
@@ -994,7 +1095,6 @@ class CampaignCoordinator:
                 raise ValueError(f"duplicate criterion id: {criterion_id}")
             ids.add(criterion_id)
             if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
-                has_internal = True
                 unknown = set(criterion) - RESEARCH_RETRY_CRITERION_FIELDS
                 if unknown:
                     raise ValueError(
@@ -1007,11 +1107,33 @@ class CampaignCoordinator:
                         "prepare_combat recovery phases"
                     )
                 continue
+            if criterion.get("kind") == PHASE_KEEPER_TARGET_KILLS:
+                has_keeper_target_kills = True
+                unknown = set(criterion) - PHASE_KEEPER_TARGET_KILL_FIELDS
+                if unknown:
+                    raise ValueError(
+                        "unknown phase_keeper_target_kills criterion field(s): "
+                        + ", ".join(sorted(unknown))
+                    )
+                count = criterion.get("count")
+                if (
+                    phase_kind != "farm"
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                    or count > MAX_PHASE_KEEPER_TARGET_KILLS
+                ):
+                    raise ValueError(
+                        "phase_keeper_target_kills is reserved for farm phases "
+                        "and requires an integer count from 1 through "
+                        f"{MAX_PHASE_KEEPER_TARGET_KILLS}"
+                    )
+                continue
             if criterion.get("kind") != PHASE_ACTION_SUCCEEDED:
                 self._validate_public_phase_criterion(criterion)
                 public_criteria.append(criterion)
                 continue
-            has_internal = True
+            has_action_receipt = True
             unknown = set(criterion) - PHASE_ACTION_CRITERION_FIELDS
             if unknown:
                 raise ValueError(
@@ -1033,17 +1155,40 @@ class CampaignCoordinator:
                     "phase_action_succeeded names tools unavailable to this phase: "
                     + ", ".join(unavailable)
                 )
-        if has_internal and any(
+        if has_action_receipt and any(
             criterion.get("kind") in {"composite_all", "composite_any"}
             for criterion in public_criteria
         ):
             raise ValueError(
                 "phase_action_succeeded cannot be referenced by composite criteria"
             )
-        if phase_kind == "farm" and has_internal and not public_criteria:
+        if (
+            phase_kind == "farm"
+            and has_action_receipt
+            and not public_criteria
+            and not has_keeper_target_kills
+        ):
             raise ValueError(
                 "farm phase cannot complete merely because an action launched; "
-                "require an observable farming outcome such as a max-health milestone"
+                "require max-health progress or a phase-local verified target-kill milestone"
+            )
+        invalid_farm_outcomes = self.invalid_farm_outcome_criteria(criteria)
+        if phase_kind == "farm" and invalid_farm_outcomes:
+            kinds = ", ".join(
+                sorted(
+                    {
+                        str(criterion.get("kind") or "unknown")
+                        for criterion in invalid_farm_outcomes
+                    }
+                )
+            )
+            raise ValueError(
+                "farm phase outcome must be forward max-health progress or a "
+                "phase-local verified target-kill count caused by the configured "
+                "keeper hunt; unsupported farm outcome kind(s): "
+                f"{kinds}. Inventory, food, equipment, currency, location, and "
+                "recovery targets belong to preparation or support phases and "
+                "cannot define farm completion"
             )
         preparation_mutations = {
             tool
@@ -1100,6 +1245,161 @@ class CampaignCoordinator:
             )
 
     @staticmethod
+    def invalid_farm_outcome_criteria(
+        criteria: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return public outcomes that cannot prove keeper farming work.
+
+        An inventory target can be satisfied by casting, shopping, or pickup
+        before the keeper ever fights, so treating it as farm completion
+        recreates a skip-work checkpoint under a different observable. Farm
+        completion is limited to forward max-health progress or the controller's
+        phase-local exact-target kill receipt.
+        """
+
+        max_health_metrics = {
+            "max_health",
+            "status.vitals.health.max",
+            "look.vitals.health.max",
+        }
+
+        def valid_max_health_progress(criterion: dict[str, Any]) -> bool:
+            value = criterion.get("value")
+            return bool(
+                criterion.get("kind") == "numeric_threshold"
+                and str(criterion.get("metric") or "") in max_health_metrics
+                and str(criterion.get("operator") or ">=") in {">", ">="}
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            )
+
+        return [
+            criterion
+            for criterion in criteria
+            if isinstance(criterion, dict)
+            and criterion.get("kind")
+            not in {
+                PHASE_ACTION_SUCCEEDED,
+                PHASE_KEEPER_TARGET_KILLS,
+                RESEARCH_RETRY_UNLOCKED,
+            }
+            and not valid_max_health_progress(criterion)
+        ]
+
+    def observable_success_evaluation(
+        self,
+        goal: dict[str, Any],
+        criteria: list[dict[str, Any]],
+        observation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Evaluate only the phase outcomes that live state can verify.
+
+        Internal action receipts are deliberately excluded.  If every public
+        outcome is already true, an action receipt would be the phase's only
+        remaining gate and could turn a no-op launch into apparent progress.
+        """
+
+        public = [
+            {
+                **criterion,
+                "id": str(criterion.get("id") or f"criterion_{index + 1}"),
+            }
+            for index, criterion in enumerate(criteria)
+            if isinstance(criterion, dict)
+            and criterion.get("kind")
+            not in {
+                PHASE_ACTION_SUCCEEDED,
+                PHASE_KEEPER_TARGET_KILLS,
+                RESEARCH_RETRY_UNLOCKED,
+            }
+        ]
+        if not public:
+            return None
+        evaluation = self.criteria.evaluate(
+            {"id": str(goal.get("id") or "campaign-phase"), "success_criteria": public},
+            observation,
+        )
+        results = {
+            str(result.get("id") or ""): result
+            for result in evaluation.get("criteria", [])
+            if isinstance(result, dict)
+        }
+        sentinel = object()
+
+        def known(criterion: dict[str, Any]) -> bool:
+            kind = str(criterion.get("kind") or "")
+            result = results.get(str(criterion.get("id") or ""), {})
+            if kind in {"composite_all", "composite_any", "event_occurred"}:
+                return True
+            if kind in {"numeric_threshold", "numeric_delta"}:
+                metric = str(criterion.get("metric") or "")
+                if metric == "carried_currency" and not isinstance(
+                    deep_get(observation, "inventory.items", sentinel), list
+                ):
+                    return False
+                value = self.criteria._numeric_metric(observation, metric)
+                return isinstance(value, (int, float)) and not isinstance(value, bool)
+            if kind == "state_equals":
+                path = str(criterion.get("path", criterion.get("metric", "")))
+                return self.criteria._state_value(observation, path) is not None
+            if kind == "inventory_contains":
+                return isinstance(
+                    deep_get(observation, "inventory.items", sentinel), list
+                )
+            if kind == "equipment_count":
+                if result.get("met") is True:
+                    return True
+                inventory_known = isinstance(
+                    deep_get(observation, "inventory.items", sentinel), list
+                )
+                equipped_known = isinstance(
+                    deep_get(observation, "equipment.equipped", sentinel), list
+                )
+                if str(criterion.get("category") or "") == "weapon":
+                    wielding = deep_get(
+                        observation, "equipment.wielding", sentinel
+                    )
+                    return (
+                        inventory_known
+                        and equipped_known
+                        and isinstance(wielding, (list, str))
+                    )
+                return inventory_known and equipped_known
+            if kind == "equipment_wielding":
+                if result.get("met") is True:
+                    return True
+                return isinstance(
+                    deep_get(observation, "equipment.wielding", sentinel),
+                    (list, str),
+                )
+            if kind == "location_reached":
+                if result.get("met") is True:
+                    return True
+                room_id = deep_get(
+                    observation,
+                    "look.room.num",
+                    deep_get(observation, "look.room_id", sentinel),
+                )
+                room_name = deep_get(observation, "look.room.name", sentinel)
+                requires_id = criterion.get("room_id") is not None
+                requires_name = bool(
+                    str(
+                        criterion.get("location", criterion.get("room", ""))
+                        or ""
+                    ).strip()
+                )
+                return (
+                    (not requires_id or room_id is not sentinel)
+                    and (not requires_name or room_name is not sentinel)
+                )
+            return False
+
+        return {
+            **evaluation,
+            "evidence_complete": all(known(criterion) for criterion in public),
+        }
+
+    @staticmethod
     def _validate_public_phase_criterion(criterion: dict[str, Any]) -> None:
         """Reject semantically invalid observation paths before persistence."""
 
@@ -1153,7 +1453,11 @@ class CampaignCoordinator:
             criterion
             for criterion in annotated
             if criterion.get("kind")
-            not in {PHASE_ACTION_SUCCEEDED, RESEARCH_RETRY_UNLOCKED}
+            not in {
+                PHASE_ACTION_SUCCEEDED,
+                PHASE_KEEPER_TARGET_KILLS,
+                RESEARCH_RETRY_UNLOCKED,
+            }
         ]
         public_results: dict[str, dict[str, Any]] = {}
         if public:
@@ -1168,10 +1472,35 @@ class CampaignCoordinator:
 
         attempts = self.storage.phase_attempts(phase["id"], limit=200)
         successful = [attempt for attempt in attempts if attempt.get("status") == "succeeded"]
+        leases = self.storage.get_runtime(
+            CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY, {}
+        )
+        lease = (
+            leases.get(str(phase["id"]), {})
+            if isinstance(leases, dict)
+            else {}
+        )
+        lease = lease if isinstance(lease, dict) else {}
         results: list[dict[str, Any]] = []
         evidence_event_ids: list[str] = []
         for criterion in annotated:
             criterion_id = str(criterion["id"])
+            if criterion.get("kind") == PHASE_KEEPER_TARGET_KILLS:
+                required = int(criterion.get("count", 1) or 1)
+                observed = int(lease.get("phase_target_kills", 0) or 0)
+                met = observed >= required
+                results.append(
+                    {
+                        "id": criterion_id,
+                        "kind": PHASE_KEEPER_TARGET_KILLS,
+                        "met": met,
+                        "detail": (
+                            f"verified phase-local keeper target kills {observed}; "
+                            f"required {required}"
+                        ),
+                    }
+                )
+                continue
             if criterion.get("kind") == RESEARCH_RETRY_UNLOCKED:
                 # The CampaignCoordinator deliberately has no access to the
                 # controller's retained research-exhaustion evidence.  The
@@ -1395,11 +1724,10 @@ class CampaignCoordinator:
         downtime_at_lease_seconds = 0.0
         elapsed_basis = "phase_activation"
         last_verified_progress_at: str | None = None
-        downtime = self.storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY, {})
-        if (
-            isinstance(downtime, dict)
-            and str(downtime.get("phase_id") or "") == str(phase.get("id") or "")
-        ):
+        downtime = self.storage.campaign_phase_downtime(
+            str(phase.get("id") or "")
+        )
+        if isinstance(downtime, dict):
             try:
                 downtime_seconds = max(0.0, float(downtime.get("seconds", 0.0) or 0.0))
             except (TypeError, ValueError):
@@ -1724,7 +2052,6 @@ class CampaignCoordinator:
                 "use_safe_spots",
                 "flee_below",
                 "fight_above_vigor",
-                "eat_before_fighting",
                 "buy_food",
                 "next_hp_milestone",
                 "selection_basis",
@@ -1751,7 +2078,6 @@ class CampaignCoordinator:
                     "use_safe_spots",
                     "flee_below",
                     "fight_above_vigor",
-                    "eat_before_fighting",
                     "buy_food",
                     "selection_basis",
                 )

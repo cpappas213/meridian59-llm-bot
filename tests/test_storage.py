@@ -11,6 +11,8 @@ from meridian_bot.campaign import (
     CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
     CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
     CampaignCoordinator,
+    MAX_PHASE_KEEPER_TARGET_KILLS,
+    PHASE_KEEPER_TARGET_KILLS,
 )
 from meridian_bot.criteria import CriteriaEvaluator
 from meridian_bot.storage import IdempotencyConflict, InvalidTransition, Storage
@@ -132,6 +134,155 @@ class StorageTests(unittest.TestCase):
                         observation,
                     )
 
+    def test_manager_rejects_an_already_satisfied_observable_phase_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(
+                    goal_payload(
+                        request_id="phase-outcome-must-be-unmet",
+                        objective="Raise maximum HP to at least 50.",
+                        success_criteria=[
+                            {
+                                "id": "max-hp-50",
+                                "kind": "numeric_threshold",
+                                "metric": "max_health",
+                                "operator": ">=",
+                                "value": 50,
+                            }
+                        ],
+                    )
+                )["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                observation = {
+                    "status": {
+                        "vitals": {"health": {"current": 40, "max": 40}}
+                    }
+                }
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "observable outcome cannot be verified from the current observation",
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "farm",
+                                "objective": "Guess at an unobserved HP milestone.",
+                                "targets": [
+                                    {
+                                        "id": "unknown-41",
+                                        "type": "max_health_at_least",
+                                        "value": 41,
+                                    }
+                                ],
+                                "context": {
+                                    "room": 562,
+                                    "target": "fungus beast",
+                                    "use_safe_spots": False,
+                                },
+                            },
+                        },
+                        {},
+                    )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "observable outcome cannot be verified from the current observation",
+                ):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "return_home",
+                                "objective": "Return to room 708.",
+                                "targets": [
+                                    {
+                                        "id": "room-708",
+                                        "type": "location_reached",
+                                        "room_id": 708,
+                                    }
+                                ],
+                            },
+                        },
+                        {"look": {"room": {"name": "Yonder Inn"}}},
+                    )
+
+                for action_receipt in (False, True):
+                    targets = [
+                        {
+                            "id": "already-40",
+                            "type": "max_health_at_least",
+                            "value": 40,
+                        }
+                    ]
+                    if action_receipt:
+                        targets.append(
+                            {
+                                "id": "keeper-launch",
+                                "type": "phase_action_succeeded",
+                                "tools": ["autopilot"],
+                            }
+                        )
+                    with self.subTest(action_receipt=action_receipt):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "observable outcome is already true before any phase action.*observed 40 >= 40",
+                        ):
+                            coordinator.apply_manager_decision(
+                                run,
+                                goal,
+                                {
+                                    "decision": "start_phase",
+                                    "phase": {
+                                        "kind": "farm",
+                                        "objective": "Farm to an already reached milestone.",
+                                        "targets": targets,
+                                        "context": {
+                                            "room": 562,
+                                            "target": "fungus beast",
+                                            "use_safe_spots": False,
+                                        },
+                                    },
+                                },
+                                observation,
+                            )
+
+                self.assertIsNone(storage.active_campaign_phase(run["id"]))
+                valid = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "farm",
+                            "objective": "Farm to the next unmet milestone.",
+                            "targets": [
+                                {
+                                    "id": "next-41",
+                                    "type": "max_health_at_least",
+                                    "value": 41,
+                                }
+                            ],
+                            "context": {
+                                "room": 562,
+                                "target": "fungus beast",
+                                "use_safe_spots": False,
+                            },
+                        },
+                    },
+                    observation,
+                )
+                self.assertTrue(
+                    valid["context"]["initial_observable_outcome_unmet"]
+                )
+
     def test_inventory_food_category_counts_edible_items_not_reagents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with Storage(Path(temporary) / "bot.sqlite3") as storage:
@@ -240,6 +391,40 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(available["all_met"])
                 self.assertFalse(full["all_met"])
                 self.assertFalse(unknown["all_met"])
+
+                durable_goal = storage.submit_goal(
+                    goal_payload(request_id="known-derived-capacity-phase")
+                )["goal"]
+                coordinator = CampaignCoordinator(storage, evaluator)
+                run = storage.ensure_campaign_run(durable_goal)
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    durable_goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "free_inventory_capacity",
+                            "objective": "Create room in the full inventory.",
+                            "targets": [
+                                {
+                                    "id": "capacity",
+                                    "type": "inventory_not_full",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "inventory": {
+                            "carry": {
+                                "known": True,
+                                "room_for": {"weight": 0, "bulk": 2414},
+                            }
+                        }
+                    },
+                )
+                self.assertTrue(
+                    phase["context"]["initial_observable_outcome_unmet"]
+                )
 
     def test_named_ability_state_path_resolves_live_catalogue_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -452,6 +637,181 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(
                     phase["id"], storage.active_campaign_phase(run["id"])["id"]
                 )
+
+    def test_operator_resume_excludes_a_long_paused_interval_from_phase_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("long-paused-phase"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Keep farming across a planned pause.",
+                        "success_criteria": [],
+                        "budget": {"max_actions": 120, "max_minutes": 180},
+                    },
+                    mode="start",
+                )
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-long-phase",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+                activated_at = datetime.now(timezone.utc) - timedelta(minutes=181)
+                paused_at = datetime.now(timezone.utc) - timedelta(minutes=120)
+                with storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET activated_at=?,updated_at=? WHERE id=?",
+                        (activated_at.isoformat(), paused_at.isoformat(), phase["id"]),
+                    )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-long-phase",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                    }
+                )
+
+                downtime = storage.campaign_phase_downtime(phase["id"])
+                self.assertIsNotNone(downtime)
+                self.assertGreaterEqual(downtime["seconds"], 119 * 60)
+                self.assertLess(downtime["seconds"], 121 * 60)
+                current = storage.active_campaign_phase(run["id"])
+                self.assertIsNone(
+                    CampaignCoordinator(
+                        storage, CriteriaEvaluator(storage)
+                    ).budget_exhausted(current)
+                )
+                self.assertEqual(
+                    phase["id"],
+                    storage.get_runtime(CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY)[
+                        "phase_id"
+                    ],
+                )
+
+    def test_paused_phase_downtime_accumulates_across_interleaved_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("repeated-paused-phase"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Accumulate only active farming time.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_DOWNTIME_RUNTIME_KEY,
+                    {"phase_id": phase["id"], "seconds": 30},
+                )
+                migrated = storage.add_campaign_phase_downtime(
+                    goal_id=goal["id"],
+                    run_id=run["id"],
+                    phase_id=phase["id"],
+                    seconds=30,
+                )
+                self.assertEqual(60, migrated["seconds"])
+                storage.add_campaign_phase_downtime(
+                    goal_id="other-goal",
+                    run_id="other-run",
+                    phase_id="other-phase",
+                    seconds=90,
+                )
+
+                storage.manage_goal(
+                    {
+                        "request_id": "pause-repeated-phase",
+                        "goal_id": goal["id"],
+                        "action": "pause",
+                    }
+                )
+                with storage.transaction() as connection:
+                    connection.execute(
+                        "UPDATE campaign_phases SET updated_at=? WHERE id=?",
+                        (
+                            (
+                                datetime.now(timezone.utc) - timedelta(minutes=2)
+                            ).isoformat(),
+                            phase["id"],
+                        ),
+                    )
+                storage.manage_goal(
+                    {
+                        "request_id": "resume-repeated-phase",
+                        "goal_id": goal["id"],
+                        "action": "resume",
+                    }
+                )
+
+                accumulated = storage.campaign_phase_downtime(phase["id"])
+                other = storage.campaign_phase_downtime("other-phase")
+                self.assertGreaterEqual(accumulated["seconds"], 179)
+                self.assertLess(accumulated["seconds"], 181)
+                self.assertEqual(90, other["seconds"])
+
+    def test_resume_ignores_malformed_and_future_phase_pause_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload("invalid-pause-time"))["goal"]
+                run = storage.ensure_campaign_run(goal)
+                phase = storage.create_campaign_phase(
+                    run,
+                    {
+                        "kind": "farm",
+                        "objective": "Resume despite corrupt clock evidence.",
+                        "success_criteria": [],
+                    },
+                    mode="start",
+                )
+                storage.add_campaign_phase_downtime(
+                    goal_id=goal["id"],
+                    run_id=run["id"],
+                    phase_id=phase["id"],
+                    seconds=37,
+                )
+
+                for suffix, paused_at in (
+                    ("malformed", "not-a-timestamp"),
+                    (
+                        "future",
+                        (
+                            datetime.now(timezone.utc) + timedelta(days=1)
+                        ).isoformat(),
+                    ),
+                ):
+                    storage.manage_goal(
+                        {
+                            "request_id": f"pause-{suffix}-time",
+                            "goal_id": goal["id"],
+                            "action": "pause",
+                        }
+                    )
+                    with storage.transaction() as connection:
+                        connection.execute(
+                            "UPDATE campaign_phases SET updated_at=? WHERE id=?",
+                            (paused_at, phase["id"]),
+                        )
+                    storage.manage_goal(
+                        {
+                            "request_id": f"resume-{suffix}-time",
+                            "goal_id": goal["id"],
+                            "action": "resume",
+                        }
+                    )
+                    self.assertEqual(
+                        37,
+                        storage.campaign_phase_downtime(phase["id"])["seconds"],
+                    )
+                    self.assertEqual(
+                        phase["id"], storage.active_campaign_phase(run["id"])["id"]
+                    )
 
     def test_migration_repairs_paused_goal_with_active_campaign_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1419,6 +1779,269 @@ class StorageTests(unittest.TestCase):
                                 },
                             },
                         },
+                    )
+
+    def test_campaign_manager_rejects_food_as_farm_completion_but_allows_support(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                observation = {
+                    "inventory": {"items": []},
+                    "status": {
+                        "vitals": {"health": {"current": 40, "max": 40}}
+                    },
+                }
+                food = {
+                    "id": "farm-kill-milestone",
+                    "type": "item_count_at_least",
+                    "item": "food",
+                    "count": 1,
+                }
+
+                for targets in (
+                    [food],
+                    [
+                        {
+                            "id": "next-hp",
+                            "type": "max_health_at_least",
+                            "value": 41,
+                        },
+                        food,
+                    ],
+                ):
+                    with self.subTest(targets=targets):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "farm phase outcome must be forward max-health progress.*inventory_contains",
+                        ):
+                            coordinator.apply_manager_decision(
+                                run,
+                                goal,
+                                {
+                                    "decision": "start_phase",
+                                    "phase": {
+                                        "kind": "farm",
+                                        "objective": "Farm fungus beasts for food.",
+                                        "targets": targets,
+                                        "context": {
+                                            "room": 562,
+                                            "target": "fungus beast",
+                                            "use_safe_spots": False,
+                                        },
+                                    },
+                                },
+                                observation,
+                            )
+
+                self.assertIsNone(storage.active_campaign_phase(run["id"]))
+                support = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "prepare_combat",
+                            "objective": "Create one food item for later combat.",
+                            "targets": [food],
+                        },
+                    },
+                    observation,
+                )
+
+                self.assertEqual("prepare_combat", support["kind"])
+                self.assertEqual(
+                    {
+                        "id": "farm-kill-milestone",
+                        "kind": "inventory_contains",
+                        "item": "food",
+                        "count": 1,
+                    },
+                    support["success_criteria"][0],
+                )
+                self.assertTrue(
+                    support["context"]["initial_observable_outcome_unmet"]
+                )
+
+    def test_campaign_manager_compiles_phase_local_keeper_target_kills(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                phase = coordinator.apply_manager_decision(
+                    run,
+                    goal,
+                    {
+                        "decision": "start_phase",
+                        "phase": {
+                            "kind": "farm",
+                            "objective": "Verify two exact fungus-beast kills.",
+                            "targets": [
+                                {
+                                    "id": "two-target-kills",
+                                    "type": "keeper_target_kills_at_least",
+                                    "count": 2,
+                                }
+                            ],
+                            "context": {
+                                "room": 562,
+                                "target": "fungus beast",
+                                "use_safe_spots": False,
+                            },
+                        },
+                    },
+                    {"status": {"vitals": {"health": {"max": 50}}}},
+                )
+
+                self.assertEqual(
+                    {
+                        "id": "two-target-kills",
+                        "kind": PHASE_KEEPER_TARGET_KILLS,
+                        "count": 2,
+                    },
+                    phase["success_criteria"][0],
+                )
+                self.assertTrue(
+                    phase["context"]["initial_observable_outcome_unmet"]
+                )
+                self.assertFalse(
+                    coordinator.evaluate_phase(
+                        goal, run, phase, {}
+                    ).completed
+                )
+
+                storage.set_runtime(
+                    CAMPAIGN_PHASE_PROGRESS_LEASE_RUNTIME_KEY,
+                    {
+                        phase["id"]: {
+                            "phase_id": phase["id"],
+                            "phase_target_kills": 2,
+                            "renewed_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    },
+                )
+                completed = coordinator.evaluate_phase(goal, run, phase, {})
+
+                self.assertTrue(completed.completed)
+                self.assertIn(
+                    "verified phase-local keeper target kills 2; required 2",
+                    completed.detail["criteria"][0]["detail"],
+                )
+
+    def test_campaign_manager_rejects_backward_max_health_farm_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                criteria = [
+                    {
+                        "id": "lose-max-health-threshold",
+                        "kind": "numeric_threshold",
+                        "metric": "max_health",
+                        "operator": "<",
+                        "value": 39,
+                    },
+                    {
+                        "id": "lose-max-health-delta",
+                        "kind": "numeric_delta",
+                        "metric": "max_health",
+                        "operator": "<=",
+                        "value": -1,
+                        "baseline": 40,
+                    },
+                ]
+
+                for criterion in criteria:
+                    with self.subTest(criterion=criterion):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "farm phase outcome must be forward max-health progress",
+                        ):
+                            coordinator.apply_manager_decision(
+                                run,
+                                goal,
+                                {
+                                    "decision": "start_phase",
+                                    "phase": {
+                                        "kind": "farm",
+                                        "objective": "Wait for backward HP movement.",
+                                        "success_criteria": [criterion],
+                                        "context": {
+                                            "room": 562,
+                                            "target": "fungus beast",
+                                            "use_safe_spots": False,
+                                        },
+                                    },
+                                },
+                                {"status": {"vitals": {"health": {"max": 40}}}},
+                            )
+
+    def test_campaign_keeper_target_kill_count_is_strictly_bounded(self) -> None:
+        compiled = CampaignCoordinator.compile_phase_targets(
+            "farm",
+            [
+                {
+                    "id": "bounded-target-kills",
+                    "type": "keeper_target_kills_at_least",
+                    "count": MAX_PHASE_KEEPER_TARGET_KILLS,
+                }
+            ],
+        )
+        self.assertEqual(MAX_PHASE_KEEPER_TARGET_KILLS, compiled[0]["count"])
+        with self.assertRaisesRegex(ValueError, "integer from 1 through"):
+            CampaignCoordinator.compile_phase_targets(
+                "farm",
+                [
+                    {
+                        "id": "unbounded-target-kills",
+                        "type": "keeper_target_kills_at_least",
+                        "count": MAX_PHASE_KEEPER_TARGET_KILLS + 1,
+                    }
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with Storage(Path(temporary) / "bot.sqlite3") as storage:
+                goal = storage.submit_goal(goal_payload())["goal"]
+                coordinator = CampaignCoordinator(
+                    storage, CriteriaEvaluator(storage)
+                )
+                run = storage.ensure_campaign_run(goal)
+                with self.assertRaisesRegex(ValueError, "integer count from 1 through"):
+                    coordinator.apply_manager_decision(
+                        run,
+                        goal,
+                        {
+                            "decision": "start_phase",
+                            "phase": {
+                                "kind": "farm",
+                                "objective": "Attempt an unbounded farm phase.",
+                                "success_criteria": [
+                                    {
+                                        "id": "raw-unbounded-target-kills",
+                                        "kind": PHASE_KEEPER_TARGET_KILLS,
+                                        "count": MAX_PHASE_KEEPER_TARGET_KILLS + 1,
+                                    }
+                                ],
+                                "context": {
+                                    "room": 562,
+                                    "target": "fungus beast",
+                                    "use_safe_spots": False,
+                                },
+                            },
+                        },
+                        {},
                     )
 
     def test_campaign_manager_rejects_action_only_mutating_combat_preparation(

@@ -39,6 +39,71 @@ and intends to use semantic versioning after its first public release.
 
 ### Fixed
 
+- Prevented controller observation polling from competing with urgent keeper
+  combat, retreat, travel, and recovery. The bot now checks in-process keeper
+  status and cached pushed look state first, uses current room/vitals with
+  explicitly cached slow context while survival owns the packet budget, and
+  resumes a full refresh after the urgent activity ends.
+- Reconciled durable keeper death receipts before every mode-specific controller
+  return, with stable death-ID deduplication and Underworld/max-HP fallbacks when
+  the receipt arrives late. Death accounting now survives `farm` to `survive`
+  handoff without treating ordinary retaliation or death from the already
+  engaged monster as proof that a verified safe spot failed.
+- Added a durable retry circuit for deterministic planner protocol, response,
+  prompt-budget, and execution-plan failures. An unchanged goal/phase/material
+  character state no longer repeats the same model request across turns or a
+  controller restart; one bounded retry becomes eligible after the fingerprint
+  materially changes.
+- Made an out-of-reach open-field quarry advance along at most four exact,
+  guarded path steps instead of entering the wall-only pull loop. Policy-off or
+  stale holds no longer influence farm combat, obstacle detours count as
+  progress, and the legacy and behavior-tree paths now share exact-target pull
+  conversion and cancellation semantics.
+- Kept low-health recovery aimed at one bounded refuge instead of alternating
+  between adjacent hostile rooms. Emergency travel now closes the 70-75% health
+  deadband, times out motionless and cyclic walks, honors confinement across
+  replans and every landing path, preserves local-wall fallbacks, and treats
+  player/operator cancellation as terminal for the current pass. The controller
+  reconciles the same canonical recovery thresholds without repeatedly hammering
+  an older partial status shape.
+- Initialized the keeper's current vigor before its hostile-room provisioning
+  refusal reports it, preventing a fresh field keeper from aborting with a
+  JavaScript temporal-dead-zone error before combat can begin.
+- Made the exact rest-reachable 80 vigor satisfy an empty-larder fighting floor,
+  counted real nested food nutrition and stack quantities, and stopped optional
+  Create Food casts once that effective floor is met instead of repeatedly
+  spending departure mana while chasing a provisioning ceiling.
+- Stopped a shattered weapon from silently turning later attacks into punches.
+  A live fight now continues only after a spare is authoritatively equipped;
+  otherwise it disengages before another attack, while death and a killing blow
+  still take precedence over recovery traffic.
+- Counted campaign phase time only while its goal is active. Operator pauses,
+  coordinated restarts, and repeated/interleaved pause cycles now accumulate
+  per-phase downtime without instantly exhausting a resumed farming phase.
+- Let coordinated shutdown depart from a full-health proven wall even when
+  harmless adjacent monsters remain camped there, instead of waiting forever
+  for a threat-clear condition the survival keeper cannot create while holding.
+- Made operator safe-spot verification an evidence checkpoint instead of
+  permanent immunity. Ordinary retaliation, rest damage, withdrawal, or death
+  from the monster already engaged or pulled to the wall does not disprove the
+  square; evidence that a new monster can acquire the character, or an explicit
+  placement/geometry failure, retires that exact coordinate. Selection, keeper
+  status, and broker reporting consistently reject only those failed spots.
+- Preferred collision-proven baked room rails over learned coordinate tracks and
+  bounded the remaining learned replay by one deadline and movement budget. Tight
+  forest crossings no longer expand one stale waypoint into repeated fine-walk
+  searches and wall oscillation.
+- Made deterministic post-death and low-health help pleas explicitly opt-in and
+  default-off without disabling self-rearming or LLM replies. Restart
+  reconciliation now fails closed on missing/stale plea policy, and the legacy
+  templates no longer emit a mangled em-dash control character when deliberately
+  enabled.
+- Made LLM-generated proactive greetings explicitly opt-in and default-off while
+  preserving responses to incoming player and NPC messages. Merely seeing a player
+  can no longer cause unsolicited speech under the shipped configuration.
+- Made `tui.bat` start a stopped scheduled controller or a hidden standalone
+  controller when no task is installed, and wait for the broker to join the
+  game before opening the console instead of racing startup.
 - Imported structured compendium item values into financial planning and split
   source-estimated liquidation value from exact live merchant quotes. A zero
   confirmed quote now means sale-eligible loot still needs quoting rather than
@@ -54,8 +119,37 @@ and intends to use semantic versioning after its first public release.
   flows. Finish destinations now come only from approved goal criteria, while
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
-- Updated the bundled `m59-harness` pin to the latest tested official upstream
-  revision and removed the stale integration-fork dependency.
+- Updated the bundled `m59-harness` pin to public integration revision
+  `00b1c0c5cfb02c177cdb552469f0a213b98c554d`, based on official upstream revision
+  `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
+  exhausted wall-search denials while retaining spawn-cap and independent danger
+  evidence.
+- Kept farm combat engaged for a bounded 30-round window instead of falling back
+  to the generic three-swing probe, while preserving per-swing health aborts and
+  operator-configured round budgets. Monster health-band messages are now captured
+  through the complete exchange and used only for a conservative early retreat;
+  they can never relax the hard flee threshold.
+- Counted source-defined positive combat prose such as weapon pokes only when it
+  names the exact selected foe. Real damage now advances combat progress without
+  mistaking status, item, room, or other-target messages for landed hits.
+- Fixed failed-heal recovery after a farm fight to re-read adjacent hostiles rather
+  than referencing state from another behavior pass, eliminating the live
+  `near is not defined` exception without misreporting a cornered character as safe.
+- Scoped JavaScript keeper-crash stagnation to the exact harness revision that
+  produced it. A newly pinned build may retry a death-free tactic once, while
+  same-revision crashes and explicit route, over-level-hazard, spawn-cap, or
+  placement/geometry quarantine evidence remain durable. Death remains durable
+  combat accounting but is not, by itself, safe-spot disproof.
+- Reused controller-grounded open-field positioning for the same farm room and
+  prey instead of reviving a cached safe-wall recipe. Explicit operator policy,
+  stricter flee and vigor thresholds, and all retained danger evidence remain
+  authoritative, while campaign-manager output cannot forge the controller's
+  tactic provenance.
+- Kept operator-named farm prey binding across research, campaign phases, and
+  keeper launches. Exhausting only a safe-wall search now retries the same room
+  and prey in bounded open-field mode, while explicit new-monster safe-spot
+  breaches, critical-health, room-hazard, and spawn-cap evidence continue to
+  block unsafe tactics.
 - Made `Esc` an immediate, consistent cancel/back control across character
   status, goal drafting/review, goal modification, goal management, priority
   editing, and destructive confirmations.

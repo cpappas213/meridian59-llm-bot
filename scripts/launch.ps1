@@ -2,7 +2,9 @@ param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$PythonExecutable = "",
     [string]$InstallRoot = "$env:LOCALAPPDATA\m59-llm-bot",
-    [string]$ConfigPath = ""
+    [string]$ConfigPath = "",
+    [ValidateRange(5, 600)]
+    [int]$StartupTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,14 +36,9 @@ if (-not $PythonExecutable) {
 }
 $PythonExecutable = [System.IO.Path]::GetFullPath($PythonExecutable)
 
-$installedTask = Get-ScheduledTask -TaskName "Meridian59 LLM Bot" -ErrorAction SilentlyContinue
 $hasConfig = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
-if ((-not $hasConfig) -or (-not $installedTask)) {
-    if ($hasConfig) {
-        Write-Host "The previous setup did not finish. Resuming one-time setup."
-    } else {
-        Write-Host "No installed bot was found. Starting one-time setup."
-    }
+if (-not $hasConfig) {
+    Write-Host "No installed bot was found. Starting one-time setup."
     & (Join-Path $resolvedProjectRoot "scripts\install.ps1") `
         -ProjectRoot $resolvedProjectRoot `
         -PythonExecutable $PythonExecutable `
@@ -68,22 +65,86 @@ if ((-not $hasConfig) -or (-not $installedTask)) {
 }
 
 $task = Get-ScheduledTask -TaskName "Meridian59 LLM Bot" -ErrorAction SilentlyContinue
-if (-not $task) {
-    throw "The controller scheduled task is missing. Re-run setup from option 2."
-}
 $env:PYTHONPATH = Join-Path $resolvedProjectRoot "src"
-$previousErrorActionPreference = $ErrorActionPreference
-try {
-    $ErrorActionPreference = "Continue"
-    $null = & $PythonExecutable -m meridian_bot.cli --config $resolvedConfigPath status 2>$null
-    $controllerAvailable = $LASTEXITCODE -eq 0
-} finally {
-    $ErrorActionPreference = $previousErrorActionPreference
-}
-if ($task.State -ne "Running" -and -not $controllerAvailable) {
-    Start-ScheduledTask -TaskName "Meridian59 LLM Bot"
+
+function Invoke-ControllerStatus {
+    param([switch]$RequireJoined)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Unavailable is expected while the scheduled or standalone controller
+        # is starting, so capture the native exit code instead of terminating.
+        $ErrorActionPreference = "Continue"
+        $arguments = @("-m", "meridian_bot.cli", "--config", $resolvedConfigPath, "status")
+        if ($RequireJoined) { $arguments += "--require-joined" }
+        $output = @(& $PythonExecutable @arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
 }
 
+$probe = Invoke-ControllerStatus
+$standaloneController = $null
+if ($probe.ExitCode -ne 0) {
+    if ($task) {
+        if ($task.State -ne "Running") {
+            Write-Host "Starting the Meridian 59 controller task..."
+            Start-ScheduledTask -TaskName "Meridian59 LLM Bot"
+        } else {
+            Write-Host "The controller task is starting; waiting for its API..."
+        }
+    } else {
+        # A development install may deliberately omit the scheduled task. TUI
+        # is still an entry point, so start the same controller launcher as a
+        # detached hidden process and leave it running when the console closes.
+        Write-Host "No controller task is installed; starting the controller in the background..."
+        $controllerLauncher = Join-Path $resolvedProjectRoot "scripts\run-controller.ps1"
+        $controllerArguments = @(
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$controllerLauncher`"",
+            "-ProjectRoot", "`"$resolvedProjectRoot`"",
+            "-PythonExecutable", "`"$PythonExecutable`"",
+            "-ConfigPath", "`"$resolvedConfigPath`""
+        )
+        $standaloneController = Start-Process `
+            -FilePath "powershell.exe" `
+            -ArgumentList $controllerArguments `
+            -WorkingDirectory $resolvedProjectRoot `
+            -WindowStyle Hidden `
+            -PassThru
+    }
+}
+
+$startupDeadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
+$ready = Invoke-ControllerStatus -RequireJoined
+while ($ready.ExitCode -ne 0 -and (Get-Date) -lt $startupDeadline) {
+    if ($standaloneController -and $standaloneController.HasExited) {
+        throw "The background controller exited before the broker joined the game. Check $resolvedInstallRoot\logs\controller.log."
+    }
+    if ($task) {
+        $task = Get-ScheduledTask -TaskName "Meridian59 LLM Bot" -ErrorAction SilentlyContinue
+        if ($task -and $task.State -ne "Running" -and (Invoke-ControllerStatus).ExitCode -ne 0) {
+            $taskInfo = Get-ScheduledTaskInfo -TaskName "Meridian59 LLM Bot" -ErrorAction SilentlyContinue
+            $result = if ($taskInfo) { " Last task result: $($taskInfo.LastTaskResult)." } else { "" }
+            throw "The controller task stopped before the broker joined the game.$result Check $resolvedInstallRoot\logs\controller.log."
+        }
+    }
+    Start-Sleep -Seconds 1
+    $ready = Invoke-ControllerStatus -RequireJoined
+}
+if ($ready.ExitCode -ne 0) {
+    throw "The controller did not reach a joined game session within $StartupTimeoutSeconds seconds. It was left running for diagnosis. Check $resolvedInstallRoot\logs\controller.log."
+}
+
+Write-Host "Controller, broker, and game session ready."
 Set-Location -LiteralPath $resolvedProjectRoot
 & $PythonExecutable -m meridian_bot.cli --config $resolvedConfigPath tui
 exit $LASTEXITCODE
