@@ -54,6 +54,14 @@ and intends to use semantic versioning after its first public release.
 - Initialized the keeper's current vigor before its hostile-room provisioning
   refusal reports it, preventing a fresh field keeper from aborting with a
   JavaScript temporal-dead-zone error before combat can begin.
+- Made the exact rest-reachable 80 vigor satisfy an empty-larder fighting floor,
+  counted real nested food nutrition and stack quantities, and stopped optional
+  Create Food casts once that effective floor is met instead of repeatedly
+  spending departure mana while chasing a provisioning ceiling.
+- Stopped a shattered weapon from silently turning later attacks into punches.
+  A live fight now continues only after a spare is authoritatively equipped;
+  otherwise it disengages before another attack, while death and a killing blow
+  still take precedence over recovery traffic.
 - Counted campaign phase time only while its goal is active. Operator pauses,
   coordinated restarts, and repeated/interleaved pause cycles now accumulate
   per-phase downtime without instantly exhausting a resumed farming phase.
@@ -95,7 +103,7 @@ and intends to use semantic versioning after its first public release.
   farm launch staging comes from source-verified safe-room flags and live state
   instead of mainland/Raza room-ID policy.
 - Updated the bundled `m59-harness` pin to public integration revision
-  `800928ce2da29264dcf6d47b035ad178c8d5094d`, based on official upstream revision
+  `00b1c0c5cfb02c177cdb552469f0a213b98c554d`, based on official upstream revision
   `892d94d6b0361970100d39b1f6fb35eb4a9ea794`. Open-field farm policy now ignores
   exhausted wall-search denials while retaining spawn-cap and independent danger
   evidence.
