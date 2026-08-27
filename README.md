@@ -31,15 +31,17 @@ goal. Setup proceeds in this order:
 2. The installer locally collects the desired character name and complete
    conversation persona. It can also be revised later through the `persona` MCP
    tool or the local `setup-persona` command.
-3. The configured LLM selects a supported build. The controller previews,
-   audits, creates, and verifies the named character through the harness.
+3. The operator selects or creates the intended character outside this
+   controller. The controller only verifies that its live name matches the
+   stored persona.
 4. Once status reports `onboarding.ready_for_goals=true`, a human or higher-level
    agent submits the first strategic goal.
 
-Generated first-run names such as `User123456789` may be replaced automatically.
-An established, differently named character is preserved unless the persona is
-set again with `replace_existing_character=true`. Character creation never
-invents a gameplay goal.
+Every selected character—including generated names such as `User123456789`—is
+preserved. The controller permanently filters and rejects the harness `reroll`
+tool and cannot suicide, recreate, or replace a character. A name mismatch must
+be resolved by selecting/creating the intended character outside the controller
+or updating the persona name. Onboarding never invents a gameplay goal.
 
 ## Capabilities
 
@@ -136,13 +138,9 @@ broker remain loopback-only.
 2. The installer has already stored the desired name and persona. The terminal
    dashboard shows onboarding, connection, character vitals, skills/spells,
    current goal, queue, and recent events while onboarding completes.
-3. If an established differently named character should be replaced, explicitly
-   confirm that decision from the terminal without a supervising agent:
-
-   ```powershell
-   python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" `
-     setup-persona --update-existing --reuse-current --replace-existing-character
-   ```
+3. If the selected character name differs from the persona, select or create the
+   intended character with a normal client/operator workflow, or update the
+   persona name. The controller will not replace either character.
 
 4. Press `N` in the terminal dashboard and describe the first high-level goal in
    plain language. The configured model constructs a validated structured draft
@@ -201,9 +199,9 @@ instead of terminating while the character may still be exposed.
 For the voice and identity concept, write one paragraph of roughly 2-4 sentences
 or 40-100 words. Describe the broad archetype/background impression, emotional
 tone, social presence, and a useful tension or flaw. Setup explains that this
-context informs the initial build, roleplay-aware planning, and dialogue but
-cannot create goals or override policy; focused traits and speech rules are
-collected separately.
+context informs roleplay-aware planning and dialogue but cannot change a
+character, create goals, or override policy; focused traits and speech rules
+are collected separately.
 
 ## Goal monitoring console
 

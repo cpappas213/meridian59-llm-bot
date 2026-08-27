@@ -8,13 +8,14 @@ theft, ambushes, bargains, lies, market play, rivalries, and other game-legal
 tactics are valid when they advance the active goal.
 
 The non-negotiable play boundary is **no cheating**. Death avoidance, banking,
-preserving valuable property, avoiding unnecessary alignment changes, and
-avoiding unnecessary rerolls are strong guidance, not action gates.
+preserving valuable property, and avoiding unnecessary alignment changes are
+strong guidance rather than approval gates. Character suicide/replacement is a
+separate hard capability denial: this controller never receives that authority.
 
 **No game action requires operator approval.** A consequential action may be
 performed autonomously after a non-blocking preflight. Hard denials exist only
-for cheating, invalid/stale actions, unavailable capabilities, and failures that
-would make durable execution unsafe.
+for cheating, invalid/stale actions, unavailable capabilities (including all
+character replacement), and failures that would make durable execution unsafe.
 
 ## 2. Authority order
 
@@ -68,8 +69,8 @@ forbidden even if technically reachable on the LAN.
 Subject to an active goal, risk checks, and ordinary game rules, the bot may
 autonomously:
 
-- connect, select or create a character, reroll/replace a character, reconnect,
-  observe, wait, travel, rest, recover, flee, and use ordinary game services;
+- connect to or select an existing character, reconnect, observe, wait, travel,
+  rest, recover, flee, and use ordinary game services;
 - fight creatures or players, initiate PvP, defend itself, pursue or disengage;
 - steal, loot, conceal intent, bluff, deceive, negotiate, form or break tactical
   arrangements, and react to reputational consequences;
@@ -90,7 +91,6 @@ and informational reporting.
 
 The following trigger a non-blocking consequence preflight and pre/post event:
 
-- character creation, replacement, deletion, or reroll;
 - deliberate item/currency drop;
 - sale, trade, giveaway, destruction, or other transfer of protected property;
 - an action expected to change alignment/karma materially; and
@@ -167,23 +167,28 @@ The preflight is deterministic where possible and may include a concise public
 planner rationale. It is committed before execution, then linked to the verified
 outcome. Notification delivery is asynchronous and does not delay the action.
 
-## 7. Character identity and reroll guidance
+## 7. Character identity and lifecycle boundary
 
-- Discover existing character state before deciding to replace it.
 - A human supplies the desired character name and persona; the controller does
   not invent an identity during execution.
-- The configured LLM selects the initial supported build after the persona is
-  stored. This onboarding operation is independent of the gameplay goal queue.
-- Preserve an established differently named character unless the human explicitly
-  requests replacement. Generated first-run placeholder identities may be
-  replaced automatically.
-- Before reroll/replacement, record observed progression, inventory/equipment,
-  alignment, outstanding goals, expected losses, and known alternatives.
-- Emit an interesting pre-action notice and a verified post-action result.
-- Never use harness `leave(forget=true)` as routine cleanup or recovery. Use only
-  the exact tested character-management primitive required by the selected tactic.
+- Onboarding observes the selected character and reports ready only after its
+  live name matches the persona. It never selects a build or mutates a character.
+- Missing, stale, cached, or conflicting identity evidence fails closed by
+  withholding gameplay goals. It is never evidence that no character exists.
+- Every differently named character, including a generated first-run placeholder,
+  is preserved. The operator must select/create the intended character outside
+  the controller or update the persona to match the selected character.
+- The harness `reroll` tool is removed from controller capabilities and rejected
+  at the planner, policy, broker call, and raw JSON-RPC boundaries. No action,
+  persisted onboarding state, configuration value, or model output can override it.
+- Broker capability growth is fail-closed: unreviewed tool names are unavailable,
+  and lifecycle directives added under an approved tool name are filtered from
+  planner enums and rejected again before network I/O.
+- Harness `leave(forget=true)` is also rejected. Coordinated shutdown always logs
+  out with literal `forget=false` and requires an explicit `forgotten=false`
+  receipt.
 
-These rules are guidance and audit requirements, not an operator prompt.
+These rules are hard authority boundaries, not operator approval prompts.
 
 ## 8. Alignment guidance
 

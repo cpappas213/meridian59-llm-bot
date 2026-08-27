@@ -284,13 +284,16 @@ creates a new goal; it does not mutate the proposal into a goal.
 }
 ```
 
-`action_class` is one of:
+New `action_class` values are:
 
-- `character_create_or_reroll`
 - `item_drop`
 - `protected_property_transaction`
 - `alignment_change`
 - `other_consequential_action`
+
+Older databases may contain the legacy `character_create_or_reroll` value for
+audit history. The controller never creates a new assessment with that class and
+cannot execute the corresponding harness tool.
 
 Assessment states are `assessed`, `executed`, `abandoned`, and `failed`. The
 assessment is recorded before execution and linked to the verified outcome. It is
@@ -610,20 +613,21 @@ Input for update:
     "taboos": [],
     "relationship_defaults": "...",
     "max_reply_characters": 360
-  },
-  "replace_existing_character": false
+  }
 }
 ```
 
 For update, copy the read response's `version` to `expected_version`; do not send
 a top-level `version` field. `request_id` is required and idempotent. Persona
 accepts only the eight nested fields shown above, with string arrays for traits,
-speech style, values, and taboos. The top-level replacement flag is optional and
-must be true only after explicit operator direction. A successful read/update
-also returns durable `onboarding` status. The complete persona affects dialogue,
-initial identity, and the model's choices among equally safe, goal-compatible
+speech style, values, and taboos. For compatibility, an older client may send
+`replace_existing_character=false`; the schema marks it deprecated and false-only.
+`true` is rejected before persona persistence. A successful read/update also
+returns durable `onboarding` status. The complete persona affects dialogue,
+identity verification, and the model's choices among equally safe, goal-compatible
 campaign phases, tactics, and safe endings. It does not grant controller
-authority or modify the gameplay goal queue.
+authority, mutate a character, or modify the gameplay goal queue. Identity states
+include `awaiting_character_identity`, `awaiting_persona_name_match`, and `ready`.
 
 ### 8.6 `events`
 

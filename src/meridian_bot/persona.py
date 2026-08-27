@@ -22,8 +22,8 @@ PERSONA_SCHEMA: dict[str, Any] = {
             "description": (
                 "One short paragraph, ideally 2-4 sentences or 40-100 words, describing the broad "
                 "archetype/background impression, emotional tone, social presence, and a meaningful "
-                "tension or flaw. It informs build selection, roleplay-aware planning, and dialogue "
-                "without creating goals or overriding policy."
+                "tension or flaw. It informs roleplay-aware planning and dialogue without changing "
+                "a character, creating goals, or overriding policy."
             ),
         },
         "traits": {
@@ -88,10 +88,12 @@ PERSONA_TOOL_INPUT_SCHEMA: dict[str, Any] = {
         "persona": PERSONA_SCHEMA,
         "replace_existing_character": {
             "type": "boolean",
+            "const": False,
             "default": False,
+            "deprecated": True,
             "description": (
-                "Explicitly allow onboarding to replace an established differently named character. "
-                "Generated first-run placeholder names may be replaced without this flag."
+                "Compatibility-only false value. Character replacement is permanently disabled; "
+                "the controller cannot suicide, reroll, replace, or recreate a character."
             ),
         },
     },

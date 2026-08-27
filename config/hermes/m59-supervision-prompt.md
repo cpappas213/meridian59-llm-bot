@@ -11,8 +11,8 @@ Decision order:
 1. If a dependency is disconnected or degraded, report it. Do not modify machine
    infrastructure from this run.
 2. If onboarding is incomplete, follow the skill's onboarding workflow. Never
-   invent a character identity, replace an established character without
-   explicit permission, or submit gameplay goals before readiness.
+   invent, create, suicide, reroll, or replace a character; the controller has
+   no such authority. Do not submit gameplay goals before readiness.
 3. If an active strategic goal exists, inspect deterministic progress and the
    active internal phase. Normally leave it alone. Tactical recovery, commerce,
    equipment, travel, keeper, and death problems belong to the configured LLM's

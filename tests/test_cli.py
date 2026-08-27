@@ -91,7 +91,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(["safe_stop"], calls)
         self.assertEqual(52, json.loads(output.getvalue())["destination_room_id"])
 
-    def test_parser_exposes_local_persona_setup(self) -> None:
+    def test_parser_keeps_hidden_replacement_tombstone_for_clear_failure(self) -> None:
         args = parser().parse_args(
             [
                 "--config",
@@ -107,6 +107,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.update_existing)
         self.assertTrue(args.reuse_current)
         self.assertTrue(args.replace_existing_character)
+        self.assertNotIn("replace-existing-character", parser().format_help())
 
     def test_prompt_persona_collects_every_supported_field(self) -> None:
         answers = iter(
@@ -144,7 +145,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("A voice and identity concept is required.", output)
         guidance = "\n".join(output)
         self.assertIn("2-4 sentences or 40-100 words", guidance)
-        self.assertIn("initial build, roleplay-aware planning", guidance)
+        self.assertIn("roleplay-aware planning and in-game dialogue", guidance)
         self.assertIn("Never include credentials or private data", guidance)
         self.assertIn("Enter a whole number from 1 through 1000.", output)
 
@@ -179,7 +180,9 @@ class CliTests(unittest.TestCase):
                 stored = controller.persona()
                 self.assertEqual(1, stored["version"])
                 self.assertEqual("Sable", stored["name"])
-                self.assertEqual("pending", stored["onboarding"]["status"])
+                self.assertEqual(
+                    "awaiting_character_identity", stored["onboarding"]["status"]
+                )
             finally:
                 controller.close()
 
@@ -200,7 +203,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(1, preserved["version"])
             self.assertEqual("Sable", preserved["name"])
 
-    def test_setup_persona_can_explicitly_reuse_for_character_replacement(self) -> None:
+    def test_setup_persona_rejects_character_replacement_without_updating_persona(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = replace(
                 config(Path(temporary)), onboarding=OnboardingConfig(enabled=True)
@@ -220,26 +223,26 @@ class CliTests(unittest.TestCase):
                 output_fn=lambda _: None,
             )
 
-            result = setup_persona(
-                value,
-                update_existing=True,
-                reuse_current=True,
-                replace_existing_character=True,
-                output_fn=lambda _: None,
-            )
+            with self.assertRaisesRegex(ValueError, "permanently disabled"):
+                setup_persona(
+                    value,
+                    update_existing=True,
+                    reuse_current=True,
+                    replace_existing_character=True,
+                    output_fn=lambda _: None,
+                )
 
-            self.assertEqual(0, result)
             controller = BotController(value)
             try:
-                self.assertEqual(2, controller.persona()["version"])
+                self.assertEqual(1, controller.persona()["version"])
                 onboarding = controller.storage.get_runtime("onboarding_v1")
-                self.assertTrue(onboarding["replace_existing_character"])
+                self.assertNotIn("replace_existing_character", onboarding)
             finally:
                 controller.close()
 
-    def test_character_replacement_requires_explicit_persona_update(self) -> None:
+    def test_character_replacement_is_permanently_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ValueError, "requires --update-existing"):
+            with self.assertRaisesRegex(ValueError, "permanently disabled"):
                 setup_persona(
                     config(Path(temporary)),
                     replace_existing_character=True,

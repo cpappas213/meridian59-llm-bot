@@ -41,10 +41,10 @@ gate below is complete or explicitly waived with a recorded rationale.
 - [ ] Run `doctor` and verify the exact configured LLM model is advertised.
 - [ ] Exercise `-SkipPersonaSetup`; verify first status is `awaiting_persona`
   and that premature goal or proposal activation returns `ONBOARDING_REQUIRED`.
-- [ ] Complete the local installer persona wizard without an MCP host. Verify a
-  generated placeholder is replaced using the configured LLM's supported build,
-  while an established identity is preserved without the explicit replacement
-  flag.
+- [ ] Complete the local installer persona wizard without an MCP host. Verify
+  that a generated placeholder and an established differently named identity
+  are both preserved, onboarding withholds goals on a name mismatch, and no
+  model or character-lifecycle tool is called.
 - [ ] Verify onboarding becomes `ready_for_goals` with no auto-created goal,
   then submit one reversible human-authored goal.
 - [ ] Reopen the first-run-aware launcher. Verify it skips setup, attaches one

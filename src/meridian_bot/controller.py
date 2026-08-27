@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .broker import (
+    APPROVED_BROKER_TOOLS,
     BrokerClient,
     BrokerError,
     CONTROLLER_ONLY_TOOLS,
+    FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS,
     Tool,
     ToolCallError,
     normalize_tool_arguments,
@@ -280,11 +282,29 @@ BANK_BALANCE_CONTEXT_RUNTIME_KEY = "bank_balance_context_v1"
 RECENT_ROOM_TRANSITION_RUNTIME_KEY = "recent_room_transition_v1"
 RECENT_INVENTORY_CREATION_RUNTIME_KEY = "recent_inventory_creation_v1"
 ONBOARDING_RUNTIME_KEY = "onboarding_v1"
+ONBOARDING_SAFE_METADATA_FIELDS = frozenset(
+    {
+        "request_id",
+        "persona_version",
+        "desired_name",
+        "requested_at",
+        "completed_at",
+        "current_name",
+        "updated_at",
+    }
+)
+ONBOARDING_SAFE_STATUSES = frozenset(
+    {
+        "disabled",
+        "awaiting_persona",
+        "awaiting_character_identity",
+        "awaiting_persona_name_match",
+        "ready",
+    }
+)
 PLANNED_CONTROLLER_STOP_RUNTIME_KEY = "planned_controller_stop_v1"
 CHARACTER_DEATH_CURSOR_RUNTIME_KEY = "character_death_cursor_v1"
 PLANNER_FAILURE_CIRCUIT_RUNTIME_PREFIX = "planner_failure_circuit_v1"
-GENERATED_CHARACTER_NAME_RE = re.compile(r"^User\d+$", re.IGNORECASE)
-
 # A shutdown is deliberately much slower than a process stop. The keeper first
 # gets a bounded opportunity to recover or withdraw, and long ordinary-client
 # routes can take minutes. Failure never advances to logout/process termination.
@@ -311,6 +331,10 @@ class BotController:
     def __init__(self, config: BotConfig):
         self.config = config
         self.storage = Storage(config.database_path)
+        # Scrub historic replacement grants and in-progress creation receipts
+        # before connection, goal reconciliation, or any controller turn. This
+        # is unconditional even when onboarding is disabled or a goal is active.
+        self._scrub_legacy_onboarding_runtime()
         self.knowledge = KnowledgeBase(config)
         self.broker = BrokerClient(config)
         self.pvp = PvpCoordinator(
@@ -2897,7 +2921,13 @@ class BotController:
     def _planner_tools(
         self, phase: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        tools = [tool for tool in self.broker.planner_tools() if tool.get("name") not in PVP_TOOL_NAMES]
+        tools = [
+            tool
+            for tool in self.broker.planner_tools()
+            if tool.get("name") in APPROVED_BROKER_TOOLS
+            and tool.get("name") not in PVP_TOOL_NAMES
+            and tool.get("name") not in FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS
+        ]
         tools.extend(self.pvp.planner_tools())
         tools.append(self.knowledge.planner_tool())
         tools = self.campaign.tools_for_phase(phase, tools) if phase is not None else tools
@@ -10257,7 +10287,12 @@ class BotController:
         )
 
     def _available_tools(self) -> dict[str, Any]:
-        tools = dict(self.broker.capabilities())
+        tools = {
+            name: tool
+            for name, tool in self.broker.capabilities().items()
+            if name in APPROVED_BROKER_TOOLS
+            and name not in FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS
+        }
         # These intentionally shadow any future broker tools with the same
         # names: both are controller-owned compositions of ordinary calls.
         for name in PVP_TOOL_NAMES:
@@ -11967,12 +12002,14 @@ class BotController:
         }
 
     def set_persona(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Persist a persona and request goal-independent character onboarding."""
+        """Persist a persona and request non-mutating identity verification."""
 
         allowed = {
             "request_id",
             "expected_version",
             "persona",
+            # Compatibility tombstone for older clients. False carries no
+            # authority; true is rejected before persona persistence.
             "replace_existing_character",
         }
         unknown = sorted(set(payload) - allowed)
@@ -11981,6 +12018,11 @@ class BotController:
         replace_existing = payload.get("replace_existing_character", False)
         if not isinstance(replace_existing, bool):
             raise ValueError("replace_existing_character must be a boolean")
+        if replace_existing:
+            raise ValueError(
+                "character replacement is permanently disabled; the controller "
+                "cannot suicide, reroll, replace, or recreate a character"
+            )
         stored = self.storage.set_persona(
             {
                 key: value
@@ -11993,7 +12035,7 @@ class BotController:
                 }
             }
         )
-        if self.config.onboarding.enabled and self.config.onboarding.create_from_persona:
+        if self.config.onboarding.enabled:
             previous = self.storage.get_runtime(ONBOARDING_RUNTIME_KEY, {})
             request_id = str(payload.get("request_id", ""))
             already_recorded = bool(
@@ -12007,22 +12049,67 @@ class BotController:
                     "request_id": request_id,
                     "persona_version": stored["version"],
                     "desired_name": stored["name"],
-                    "replace_existing_character": replace_existing,
                     "requested_at": timestamp(),
                 }
                 self.storage.set_runtime(ONBOARDING_RUNTIME_KEY, state)
                 self.storage.emit_event(
                     "onboarding.requested",
-                    f"Character onboarding requested for {stored['name']}",
+                    f"Character identity verification requested for {stored['name']}",
                     severity="notice",
                     interesting=True,
                     data={
                         "persona_version": stored["version"],
                         "desired_name": stored["name"],
-                        "replace_existing_character": replace_existing,
+                        "character_lifecycle_mutation_allowed": False,
                     },
                 )
         return {**stored, "onboarding": self._onboarding_status(self.last_observation or {})}
+
+    def _scrub_legacy_onboarding_runtime(self) -> None:
+        """Remove every persisted character-mutation grant before startup work."""
+
+        previous = self.storage.get_runtime(ONBOARDING_RUNTIME_KEY, {})
+        if not isinstance(previous, dict):
+            self.storage.set_runtime(ONBOARDING_RUNTIME_KEY, {})
+            self.storage.emit_event(
+                "onboarding.legacy_state_scrubbed",
+                "Discarded malformed legacy onboarding state",
+                severity="warning",
+                interesting=True,
+                data={"character_lifecycle_mutation_allowed": False},
+            )
+            return
+        if not previous:
+            return
+        safe_state = {
+            key: previous[key]
+            for key in ONBOARDING_SAFE_METADATA_FIELDS
+            if key in previous
+        }
+        previous_status = str(previous.get("status") or "")
+        safe_state["status"] = (
+            previous_status
+            if previous_status in ONBOARDING_SAFE_STATUSES
+            else "awaiting_character_identity"
+        )
+        if previous == safe_state:
+            return
+        safe_state["updated_at"] = timestamp()
+        self.storage.set_runtime(ONBOARDING_RUNTIME_KEY, safe_state)
+        self.storage.emit_event(
+            "onboarding.legacy_state_scrubbed",
+            "Removed legacy character-creation and replacement authority",
+            severity="warning",
+            interesting=True,
+            data={
+                "previous_status": previous_status or None,
+                "status": safe_state["status"],
+                "removed_fields": sorted(
+                    set(previous) - ONBOARDING_SAFE_METADATA_FIELDS - {"status"}
+                ),
+                "character_lifecycle_mutation_allowed": False,
+            },
+        )
 
     def _onboarding_status(
         self, observation: dict[str, Any] | None = None
@@ -12033,6 +12120,7 @@ class BotController:
             return {
                 "status": "disabled",
                 "ready_for_goals": True,
+                "character_lifecycle_mutation_allowed": False,
                 "next_action": "Submit a goal when ready.",
             }
         persona = self.storage.persona()
@@ -12040,6 +12128,7 @@ class BotController:
             return {
                 "status": "awaiting_persona",
                 "ready_for_goals": False,
+                "character_lifecycle_mutation_allowed": False,
                 "next_action": (
                     "Set the character name and complete persona through the persona tool."
                 ),
@@ -12050,246 +12139,122 @@ class BotController:
             self._character_name(observation or self.last_observation or {}) or ""
         ).strip()
         desired_name = str(persona.get("name") or state.get("desired_name") or "").strip()
+        public_state = {
+            key: state[key]
+            for key in (
+                "request_id",
+                "persona_version",
+                "requested_at",
+                "completed_at",
+                "updated_at",
+            )
+            if key in state
+        }
         if current_name and desired_name and current_name.casefold() == desired_name.casefold():
             return {
-                **state,
+                **public_state,
                 "status": "ready",
                 "ready_for_goals": True,
+                "character_lifecycle_mutation_allowed": False,
                 "desired_name": desired_name,
                 "current_name": current_name,
                 "next_action": "Submit the first strategic goal.",
             }
-        status = str(state.get("status") or "pending")
-        next_actions = {
-            "pending": "The configured LLM will choose and create the character build.",
-            "planning": "The configured LLM is choosing the character build.",
-            "creating": "The controller is creating and verifying the character.",
-            "awaiting_existing_character_confirmation": (
-                "Set the persona again with replace_existing_character=true to replace the established character."
-            ),
-            "failed": (
-                "Review the onboarding error, then set the persona again with a new request_id to retry."
-            ),
-        }
+        if not current_name:
+            return {
+                **public_state,
+                "status": "awaiting_character_identity",
+                "ready_for_goals": False,
+                "character_lifecycle_mutation_allowed": False,
+                "desired_name": desired_name,
+                "current_name": None,
+                "next_action": (
+                    "Wait for a fresh observation that verifies the selected character. "
+                    "The controller will never create, replace, reroll, or suicide one."
+                ),
+            }
         return {
-            **state,
-            "status": status,
+            **public_state,
+            "status": "awaiting_persona_name_match",
             "ready_for_goals": False,
+            "character_lifecycle_mutation_allowed": False,
             "desired_name": desired_name,
-            "current_name": current_name or None,
-            "next_action": next_actions.get(
-                status, "Wait for the controller to complete character onboarding."
+            "current_name": current_name,
+            "next_action": (
+                f"The selected character is {current_name}, but the persona name is "
+                f"{desired_name}. Select or create the intended character outside the "
+                "controller, or update the persona to the selected character's name. "
+                "The controller will not replace either character."
             ),
         }
-
-    def _set_onboarding_state(self, **updates: Any) -> dict[str, Any]:
-        current = self.storage.get_runtime(ONBOARDING_RUNTIME_KEY, {})
-        value = dict(current) if isinstance(current, dict) else {}
-        value.update(updates)
-        value["updated_at"] = timestamp()
-        self.storage.set_runtime(ONBOARDING_RUNTIME_KEY, value)
-        return value
 
     def _onboarding_turn(self, observation: dict[str, Any]) -> dict[str, Any]:
-        """Create the persona-named character before accepting ordinary goals."""
+        """Verify persona identity without invoking character lifecycle tools."""
 
         status = self._onboarding_status(observation)
-        if status.get("ready_for_goals") or status.get("status") in {
-            "awaiting_persona",
-            "awaiting_existing_character_confirmation",
-            "failed",
-        }:
+        if status.get("status") in {"disabled", "awaiting_persona"}:
             return status
 
-        persona_record = self.storage.persona()
-        desired_name = str(persona_record.get("name") or "").strip()
-        current_name = str(self._character_name(observation) or "").strip()
-        state = self.storage.get_runtime(ONBOARDING_RUNTIME_KEY, {})
-        state = dict(state) if isinstance(state, dict) else {}
-        generated_placeholder = bool(
-            current_name and GENERATED_CHARACTER_NAME_RE.fullmatch(current_name)
-        )
-        may_replace = bool(state.get("replace_existing_character")) or generated_placeholder
+        # Migrate old runtime records fail-closed.  Historic builds persisted
+        # build choices, action attempts, ``status=creating``, and even an
+        # explicit replacement grant.  None of those fields has authority in
+        # the observation-only onboarding model.
+        previous = self.storage.get_runtime(ONBOARDING_RUNTIME_KEY, {})
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        safe_state = {
+            key: previous[key]
+            for key in ONBOARDING_SAFE_METADATA_FIELDS
+            if key in previous
+        }
+        projected_status = str(status.get("status") or "awaiting_character_identity")
         if (
-            current_name
-            and current_name.casefold() != desired_name.casefold()
-            and self.config.onboarding.preserve_existing_character
-            and not may_replace
+            projected_status == "awaiting_character_identity"
+            and previous.get("status") == "ready"
         ):
-            first_notice = state.get("status") != "awaiting_existing_character_confirmation"
-            state = self._set_onboarding_state(
-                status="awaiting_existing_character_confirmation",
-                current_name=current_name,
-            )
-            if first_notice:
+            # A missing identity is transient uncertainty, not evidence that
+            # completed onboarding should be replayed.  Preserve the durable
+            # completion while temporarily withholding gameplay goals.
+            safe_state["status"] = "ready"
+        else:
+            safe_state["status"] = projected_status
+        current_name = status.get("current_name")
+        if isinstance(current_name, str) and current_name.strip():
+            safe_state["current_name"] = current_name.strip()
+        if projected_status == "ready" and "completed_at" not in safe_state:
+            safe_state["completed_at"] = timestamp()
+        safe_state["updated_at"] = timestamp()
+
+        comparable_previous = dict(previous)
+        comparable_previous.pop("updated_at", None)
+        comparable_safe = dict(safe_state)
+        comparable_safe.pop("updated_at", None)
+        if comparable_previous != comparable_safe:
+            self.storage.set_runtime(ONBOARDING_RUNTIME_KEY, safe_state)
+            if projected_status == "awaiting_persona_name_match":
                 self.storage.emit_event(
-                    "onboarding.existing_character_preserved",
-                    f"Preserved established character {current_name} during onboarding",
+                    "onboarding.character_preserved",
+                    f"Preserved selected character {status.get('current_name')}",
                     severity="warning",
                     interesting=True,
-                    data={"current_name": current_name, "desired_name": desired_name},
+                    data={
+                        "current_name": status.get("current_name"),
+                        "desired_name": status.get("desired_name"),
+                        "character_lifecycle_mutation_allowed": False,
+                    },
                 )
-            return self._onboarding_status(observation)
-
-        capabilities = self.broker.capabilities()
-        if "reroll" not in capabilities:
-            self._set_onboarding_state(
-                status="failed",
-                error="the pinned harness does not expose the reroll capability",
-            )
-            return self._onboarding_status(observation)
-
-        self._set_onboarding_state(status="planning", current_name=current_name or None)
-        choice = self.model.plan_character(
-            persona=persona_record,
-            current_character={
-                "name": current_name or None,
-                "generated_placeholder": generated_placeholder,
-                "vitals": redact(deep_get(observation, "status.vitals", {})),
-            },
-        )
-        self.dependencies["model"] = "healthy"
-        arguments = {
-            "action": "reroll",
-            "agent": self.config.game.agent,
-            "name": desired_name,
-            "stats": choice["stats"],
-            "loadout": choice["loadout"],
-        }
-        preview = self.broker.call_tool(
-            "reroll",
-            {**arguments, "action": "plan"},
-            timeout=30,
-            mutation=False,
-        )
-        if not isinstance(preview, dict) or preview.get("ok") is not True:
-            self._set_onboarding_state(
-                status="failed",
-                build=choice,
-                error="the harness rejected the character creation plan",
-                preview=redact(preview),
-            )
-            self.storage.emit_event(
-                "onboarding.character_plan_rejected",
-                "Harness rejected the LLM-selected character build",
-                severity="warning",
-                interesting=True,
-                data={"build": choice, "preview": redact(preview)},
-            )
-            return self._onboarding_status(observation)
-
-        synthetic_goal = {
-            "id": None,
-            "title": f"Onboard character {desired_name}",
-            "objective": "Create the persona-defined character before goal-driven play.",
-        }
-        decision = self.policy.evaluate(
-            "reroll",
-            arguments,
-            observation,
-            synthetic_goal,
-            known_tools=set(capabilities),
-        )
-        if decision.decision == "deny":
-            self._set_onboarding_state(status="failed", error=decision.summary)
-            return self._onboarding_status(observation)
-
-        correlation_id = uuid7()
-        attempt_id = self.storage.create_action_attempt(
-            None,
-            observation.get("id"),
-            "reroll",
-            arguments,
-            choice["rationale"],
-            decision.id,
-            correlation_id,
-        )
-        assessment_id: str | None = None
-        if decision.decision == "allow_with_caution":
-            assessment = self.policy.consequence_assessment(
-                decision, synthetic_goal, choice["rationale"]
-            )
-            assessment["action_attempt_id"] = attempt_id
-            assessment_id = self.storage.record_consequence(assessment)["id"]
-
-        self._set_onboarding_state(status="creating", build=choice, attempt_id=attempt_id)
-        self.storage.update_action_attempt(attempt_id, "sent")
-        self.storage.emit_event(
-            "onboarding.character_creation.started",
-            f"Creating persona-defined character {desired_name}",
-            severity="notice",
-            interesting=True,
-            data={"build": choice, "replacing": current_name or None},
-            correlation_id=correlation_id,
-            policy_decision_id=decision.id,
-        )
-        try:
-            result = self.broker.call_tool(
-                "reroll",
-                {**arguments, "confirm": True},
-                timeout=max(90, self.config.model.planner_timeout_seconds),
-                mutation=True,
-            )
-            after = self.broker.observe()
-            self.last_observation = after
-            created_name = str(self._character_name(after) or "").strip()
-            verified = bool(
-                isinstance(result, dict)
-                and result.get("done") is True
-                and created_name.casefold() == desired_name.casefold()
-            )
-            self.storage.update_action_attempt(
-                attempt_id,
-                "succeeded" if verified else "failed",
-                result={"broker": redact(result), "created_name": created_name},
-                error_code=None if verified else "ONBOARDING_VERIFICATION_FAILED",
-            )
-            if assessment_id:
-                self.storage.complete_consequence(
-                    assessment_id,
-                    outcome={"created_name": created_name, "verified": verified},
-                    succeeded=verified,
+            elif projected_status == "ready" and previous.get("status") != "ready":
+                self.storage.emit_event(
+                    "onboarding.identity_verified",
+                    f"Verified selected character {status.get('current_name')}",
+                    severity="notice",
+                    interesting=True,
+                    data={
+                        "current_name": status.get("current_name"),
+                        "persona_version": safe_state.get("persona_version"),
+                        "character_lifecycle_mutation_allowed": False,
+                    },
                 )
-            if not verified:
-                self._set_onboarding_state(
-                    status="failed",
-                    error="character creation did not return the requested verified name",
-                    result=redact(result),
-                    created_name=created_name or None,
-                )
-                return self._onboarding_status(after)
-            self._set_fallback()
-            self._set_onboarding_state(
-                status="ready",
-                completed_at=timestamp(),
-                current_name=created_name,
-                result={"done": True, "stats_as_asked": result.get("stats_as_asked")},
-            )
-            self.storage.emit_event(
-                "onboarding.completed",
-                f"Character {created_name} is ready for strategic goals",
-                severity="notice",
-                interesting=True,
-                data={"persona_version": persona_record["version"], "build": choice},
-                correlation_id=correlation_id,
-                policy_decision_id=decision.id,
-            )
-            return self._onboarding_status(after)
-        except (BrokerError, ValueError) as exc:
-            self.storage.update_action_attempt(
-                attempt_id,
-                "failed",
-                result={"error": str(exc)[:500]},
-                error_code=getattr(exc, "code", "ONBOARDING_FAILED"),
-            )
-            if assessment_id:
-                self.storage.complete_consequence(
-                    assessment_id,
-                    outcome={"error": str(exc)[:500]},
-                    succeeded=False,
-                )
-            self._set_onboarding_state(status="failed", error=str(exc)[:500])
-            raise
+        return self._onboarding_status(observation)
 
     def manage_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         if (
@@ -23169,6 +23134,11 @@ class BotController:
         """Execute one concrete tool under continuous safety ownership."""
 
         tool = str(plan.get("tool") or "")
+        if tool in FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS:
+            raise ModelError(
+                f"{tool} is permanently disabled: the controller cannot suicide, "
+                "reroll, replace, or recreate a character"
+            )
         if tool == KNOWLEDGE_TOOL_NAME:
             # Local knowledge lookup never mutates or competes with the keeper.
             return self._execute_with_ownership(goal, observation, plan)
@@ -23210,6 +23180,11 @@ class BotController:
         """Implementation for an action whose foreground lease is established."""
 
         tool = str(plan.get("tool") or "")
+        if tool in FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS:
+            raise ModelError(
+                f"{tool} is permanently disabled: the controller cannot suicide, "
+                "reroll, replace, or recreate a character"
+            )
         safety_recovery = plan.get("safety_recovery") is True
         arguments = plan.get("arguments")
         if not isinstance(arguments, dict):
@@ -23826,8 +23801,6 @@ class BotController:
             assessment = self.policy.consequence_assessment(policy, goal, rationale)
             assessment["action_attempt_id"] = attempt_id
             assessment_id = self.storage.record_consequence(assessment)["id"]
-            if tool == "reroll" and arguments.get("action") == "reroll":
-                arguments["confirm"] = True
         self.storage.update_action_attempt(attempt_id, "sent")
         farm_launch_boundary_at_ms: int | None = None
         farm_launch_boundary_started_at: str | None = None
@@ -30120,13 +30093,22 @@ class BotController:
         leave = capabilities.get("leave")
         if leave is None:
             raise RuntimeError("broker does not expose the controller-owned leave tool")
-        arguments: dict[str, Any] = {"agent": self.config.game.agent}
-        if leave.accepts("forget"):
-            # FR-CHAR-006: ordinary shutdown must preserve the credential roster.
-            arguments["forget"] = False
+        if not leave.accepts("forget"):
+            raise RuntimeError(
+                "broker leave schema cannot explicitly preserve the credential roster"
+            )
+        # FR-CHAR-006: every logout states roster preservation explicitly.
+        arguments: dict[str, Any] = {
+            "agent": self.config.game.agent,
+            "forget": False,
+        }
         result = self.broker.call_tool(
             "leave", arguments, timeout=30, mutation=True
         )
+        if not isinstance(result, dict) or result.get("forgotten") is not False:
+            raise RuntimeError(
+                "broker did not affirm that the character remains in its credential roster"
+            )
         if not isinstance(result, dict) or result.get("left") is not True:
             try:
                 health = self.broker.health(timeout=3)
@@ -30137,13 +30119,6 @@ class BotController:
                 raise RuntimeError(
                     "broker did not affirm that the character logged out"
                 )
-        if not isinstance(result, dict):
-            result = {"left": True}
-        if result.get("forgotten") is True:
-            raise RuntimeError(
-                "broker unexpectedly removed the character from its credential roster"
-            )
-
         deadline = time.monotonic() + SHUTDOWN_SESSION_EXIT_TIMEOUT_SECONDS
         session_absent = False
         while time.monotonic() < deadline:

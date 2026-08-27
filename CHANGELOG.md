@@ -14,8 +14,8 @@ and intends to use semantic versioning after its first public release.
   recovers and routes to fresh source-verified safety, releases the keeper, logs
   out without forgetting the character, and fails safe without terminating when
   any required boundary cannot be verified.
-- First-run onboarding driven by an operator-defined name/persona and a
-  configured OpenAI-compatible model.
+- First-run identity verification driven by an operator-defined name/persona,
+  with gameplay goals withheld until the selected live character matches.
 - A local installer persona wizard and JSON-input path that do not require a
   supervising model or MCP host, including inline length, content, usage, and
   privacy guidance for the voice and identity concept.
@@ -33,8 +33,9 @@ and intends to use semantic versioning after its first public release.
   modes with manual fallback.
 - A validated regional timezone picker with common Windows/US alias
   normalization and incomplete-install recovery on the next launch.
-- Explicit preservation of established characters unless replacement is
-  requested.
+- Permanent preservation of every selected character, including generated
+  placeholders, with character creation, suicide, reroll, and replacement
+  removed from controller authority.
 - Public-repository documentation, contribution, security, and CI scaffolding.
 
 ### Fixed

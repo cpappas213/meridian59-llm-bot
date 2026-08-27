@@ -34,9 +34,20 @@ class Decision:
 
 
 class PolicyEngine:
-    VERSION = "fair-play-v1"
-    PLANNER_DENY = {"join", "leave", "fleet", "recording", "converse", "inbox"}
-    CONSEQUENCE_TOOLS = {"trade", "sell", "sell_all", "supply", "split", "reroll"}
+    VERSION = "fair-play-v2"
+    PLANNER_DENY = {
+        "join",
+        "leave",
+        "fleet",
+        "recording",
+        "converse",
+        "inbox",
+        # The harness implements every reroll action through a destructive
+        # character-lifecycle surface.  This is a hard boundary, not an
+        # autonomous consequence that a planner may accept with caution.
+        "reroll",
+    }
+    CONSEQUENCE_TOOLS = {"trade", "sell", "sell_all", "supply", "split"}
 
     def __init__(self, config: PolicyConfig):
         self.config = config
@@ -51,7 +62,8 @@ class PolicyEngine:
                 "avoid_death": self.config.avoid_death,
                 "bank_before_hazard": self.config.bank_before_hazard,
                 "protected_property": "strong caution plus informational pre/post log; action remains autonomous",
-                "reroll_drop_alignment": "strong caution plus informational pre/post log; action remains autonomous",
+                "character_replacement": "permanently disabled; the controller cannot suicide, reroll, replace, or recreate a character",
+                "drop_alignment": "strong caution plus informational pre/post log; action remains autonomous",
             },
         }
         if observation is not None:
@@ -117,8 +129,6 @@ class PolicyEngine:
         return Decision(decision_id, "allow", "ordinary_game_action", ("FAIR-ORDINARY-001",), {}, "Ordinary player capability allowed.", False)
 
     def _classify(self, tool: str, arguments: dict[str, Any], observation: dict[str, Any]) -> tuple[str | None, list[str], dict[str, Any]]:
-        if tool == "reroll" and arguments.get("action") in {"reroll", "verify"}:
-            return "character_create_or_reroll", ["GUIDE-REROLL-001"], {"name": arguments.get("name"), "stats": arguments.get("stats"), "irreversible": True}
         if tool == "act" and arguments.get("verb") == "drop":
             item = self._inventory_match(arguments.get("target"), observation)
             return "item_drop", ["GUIDE-PROPERTY-001"], {"transaction": "drop", "item": item, "protected": self._protected(item), "uncertainty": "medium" if not item else "low"}

@@ -2,7 +2,8 @@
 
 ## 1. Product intent
 
-Create a continuously running Meridian 59 character controlled by a local LLM.
+Operate an existing Meridian 59 character continuously through a local LLM
+controller.
 The character should pursue operator-supplied durable goals, react to the world,
 converse with players in a human-defined persona, survive routine disruptions,
 and make its state understandable through an MCP supervisor.
@@ -17,7 +18,7 @@ revising tactics in service of the active goal.
 |---|---|
 | User/operator | Sets intent and high-level guidance and owns the account and risk policy. |
 | Human/higher-level supervisor | Configures the persona/name, converts intent into structured goals, explains status and consequential events, and manages the queue at the user's direction. |
-| Configured LLM | Selects the initial supported character build and plans tactics beneath an active strategic goal. |
+| Configured LLM | Plans tactics beneath an active strategic goal; it has no character-lifecycle role. |
 | Controller | Durably manages goals, plans, authorizes and executes game actions, verifies outcomes, preserves state, and reports evidence. |
 | Harness | Implements the ordinary game protocol, packet pacing, movement, combat primitives, recovery routines, telemetry, and game-derived reference data. |
 | Game players | Interact with the character in-world. Their messages are social input, never operator authority. |
@@ -28,8 +29,8 @@ revising tactics in service of the active goal.
 
 - One configured Meridian 59 account and one active character.
 - Account and character discovery without mutation.
-- Persona-driven initial character creation after the human configures an LLM
-  endpoint and supplies the intended name/persona.
+- Persona-to-live-character identity verification after the human selects or
+  creates the intended character outside the controller.
 - One durable active goal and a durable ordered queue.
 - LLM planning and sequential execution through the harness broker.
 - Survival, recovery, banking, and bounded mechanical-autopilot fallbacks.
@@ -54,29 +55,35 @@ revising tactics in service of the active goal.
 ### 4.1 Account and character lifecycle
 
 - **FR-CHAR-001**: The system shall connect to the configured server through the
-  harness using the configured account and discover available characters before
-  proposing a mutation.
+  harness using the configured account and discover the selected character
+  without invoking character lifecycle mutations.
 - **FR-CHAR-002**: Credential values shall be read only from a private local
   secret store and shall never appear in logs, status responses, prompts,
   notifications, dashboards, journal entries, or source control.
 - **FR-CHAR-003**: A human or higher-level supervisor shall supply the desired
-  character name and complete conversational persona before character creation.
-- **FR-CHAR-004**: The configured LLM shall select a harness-supported initial
-  stat/loadout build from that persona. The controller shall preview, run a
-  non-blocking consequence preflight, create the character, and verify its exact
-  name independently of the gameplay goal queue.
+  character name and complete conversational persona before onboarding can
+  become goal-ready.
+- **FR-CHAR-004**: The controller shall never create, suicide, delete, reroll,
+  replace, or recreate a character. It shall remove the entire harness `reroll`
+  tool from discovered/planner capabilities and reject it at policy, tool-call,
+  and raw JSON-RPC boundaries. New broker tool names shall be unavailable until
+  explicitly reviewed, and character-lifecycle actions added beneath an approved
+  tool name shall also be filtered and rejected.
 - **FR-CHAR-005**: After joining, the controller shall capture a baseline character
   snapshot including identity, vitals, location, inventory/equipment summary,
   progress, bank state when observable, and alignment/karma state when observable.
 - **FR-CHAR-006**: The controller shall not use the harness's destructive
-  `leave(forget=true)` behavior during ordinary operation.
+  `leave(forget=true)` behavior under any circumstance. Every controller logout
+  shall send the literal boolean `forget=false` and require an explicit
+  `forgotten=false` broker receipt before shutdown may advance.
 - **FR-CHAR-007**: On a fresh run, onboarding shall remain `awaiting_persona`
   until a persona is set and shall not invent a name, persona, or gameplay goal.
 - **FR-CHAR-008**: A generated placeholder name matching `User` followed by
-  digits may be replaced automatically during onboarding.
-- **FR-CHAR-009**: A differently named established character shall be preserved
-  unless the human explicitly sets `replace_existing_character=true` in a new
-  persona request.
+  digits shall receive exactly the same preservation as every other character.
+- **FR-CHAR-009**: A differently named character shall always be preserved.
+  Onboarding shall require external character selection/creation or a persona-name
+  correction; no request, model output, configuration, or persisted legacy state
+  may grant replacement authority.
 - **FR-CHAR-010**: The controller shall expose durable onboarding status and
   shall not report `ready_for_goals` until the intended identity is verified.
 - **FR-CHAR-011**: Goal submission and proposal acceptance shall fail with
@@ -362,13 +369,16 @@ revising tactics in service of the active goal.
 
 ### 4.7 Consequential-action guidance and proposals
 
-- **FR-GUIDE-001**: No game action shall require operator approval. The controller
-  shall either deny an action because it violates the hard no-cheating policy or
-  evaluate it autonomously under goal, risk, and consequence guidance.
-- **FR-GUIDE-002**: Rerolls/character replacement, deliberate item drops,
-  protected-property transfers or disposal, and alignment changes shall carry a
-  strong default preference to avoid unnecessary permanent loss, but the
-  preference shall never become an approval gate.
+- **FR-GUIDE-001**: No authorized, available, structurally valid game action shall
+  require operator approval. The controller shall hard-deny cheating, character
+  lifecycle mutation, unreviewed broker capabilities, stale/invalid actions, and
+  execution-integrity violations; remaining actions shall be evaluated
+  autonomously under goal, risk, and consequence guidance.
+- **FR-GUIDE-002**: Deliberate item drops, protected-property transfers or
+  disposal, and alignment changes shall carry a strong default preference to
+  avoid unnecessary permanent loss, but the preference shall never become an
+  approval gate. Character replacement is instead governed by FR-CHAR-004's hard
+  denial.
 - **FR-GUIDE-003**: Before a consequential action, the controller shall record a
   non-blocking preflight containing the goal rationale, expected permanent effects,
   estimated value/loss, risk, uncertainty, and safer known alternatives.
@@ -454,6 +464,7 @@ revising tactics in service of the active goal.
   extension mechanism and shall not patch Hermes core.
 - **NFR-MAINT-003**: The controller shall detect an incompatible harness capability
   set at startup and fail clearly rather than improvising against unknown schemas.
+  Unreviewed tools and newly introduced lifecycle actions shall fail closed.
 - **NFR-AUD-001**: A reviewer shall be able to reconstruct why each executed action
   was selected, what policy authorized it, and what observation verified it,
   without storing private chain-of-thought.

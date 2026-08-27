@@ -149,6 +149,42 @@ class ApiTests(unittest.TestCase):
                 servers.stop()
                 controller.storage.close()
 
+    def test_persona_api_rejects_character_replacement_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            servers = ApiServers(controller)
+            try:
+                controller.startup(connect_game=False)
+                servers.start()
+                control_port = servers.control.server_address[1]
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{control_port}/v1/persona",
+                    data=json.dumps(
+                        {
+                            "request_id": "api-replacement-denied",
+                            "expected_version": 0,
+                            "persona": {"name": "Sable"},
+                            "replace_existing_character": True,
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "authorization": "Bearer test-token",
+                        "content-type": "application/json",
+                    },
+                    method="PUT",
+                )
+
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(request, timeout=2)
+
+                self.assertEqual(400, rejected.exception.code)
+                error = json.load(rejected.exception)
+                self.assertIn("permanently disabled", error["message"])
+                self.assertEqual(0, controller.persona()["version"])
+            finally:
+                servers.stop()
+                controller.storage.close()
+
     def test_knowledge_routes_resolve_validate_and_reject_unknown_goal_location(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

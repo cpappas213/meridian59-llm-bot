@@ -43,32 +43,35 @@ incoming/outgoing lines in 30 minutes by default.
 flowchart LR
     A["Install: configure game, LLM, and account"] --> B["Local persona wizard"]
     B --> C["Persist operator-authored name and persona"]
-    C --> D{"Existing established character?"}
-    D -->|"Yes, no replacement permission"| E["Preserve and request decision"]
-    D -->|"No or explicitly replace"| F["LLM selects supported build"]
-    F --> G["Preview and consequence audit"]
-    G --> H["Harness creates character"]
-    H --> I["Verify exact name"]
-    I --> J["Ready for operator goal"]
+    C --> D["Observe selected character identity"]
+    D --> E{"Name matches persona?"}
+    E -->|"Yes"| F["Ready for operator goal"]
+    E -->|"No or unknown"| G["Preserve character and withhold goals"]
+    G --> H["Select/create externally or update persona name"]
+    H --> D
 ```
 
-The durable onboarding record is separate from the goal queue. A first-run
-placeholder matching `User` plus digits can be replaced automatically. Any
-other differently named character is preserved until a persona update includes
-`replace_existing_character=true`. The LLM chooses from harness-supported stat
-and loadout presets; the controller previews and audits the destructive reroll,
-then verifies the exact desired name. It does not create a gameplay goal.
+The durable onboarding record is separate from the goal queue and is strictly
+observation-only. Every existing identity, including a generated `User` plus
+digits placeholder, is preserved. Missing or conflicting identity evidence
+withholds gameplay goals; it never authorizes character creation or replacement.
+The broker adapter removes `reroll` from discovered capabilities and rejects it
+again at the tool-call and raw JSON-RPC boundaries. Policy and controller tool
+filters add independent denials. Broker capability growth is fail-closed through
+an explicit reviewed-tool allowlist, and lifecycle directives added beneath an
+otherwise approved tool are removed from planner enums and rejected at the wire.
+Onboarding does not create a gameplay goal.
 The installer invokes the local `setup-persona` command before launching the
 controller, so this state machine does not depend on a frontier supervisor or an
-MCP host. The configured runtime model is used only for the supported build
-selection and later bot roles; it does not invent the persona.
+MCP host. The configured runtime model does not select or mutate a character
+build; it is used only for later bot roles and does not invent the persona.
 
 ## Major components
 
 - `controller.py`: onboarding, observe-plan-authorize-execute-verify loop,
   campaign coordination, deterministic completion, and supervision projection.
 - `storage.py`: SQLite/WAL durable state and request idempotency.
-- `model.py`: OpenAI-compatible goal drafting, planning, onboarding, conversation, and journal
+- `model.py`: OpenAI-compatible goal drafting, planning, conversation, and journal
   assessment roles with explicit unauthenticated, Bearer, and Anthropic header
   modes.
 - `policy.py`: hard authority separation and non-blocking consequence audits.

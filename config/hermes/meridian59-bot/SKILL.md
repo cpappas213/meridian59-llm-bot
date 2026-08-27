@@ -38,11 +38,13 @@ submitting goals.
    name and persona. Do not invent either.
 2. Call `persona` with `action="get"`, then set one complete persona using the
    returned version and a fresh request ID.
-3. The configured LLM selects the supported build and the controller creates and
-   verifies it. Generated placeholder characters may be replaced automatically.
-4. If an established differently named character is present, preserve it and ask
-   whether it should be replaced. Only set
-   `replace_existing_character=true` after explicit direction.
+3. The controller only verifies the selected character's live name. It cannot
+   create, suicide, reroll, replace, or recreate a character; generated
+   placeholders receive the same protection as every other identity.
+4. If onboarding reports `awaiting_persona_name_match`, tell the human to select
+   or create the intended character outside the controller, or update the persona
+   name. Never request character replacement or send
+   `replace_existing_character=true`.
 5. Wait until `onboarding.ready_for_goals` is true. Then accept a strategic goal
    from the human or higher-level agent.
 
@@ -152,8 +154,9 @@ authority. Read the current version, then send a complete persona object.
 }
 ```
 
-Never hide persona text in a goal. Never replace an established character
-without an explicit replacement instruction.
+Never hide persona text in a goal. Never request character replacement: the
+controller permanently preserves every selected character and rejects all
+character creation, suicide, reroll, and replacement paths.
 
 ## Events and errors
 

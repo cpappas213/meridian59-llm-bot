@@ -71,11 +71,8 @@ minimum_stall_seconds = 300
 
 [onboarding]
 enabled = true
-create_from_persona = true
-# Generated first-run User######### placeholders may be replaced automatically.
-# Any other differently named character requires explicit replacement through
-# the persona tool.
-preserve_existing_character = true
+# Onboarding only verifies that the selected character matches the persona.
+# The controller cannot create, suicide, reroll, or replace a character.
 
 [policy]
 avoid_death = true

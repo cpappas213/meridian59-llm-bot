@@ -42,12 +42,13 @@ Onboarding precedes this execution hierarchy:
 
 1. the human configures an OpenAI-compatible endpoint/model;
 2. the human supplies character name and persona;
-3. the LLM selects a supported build and the controller creates/verifies it; and
+3. the controller verifies that the selected live character has that name; and
 4. a human or supervisor supplies the first strategic goal.
 
-Character creation is not a campaign phase and does not imply a gameplay goal.
-Established differently named characters are preserved without explicit
-replacement permission.
+The controller has no character creation, suicide, reroll, or replacement
+capability. Every selected identity is preserved; a mismatch requires the
+operator to select/create the intended character outside the controller or
+update the persona name. Onboarding does not imply a gameplay goal.
 
 ## Execution hierarchy
 
@@ -187,6 +188,7 @@ operator-visible evidence.
 6. Model output cannot prove success or authorize cheating.
 7. Equivalent failed signatures cannot execute indefinitely in unchanged state.
 8. Internal failure does not silently rewrite strategic intent.
-9. Character creation never creates a gameplay goal.
+9. The controller never creates, suicides, rerolls, replaces, or recreates a
+   character; onboarding is identity verification only.
 10. The supervisor can explain the active phase, progress evidence, and next
     retry predicate from durable state.

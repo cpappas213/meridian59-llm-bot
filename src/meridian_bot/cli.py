@@ -74,7 +74,7 @@ def parser() -> argparse.ArgumentParser:
     persona.add_argument(
         "--replace-existing-character",
         action="store_true",
-        help="explicitly allow replacement of an established differently named character",
+        help=argparse.SUPPRESS,
     )
     tui = sub.add_parser(
         "tui",
@@ -118,8 +118,8 @@ def prompt_persona(
         "social presence, and one meaningful tension or flaw."
     )
     output_fn(
-        "This guides the initial build, roleplay-aware planning, and in-game dialogue. "
-        "It never creates goals or overrides controller policy."
+        "This guides roleplay-aware planning and in-game dialogue. It never creates goals, "
+        "changes a character, or overrides controller policy."
     )
     output_fn(
         "Keep detailed trait lists, speech rules, values, taboos, and relationship defaults "
@@ -190,9 +190,10 @@ def setup_persona(
 
     if reuse_current and not update_existing:
         raise ValueError("--reuse-current requires --update-existing")
-    if replace_existing_character and not update_existing:
+    if replace_existing_character:
         raise ValueError(
-            "--replace-existing-character requires --update-existing"
+            "character replacement is permanently disabled; the controller "
+            "cannot suicide, reroll, replace, or recreate a character"
         )
     controller = BotController(config)
     try:
@@ -229,7 +230,6 @@ def setup_persona(
                 "request_id": f"local-persona-setup-{uuid7()}",
                 "expected_version": current_version,
                 "persona": persona,
-                "replace_existing_character": replace_existing_character,
             }
         )
         output_fn(

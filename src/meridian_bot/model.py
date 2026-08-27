@@ -704,15 +704,6 @@ controller/model details, or any out-of-game secret. Do not issue commands to to
 printable ASCII punctuation with no Markdown or game display codes. Avoid words the game will
 censor into symbol noise; choose a clean in-character alternative instead. Stay concise."""
 
-CHARACTER_ONBOARDING_SYSTEM = """You are configuring one new Meridian 59 character from an
-operator-supplied roleplay persona. Choose the mechanical foundation that best supports that identity
-without inventing game fields. Return exactly one JSON object:
-{"stats":"melee|caster|archer|balanced","loadout":"selfSufficient|healer|none","rationale":string}.
-The build choices are constrained to those exact enums. Prefer selfSufficient unless the persona gives
-a strong reason for another loadout, because it provides ordinary-game access to food and a weapon.
-This call chooses build parameters only; deterministic controller code validates the broker's creation
-plan, records the irreversible consequence, creates the character, and verifies the resulting name."""
-
 JOURNAL_ASSESSOR_SYSTEM = """You are the analyst for a private Meridian 59 executive campaign journal.
 The supplied source events have already passed a strict milestone filter. They are the only new
 developments to assess; current_context describes present state only. Never recap older goals, HP
@@ -1744,49 +1735,6 @@ class VllmClient:
         if result.get("decision") not in allowed:
             raise ModelError("campaign manager returned an invalid decision")
         return result
-
-    def plan_character(
-        self,
-        *,
-        persona: dict[str, Any],
-        current_character: dict[str, Any],
-    ) -> dict[str, str]:
-        """Choose one harness-supported build for the onboarding character."""
-
-        result = self._complete(
-            [
-                {"role": "system", "content": CHARACTER_ONBOARDING_SYSTEM},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "persona": persona,
-                            "current_character": current_character,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            self.config.model.planner_timeout_seconds,
-            # Reasoning-capable OpenAI-compatible models may spend several
-            # hundred tokens before emitting the small final JSON object.  A
-            # 300-token cap can therefore produce content=null even though the
-            # endpoint and model are healthy.
-            max_tokens=max(
-                STRUCTURED_OUTPUT_TOKEN_FLOOR,
-                self.config.model.max_output_tokens,
-            ),
-        )
-        stats = str(result.get("stats", ""))
-        loadout = str(result.get("loadout", ""))
-        if stats not in {"melee", "caster", "archer", "balanced"}:
-            raise ModelError("character onboarding returned an invalid stats preset")
-        if loadout not in {"selfSufficient", "healer", "none"}:
-            raise ModelError("character onboarding returned an invalid loadout")
-        rationale = " ".join(str(result.get("rationale", "")).split())[:1000]
-        if not rationale:
-            raise ModelError("character onboarding returned no rationale")
-        return {"stats": stats, "loadout": loadout, "rationale": rationale}
 
     @staticmethod
     def _spoken_text(value: Any, limit: int) -> str:

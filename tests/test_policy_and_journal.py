@@ -686,26 +686,6 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual(legal_actions, sent["legal_actions"])
             self.assertEqual(recent_history[-12:], sent["recent_history"])
 
-    def test_character_onboarding_reserves_room_for_reasoning_then_json(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            client = VllmClient(config(Path(temporary)))
-            with patch.object(
-                client,
-                "_complete",
-                return_value={
-                    "stats": "caster",
-                    "loadout": "selfSufficient",
-                    "rationale": "Matches the persona.",
-                },
-            ) as complete:
-                result = client.plan_character(
-                    persona={"name": "Sable"},
-                    current_character={"name": "User123"},
-                )
-
-            self.assertEqual("caster", result["stats"])
-            self.assertGreaterEqual(complete.call_args.kwargs["max_tokens"], 4096)
-
     def test_vllm_retries_reasoning_only_length_with_larger_budget(self) -> None:
         class Response:
             def __init__(self, content: str | None, reasoning: str | None = None):
@@ -1105,6 +1085,24 @@ class PolicyAndJournalTests(unittest.TestCase):
             self.assertEqual("item_drop", drop.action_class)
             self.assertTrue(drop.notify)
             self.assertEqual("deny", leave.decision)
+
+    def test_reroll_is_a_hard_policy_denial_for_every_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg = config(Path(temporary))
+            policy = PolicyEngine(cfg.policy)
+
+            for action in ("plan", "verify", "reroll"):
+                with self.subTest(action=action):
+                    decision = policy.evaluate(
+                        "reroll",
+                        {"agent": "primary", "action": action, "confirm": True},
+                        {},
+                        {"id": "goal"},
+                        known_tools={"reroll"},
+                    )
+                    self.assertEqual("deny", decision.decision)
+                    self.assertEqual("invalid_action", decision.action_class)
+                    self.assertIn("AUTH-TOOL-001", decision.matched_rules)
 
     def test_bank_transfer_is_logged_as_autonomous_property_transaction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

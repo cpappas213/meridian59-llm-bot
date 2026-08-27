@@ -50,8 +50,9 @@ The following are `interesting=true` by default:
 - creation or resolution of a durable failure lesson and deterministic retry
   unlock/suppression;
 - a controller-created goal proposal;
-- consequential-action preflight and verified outcome, including rerolls,
-  alignment changes, deliberate drops, and protected-property transactions;
+- consequential-action preflight and verified outcome, including alignment
+  changes, deliberate drops, and protected-property transactions (legacy
+  reroll records remain audit history, but new rerolls are impossible);
 - death, near-death, escape from a severe threat, or substantial loss;
 - a PvP encounter and its outcome;
 - successful or failed theft with material consequences;

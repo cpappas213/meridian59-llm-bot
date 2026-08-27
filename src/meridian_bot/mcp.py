@@ -45,12 +45,12 @@ TOOLS = [
     {
         "name": "persona",
         "description": (
-            "Read or set the character's versioned persona and initiate first-run character onboarding. "
+            "Read or set the character's versioned persona and verify it against the selected character. "
             "Call get first. Set requires request_id "
             "and a persona containing name plus the documented voice/style fields; pass the get response's "
-            "version as expected_version, not as version. An established differently named character is "
-            "preserved unless replace_existing_character=true is explicitly supplied. Persona does not alter "
-            "ordinary gameplay authority."
+            "version as expected_version, not as version. A differently named or temporarily unidentified "
+            "character is always preserved. Persona does not grant character-lifecycle authority, and the "
+            "controller cannot create, replace, reroll, or suicide a character."
         ),
         "inputSchema": PERSONA_TOOL_INPUT_SCHEMA,
     },

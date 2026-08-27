@@ -232,7 +232,6 @@ sequenceDiagram
     participant User as Human operator
     participant Supervisor
     participant C as Controller
-    participant LLM as Configured LLM
     participant B as Harness broker
 
     User->>C: Configure game and LLM endpoint/model
@@ -240,13 +239,11 @@ sequenceDiagram
     User->>Supervisor: Desired name and persona
     Supervisor->>C: set_persona(versioned request)
     C->>B: Observe existing character
-    alt Established different identity without replacement permission
-        C-->>Supervisor: Preserve character; request explicit decision
-    else New placeholder or explicit replacement
-        C->>LLM: Persona and supported build choices
-        LLM-->>C: Stat/loadout preset
-        C->>B: Preview, audit, create, observe
-        B-->>C: Verified exact character name
+    alt Character identity temporarily unavailable
+        C-->>Supervisor: Withhold goals; wait for fresh identity evidence
+    else Selected identity differs from persona name
+        C-->>Supervisor: Preserve character; select/create externally or update persona
+    else Selected identity exactly matches persona name
         C-->>Supervisor: ready_for_goals=true
     end
     User->>Supervisor: Strategic gameplay goal
@@ -348,15 +345,17 @@ sequenceDiagram
 ## 6. Compatibility contract
 
 At startup the harness adapter shall interrogate the broker capability/tool list
-and compare it with a tested manifest containing:
+and compare it with a tested, fail-closed manifest containing:
 
 - harness Git revision or semantic build identifier when available;
 - required tool names and input-schema hashes;
-- optional capabilities;
+- an explicit allowlist of reviewed optional capabilities;
 - expected protocol/API version; and
 - known incompatibilities.
 
-Missing required tools or changed schemas place the controller in `incompatible`
-state. Optional capabilities degrade only their associated tactics. The adapter
+Missing required tools or incompatible schemas place the controller in
+`incompatible` state. Unreviewed tool names remain unavailable; lifecycle action
+enums added beneath reviewed names are filtered and rejected at execution.
+Optional capabilities degrade only their associated tactics. The adapter
 shall translate harness-specific payloads into internal typed observations so
 the rest of the controller does not depend on unstable raw output.

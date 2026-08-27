@@ -6,18 +6,297 @@ from dataclasses import replace
 from pathlib import Path
 
 from meridian_bot.broker import (
+    APPROVED_BROKER_TOOLS,
     BrokerClient,
     BrokerError,
     CONTROLLER_ONLY_TOOLS,
+    FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS,
     HarnessIncompatible,
     Tool,
     ToolCallError,
+    guard_controller_tool_call,
 )
 
 from .helpers import config
 
 
 class BrokerTests(unittest.TestCase):
+    def test_reroll_is_filtered_from_controller_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            tool_names = {
+                "join",
+                "leave",
+                "look",
+                "status",
+                "inventory",
+                "autopilot",
+                "wait_for_event",
+                "reroll",
+                "restart_character",
+            }
+
+            def fake_rpc(
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 30,
+            ) -> dict[str, object]:
+                self.assertEqual("tools/list", method)
+                return {
+                    "tools": [
+                        {
+                            "name": name,
+                            "description": name,
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        }
+                        for name in sorted(tool_names)
+                    ]
+                }
+
+            broker.rpc = fake_rpc  # type: ignore[method-assign]
+
+            capabilities = broker.capabilities(refresh=True)
+            planner_names = {tool["name"] for tool in broker.planner_tools()}
+
+            self.assertEqual(frozenset({"reroll"}), FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS)
+            self.assertNotIn("reroll", APPROVED_BROKER_TOOLS)
+            self.assertNotIn("reroll", capabilities)
+            self.assertNotIn("reroll", planner_names)
+            self.assertNotIn("restart_character", capabilities)
+            self.assertNotIn("restart_character", planner_names)
+
+    def test_every_reroll_action_is_rejected_before_any_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "reroll": Tool(
+                    "reroll",
+                    "Destructive character replacement.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"enum": ["plan", "verify", "reroll"]},
+                            "confirm": {"type": "boolean"},
+                        },
+                        "required": ["action"],
+                    },
+                )
+            }
+            requests: list[object] = []
+            broker._json_request = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: requests.append((_args, _kwargs))
+            )
+
+            for arguments in (
+                {"action": "plan"},
+                {"action": "verify"},
+                {"action": "reroll", "confirm": True},
+            ):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaisesRegex(ToolCallError, "permanently disabled"):
+                        broker.call_tool("reroll", arguments)
+                    with self.assertRaisesRegex(ToolCallError, "permanently disabled"):
+                        broker.rpc(
+                            "tools/call",
+                            {"name": "reroll", "arguments": arguments},
+                        )
+
+            self.assertEqual([], requests)
+
+    def test_controller_cannot_forget_a_character_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "leave": Tool(
+                    "leave",
+                    "Log out.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "forget": {"type": "boolean"},
+                        },
+                        "required": ["agent"],
+                    },
+                )
+            }
+
+            requests: list[dict[str, object]] = []
+
+            def fake_json_request(
+                _url: str,
+                payload: dict[str, object],
+                _timeout: float,
+            ) -> dict[str, object]:
+                requests.append(payload)
+                return {"result": {"content": [{"text": "{}"}]}}
+
+            broker._json_request = fake_json_request  # type: ignore[method-assign]
+
+            for forget in (True, 1, 0, "false", None, []):
+                with self.subTest(forget=forget):
+                    with self.assertRaisesRegex(ToolCallError, "literal boolean false"):
+                        broker.call_tool(
+                            "leave",
+                            {"agent": "primary", "forget": forget},
+                            mutation=True,
+                        )
+                    with self.assertRaisesRegex(ToolCallError, "literal boolean false"):
+                        broker.rpc(
+                            "tools/call",
+                            {
+                                "name": "leave",
+                                "arguments": {"agent": "primary", "forget": forget},
+                            },
+                        )
+
+            self.assertEqual([], requests)
+            broker.call_tool("leave", {"agent": "primary"}, mutation=True)
+            wire_arguments = requests[-1]["params"]["arguments"]  # type: ignore[index]
+            self.assertIs(wire_arguments["forget"], False)  # type: ignore[index]
+
+    def test_unreviewed_upstream_tool_is_rejected_before_any_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            requests: list[object] = []
+            broker._json_request = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: requests.append((_args, _kwargs))
+            )
+
+            for invoke in (
+                lambda: broker.call_tool(
+                    "restart_character", {"confirm": True}, mutation=True
+                ),
+                lambda: broker.rpc(
+                    "tools/call",
+                    {
+                        "name": "restart_character",
+                        "arguments": {"confirm": True},
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(ToolCallError, "fail-closed"):
+                    invoke()
+
+            self.assertEqual([], requests)
+
+    def test_lifecycle_action_added_under_approved_tool_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = BrokerClient(config(Path(temporary)))
+            broker._manifest = {
+                "act": Tool(
+                    "act",
+                    "Generic ordinary-client action.",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "verb": {
+                                "type": "string",
+                                "enum": [
+                                    "get",
+                                    "suicide",
+                                    "delete_character",
+                                    "perform_suicide",
+                                    "force-reroll",
+                                    "restartCharacter",
+                                ],
+                            },
+                            "options": {
+                                "type": "object",
+                                "properties": {
+                                    "onDeath": {
+                                        "type": "string",
+                                        "enum": ["reset"],
+                                    }
+                                },
+                            },
+                        },
+                    },
+                )
+            }
+            requests: list[object] = []
+            broker._json_request = (  # type: ignore[method-assign]
+                lambda *_args, **_kwargs: requests.append((_args, _kwargs))
+            )
+
+            planner = broker._manifest["act"].planner_view()
+            self.assertEqual(
+                ["get"], planner["input_schema"]["properties"]["verb"]["enum"]
+            )
+            self.assertNotIn("options", planner["input_schema"]["properties"])
+            for arguments in (
+                {"agent": "primary", "verb": "suicide"},
+                {"agent": "primary", "verb": "delete_character"},
+                {"agent": "primary", "verb": "perform_suicide"},
+                {
+                    "agent": "primary",
+                    "options": {"operation": "force-reroll"},
+                },
+                {"agent": "primary", "restartCharacter": True},
+                {
+                    "agent": "primary",
+                    "options": {"on_death": "reroll"},
+                },
+                {"agent": "primary", "command": "auto_reroll"},
+                {"agent": "primary", "suicide_on_failure": True},
+                {
+                    "agent": "primary",
+                    "character_lifecycle": {"operation": "reset"},
+                },
+                {
+                    "agent": "primary",
+                    "action": "delete",
+                    "target": "character",
+                },
+                {
+                    "agent": "primary",
+                    "character": {"operation": "reset"},
+                },
+                {
+                    "agent": "primary",
+                    "characterLifecycle": {"operation": "reset"},
+                },
+                {
+                    "agent": "primary",
+                    "onDeath": "reset",
+                },
+            ):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaisesRegex(
+                        ToolCallError, "character-lifecycle directives"
+                    ):
+                        broker.call_tool("act", arguments, mutation=True)
+                    with self.assertRaisesRegex(
+                        ToolCallError, "character-lifecycle directives"
+                    ):
+                        broker.rpc(
+                            "tools/call",
+                            {"name": "act", "arguments": arguments},
+                        )
+
+            self.assertEqual([], requests)
+            self.assertEqual(
+                {"agent": "primary", "spell": "Forget"},
+                guard_controller_tool_call(
+                    "cast", {"agent": "primary", "spell": "Forget"}
+                ),
+            )
+            opaque_join = {
+                "agent": "reset",
+                "account": "new",
+                "password": "auto-reroll",
+                "character": "Reset",
+                "host": "suicide",
+            }
+            self.assertEqual(
+                opaque_join,
+                guard_controller_tool_call("join", opaque_join),
+            )
+
     def test_managed_launch_command_includes_separate_read_only_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             broker = BrokerClient(config(Path(temporary)))

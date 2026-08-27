@@ -60,7 +60,7 @@ Configuration is TOML and unknown keys fail closed. Important sections are:
 | `harness` | Root, exact expected revision, broker endpoint, Node path, state file. |
 | `model` | OpenAI-compatible base URL, exact model ID, explicit auth mode, timeouts, output budget, JSON-mode and optional thinking controls. |
 | `controller` | Loopback API, read-only dashboard, cadence, conversation bounds. |
-| `onboarding` | Persona-driven creation and established-character preservation. |
+| `onboarding` | Non-mutating verification of selected-character/persona identity. |
 | `policy` | Survival and consequence guidance. |
 | `learning` | Failure budgets and deterministic retry cooldowns. |
 | `notifications` | Optional Windows/Obsidian sinks. |
@@ -89,11 +89,11 @@ During installation and first launch:
    `awaiting_persona`; `-PersonaFile` supports unattended setup.
 2. Run `doctor` and correct dependency failures.
 3. Read persona/status and verify that the intended persona is versioned and
-   onboarding is pending or in progress.
-4. The configured LLM chooses a supported build; the controller previews,
-   audits, creates, and verifies the character.
-5. An established differently named character is not replaced without an
-   explicit `replace_existing_character=true` persona update.
+   onboarding is waiting for or verifying the selected live identity.
+4. Select or create the intended character outside the controller. The controller
+   verifies only that its live name matches the persona.
+5. If names differ, select the intended character externally or update the
+   persona name. The controller permanently refuses all character replacement.
 6. Wait for `onboarding.ready_for_goals=true`.
 7. A human or higher-level agent supplies the first strategic goal.
 
@@ -117,9 +117,10 @@ The same local wizard can be run manually:
 python -m meridian_bot.cli --config "$env:LOCALAPPDATA\m59-llm-bot\bot.toml" setup-persona
 ```
 
-It preserves an existing persona by default. Explicitly replacing an established
-differently named character requires
-`--update-existing --reuse-current --replace-existing-character`.
+It preserves an existing persona by default. To change only the persona, use
+`--update-existing` (and optionally `--reuse-current`). Character replacement is
+not a supported command; the compatibility flag fails with a permanent-disabled
+error and performs no write.
 
 No standing goal is installed and no goal is inferred from persona text.
 
@@ -224,9 +225,9 @@ Do not advance the harness independently of the root gitlink and
   or killed the character there.
 - **Harness revision mismatch:** initialize/update the submodule to the committed
   revision; never bypass the expected-revision check.
-- **Character preserved:** this is intentional for an established identity. Set
-  the persona again with the explicit replacement flag only after operator
-  confirmation.
+- **Character/persona name mismatch:** the selected character is intentionally
+  preserved and gameplay goals remain withheld. Select or create the intended
+  character outside the controller, or update the persona name to match it.
 - **No active goal after setup:** expected. A human or supervisor must supply it.
 - **Control API rejected:** verify loopback URL and control token without logging
   the token.

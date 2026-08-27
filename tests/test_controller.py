@@ -19,6 +19,7 @@ from meridian_bot.campaign import (
 )
 from meridian_bot.contracts import CRITERION_KINDS
 from meridian_bot.controller import (
+    ONBOARDING_RUNTIME_KEY,
     PLANNED_CONTROLLER_STOP_RUNTIME_KEY,
     RESEARCH_RECIPE_EXHAUSTION_RUNTIME_KEY,
     RESEARCH_RETRY_STATE_SCHEMA_VERSION,
@@ -35,6 +36,7 @@ from meridian_bot.model import (
 from meridian_bot.persona import PERSONA_FIELDS
 from meridian_bot.simulator import SimulatedBroker
 from meridian_bot.config import OnboardingConfig
+from meridian_bot.utils import timestamp
 
 from .helpers import config, goal_payload
 
@@ -1285,7 +1287,7 @@ class OnboardingModel:
 
 
 class OnboardingBroker(SimulatedBroker):
-    def __init__(self, current_name: str) -> None:
+    def __init__(self, current_name: str | None) -> None:
         super().__init__()
         self.current_name = current_name
         self.tools["reroll"] = Tool(
@@ -1307,8 +1309,17 @@ class OnboardingBroker(SimulatedBroker):
 
     def observe(self) -> dict[str, object]:
         value = super().observe()
-        value["look"]["self"]["name"] = self.current_name
-        value["status"]["character"] = self.current_name
+        if self.current_name:
+            value["look"]["self"]["name"] = self.current_name
+            value["status"]["character"] = self.current_name
+        else:
+            value["look"].pop("self", None)
+            value["look"].pop("character", None)
+            value["status"].pop("character", None)
+            value["freshness"] = {
+                "mode": "tactical_cache",
+                "status": "derived_from_cached_look",
+            }
         return value
 
     def call_tool(
@@ -1376,7 +1387,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.close()
 
-    def test_onboarding_uses_llm_build_after_persona_and_then_waits_for_goals(self) -> None:
+    def test_onboarding_never_replaces_generated_placeholder_character(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = replace(
                 config(Path(temporary)), onboarding=OnboardingConfig(enabled=True)
@@ -1398,21 +1409,71 @@ class ControllerTests(unittest.TestCase):
                         },
                     }
                 )
-                self.assertEqual("pending", persona["onboarding"]["status"])
+                self.assertEqual(
+                    "awaiting_character_identity", persona["onboarding"]["status"]
+                )
 
                 result = controller.turn()
 
                 self.assertTrue(result["idle"])
-                self.assertEqual("ready", result["onboarding"]["status"])
-                self.assertTrue(result["onboarding"]["ready_for_goals"])
-                self.assertEqual("Sable", broker.current_name)
-                self.assertEqual(1, len(model.requests))
+                self.assertEqual(
+                    "awaiting_persona_name_match", result["onboarding"]["status"]
+                )
+                self.assertFalse(result["onboarding"]["ready_for_goals"])
+                self.assertFalse(
+                    result["onboarding"]["character_lifecycle_mutation_allowed"]
+                )
+                self.assertEqual("User123456", broker.current_name)
+                self.assertEqual([], model.requests)
                 rerolls = [call for call in broker.calls if call[0] == "reroll"]
-                self.assertEqual(["plan", "reroll"], [call[1]["action"] for call in rerolls])
+                self.assertEqual([], rerolls)
                 self.assertEqual([], controller.storage.goals(["active", "queued"]))
                 self.assertEqual(
+                    0,
+                    len(
+                        controller.storage.events(
+                            kinds=["onboarding.character_creation.started"]
+                        )["events"]
+                    ),
+                )
+            finally:
+                controller.close()
+
+    def test_onboarding_only_verifies_an_already_selected_matching_character(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = replace(
+                config(Path(temporary)), onboarding=OnboardingConfig(enabled=True)
+            )
+            controller = BotController(value)
+            try:
+                broker = OnboardingBroker("Sable")
+                model = OnboardingModel()
+                controller.broker = broker
+                controller.model = model  # type: ignore[assignment]
+                controller.set_persona(
+                    {
+                        "request_id": "verify-sable",
+                        "expected_version": 0,
+                        "persona": {"name": "Sable"},
+                    }
+                )
+
+                result = controller.turn()
+
+                self.assertEqual("ready", result["onboarding"]["status"])
+                self.assertTrue(result["onboarding"]["ready_for_goals"])
+                self.assertFalse(
+                    result["onboarding"]["character_lifecycle_mutation_allowed"]
+                )
+                self.assertEqual([], model.requests)
+                self.assertFalse(any(name == "reroll" for name, _ in broker.calls))
+                self.assertEqual(
                     1,
-                    len(controller.storage.events(kinds=["onboarding.completed"])["events"]),
+                    len(
+                        controller.storage.events(
+                            kinds=["onboarding.identity_verified"]
+                        )["events"]
+                    ),
                 )
             finally:
                 controller.close()
@@ -1472,7 +1533,7 @@ class ControllerTests(unittest.TestCase):
                 result = controller.turn()
 
                 self.assertEqual(
-                    "awaiting_existing_character_confirmation",
+                    "awaiting_persona_name_match",
                     result["onboarding"]["status"],
                 )
                 self.assertEqual("EstablishedHero", broker.current_name)
@@ -1480,7 +1541,7 @@ class ControllerTests(unittest.TestCase):
             finally:
                 controller.close()
 
-    def test_onboarding_replaces_established_character_only_after_explicit_request(self) -> None:
+    def test_onboarding_rejects_explicit_character_replacement_request(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             value = replace(
                 config(Path(temporary)), onboarding=OnboardingConfig(enabled=True)
@@ -1500,19 +1561,20 @@ class ControllerTests(unittest.TestCase):
                 )
                 controller.turn()
 
-                controller.set_persona(
-                    {
-                        "request_id": "replace-explicitly",
-                        "expected_version": 1,
-                        "persona": {"name": "Sable"},
-                        "replace_existing_character": True,
-                    }
-                )
-                result = controller.turn()
+                with self.assertRaisesRegex(ValueError, "permanently disabled"):
+                    controller.set_persona(
+                        {
+                            "request_id": "replace-explicitly",
+                            "expected_version": 1,
+                            "persona": {"name": "Sable"},
+                            "replace_existing_character": True,
+                        }
+                    )
 
-                self.assertEqual("ready", result["onboarding"]["status"])
-                self.assertEqual("Sable", broker.current_name)
-                self.assertEqual(1, len(model.requests))
+                self.assertEqual(1, controller.persona()["version"])
+                self.assertEqual("EstablishedHero", broker.current_name)
+                self.assertEqual([], model.requests)
+                self.assertFalse(any(name == "reroll" for name, _ in broker.calls))
             finally:
                 controller.close()
 
@@ -1538,6 +1600,226 @@ class ControllerTests(unittest.TestCase):
                             "replace_existing_character": "yes",
                         }
                     )
+                accepted = controller.set_persona(
+                    {
+                        "request_id": "compatibility-false",
+                        "expected_version": 0,
+                        "persona": {"name": "Sable"},
+                        "replace_existing_character": False,
+                    }
+                )
+                self.assertEqual(1, accepted["version"])
+            finally:
+                controller.close()
+
+    def test_ready_onboarding_with_missing_identity_never_reenters_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = replace(
+                config(Path(temporary)), onboarding=OnboardingConfig(enabled=True)
+            )
+            controller = BotController(value)
+            try:
+                broker = OnboardingBroker("Sable")
+                model = OnboardingModel()
+                controller.broker = broker
+                controller.model = model  # type: ignore[assignment]
+                controller.set_persona(
+                    {
+                        "request_id": "ready-before-identity-gap",
+                        "expected_version": 0,
+                        "persona": {"name": "Sable"},
+                    }
+                )
+                controller.turn()
+                controller.storage.set_runtime(
+                    ONBOARDING_RUNTIME_KEY,
+                    {
+                        "status": "ready",
+                        "request_id": "ready-before-identity-gap",
+                        "persona_version": 1,
+                        "desired_name": "Sable",
+                        "current_name": "Sable",
+                        "completed_at": timestamp(),
+                        # Every legacy mutation field must be scrubbed and inert.
+                        "replace_existing_character": True,
+                        "build": {"stats": "melee"},
+                        "attempt_id": "old-destructive-attempt",
+                    },
+                )
+                broker.calls.clear()
+                broker.current_name = None
+
+                missing = controller.turn()
+
+                self.assertEqual(
+                    "awaiting_character_identity", missing["onboarding"]["status"]
+                )
+                self.assertFalse(missing["onboarding"]["ready_for_goals"])
+                self.assertEqual([], model.requests)
+                self.assertFalse(any(name == "reroll" for name, _ in broker.calls))
+                self.assertEqual(
+                    0,
+                    len(
+                        controller.storage.events(
+                            kinds=["onboarding.character_creation.started"]
+                        )["events"]
+                    ),
+                )
+                durable = controller.storage.get_runtime(ONBOARDING_RUNTIME_KEY)
+                self.assertEqual("ready", durable["status"])
+                self.assertNotIn("replace_existing_character", durable)
+                self.assertNotIn("build", durable)
+                self.assertNotIn("attempt_id", durable)
+
+                broker.current_name = "Sable"
+                restored = controller.turn()
+                self.assertEqual("ready", restored["onboarding"]["status"])
+                self.assertTrue(restored["onboarding"]["ready_for_goals"])
+                self.assertFalse(any(name == "reroll" for name, _ in broker.calls))
+            finally:
+                controller.close()
+
+    def test_legacy_creating_and_replacement_grant_are_inert(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = replace(
+                config(Path(temporary)),
+                onboarding=OnboardingConfig(
+                    enabled=True,
+                    create_from_persona=False,
+                    preserve_existing_character=False,
+                ),
+            )
+            controller = BotController(value)
+            try:
+                broker = OnboardingBroker("EstablishedHero")
+                model = OnboardingModel()
+                controller.broker = broker
+                controller.model = model  # type: ignore[assignment]
+                controller.set_persona(
+                    {
+                        "request_id": "legacy-dangerous-state",
+                        "expected_version": 0,
+                        "persona": {"name": "Sable"},
+                    }
+                )
+                controller.storage.set_runtime(
+                    ONBOARDING_RUNTIME_KEY,
+                    {
+                        "status": "creating",
+                        "request_id": "legacy-dangerous-state",
+                        "persona_version": 1,
+                        "desired_name": "Sable",
+                        "replace_existing_character": True,
+                        "attempt_id": "legacy-attempt",
+                    },
+                )
+
+                result = controller.turn()
+
+                self.assertEqual(
+                    "awaiting_persona_name_match", result["onboarding"]["status"]
+                )
+                self.assertEqual("EstablishedHero", broker.current_name)
+                self.assertEqual([], model.requests)
+                self.assertFalse(any(name == "reroll" for name, _ in broker.calls))
+                durable = controller.storage.get_runtime(ONBOARDING_RUNTIME_KEY)
+                self.assertEqual("awaiting_persona_name_match", durable["status"])
+                self.assertNotIn("replace_existing_character", durable)
+                self.assertNotIn("attempt_id", durable)
+            finally:
+                controller.close()
+
+    def test_startup_scrubs_legacy_creation_state_with_active_goal_and_disabled_onboarding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            value = replace(
+                config(Path(temporary)),
+                onboarding=OnboardingConfig(enabled=False),
+            )
+            seed = BotController(value)
+            try:
+                seed.storage.submit_goal(
+                    goal_payload(request_id="active-during-legacy-scrub")
+                )
+                self.assertIsNotNone(seed.storage.active_goal())
+                self.assertEqual(0, seed.persona()["version"])
+                seed.storage.set_runtime(
+                    ONBOARDING_RUNTIME_KEY,
+                    {
+                        "status": "creating",
+                        "request_id": "old-process",
+                        "replace_existing_character": True,
+                        "build": {"stats": "melee"},
+                        "attempt_id": "old-destructive-attempt",
+                        "result": {"confirm": True},
+                    },
+                )
+            finally:
+                seed.close()
+
+            controller = BotController(value)
+            try:
+                self.assertIsNotNone(controller.storage.active_goal())
+                self.assertEqual(0, controller.persona()["version"])
+                durable = controller.storage.get_runtime(ONBOARDING_RUNTIME_KEY)
+                self.assertEqual("awaiting_character_identity", durable["status"])
+                self.assertNotIn("replace_existing_character", durable)
+                self.assertNotIn("build", durable)
+                self.assertNotIn("attempt_id", durable)
+                self.assertNotIn("result", durable)
+                events = controller.storage.events(
+                    kinds=["onboarding.legacy_state_scrubbed"]
+                )["events"]
+                self.assertEqual(1, len(events))
+            finally:
+                controller.close()
+
+    def test_controller_filters_reroll_from_noncompliant_broker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                controller.broker = OnboardingBroker("Sable")
+
+                self.assertNotIn("reroll", controller._available_tools())
+                self.assertNotIn(
+                    "reroll", {tool["name"] for tool in controller._planner_tools()}
+                )
+                controller.broker.tools["restart_character"] = Tool(
+                    "restart_character",
+                    "Unreviewed destructive upstream addition.",
+                    {
+                        "type": "object",
+                        "properties": {"confirm": {"type": "boolean"}},
+                    },
+                )
+                self.assertNotIn("restart_character", controller._available_tools())
+                self.assertNotIn(
+                    "restart_character",
+                    {tool["name"] for tool in controller._planner_tools()},
+                )
+                with self.assertRaisesRegex(ModelError, "permanently disabled"):
+                    controller._execute(
+                        {"id": "legacy-goal"},
+                        {},
+                        {
+                            "tool": "reroll",
+                            "arguments": {
+                                "agent": "primary",
+                                "action": "verify",
+                            },
+                        },
+                    )
+                with self.assertRaisesRegex(ModelError, "unknown broker tool"):
+                    controller._execute_with_ownership(
+                        {"id": "legacy-goal"},
+                        {},
+                        {
+                            "tool": "restart_character",
+                            "arguments": {"confirm": True},
+                        },
+                    )
+                self.assertEqual([], controller.broker.calls)
             finally:
                 controller.close()
 
@@ -2116,6 +2398,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(["name"], persona["required"])
         self.assertFalse(persona["additionalProperties"])
         self.assertIn("Do not send a top-level version field", schema["description"])
+        replacement = schema["properties"]["replace_existing_character"]
+        self.assertIs(replacement["const"], False)
+        self.assertTrue(replacement["deprecated"])
+        self.assertIn("permanently disabled", replacement["description"])
 
     def test_every_mcp_schema_is_closed_and_documented_recursively(self) -> None:
         self.assertEqual(set(CRITERION_KINDS), CriteriaEvaluator.SUPPORTED)
@@ -18155,6 +18441,61 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(broker.joined)
                 self.assertTrue(broker.keeper_running)
                 leaves = [args for name, args in broker.calls if name == "leave"]
+                self.assertEqual(1, len(leaves))
+                self.assertIs(leaves[0]["forget"], False)
+            finally:
+                controller.storage.close()
+
+    def test_shutdown_logout_requires_preservation_schema_and_receipt(self) -> None:
+        class MissingPreservationReceiptBroker(ShutdownBroker):
+            def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+                *,
+                timeout: float = 180,
+                mutation: bool = False,
+            ) -> object:
+                result = super().call_tool(
+                    name, arguments, timeout=timeout, mutation=mutation
+                )
+                if name == "leave" and isinstance(result, dict):
+                    result = dict(result)
+                    result.pop("forgotten", None)
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            controller = BotController(config(Path(temporary)))
+            try:
+                missing_schema = ShutdownBroker()
+                missing_schema.tools["leave"] = Tool(
+                    "leave",
+                    "Legacy logout without an explicit preservation control.",
+                    {
+                        "type": "object",
+                        "properties": {"agent": {"type": "string"}},
+                        "required": ["agent"],
+                    },
+                )
+                controller.broker = missing_schema
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot explicitly preserve"
+                ):
+                    controller._logout_for_shutdown()
+                self.assertTrue(missing_schema.joined)
+                self.assertNotIn("leave", [name for name, _ in missing_schema.calls])
+
+                missing_receipt = MissingPreservationReceiptBroker()
+                controller.broker = missing_receipt
+                with self.assertRaisesRegex(
+                    RuntimeError, "did not affirm.*credential roster"
+                ):
+                    controller._logout_for_shutdown()
+                leaves = [
+                    arguments
+                    for name, arguments in missing_receipt.calls
+                    if name == "leave"
+                ]
                 self.assertEqual(1, len(leaves))
                 self.assertIs(leaves[0]["forget"], False)
             finally:

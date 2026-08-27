@@ -35,9 +35,10 @@ semantics, attachment, safe shutdown, and adapter translations.
 ### 2.3 Live LAN environment
 
 Run low-risk tests against the configured server/account. Begin in discovery-only
-mode. Default commissioning does not trigger a reroll, deliberate drop, or
-alignment change merely to prove instrumentation; the simulator covers those
-paths. If a live goal selects one, it remains autonomous and must produce the
+mode. Commissioning never triggers character creation, suicide, replacement, or
+reroll. Deliberate drop or alignment change need not be triggered merely to prove
+instrumentation; the simulator covers those paths. If a live goal selects one of
+the remaining consequential actions, it stays autonomous and must produce the
 specified consequence preflight, log, notification, and verified outcome.
 
 ### 2.4 Desktop integration environment
@@ -68,18 +69,19 @@ real vault.
 | ID | Priority | Test and expected result | Requirements |
 |---|---|---|---|
 | AT-CHAR-001 | P0 | Start with the live account in discovery mode. Return redacted roster/baseline without deleting, rerolling, or forgetting a character. | FR-CHAR-001, FR-CHAR-005, FR-CHAR-006 |
-| AT-CHAR-002 | P0 | Start without a persona. Status remains `awaiting_persona`; no model character plan, reroll, or goal creation occurs. | FR-CHAR-007 |
-| AT-CHAR-003 | P0 | Set a persona/name while a generated `User`-plus-digits placeholder exists. The configured LLM selects a supported build; the controller previews, records the preflight, rerolls, verifies the exact name, and reports ready without creating a goal. | FR-CHAR-003, FR-CHAR-004, FR-CHAR-008, FR-CHAR-010 |
+| AT-CHAR-002 | P0 | Start without a persona. Status remains `awaiting_persona`; no model character plan, lifecycle tool, or goal creation occurs. | FR-CHAR-007 |
+| AT-CHAR-003 | P0 | Set a persona/name while a generated `User`-plus-digits placeholder exists. The placeholder is preserved, onboarding reports `awaiting_persona_name_match`, no model is called, and no gameplay goal or broker mutation occurs. | FR-CHAR-003, FR-CHAR-004, FR-CHAR-008, FR-CHAR-010 |
 | AT-CHAR-004 | P0 | Seed canary credentials/tokens and exercise all outputs/errors. Automated scan finds no canary in logs, DB export, events, prompts, dashboard, notification, or journal. | FR-CHAR-002; NFR-SEC-002, NFR-SEC-003 |
 | AT-CHAR-005 | P1 | Verify private runtime files are outside Git, ignored defensively, and readable only by intended Windows identity to the practical platform extent. | FR-CHAR-002 |
-| AT-CHAR-006 | P0 | Start with an established differently named character and set a new persona without replacement permission. The character is preserved and onboarding requests an explicit decision. | FR-CHAR-001, FR-CHAR-009 |
-| AT-CHAR-007 | P0 | Repeat the persona update with `replace_existing_character=true`. The controller runs the LLM build selection, audited reroll, and exact-name verification. | FR-CHAR-004, FR-CHAR-009, FR-CHAR-010 |
+| AT-CHAR-006 | P0 | Start with any differently named character and set a new persona. The character is preserved and onboarding instructs the operator to select/create externally or correct the persona name. | FR-CHAR-001, FR-CHAR-009 |
+| AT-CHAR-007 | P0 | Attempt `replace_existing_character=true`, planner `reroll`, direct broker `plan`/`verify`/`reroll`, a new unreviewed `restart_character` tool, an approved tool extended with `verb=suicide`, and raw JSON-RPC `tools/call`. Every path is rejected before network I/O and persona state is not changed. | FR-CHAR-004, FR-CHAR-008, FR-CHAR-009 |
 | AT-CHAR-008 | P0 | Complete onboarding with no active/queued goals. The controller remains goal-idle until a human/supervisor submits a goal. | FR-CHAR-007, FR-CHAR-010; FR-GOAL-001 |
 | AT-CHAR-009 | P0 | Submit a goal or accept a proposal before onboarding is ready. The controller returns `ONBOARDING_REQUIRED` and creates no goal. | FR-CHAR-011 |
 | AT-CHAR-010 | P0 | Run local persona setup against a fresh runtime. It prompts for every documented persona field, gives concrete length/content/usage/privacy guidance for voice and identity, requires that concept to be non-empty, persists onboarding without an MCP host or model call, and preserves an existing persona unless update is explicit. | FR-CHAR-003, FR-CHAR-007, FR-CHAR-012 |
 | AT-CHAR-011 | P1 | Enter an OpenAI-compatible base URL during interactive installation. Setup requests `/models` with the selected unauthenticated, Bearer, or Anthropic headers, presents unique returned IDs as a numbered picker, and falls back to manual model-ID entry when discovery is unavailable. | FR-CHAR-012, FR-CHAR-013 |
 | AT-CHAR-012 | P0 | Exercise each model auth mode. `none` sends no credential even if an ambient key exists; `bearer` sends only HTTP Bearer; `anthropic` sends only `x-api-key` plus `anthropic-version`; either authenticated mode fails before network access when its key is missing. | FR-CHAR-002, FR-CHAR-013 |
 | AT-CHAR-013 | P0 | Select Pacific Time during setup and pass `PST` through the unattended compatibility path. Both persist `America/Los_Angeles`; an invalid advanced IANA value is rejected at the prompt rather than failing during persona/controller initialization. | FR-CHAR-014 |
+| AT-CHAR-014 | P0 | Seed completed or legacy `creating` onboarding with a replacement grant, then supply a tactical-cache observation with no character name. Goals remain withheld, legacy mutation fields are scrubbed, and no model or broker lifecycle call occurs; a later matching identity returns to ready. | FR-CHAR-004, FR-CHAR-008, FR-CHAR-010 |
 
 ## 5. LLM loop and executor tests
 
@@ -190,7 +192,7 @@ real vault.
 | AT-HARN-002 | P0 | Remove/change a required tool schema. Controller enters `incompatible`, performs no game mutations, and emits a clear alert. | NFR-MAINT-003 |
 | AT-HARN-003 | P0 | Start controller with a healthy existing broker. It attaches and starts no second process. | NFR-REL-002 |
 | AT-HARN-004 | P0 | Create conflicting broker port/lock/process states. Controller blocks and alerts instead of guessing, killing, or duplicating. | NFR-REL-002 |
-| AT-HARN-005 | P1 | Verify controller never calls `leave(forget=true)` in ordinary, restart, error, or graceful-stop paths. | FR-CHAR-006 |
+| AT-HARN-005 | P1 | Verify every controller logout sends literal `leave(forget=false)`, malformed truthy/non-boolean values are rejected before network I/O, and shutdown requires an explicit `forgotten=false` broker receipt. | FR-CHAR-006 |
 | AT-HARN-006 | P0 | Instrument concurrent broker mutations. Maximum in-flight mutations per character is exactly one. | FR-PLAY-003 |
 | AT-HARN-007 | P1 | Update to a candidate upstream commit. Contract suite detects compatible changes or reports exact incompatible schemas before live play. | NFR-MAINT-003 |
 | AT-HARN-008 | P0 | Request shutdown with active and queued goals while exposed. The controller pauses every runnable goal, serializes behind the current mutation, recovers and travels to fresh source-verified safety, releases the keeper, calls `leave(forget=false)`, verifies the session absent, then exits. Repeat from an already-safe room and verify travel is skipped. | FR-CHAR-006, FR-CHAR-015; FR-PLAY-003 |
@@ -236,8 +238,9 @@ These scenarios run in order and stop on any unexpected persistent-state change.
    baseline, safe-stop.
 2. **Read-only status**: query through the supervisor and dashboard; compare to harness
    telemetry.
-3. **Onboarding**: set a test persona, verify character preservation or explicitly
-   authorize replacement, and wait for `ready_for_goals` without auto-created work.
+3. **Onboarding**: set a test persona matching the selected live character,
+   verify that mismatched and temporarily unidentified characters are preserved,
+   and wait for `ready_for_goals` without auto-created work or lifecycle mutation.
 4. **Reversible travel/rest goal**: reach a known safe location or perform another
    clearly reversible objective, verify criteria, and pause/resume once.
 5. **Banking proof**: with a deliberately small safe amount, verify carried/banked
@@ -251,10 +254,10 @@ These scenarios run in order and stop on any unexpected persistent-state change.
 9. **Notification proof**: create a test notice and a controlled goal milestone;
    verify Windows alert and exactly-once Obsidian entries.
 
-Reroll, item drop, or alignment-change live scenarios are optional during
-commissioning because they need not be performed merely for testing. They remain
-autonomous if selected by a real goal. Passing their simulator consequence,
-logging, and notification tests is required even if live execution is deferred.
+Item-drop or alignment-change live scenarios are optional during commissioning
+because they need not be performed merely for testing. They remain autonomous if
+selected by a real goal. Character lifecycle mutations are never live scenarios;
+tests prove only that every controller path denies them before wire I/O.
 
 ## 13. Evidence package
 

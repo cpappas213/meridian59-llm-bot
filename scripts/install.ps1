@@ -525,8 +525,6 @@ minimum_stall_seconds = 300
 
 [onboarding]
 enabled = true
-create_from_persona = true
-preserve_existing_character = true
 
 [policy]
 avoid_death = true
@@ -610,10 +608,11 @@ Write-Host "Installed. Controller data: $installRoot"
 if ($registerHermes) { Write-Host "Restart Hermes to load mcp_meridian_bot_* and mcp_meridian_knowledge_* tools." }
 if (-not $SkipScheduledTask) { Write-Host "Dashboard: http://$DashboardBind`:8904/" }
 if ($SkipPersonaSetup) {
-    Write-Host "Next: run 'm59-bot --config `"$configPath`" setup-persona', then wait for onboarding to report ready_for_goals=true."
+    Write-Host "Next: select or create the intended character outside the controller, run 'm59-bot --config `"$configPath`" setup-persona', then wait for onboarding to report ready_for_goals=true."
 } else {
-    Write-Host "Character onboarding is configured. Wait for onboarding to report ready_for_goals=true, then submit the first strategic goal."
-    Write-Host "If an established character requires explicit replacement, run setup-persona with --update-existing --reuse-current --replace-existing-character."
+    Write-Host "Character identity verification is configured. The controller never creates or replaces a character."
+    Write-Host "If the selected character name differs from the persona, select/create the intended character outside the controller or update the persona name."
+    Write-Host "Wait for onboarding to report ready_for_goals=true, then submit the first strategic goal."
 }
 if ((-not $SkipScheduledTask) -and (-not $SkipTui)) {
     Write-Host "Opening the goal monitoring console. Press Q to leave the console; the controller will continue running."

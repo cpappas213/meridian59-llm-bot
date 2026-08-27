@@ -145,9 +145,12 @@ class LearningConfig:
 
 @dataclass(frozen=True)
 class OnboardingConfig:
-    """Controls the one-time transition from configuration to goal-ready play."""
+    """Controls non-mutating persona/selected-character verification."""
 
     enabled: bool = True
+    # Deprecated compatibility fields accepted from existing installations.
+    # They are deliberately inert: no configuration can grant the controller
+    # character-lifecycle authority.
     create_from_persona: bool = True
     preserve_existing_character: bool = True
 

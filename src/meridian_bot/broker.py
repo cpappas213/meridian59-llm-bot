@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -31,6 +32,232 @@ class ToolCallError(BrokerError):
 
 UNSUPPORTED_AUTOPILOT_MODES = {"tick"}
 
+# Character replacement in the harness is implemented by suiciding the live
+# character.  Even its nominally diagnostic ``verify`` action can do that when
+# it is pointed at a joined session.  The bot controller therefore has no
+# character-lifecycle capability at all: keep the whole tool out of the
+# supported manifest and reject it again at both call boundaries.
+FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS = frozenset({"reroll"})
+
+# Upstream capability growth is fail-closed.  A newly introduced harness tool
+# is neither advertised nor callable until its schema and lifecycle effects are
+# deliberately reviewed here.  This prevents a future character-reset alias
+# from silently becoming planner authority merely because the harness added it.
+APPROVED_BROKER_TOOLS = frozenset(
+    {
+        "abilities",
+        "act",
+        "approach",
+        "attack",
+        "attack_intent",
+        "autopilot",
+        "bank",
+        "buy_next_planned_skills",
+        "cancel_action",
+        "cancel_movement",
+        "cast",
+        "chat",
+        "commander_lease",
+        "commerce_catalog",
+        "commerce_commit",
+        "commerce_prepare",
+        "commerce_status",
+        "container",
+        "context_intent",
+        "converse",
+        "describe",
+        "drop_sources",
+        "equip_best",
+        "equipment",
+        "escape_underworld",
+        "face",
+        "faction_game",
+        "faction_join",
+        "faction_loyalty",
+        "faction_soldier",
+        "faction_status",
+        "fight",
+        "fleet",
+        "go_through",
+        "guild",
+        "history",
+        "hunting_grounds",
+        "inbox",
+        "inventory",
+        "join",
+        "jump",
+        "leave",
+        "leave_raza",
+        "loadout",
+        "look",
+        "look_at",
+        "loot",
+        "loot_run",
+        "map",
+        "merchants",
+        "move_intent",
+        "movement_mode",
+        "pilot",
+        "post_mortem",
+        "prey",
+        "progress",
+        "quartermaster",
+        "recording",
+        "remaining_required_to_learn_new_skills",
+        "replay_track",
+        "rescue",
+        "resolve_item_names",
+        "rest",
+        "rest_up",
+        "safe_spots",
+        "safety",
+        "say",
+        "sell",
+        "sell_all",
+        "shop",
+        "signets",
+        "spells",
+        "split",
+        "spread",
+        "status",
+        "supply",
+        "tithe",
+        "trade",
+        "travel",
+        "travel_estimate",
+        "wait_for_event",
+        "walk_to",
+        "wear_best",
+        "who",
+        "who_buys",
+    }
+)
+
+
+def lifecycle_tokens(value: Any) -> set[str]:
+    """Tokenize lifecycle vocabulary consistently across snake/camel/kebab case."""
+
+    if not isinstance(value, str):
+        return set()
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value.strip())
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", expanded).casefold()
+    return {word for word in normalized.split("_") if word}
+
+
+def is_character_lifecycle_directive(value: Any) -> bool:
+    """Recognize an unambiguous lifecycle directive contained in one string."""
+
+    words = lifecycle_tokens(value)
+    if words & {"permadeath", "reroll", "suicide"}:
+        return True
+    return bool(words & {"character", "death"}) and bool(
+        words
+        & {
+            "create",
+            "delete",
+            "forget",
+            "new",
+            "recreate",
+            "replace",
+            "reset",
+            "restart",
+            "retire",
+        }
+    )
+
+
+def collect_lifecycle_tokens(value: Any, *, field_name: str = "") -> set[str]:
+    """Collect semantics across a whole structured argument subtree."""
+
+    field_words = lifecycle_tokens(field_name)
+    words = set(field_words)
+    if isinstance(value, str):
+        # Join credentials and selectors are opaque data, never instructions.
+        # Keep the field-name semantics (notably ``character``) so sibling
+        # action fields still combine correctly, but do not interpret a real
+        # account/password/character value such as "Reset" as an operation.
+        if not field_words & {
+            "account",
+            "agent",
+            "character",
+            "host",
+            "password",
+            "port",
+        }:
+            words.update(lifecycle_tokens(value))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            words.update(collect_lifecycle_tokens(item, field_name=str(key)))
+    elif isinstance(value, list):
+        for item in value:
+            words.update(collect_lifecycle_tokens(item, field_name=field_name))
+    return words
+
+
+def contains_character_lifecycle_directive(
+    value: Any,
+    *,
+    field_name: str = "",
+) -> bool:
+    """Combine split key/value meaning before deciding whether a call is unsafe."""
+
+    words = collect_lifecycle_tokens(value, field_name=field_name)
+    if words & {"permadeath", "reroll", "suicide"}:
+        return True
+    return bool(words & {"character", "death"}) and bool(
+        words
+        & {
+            "create",
+            "delete",
+            "forget",
+            "new",
+            "recreate",
+            "replace",
+            "reset",
+            "restart",
+            "retire",
+        }
+    )
+
+
+def guard_controller_tool_call(name: str, arguments: Any) -> dict[str, Any]:
+    """Reject unreviewed or lifecycle-destructive calls before network I/O."""
+
+    normalized_name = str(name or "").casefold()
+    if normalized_name in FORBIDDEN_CHARACTER_LIFECYCLE_TOOLS:
+        raise ToolCallError(
+            f"{name} is permanently disabled: the controller cannot suicide, "
+            "reroll, replace, or recreate a character"
+        )
+    if normalized_name not in APPROVED_BROKER_TOOLS:
+        raise ToolCallError(
+            f"unapproved broker tool {name!r}; upstream capabilities are fail-closed"
+        )
+    if not isinstance(arguments, dict):
+        raise ToolCallError("tool arguments must be an object")
+    guarded = dict(arguments)
+    if normalized_name == "leave":
+        unexpected = set(guarded) - {"agent", "forget"}
+        if unexpected:
+            raise ToolCallError(
+                "unreviewed leave argument(s) are fail-closed: "
+                + ", ".join(sorted(unexpected))
+            )
+        if "forget" in guarded and guarded["forget"] is not False:
+            raise ToolCallError(
+                "leave.forget must be the literal boolean false: the controller "
+                "cannot discard a character's stored login"
+            )
+        # Do not rely on the harness default. Every controller-originated
+        # logout states the preservation invariant on the wire.
+        guarded["forget"] = False
+    if contains_character_lifecycle_directive(guarded):
+        raise ToolCallError(
+            "character-lifecycle directives are permanently disabled, including "
+            "actions added beneath an otherwise approved broker tool"
+        )
+    return guarded
+
 
 @dataclass(frozen=True)
 class Tool:
@@ -43,6 +270,31 @@ class Tool:
         properties = schema.get("properties") if isinstance(schema, dict) else None
         if isinstance(properties, dict):
             properties.pop("agent", None)
+            for property_name in list(properties):
+                if is_character_lifecycle_directive(property_name):
+                    properties.pop(property_name, None)
+                    continue
+                property_schema = properties.get(property_name)
+                enum = (
+                    property_schema.get("enum")
+                    if isinstance(property_schema, dict)
+                    else None
+                )
+                if (
+                    property_name.casefold()
+                    in {"action", "command", "intent", "mode", "operation", "verb"}
+                    and isinstance(enum, list)
+                ):
+                    property_schema["enum"] = [
+                        value
+                        for value in enum
+                        if not is_character_lifecycle_directive(value)
+                    ]
+                if contains_character_lifecycle_directive(
+                    property_schema,
+                    field_name=property_name,
+                ):
+                    properties.pop(property_name, None)
             # Travel is scoped to the destination authorized by the bot. Newer
             # harnesses otherwise run unrelated banking/provisioning errands by
             # default before departure, so that switch stays controller-owned.
@@ -63,7 +315,16 @@ class Tool:
                     ]
         required = schema.get("required") if isinstance(schema, dict) else None
         if isinstance(required, list):
-            schema["required"] = [name for name in required if name != "agent"]
+            schema["required"] = [
+                name
+                for name in required
+                if name != "agent"
+                and not is_character_lifecycle_directive(name)
+                and (
+                    not isinstance(properties, dict)
+                    or name in properties
+                )
+            ]
         return {
             "name": self.name,
             "description": self.description + " The controller selects the only configured character; never supply an agent id.",
@@ -117,7 +378,7 @@ def normalize_tool_arguments(tool: Tool, arguments: dict[str, Any]) -> dict[str,
 
 
 # Session lifecycle, credential-bearing, debugging, and conversation tools are
-# controller-owned. The planner sees every other ordinary-player capability.
+# controller-owned. The planner sees only reviewed ordinary-player capabilities.
 CONTROLLER_ONLY_TOOLS = {
     "join",
     "leave",
@@ -254,6 +515,13 @@ class BrokerClient:
         return env
 
     def rpc(self, method: str, params: dict[str, Any] | None = None, timeout: float = 30) -> Any:
+        if method == "tools/call" and isinstance(params, dict):
+            tool_name = str(params.get("name") or "")
+            arguments = guard_controller_tool_call(
+                tool_name,
+                params.get("arguments", {}),
+            )
+            params = {**params, "name": tool_name, "arguments": arguments}
         payload = {"jsonrpc": "2.0", "id": self._next_id(), "method": method}
         if params is not None:
             payload["params"] = params
@@ -278,6 +546,8 @@ class BrokerClient:
                 description=str(raw.get("description", "")),
                 schema=raw.get("inputSchema") if isinstance(raw.get("inputSchema"), dict) else {},
             )
+            if tool.name not in APPROVED_BROKER_TOOLS:
+                continue
             manifest[tool.name] = tool
         required = {
             "join",
@@ -298,7 +568,7 @@ class BrokerClient:
         return [
             tool.planner_view()
             for name, tool in sorted(self.capabilities().items())
-            if name not in CONTROLLER_ONLY_TOOLS
+            if name in APPROVED_BROKER_TOOLS and name not in CONTROLLER_ONLY_TOOLS
         ]
 
     def call_tool(
@@ -309,6 +579,7 @@ class BrokerClient:
         timeout: float = 180,
         mutation: bool = False,
     ) -> Any:
+        arguments = guard_controller_tool_call(name, arguments)
         tool = self.capabilities().get(name)
         if tool is None:
             raise HarnessIncompatible(f"unknown broker tool: {name}")
